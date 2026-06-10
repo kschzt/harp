@@ -26,117 +26,123 @@ it gets, from any conforming host:
   songs from new firmware, measured (never guessed) latency, and error
   counters that end "it glitched" support threads with evidence.
 
-This repository holds the [specification](spec/harp-spec-draft-0.3.md)
-(draft 0.3.2, CC BY 4.0) and its reference implementation (Apache-2.0): a
-portable C core, a reference device daemon that turns a Raspberry Pi 4B
-into a HARP instrument over USB, a host CLI, a CLI VST3 test host, and a
-VST3 plugin shell. **The whole stack runs today**: the Pi plays as an
-instrument track in Ableton Live 12 — knobs as automation, total recall
-through the Live set's own save/reopen, offline bounce through the
-hardware. Repository layout follows the spec's Appendix E.
+**The whole stack runs today**: a Raspberry Pi 4B plays as an instrument
+track in Ableton Live 12 — knobs as automation lanes, total recall through
+the Live set's own save/reopen, offline bounce through the hardware.
 
-## Status
+## Repository map
 
-Working today, verified Pi 4B ↔ macOS over the **normative §4.3 USB
-binding** (and a TCP dev transport for simulation):
+```
+spec/             the specification (draft 0.3.2) + machine-readable CDDL
+core/             portable C11 protocol library, no dependencies:
+                  framing, deterministic CBOR, SHA-256, content-addressed
+                  objects, crash-atomic ref store, audio frame codec
+device/           harp-deviced — the reference device daemon: an 8-knob
+                  stereo synth engine behind the protocol. Transports:
+                  TCP (simulation, any OS) and FunctionFS USB gadget (Linux)
+host/             harp-probe — host-side CLI: recall flows, audio capture,
+                  offline render, determinism checks (libusb)
+shell/            the VST3 plugin ("HARP RefDev"): embedded host runtime,
+                  host-paced audio into process(), params as automation,
+                  getState/setState = Recall Bundle
+tools/vst3-host/  CLI VST3 host for automated testing of any plugin —
+                  params, block processing, WAV+hash, state round-trips
+tests/            unit tests for the core (RFC 8949 vectors included)
+docs/             architecture one-pager, VST3 shell design plan
+scripts/          Raspberry Pi provisioning + operations runbook
+external/         VST3 SDK clone (gitignored; needed for shell/tools only)
+```
 
-- **`core/`** — portable C11 library, no dependencies: §4.2 framed link,
-  RFC 8949 deterministic CBOR, SHA-256, §10 content-addressed objects
-  (blob/list/tree/snapshot), file-backed object store, refs with
-  crash-atomic (tmp+rename) CAS updates, §5.2 envelopes, §8.2 audio
-  frame codec.
-- **`device/harp-deviced`** — reference device daemon (`harp-core`,
-  `harp-recall`, `harp-stream`). The engine is a stereo drone synth whose
-  whole voice is the 8 recallable params. Transports: TCP (simulation, any
-  OS) and FunctionFS USB gadget (Linux). Audio: free-running streaming with
-  MSC timestamps, and host-paced mode with `audio.deterministic` (T15
-  passes: byte-identical double renders) and `audio.offline-rate`
-  (21.7× real time measured). State survives power cycles and cable yanks.
-- **`host/harp-probe`** — host CLI: the §12.2 project-open flow (pull,
-  archive-before-push, CAS refset, silent path on hash match), audio
-  capture and offline render over libusb.
-- **`shell/`** — the **VST3 plugin** (`HARP RefDev`, Instrument|Synth):
-  embedded §15 runtime (feeder thread, lock-free rings, host-paced
-  stream into `process()`), device params as automation,
-  `getState`/`setState` as the §15.3 Recall Bundle with
-  archive-before-push reconcile. Verified in **Ableton Live 12** and
-  closed-loop against the CLI host below.
-- **`tools/vst3-host`** — CLI VST3 host for automated, agent-driven
-  testing: params, block processing, WAV + hash, DAW-style state
-  round-trips. The SDK validator also runs on every shell build.
-- **`tests/`** — unit tests (RFC 8949 vectors included).
+## Getting started
 
-Not yet: event plane (§9 — params currently ride a vendor method;
-sample-accurate events, ramps, and echo-to-automation come with it),
-four-safe-actions UI (v0 auto-resolves by Push-with-archive), runtime/
-shell process split (§15.1), firmware management (§13), class-audio
-coexistence (§8.5), free-running ASRC path for analog devices, AU/CLAP
-ports, TCP companion spec (§4.4).
-
-## Build & demo
+### Path 1 — laptop only, five minutes (no hardware)
 
 ```sh
-cmake -B build && cmake --build build     # libusb-1.0 enables the USB transport
-./build/harp-tests                        # unit tests
+cmake -B build && cmake --build build
+./build/harp-tests                                # unit tests
+./build/harp-deviced --state-dir /tmp/refdev &    # simulated "hardware"
+./build/harp-probe demo                           # narrated total-recall walkthrough
+```
 
-# simulator (TCP dev transport):
-./build/harp-deviced --state-dir /tmp/refdev &
-./build/harp-probe demo                   # narrated §12.2/§11.4 recall walkthrough
+The `demo` walks the canonical project-open flow (spec §12.2): save,
+front-panel edits dirtying state, mismatch detection on reopen,
+archive-before-push, hash-verified restore.
 
-# real hardware (Pi gadget, see scripts/pi-bringup.md):
-./build/harp-probe -d usb identify
-./build/harp-probe -d usb demo
+### Path 2 — a real device (Raspberry Pi 4B)
+
+`scripts/pi-bringup.md` is the runbook: provision a Pi as a USB gadget
+(vendor interface + dedicated audio endpoints), connect it to your
+computer over USB-C, and the same `harp-probe` commands run against real
+hardware — plus audio:
+
+```sh
+./build/harp-probe -d usb demo                 # recall, over the wire
 ./build/harp-probe -d usb record 4 take.wav    # free-running capture, MSC-verified
-./build/harp-probe -d usb render 8 bounce.wav  # host-paced offline bounce
+./build/harp-probe -d usb render 8 bounce.wav  # host-paced offline bounce (~20x realtime)
 ./build/harp-probe -d usb t15 4                # determinism: render twice, byte-compare
 ```
 
-`harp-probe` subcommands: `identify`, `refs`, `counters`, `params`,
-`knob ID VAL` (simulate a front-panel edit), `save` (Pull), `restore`
-(Push with archive-before-push), `record SECS WAV`, `render SECS WAV`,
-`t15 SECS`, `dev-restart` (respawn the daemon — sudo-free deploys), `demo`.
-Flags: `-d HOST:PORT|usb` (default `127.0.0.1:47800`), `-s STOREDIR`
-(default `./host-store`).
+### Path 3 — the DAW (VST3 shell)
+
+Requires CMake ≥ 3.25, libusb (`brew install libusb`), and the VST3 SDK
+cloned to `external/vst3sdk` (`git clone --recursive
+https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk`).
 
 ```sh
-# VST3 shell + CLI test host (needs CMake >= 3.25; SDK in external/vst3sdk)
 cmake -B build-vst -S tools/vst3-host
-cmake --build build-vst --target install-live   # build, re-seal, install for Live
-./build-vst/harp-vst3-host ~/Library/Audio/Plug-Ins/VST3/harp-shell.vst3 \
-    --set 3=0.8 --seconds 2 --out take.wav      # drive the shell without a DAW
+cmake --build build-vst --target install-live   # build, sign, install for Live
 ```
 
-DAW-compatibility lore the hard way (details in git history and
-`docs/vst3-shell-plan.md`): Live requires Instrument plugins to declare
-an event input bus; the SDK's moduleinfotool breaks the codesign seal it
-just made (re-seal post-build or Live rejects the bundle); Live doesn't
-follow VST3 symlinks; a changed plugin binary needs a Live restart, not
-a rescan.
+Rescan plug-ins in your DAW and drop **HARP RefDev** on a track. The
+plugin claims the device over USB, streams host-paced audio into the
+DAW's engine, exposes the knobs as automatable parameters, and stores a
+Recall Bundle in the project file — reopening the project restores the
+hardware (archiving whatever was on it first).
 
-## Transport note
+The shell can also be driven without any DAW, which is how it is tested:
 
-TCP here is a **development transport** (the framed link over a socket) —
-per spec §4.4 a network binding must not ship under the `harp` identifier
-until its companion spec exists. The product path is the USB binding:
-vendor interface FF/48/01, framed link on one bulk pair, HARP stream on a
-second (§8.2), found by the §6.1 class-triple probe.
+```sh
+./build-vst/harp-vst3-host ~/Library/Audio/Plug-Ins/VST3/harp-shell.vst3 \
+    --set 3=0.8 --seconds 2 --out take.wav --hash
+```
 
-## Implementation findings → spec 0.3.1 / 0.3.2
+## Documentation
 
-Ambiguities and wire-level lessons from this implementation were folded
-into the spec as the 0.3.1 errata (see the changelog at the top of
-`spec/harp-spec-draft-0.3.md`): state-closure definition (parents
-excluded) for refset validation and bundles, `state.want` response,
-`expect = null` semantics, `slots = 0` pacing frames, class-triple
-discovery promoted to MUST (gadget devices can't author BOS platform
-capabilities), and — the hard-won one — bulk-pair flow-control rules:
-mutually blocked writers deadlock with both sides locally correct, so
-hosts drain inbound whenever outbound stalls. T15 (`audio.deterministic`)
-and `audio.offline-rate` are demonstrated on this hardware: byte-identical
-double renders, 8 s bounced in 0.37 s (21.7× real time).
+- **The specification**: [`spec/harp-spec-draft-0.3.md`](spec/harp-spec-draft-0.3.md).
+  First read: §1 (motivation and design principles), §10–§11 (the state
+  model — "Git, not SysEx"), §8 (the audio plane and clock domains).
+  The changelog at the top records what implementation taught us.
+- **Architecture one-pager**: [`docs/architecture.md`](docs/architecture.md)
+  — components, planes, and the shell's threading model.
+- **VST3 shell design plan**: [`docs/vst3-shell-plan.md`](docs/vst3-shell-plan.md)
+  — decisions, DAW-compatibility lore, and what's deliberately deferred.
+- **Pi runbook**: [`scripts/pi-bringup.md`](scripts/pi-bringup.md) —
+  provisioning, the sudo-free deploy loop, USB debugging tricks.
 
-0.3.2 came from the first DAW integration: per-edit fsync of the dirty
-flag starved the audio path on the Pi's SD card under slider drags (now:
-persist the clean→dirty transition only, coalesce the rest, flush before
-any reader), and shells must let control-plane traffic yield to stream
-service — audio outranks knobs on the host too.
+## Status
+
+Working and verified end-to-end: `harp-core`, `harp-recall`,
+`harp-stream` (free-running + host-paced with `audio.deterministic` and
+`audio.offline-rate`), the USB binding, and the VST3 shell in Ableton
+Live 12. Certification-suite behaviors exercised in miniature: T2/T3
+(unplug/replug survival), T5 (silent hash-verified reopen), T10
+(power-loss state safety), T15 (byte-identical renders).
+
+Not yet: event plane (§9 — sample-accurate events, ramps, knob echo into
+DAW automation recording), four-safe-actions UI (v0 auto-resolves by
+Push-with-archive), runtime/shell process split (§15.1), firmware
+management (§13), class-audio coexistence (§8.5), free-running ASRC for
+analog devices, AU/CLAP ports, TCP companion spec (§4.4).
+
+The spec is an **editor's draft**: breaking changes expected, version
+negotiated at `core.hello`. Changes flow through HARP Enhancement
+Proposals (§18); two interoperating implementations are required before
+a HEP merges once the process formalizes.
+
+## Licensing
+
+- Specification text: **CC BY 4.0**
+- Schemas, reference implementation, test suite: **Apache-2.0**
+- Patent posture: royalty-free; contributors sign a non-assertion
+  covenant (spec §19). Use of the protocol is unrestricted; the
+  certification *mark* (future) requires passing the test suite.
