@@ -39,7 +39,8 @@ struct ffs_descs {
     __le32 fs_count, hs_count;
     struct {
         struct usb_interface_descriptor intf;
-        struct usb_endpoint_descriptor_no_audio ep_in, ep_out;
+        /* link pair (§4.3), then dedicated audio pair (§8.2) */
+        struct usb_endpoint_descriptor_no_audio ep_in, ep_out, ep_audio_in, ep_audio_out;
     } __attribute__((packed)) fs, hs;
 } __attribute__((packed));
 
@@ -57,13 +58,13 @@ static int write_descriptors(int ep0) {
     d.header.magic = htole32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2);
     d.header.flags = htole32(FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC);
     d.header.length = htole32(sizeof d);
-    d.fs_count = htole32(3);
-    d.hs_count = htole32(3);
+    d.fs_count = htole32(5);
+    d.hs_count = htole32(5);
 
     struct usb_interface_descriptor intf = {
         .bLength = sizeof(struct usb_interface_descriptor),
         .bDescriptorType = USB_DT_INTERFACE,
-        .bNumEndpoints = 2,
+        .bNumEndpoints = 4,
         .bInterfaceClass = 0xFF, /* vendor-specific */
         .bInterfaceSubClass = 0x48, /* 'H' */
         .bInterfaceProtocol = 0x01, /* framed link */
@@ -82,16 +83,24 @@ static int write_descriptors(int ep0) {
         .bmAttributes = USB_ENDPOINT_XFER_BULK,
     };
 
+    struct usb_endpoint_descriptor_no_audio ep_audio_in = ep_in, ep_audio_out = ep_out;
+    ep_audio_in.bEndpointAddress = USB_DIR_IN | 3;
+    ep_audio_out.bEndpointAddress = USB_DIR_OUT | 4;
+
     d.fs.intf = intf;
     d.fs.ep_in = ep_in;
-    d.fs.ep_in.wMaxPacketSize = htole16(64);
     d.fs.ep_out = ep_out;
+    d.fs.ep_audio_in = ep_audio_in;
+    d.fs.ep_audio_out = ep_audio_out;
+    d.fs.ep_in.wMaxPacketSize = htole16(64);
     d.fs.ep_out.wMaxPacketSize = htole16(64);
-    d.hs.intf = intf;
-    d.hs.ep_in = ep_in;
+    d.fs.ep_audio_in.wMaxPacketSize = htole16(64);
+    d.fs.ep_audio_out.wMaxPacketSize = htole16(64);
+    d.hs = d.fs;
     d.hs.ep_in.wMaxPacketSize = htole16(512);
-    d.hs.ep_out = ep_out;
     d.hs.ep_out.wMaxPacketSize = htole16(512);
+    d.hs.ep_audio_in.wMaxPacketSize = htole16(512);
+    d.hs.ep_audio_out.wMaxPacketSize = htole16(512);
 
     if (write(ep0, &d, sizeof d) != (ssize_t)sizeof d) return -1;
 
@@ -142,6 +151,14 @@ typedef struct {
     uint8_t rbuf[FFS_READ_CHUNK];
     size_t rlen, rpos;
 } ffs_io;
+
+/* Audio endpoint fds, valid while the interface is enabled (-1 otherwise).
+ * The audio thread in harp-deviced writes/reads these directly (§8: the
+ * audio plane has dedicated transport resources, separate from the link). */
+static int g_audio_in_fd = -1, g_audio_out_fd = -1;
+
+int harp_ffs_audio_in_fd(void) { return g_audio_in_fd; }
+int harp_ffs_audio_out_fd(void) { return g_audio_out_fd; }
 
 static bool ffs_read_exact(harp_io *io, void *buf, size_t n) {
     ffs_io *f = (ffs_io *)io;
@@ -231,6 +248,10 @@ int harp_ffs_serve(const char *ffs_dir, const char *gadget_path,
                 fio.ep_in = open(path, O_RDWR);
                 snprintf(path, sizeof path, "%s/ep2", ffs_dir);
                 fio.ep_out = open(path, O_RDWR);
+                snprintf(path, sizeof path, "%s/ep3", ffs_dir);
+                g_audio_in_fd = open(path, O_RDWR);
+                snprintf(path, sizeof path, "%s/ep4", ffs_dir);
+                g_audio_out_fd = open(path, O_RDWR);
                 if (fio.ep_in < 0 || fio.ep_out < 0) {
                     fprintf(stderr, "harp-ffs: endpoint open failed: %s\n",
                             strerror(errno));
@@ -249,6 +270,9 @@ int harp_ffs_serve(const char *ffs_dir, const char *gadget_path,
                     ssize_t pr = read(fio.ep_out, &probe, 0);
                     if (pr < 0 && errno != EINTR && errno != EAGAIN) break;
                 }
+                if (g_audio_in_fd >= 0) close(g_audio_in_fd);
+                if (g_audio_out_fd >= 0) close(g_audio_out_fd);
+                g_audio_in_fd = g_audio_out_fd = -1;
                 close(fio.ep_in);
                 close(fio.ep_out);
                 fprintf(stderr, "harp-ffs: endpoints closed; waiting for enable\n");

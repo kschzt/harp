@@ -27,7 +27,8 @@ typedef struct {
     libusb_context *ctx;
     libusb_device_handle *h;
     int iface;
-    uint8_t ep_in, ep_out;
+    uint8_t ep_in, ep_out;             /* framed link */
+    uint8_t ep_audio_in, ep_audio_out; /* HARP stream (0 = absent) */
     /* pending IN bytes: grows on drain, compacts when fully consumed */
     harp_cbuf pend;
     size_t pos;
@@ -98,10 +99,11 @@ static bool usb_write_all(harp_io *io, const void *buf, size_t n) {
     return true;
 }
 
-/* Find the HARP interface in a device's active configuration. Returns true
- * and fills iface/eps on match. */
+/* Find the HARP interface in a device's active configuration. The first bulk
+ * IN/OUT pair (descriptor order) is the framed link; the second, if present,
+ * is the dedicated HARP stream (§8.2). */
 static bool find_harp_interface(libusb_device *dev, int *iface, uint8_t *ep_in,
-                                uint8_t *ep_out) {
+                                uint8_t *ep_out, uint8_t *ep_ain, uint8_t *ep_aout) {
     struct libusb_config_descriptor *cfg;
     if (libusb_get_active_config_descriptor(dev, &cfg) != 0) return false;
     bool found = false;
@@ -110,19 +112,23 @@ static bool find_harp_interface(libusb_device *dev, int *iface, uint8_t *ep_in,
         if (alt->bInterfaceClass != 0xFF || alt->bInterfaceSubClass != 0x48 ||
             alt->bInterfaceProtocol != 0x01 || alt->bNumEndpoints < 2)
             continue;
-        uint8_t in = 0, out = 0;
+        uint8_t in[2] = {0, 0}, out[2] = {0, 0};
+        int nin = 0, nout = 0;
         for (int e = 0; e < alt->bNumEndpoints; e++) {
             const struct libusb_endpoint_descriptor *ep = &alt->endpoint[e];
             if ((ep->bmAttributes & 0x03) != LIBUSB_TRANSFER_TYPE_BULK) continue;
-            if (ep->bEndpointAddress & LIBUSB_ENDPOINT_IN)
-                in = ep->bEndpointAddress;
-            else
-                out = ep->bEndpointAddress;
+            if (ep->bEndpointAddress & LIBUSB_ENDPOINT_IN) {
+                if (nin < 2) in[nin++] = ep->bEndpointAddress;
+            } else {
+                if (nout < 2) out[nout++] = ep->bEndpointAddress;
+            }
         }
-        if (in && out) {
+        if (nin >= 1 && nout >= 1) {
             *iface = alt->bInterfaceNumber;
-            *ep_in = in;
-            *ep_out = out;
+            *ep_in = in[0];
+            *ep_out = out[0];
+            *ep_ain = in[1];
+            *ep_aout = out[1];
             found = true;
         }
     }
@@ -142,8 +148,9 @@ harp_io *harp_usb_open(void) {
     ssize_t n = libusb_get_device_list(u->ctx, &list);
     for (ssize_t i = 0; i < n; i++) {
         int iface;
-        uint8_t ep_in, ep_out;
-        if (!find_harp_interface(list[i], &iface, &ep_in, &ep_out)) continue;
+        uint8_t ep_in, ep_out, ep_ain = 0, ep_aout = 0;
+        if (!find_harp_interface(list[i], &iface, &ep_in, &ep_out, &ep_ain, &ep_aout))
+            continue;
         struct libusb_device_descriptor dd;
         libusb_get_device_descriptor(list[i], &dd);
         if (libusb_open(list[i], &u->h) != 0) {
@@ -161,6 +168,8 @@ harp_io *harp_usb_open(void) {
         u->iface = iface;
         u->ep_in = ep_in;
         u->ep_out = ep_out;
+        u->ep_audio_in = ep_ain;
+        u->ep_audio_out = ep_aout;
         u->io.read_exact = usb_read_exact;
         u->io.write_all = usb_write_all;
         char serial[64] = "?";
@@ -178,6 +187,19 @@ harp_io *harp_usb_open(void) {
     libusb_exit(u->ctx);
     free(u);
     return NULL;
+}
+
+bool harp_usb_has_audio(harp_io *io) {
+    return io && ((usb_io *)io)->ep_audio_in != 0;
+}
+
+int harp_usb_audio_read(harp_io *io, void *buf, int len, unsigned timeout_ms) {
+    usb_io *u = (usb_io *)io;
+    int got = 0;
+    int rc = libusb_bulk_transfer(u->h, u->ep_audio_in, buf, len, &got, timeout_ms);
+    if (rc == 0 || rc == LIBUSB_ERROR_TIMEOUT) return got;
+    fprintf(stderr, "harp-usb: audio bulk in failed: %s\n", libusb_error_name(rc));
+    return -1;
 }
 
 void harp_usb_close(harp_io *io) {

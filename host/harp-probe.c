@@ -24,6 +24,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "harp/audio.h"
 #include "harp/envelope.h"
 #include "harp/link.h"
 #include "harp/object.h"
@@ -121,14 +122,10 @@ static void handle_ntf(probe *p, const harp_env *e) {
     }
 }
 
-/* Send a request (envelope already in `out`) and wait for its response.
- * Objects arriving on the obj stream are stored; notifications handled.
- * Returns the response envelope; rsp_buf holds the bytes. Exits on error
- * envelope unless tolerate_error. */
-static harp_env request(probe *p, harp_cbuf *out, harp_cbuf *rsp_buf, bool tolerate_error) {
-    uint64_t rid = p->next_rid; /* caller used this rid in the head */
-    if (harp_link_send(p->io, HARP_STREAM_CTL, out->buf, out->len) != 0)
-        die("link send failed");
+/* Wait for the response to `rid`. Objects arriving on the obj stream are
+ * stored; notifications handled. Exits on error envelope unless
+ * tolerate_error. */
+static harp_env wait_rsp(probe *p, uint64_t rid, harp_cbuf *rsp_buf, bool tolerate_error) {
     for (;;) {
         uint8_t stream;
         int rc = harp_link_recv(p->io, &p->link, &stream, &p->msg);
@@ -167,6 +164,14 @@ static harp_env request(probe *p, harp_cbuf *out, harp_cbuf *rsp_buf, bool toler
         harp_env_parse(rsp_buf->buf, rsp_buf->len, &e);
         return e;
     }
+}
+
+/* Send a request (envelope already in `out`) and wait for its response. */
+static harp_env request(probe *p, harp_cbuf *out, harp_cbuf *rsp_buf, bool tolerate_error) {
+    uint64_t rid = p->next_rid; /* caller used this rid in the head */
+    if (harp_link_send(p->io, HARP_STREAM_CTL, out->buf, out->len) != 0)
+        die("link send failed");
+    return wait_rsp(p, rid, rsp_buf, tolerate_error);
 }
 
 static void req_head(probe *p, harp_cbuf *out, const char *method, bool has_body) {
@@ -511,6 +516,144 @@ static uint64_t refset(probe *p, const char *name, const harp_hash *expect /* NU
     return gen;
 }
 
+/* ---------------- audio recording (§8) ---------------- */
+
+#ifdef HAVE_LIBUSB
+static void write_wav16(const char *path, const float *interleaved, size_t nframes,
+                        uint32_t rate) {
+    FILE *f = fopen(path, "wb");
+    if (!f) die("cannot write wav");
+    uint32_t data_len = (uint32_t)(nframes * 2 * 2);
+    uint8_t hdr[44];
+    memcpy(hdr, "RIFF", 4);
+    uint32_t riff = 36 + data_len;
+    memcpy(hdr + 4, &riff, 4);
+    memcpy(hdr + 8, "WAVEfmt ", 8);
+    uint32_t fmtlen = 16;
+    memcpy(hdr + 16, &fmtlen, 4);
+    uint16_t pcm = 1, ch = 2, bits = 16, align = 4;
+    uint32_t byterate = rate * 4;
+    memcpy(hdr + 20, &pcm, 2);
+    memcpy(hdr + 22, &ch, 2);
+    memcpy(hdr + 24, &rate, 4);
+    memcpy(hdr + 28, &byterate, 4);
+    memcpy(hdr + 32, &align, 2);
+    memcpy(hdr + 34, &bits, 2);
+    memcpy(hdr + 36, "data", 4);
+    memcpy(hdr + 40, &data_len, 4);
+    fwrite(hdr, 1, 44, f);
+    for (size_t i = 0; i < nframes * 2; i++) {
+        float v = interleaved[i];
+        if (v > 1.0f) v = 1.0f;
+        if (v < -1.0f) v = -1.0f;
+        int16_t s = (int16_t)(v * 32767.0f);
+        fwrite(&s, 2, 1, f);
+    }
+    fclose(f);
+}
+
+static void cmd_record(probe *p, double seconds, const char *path) {
+    if (!harp_usb_has_audio(p->io))
+        die("device exposes no HARP stream endpoints (record needs -d usb)");
+    do_hello(p);
+
+    uint32_t rate = 48000, nsamples = 256;
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    req_head(p, &req, "audio.start", true);
+    harp_cbor_map(&req, 5);
+    harp_cbor_uint(&req, 0);
+    harp_cbor_uint(&req, rate);
+    harp_cbor_uint(&req, 1);
+    harp_cbor_uint(&req, nsamples);
+    harp_cbor_uint(&req, 2);
+    harp_cbor_uint(&req, 8); /* target depth, frames */
+    harp_cbor_uint(&req, 3);
+    harp_cbor_array(&req, 2);
+    harp_cbor_uint(&req, 0);
+    harp_cbor_uint(&req, 1);
+    harp_cbor_uint(&req, 4);
+    harp_cbor_array(&req, 0);
+    request(p, &req, &rsp, false);
+    printf("      audio.start: 48 kHz float32, stereo, %u-sample blocks (free-running)\n",
+           nsamples);
+
+    size_t want_frames = (size_t)(seconds * rate);
+    float *samples = malloc(want_frames * 2 * sizeof(float));
+    if (!samples) die("oom");
+    size_t got_frames = 0;
+
+    /* stream reassembly: bulk transfers ≈ one audio frame each, but never
+     * assume framing survives transport boundaries — accumulate and parse */
+    uint8_t acc[65536];
+    size_t acc_len = 0;
+    uint64_t expect_ts = 0;
+    bool have_ts = false;
+    uint64_t lost_samples = 0, disconts = 0, frames = 0;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    while (got_frames < want_frames) {
+        int r = harp_usb_audio_read(p->io, acc + acc_len, (int)(sizeof acc - acc_len), 2000);
+        if (r < 0) die("audio stream read failed");
+        if (r == 0) die("audio stream went silent (2 s timeout)");
+        acc_len += (size_t)r;
+        size_t off = 0;
+        while (acc_len - off >= HARP_AUDIO_HDR_LEN) {
+            harp_audio_hdr h;
+            if (!harp_audio_hdr_decode(acc + off, &h)) die("malformed audio frame header");
+            size_t need = HARP_AUDIO_HDR_LEN + harp_audio_payload_len(&h);
+            if (acc_len - off < need) break; /* partial frame: wait for more */
+            if (have_ts && h.ts != expect_ts) {
+                lost_samples += h.ts - expect_ts;
+            }
+            if (h.dirflags & HARP_AUDIO_DISCONT) disconts++;
+            expect_ts = h.ts + h.nsamples;
+            have_ts = true;
+            frames++;
+            size_t take = h.nsamples;
+            if (got_frames + take > want_frames) take = want_frames - got_frames;
+            memcpy(samples + got_frames * 2, acc + off + HARP_AUDIO_HDR_LEN,
+                   take * 2 * sizeof(float));
+            got_frames += take;
+            off += need;
+        }
+        memmove(acc, acc + off, acc_len - off);
+        acc_len -= off;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    /* stop: send the request, then keep draining the stream until the device
+     * thread parks — its writes must complete before it can see the stop */
+    req_head(p, &req, "audio.stop", false);
+    uint64_t stop_rid = p->next_rid;
+    if (harp_link_send(p->io, HARP_STREAM_CTL, req.buf, req.len) != 0)
+        die("link send failed");
+    int quiet = 0;
+    while (quiet < 3) {
+        int r = harp_usb_audio_read(p->io, acc, sizeof acc, 100);
+        if (r < 0) break;
+        quiet = (r == 0) ? quiet + 1 : 0;
+    }
+    wait_rsp(p, stop_rid, &rsp, false);
+
+    double wall = (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    double stream_secs = (double)got_frames / rate;
+    double drift_ppm = (stream_secs / wall - 1.0) * 1e6;
+    write_wav16(path, samples, got_frames, rate);
+    printf("      captured %zu samples in %zu frames -> %s\n", got_frames, (size_t)frames,
+           path);
+    printf("      timestamp continuity: %llu lost samples, %llu discontinuity flags\n",
+           (unsigned long long)lost_samples, (unsigned long long)disconts);
+    printf("      device clock vs host clock: %+.1f ppm (two crystals, as §7.3 promises)\n",
+           drift_ppm);
+    free(samples);
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+}
+#endif
+
 /* ---------------- commands ---------------- */
 
 static void cmd_identify(probe *p) {
@@ -810,8 +953,8 @@ int main(int argc, char **argv) {
     }
     if (i >= argc) {
         fprintf(stderr,
-                "usage: harp-probe [-d HOST:PORT] [-s STOREDIR] "
-                "identify|refs|counters|params|knob|save|restore|demo\n");
+                "usage: harp-probe [-d HOST:PORT|usb] [-s STOREDIR] "
+                "identify|refs|counters|params|knob ID V|save|restore|record SECS WAV|demo\n");
         return 2;
     }
     const char *cmd = argv[i];
@@ -850,6 +993,22 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "restore") == 0) {
         do_hello(&p);
         do_restore(&p);
+    } else if (strcmp(cmd, "dev-restart") == 0) {
+        do_hello(&p);
+        harp_cbuf req, rsp;
+        harp_cbuf_init(&req);
+        harp_cbuf_init(&rsp);
+        req_head(&p, &req, "x.harp-refdev.restart", false);
+        request(&p, &req, &rsp, false);
+        printf("device daemon restarting (systemd respawn)\n");
+        harp_cbuf_free(&req);
+        harp_cbuf_free(&rsp);
+    } else if (strcmp(cmd, "record") == 0 && i + 2 < argc) {
+#ifdef HAVE_LIBUSB
+        cmd_record(&p, strtod(argv[i + 1], NULL), argv[i + 2]);
+#else
+        die("built without libusb");
+#endif
     } else if (strcmp(cmd, "demo") == 0)
         cmd_demo(&p, addr);
     else {

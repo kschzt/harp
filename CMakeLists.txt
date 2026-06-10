@@ -18,11 +18,13 @@ add_library(harpcore STATIC
   core/src/store.c
   core/src/envelope.c
   core/src/link.c
+  core/src/audio.c
 )
 target_include_directories(harpcore PUBLIC core/include)
 
+find_package(Threads REQUIRED)
 add_executable(harp-deviced device/harp-deviced.c)
-target_link_libraries(harp-deviced harpcore m)
+target_link_libraries(harp-deviced harpcore m Threads::Threads)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_sources(harp-deviced PRIVATE device/ffs.c) # USB gadget transport (§4.3)
 endif()

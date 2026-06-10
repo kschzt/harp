@@ -19,8 +19,10 @@
  */
 #include <arpa/inet.h>
 #include <errno.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "harp/audio.h"
 #include "harp/envelope.h"
 #include "harp/link.h"
 #include "harp/object.h"
@@ -57,6 +60,16 @@ static dev_param g_params[] = {
 };
 #define NPARAMS (sizeof g_params / sizeof g_params[0])
 
+/* audio plane state (§8): one D→H stream, free-running, MSC-timestamped */
+typedef struct {
+    pthread_t thread;
+    volatile bool running;
+    bool thread_live;
+    int fd; /* dedicated audio endpoint, device -> host */
+    uint32_t rate, nsamples, epoch;
+    uint64_t reanchors;
+} audio_state;
+
 typedef struct {
     harp_store store;
     char serial[64];
@@ -70,11 +83,130 @@ typedef struct {
     uint64_t peer_credit;   /* bytes we may still send on obj */
     uint64_t granted;       /* unconsumed credit we granted the peer */
 
+    audio_state audio;
+
     /* counters (§14.2) */
-    uint64_t frame_errors, session_resets, snapshots_taken;
+    uint64_t frame_errors, session_resets, snapshots_taken, audio_overruns;
 } device;
 
 static device g_dev;
+
+/* ---------------- the sound engine ---------------- */
+
+/* A small stereo drone synth: blended sine/saw oscillator (R detuned for
+ * width) through a Chamberlin state-variable lowpass. Every voice parameter
+ * is one of the 8 recallable params — the point is recall you can hear. */
+typedef struct {
+    float phase_l, phase_r;
+    float low_l, band_l, low_r, band_r;
+} synth_voice;
+
+static float param_value(uint32_t id) {
+    for (size_t i = 0; i < NPARAMS; i++)
+        if (g_params[i].id == id) return g_params[i].value;
+    return 0.0f;
+}
+
+static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float rate) {
+    float pitch = param_value(1), shape = param_value(2);
+    float cutoff = param_value(3), reso = param_value(4);
+    float master = param_value(8);
+
+    float freq = 55.0f * exp2f(pitch * 4.0f);            /* 55 Hz .. 880 Hz */
+    float fc = 60.0f * exp2f(cutoff * 6.0f);             /* 60 Hz .. ~3.8 kHz */
+    float f = 2.0f * sinf((float)M_PI * fc / rate);
+    float q = 1.0f - 0.9f * reso;
+    float detune = 1.004f;
+
+    for (uint32_t i = 0; i < n; i++) {
+        v->phase_l += freq / rate;
+        if (v->phase_l >= 1.0f) v->phase_l -= 1.0f;
+        v->phase_r += freq * detune / rate;
+        if (v->phase_r >= 1.0f) v->phase_r -= 1.0f;
+
+        float osc_l = sinf(2.0f * (float)M_PI * v->phase_l);
+        osc_l += ((2.0f * v->phase_l - 1.0f) - osc_l) * shape;
+        float osc_r = sinf(2.0f * (float)M_PI * v->phase_r);
+        osc_r += ((2.0f * v->phase_r - 1.0f) - osc_r) * shape;
+
+        v->low_l += f * v->band_l;
+        float high_l = osc_l - v->low_l - q * v->band_l;
+        v->band_l += f * high_l;
+        v->low_r += f * v->band_r;
+        float high_r = osc_r - v->low_r - q * v->band_r;
+        v->band_r += f * high_r;
+
+        interleaved[2 * i] = v->low_l * master * 0.5f;
+        interleaved[2 * i + 1] = v->low_r * master * 0.5f;
+    }
+}
+
+/* Free-running stream thread (§8.3 mode 0): the device clock owns the
+ * stream; the MSC counts rendered samples; frames carry (epoch, msc). */
+#define AUDIO_MAX_NSAMPLES 1024
+
+static void *audio_thread(void *arg) {
+    device *d = arg;
+    audio_state *a = &d->audio;
+    synth_voice voice = {0};
+    uint8_t frame[HARP_AUDIO_HDR_LEN + AUDIO_MAX_NSAMPLES * 2 * 4];
+    float samples[AUDIO_MAX_NSAMPLES * 2];
+    uint64_t msc = 0;
+    uint64_t period_ns = (uint64_t)a->nsamples * 1000000000ull / a->rate;
+    bool discont = false;
+
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+    while (a->running) {
+        engine_render(&voice, samples, a->nsamples, (float)a->rate);
+        harp_audio_hdr h = {HARP_AUDIO_FVER, discont ? HARP_AUDIO_DISCONT : 0, 2,
+                            a->epoch, msc, (uint16_t)a->nsamples, HARP_AUDIO_FMT_F32};
+        discont = false;
+        harp_audio_hdr_encode(&h, frame);
+        size_t payload = (size_t)a->nsamples * 2 * 4;
+        memcpy(frame + HARP_AUDIO_HDR_LEN, samples, payload);
+        if (!harp_write_all(a->fd, frame, HARP_AUDIO_HDR_LEN + payload))
+            break; /* endpoint died (stop/unplug) */
+        msc += a->nsamples;
+
+        next.tv_nsec += (long)(period_ns % 1000000000ull);
+        next.tv_sec += (time_t)(period_ns / 1000000000ull);
+        if (next.tv_nsec >= 1000000000L) {
+            next.tv_nsec -= 1000000000L;
+            next.tv_sec++;
+        }
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t behind_ns = (int64_t)(now.tv_sec - next.tv_sec) * 1000000000ll +
+                            (now.tv_nsec - next.tv_nsec);
+        if (behind_ns > 50 * 1000000ll) {
+            /* transport stalled: re-anchor, surface it (§8.3 — never silent) */
+            next = now;
+            d->audio_overruns++;
+            a->reanchors++;
+            discont = true;
+        } else {
+#ifdef __linux__
+            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+#else
+            /* macOS has no absolute clock_nanosleep; relative is fine for
+             * the simulator (audio is USB/Linux-only anyway) */
+            struct timespec rel = {0, (long)(-behind_ns)};
+            if (behind_ns < 0) nanosleep(&rel, NULL);
+#endif
+        }
+    }
+    return NULL;
+}
+
+static void audio_stop(device *d) {
+    if (!d->audio.thread_live) return;
+    d->audio.running = false;
+    pthread_join(d->audio.thread, NULL);
+    d->audio.thread_live = false;
+    fprintf(stderr, "harp-deviced: audio stream stopped (%llu reanchors)\n",
+            (unsigned long long)d->audio.reanchors);
+}
 
 /* ---------------- engine state <-> objects ---------------- */
 
@@ -286,14 +418,37 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, PROTO_MAJOR);
     harp_cbor_uint(m, PROTO_MINOR);
     harp_cbor_uint(m, 6); /* capabilities */
-    harp_cbor_array(m, 3);
+    harp_cbor_array(m, 4);
     harp_cbor_text(m, "harp-core");
     harp_cbor_text(m, "harp-recall");
+    harp_cbor_text(m, "harp-stream");
     harp_cbor_text(m, "x.harp-refdev.sim");
-    harp_cbor_uint(m, 7); /* channel map: no audio yet */
-    harp_cbor_array(m, 0);
-    harp_cbor_uint(m, 8); /* latency profile: no audio yet */
-    harp_cbor_array(m, 0);
+    harp_cbor_uint(m, 7); /* channel map (§6.3): stereo main mix, D→H */
+    harp_cbor_array(m, 2);
+    for (int ch = 0; ch < 2; ch++) {
+        harp_cbor_map(m, 5);
+        harp_cbor_uint(m, 0);
+        harp_cbor_uint(m, ch); /* slot */
+        harp_cbor_uint(m, 1);
+        harp_cbor_uint(m, 0); /* direction: device -> host */
+        harp_cbor_uint(m, 2);
+        harp_cbor_text(m, ch ? "Main R" : "Main L");
+        harp_cbor_uint(m, 3);
+        harp_cbor_text(m, "Mix");
+        harp_cbor_uint(m, 4);
+        harp_cbor_text(m, "main");
+    }
+    harp_cbor_uint(m, 8); /* latency profile (§6.4): pure-digital engine */
+    harp_cbor_array(m, 1);
+    harp_cbor_map(m, 4);
+    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, 48000);
+    harp_cbor_uint(m, 1);
+    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, 2);
+    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, 3);
+    harp_cbor_uint(m, 256);
     harp_cbor_uint(m, 9); /* build id */
     harp_cbor_text(m, "refdev sim " __DATE__);
     harp_cbor_uint(m, 10); /* boot count */
@@ -393,7 +548,8 @@ static void handle_hello(device *d, const harp_env *e) {
         send_error(d, e->rid, e->method, "incompatible", "device supports protocol 1.x only");
         return;
     }
-    /* §5.4: hello resets all per-session state */
+    /* §5.4: hello resets all per-session state — including a running stream */
+    audio_stop(d);
     d->hello_done = true;
     d->peer_credit = 0;
     d->granted = 0;
@@ -748,7 +904,7 @@ static void handle_diag_counters(device *d, const harp_env *e) {
     harp_cbor_text(&m, "audio_underruns");
     harp_cbor_uint(&m, 0);
     harp_cbor_text(&m, "audio_overruns");
-    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, d->audio_overruns);
     harp_cbor_text(&m, "audio_late_frames");
     harp_cbor_uint(&m, 0);
     harp_cbor_text(&m, "msc_discontinuities");
@@ -765,6 +921,92 @@ static void handle_diag_counters(device *d, const harp_env *e) {
     harp_cbor_uint(&m, total);
     harp_cbor_text(&m, "storage_bytes_free");
     harp_cbor_uint(&m, freeb);
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+
+#ifdef __linux__
+int harp_ffs_audio_in_fd(void); /* device/ffs.c */
+#endif
+
+/* audio.start (§8.2): free-running mode only, stereo D→H, USB transport only */
+static void handle_audio_start(device *d, const harp_env *e) {
+    uint64_t rate = 48000, nsamples = 256, mode = 0;
+    if (e->has_body) {
+        harp_cdec b;
+        harp_cdec_init(&b, e->body, e->body_len);
+        uint64_t n;
+        if (harp_cdec_map(&b, &n)) {
+            for (uint64_t i = 0; i < n; i++) {
+                uint64_t key;
+                if (!harp_cdec_uint(&b, &key)) break;
+                if (key == 0) {
+                    if (!harp_cdec_uint(&b, &rate)) break;
+                } else if (key == 1) {
+                    if (!harp_cdec_uint(&b, &nsamples)) break;
+                } else if (key == 5) {
+                    if (!harp_cdec_uint(&b, &mode)) break;
+                } else if (!harp_cdec_skip(&b))
+                    break;
+            }
+        }
+    }
+    if (mode != 0) {
+        send_error(d, e->rid, e->method, "unsupported", "host-paced mode not yet implemented");
+        return;
+    }
+    if (rate != 44100 && rate != 48000 && rate != 96000) {
+        send_error(d, e->rid, e->method, "unsupported", "rate");
+        return;
+    }
+    if (nsamples < 32 || nsamples > AUDIO_MAX_NSAMPLES) {
+        send_error(d, e->rid, e->method, "unsupported", "nsamples");
+        return;
+    }
+    int fd = -1;
+#ifdef __linux__
+    fd = harp_ffs_audio_in_fd();
+#endif
+    if (fd < 0) {
+        send_error(d, e->rid, e->method, "unsupported",
+                   "HARP stream requires the USB transport");
+        return;
+    }
+    if (d->audio.thread_live) {
+        send_error(d, e->rid, e->method, "busy", "stream already running");
+        return;
+    }
+    d->audio.fd = fd;
+    d->audio.rate = (uint32_t)rate;
+    d->audio.nsamples = (uint32_t)nsamples;
+    d->audio.reanchors = 0;
+    d->audio.running = true;
+    if (pthread_create(&d->audio.thread, NULL, audio_thread, d) != 0) {
+        d->audio.running = false;
+        send_error(d, e->rid, e->method, "internal", "thread");
+        return;
+    }
+    d->audio.thread_live = true;
+    fprintf(stderr, "harp-deviced: audio stream started (%u Hz, %u-sample blocks)\n",
+            d->audio.rate, d->audio.nsamples);
+
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, true);
+    harp_cbor_map(&m, 2);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, 0); /* clock-mode in effect: free-running */
+    harp_cbor_uint(&m, 1);
+    harp_cbor_uint(&m, d->audio.nsamples); /* device pipeline: one block */
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+
+static void handle_audio_stop(device *d, const harp_env *e) {
+    audio_stop(d);
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, false);
     send_ctl(d, &m);
     harp_cbuf_free(&m);
 }
@@ -887,13 +1129,29 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
         handle_state_send(d, &e);
     else if (strcmp(e.method, "state.refset") == 0)
         handle_state_refset(d, &e);
+    else if (strcmp(e.method, "audio.start") == 0)
+        handle_audio_start(d, &e);
+    else if (strcmp(e.method, "audio.stop") == 0)
+        handle_audio_stop(d, &e);
     else if (strcmp(e.method, "diag.counters") == 0)
         handle_diag_counters(d, &e);
     else if (strcmp(e.method, "x.harp-refdev.knob") == 0)
         handle_knob(d, &e);
     else if (strcmp(e.method, "x.harp-refdev.params") == 0)
         handle_dev_params(d, &e);
-    else
+    else if (strcmp(e.method, "x.harp-refdev.restart") == 0) {
+        /* dev-loop helper: exit cleanly so systemd (Restart=always) respawns
+         * the daemon from the (possibly updated) binary on disk — the
+         * fw.commit pattern in miniature, no root needed for deploys */
+        harp_cbuf m;
+        harp_cbuf_init(&m);
+        rsp_head(&m, e.rid, e.method, false);
+        send_ctl(d, &m);
+        harp_cbuf_free(&m);
+        fprintf(stderr, "harp-deviced: restart requested; exiting for respawn\n");
+        audio_stop(d);
+        exit(0);
+    } else
         send_error(d, e.rid, e.method, "unsupported", NULL);
 }
 
@@ -933,6 +1191,7 @@ void harp_deviced_run_session(device *d, harp_io *io) {
     }
     harp_cbuf_free(&msg);
     harp_link_free(&d->link);
+    audio_stop(d); /* session gone -> stream gone (§12) */
     d->io = NULL;
 }
 
