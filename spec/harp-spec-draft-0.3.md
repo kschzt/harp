@@ -1,4 +1,4 @@
-# HARP — Hardware Audio Recall Protocol
+# HARP — Hardware Audio Runtime Protocol
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 

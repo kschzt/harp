@@ -1,4 +1,4 @@
-# HARP — Hardware Audio Recall Protocol
+# HARP — Hardware Audio Runtime Protocol
 
 Reference implementation of the [HARP specification](spec/harp-spec-draft-0.3.md)
 (draft 0.3.0). Layout follows the spec's Appendix E.
