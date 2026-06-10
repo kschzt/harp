@@ -4,3 +4,4 @@ refdev-state/
 compile_commands.json
 .cache/
 external/
+build-vst/
