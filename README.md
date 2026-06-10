@@ -45,15 +45,16 @@ until its companion spec exists. The normative USB binding (§4.3) lands as a
 FunctionFS gadget backend for `harp-deviced` on the Raspberry Pi 4B; the
 link layer is fd-based, so only the attach path changes.
 
-## Spec ambiguities found while implementing (candidate HEP/errata)
+## Implementation findings → spec 0.3.1
 
-1. **§15.3 "full closure of `live/project`"** — a snapshot's closure
-   strictly includes its parent chain, i.e. unbounded history in every
-   bundle. This implementation embeds the *state* closure (root tree +
-   reachable objects, parents excluded) and devices do not require parent
-   ancestry to be present at `state.refset`.
-2. **`state.want` response body** is unspecified; this implementation
-   replies `{0: count-of-objects-queued}` before sending objects.
-3. **`state.refset` on an unborn ref** with the create flag: the `expect`
-   field is still required by the CDDL; we send `null` and the device
-   accepts `null`-or-create.
+Ambiguities and wire-level lessons from this implementation were folded
+into the spec as the 0.3.1 errata (see the changelog at the top of
+`spec/harp-spec-draft-0.3.md`): state-closure definition (parents
+excluded) for refset validation and bundles, `state.want` response,
+`expect = null` semantics, `slots = 0` pacing frames, class-triple
+discovery promoted to MUST (gadget devices can't author BOS platform
+capabilities), and — the hard-won one — bulk-pair flow-control rules:
+mutually blocked writers deadlock with both sides locally correct, so
+hosts drain inbound whenever outbound stalls. T15 (`audio.deterministic`)
+and `audio.offline-rate` are demonstrated on this hardware: byte-identical
+double renders, 8 s bounced in 0.37 s (21.7× real time).

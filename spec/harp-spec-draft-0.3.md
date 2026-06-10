@@ -2,7 +2,7 @@
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 
-Specification, Draft 0.3.0 — 10 June 2026
+Specification, Draft 0.3.1 — 10 June 2026
 
 | | |
 |---|---|
@@ -13,6 +13,8 @@ Specification, Draft 0.3.0 — 10 June 2026
 | **Schema & reference code license** | Apache-2.0 |
 | **Patent policy** | Royalty-free; contributors sign a non-assertion covenant (§19) |
 | **Feedback** | via HARP Enhancement Proposals (HEPs), see §18 |
+
+> **Changes in 0.3.1** — Errata from the first reference implementation (a Raspberry Pi 4B FunctionFS-gadget device against a macOS libusb host, over both a TCP dev link and the normative USB binding). Flow control: bulk endpoint pairs have no TCP-style buffering, so mutually blocked writers deadlock while each side is locally correct — hosts must drain inbound whenever outbound stalls (§4.2.1). Discovery by interface class triple promoted to MUST on hosts, because gadget-framework devices cannot author BOS platform capabilities (§4.3, §6.1). `slots = 0` pacing frames made explicit in the frame description (§8.2). Pacing backpressure defined as a pipeline-depth signal, not an error (§8.3, informative). `state.want` response defined (§11.2). Closure for refset validation and Recall Bundles defined as the *state closure*, excluding snapshot parent links (§11.3, §15.3). `expect = null` clarified as "expect unborn" (§11.3). The `audio.deterministic` (T15) and `audio.offline-rate` claims have now been demonstrated on reference hardware.
 
 > **Changes in 0.3.0** — The event layer is upgraded to full plugin-API parity (§9): scheduled ramp events, CLAP-style non-destructive modulation, per-voice addressing, full parameter flags (readonly/meter, bypass, hidden, periodic, modulatable), enum and piecewise display mapping with device-side format/parse fallback, output-parameter metering, and — closing the largest gap — transport/tempo/musical-time events so hardware sequencers follow the DAW timeline the way plugins do, not via MIDI clock. UMP remains the carrier for musical events. Certification adds T16–T17.
 
@@ -232,12 +234,14 @@ Messages larger than one frame are split across consecutive frames of the same s
 
 Streams `ctl`, `evt`, and `log` are bounded by design: implementations MUST keep individual messages on these streams ≤ 64 KiB and SHOULD keep `ctl`/`evt` messages ≤ 4 KiB. Stream `obj` carries arbitrarily large transfers and is credit-controlled: each side grants the other transmit credit in bytes via `core.credit` (§5.5); senders MUST NOT exceed granted credit. A sender with queued `ctl` or `evt` frames MUST schedule them ahead of queued `obj` frames.
 
+A bidirectional bulk pair has no equivalent of TCP's socket buffering. If one peer blocks mid-write waiting for its counterpart to read, while the counterpart is itself blocked writing in the other direction, the link deadlocks — with both sides, locally, behaving correctly. This failure mode is invisible during TCP-based development and certain on the USB binding. Hosts MUST NOT block indefinitely on an outbound transfer while inbound data may be pending; keeping an inbound read always posted, or equivalently draining the inbound direction whenever an outbound transfer stalls, satisfies this. The same discipline applies to the HARP stream's endpoint pair (§8.3, pipelining note).
+
 ### 4.3 USB binding (normative)
 
 A HARP device on USB:
 
 1. MUST present a vendor-specific interface (class `0xFF`, subclass `0x48` 'H', protocol `0x01`) with one bulk IN and one bulk OUT endpoint carrying the framed link. Max packet size SHOULD be the maximum for the negotiated bus speed.
-2. MUST include a Binary Object Store (BOS) Platform Capability descriptor with UUID `b1f0c3a6-78a4-4e0e-9c5b-2d7a0e51c9d3` *(placeholder; final value assigned at first stable release — see Appendix C)*, carrying `bcdHARP` (protocol version) and the interface number of the framed link. This allows hosts to identify HARP support without claiming interfaces.
+2. SHOULD include a Binary Object Store (BOS) Platform Capability descriptor with UUID `b1f0c3a6-78a4-4e0e-9c5b-2d7a0e51c9d3` *(placeholder; final value assigned at first stable release — see Appendix C)*, carrying `bcdHARP` (protocol version) and the interface number of the framed link. This allows hosts to identify HARP support without claiming interfaces. Devices built on gadget frameworks that cannot author platform capability descriptors (e.g. Linux libcomposite/FunctionFS) omit it and rely on the class-triple discovery hosts are required to implement (§6.1); silicon and custom-stack devices SHOULD NOT omit it.
 3. SHOULD use the device's USB VID/PID and serial-number string descriptor as its primary identity keys (§6.2).
 4. If claiming `harp-stream`, MUST present the dedicated audio endpoints described in §8.2.
 5. If claiming `harp-class-audio`, MUST present UAC2 or UAC3 audio function(s) in the same composite device (§8.5).
@@ -315,7 +319,7 @@ The device selects the highest mutually supported `major` and replies; differing
 
 ### 6.1 Discovery
 
-On USB, hosts discover HARP devices by the BOS platform capability (§4.3) and MAY additionally probe by interface class triple. The runtime maintains the system-wide device list; shells consume it (§15.2). Devices are keyed by `(vendor id, product id, serial)`; a device whose serial is unavailable MUST be treated as a distinct unit per physical port, and certification requires a serial.
+On USB, hosts discover HARP devices by the BOS platform capability (§4.3) where present, and MUST also support discovery by interface class triple — for gadget-framework devices (§4.3 item 2) the class-triple probe is the only discovery path. The runtime maintains the system-wide device list; shells consume it (§15.2). Devices are keyed by `(vendor id, product id, serial)`; a device whose serial is unavailable MUST be treated as a distinct unit per physical port, and certification requires a serial.
 
 ### 6.2 Identity descriptor
 
@@ -418,7 +422,7 @@ Transport: a dedicated bulk IN and bulk OUT endpoint pair (USB binding), separat
 audio frame
   u8   fver        = 0x01
   u8   dirflags    bit 0: direction (0 D→H, 1 H→D); bit 1: discontinuity follows; rest 0
-  u16  slots       channel count in this frame
+  u16  slots       channel count in this frame (0 = pacing-only H→D frame, §8.3)
   u32  epoch
   u64  ts          stream timestamp of first sample — device MSC (free-running)
                    or host SSI (host-paced), per §8.3
@@ -450,7 +454,7 @@ The stream runs in one of two clock modes, selected at `audio.start`; per-channe
 
 Host-paced mode admits two further OPTIONAL capabilities: `audio.deterministic` — byte-identical output for identical state, event schedule, and SSI range, certifiable under T15 — and `audio.offline-rate` — willingness to be paced faster or slower than real time, which turns offline bounce *through hardware* into an ordinary host feature rather than a stunt.
 
-Pipelining note (informative): host-paced does not mean synchronous RPC per DAW callback. The runtime keeps the device a small, fixed number of blocks ahead; the mode constrains *what* the device renders, while modest pipelining covers transport scheduling. Typical added latency is two to four blocks, constant and reported.
+Pipelining note (informative): host-paced does not mean synchronous RPC per DAW callback. The runtime keeps the device a small, fixed number of blocks ahead; the mode constrains *what* the device renders, while modest pipelining covers transport scheduling. Typical added latency is two to four blocks, constant and reported. A device MAY service pacing strictly serially — accepting no new pacing frame until its previous response is fully drained — so hosts SHOULD treat backpressure on pacing writes as a pipeline-depth signal and adapt their in-flight count, never as an error; an effective depth of one is normal and still far above real time over USB High Speed. (The first reference implementation rendered 21× real time at depth one.)
 
 ### 8.4 Many devices at once
 
@@ -701,6 +705,8 @@ Object transfer runs on stream `obj` as a CBOR sequence of `object` items, prece
 ```
 req state.want { 0 => [* hash] }                ; ask peer to send objects (recursive
                                                 ;   closure NOT implied; requester walks)
+rsp            { 0 => uint }                    ; count of requested objects the peer
+                                                ;   holds and has queued for transfer
 req state.send { 0 => [* hash], 1 => uint }     ; announce push: hashes + total bytes
 ```
 
@@ -712,7 +718,7 @@ The only way to change device state from the host:
 
 ```
 req state.refset { 0 => tstr ref-name,
-                   1 => hash / null,     ; expect: required current target
+                   1 => hash / null,     ; expect: required current target (null = expect unborn)
                    2 => hash,            ; new target (objects must be fully present)
                    ? 3 => uint flags }   ; bit 0 create-if-unborn; bit 1 force (see below)
 rsp              { 0 => uint64 new-generation }
@@ -721,7 +727,7 @@ err conflict     { details: { 0 => hash/null actual, 1 => uint64 generation, 2 =
 
 Semantics: the device atomically verifies that the ref's current target equals `expect` **and** `dirty == false`; on success it loads the new target into the live engine (for `live/*` refs) or storage and replies; otherwise it replies `conflict` with the actual state and changes nothing. The `force` flag overrides both checks; hosts MUST NOT set it except on an explicit, informed user action, and MUST archive the displaced state first (§11.4). CAS is the entire concurrency story: a knob turned between the host's read and write surfaces as `conflict`, never as silent loss.
 
-**Atomic apply.** Activation of a new target MUST be transactional with respect to power loss and error: the device validates the full object closure, stages, then commits via a journaled step such that interruption at any point leaves either the old or the new state fully intact — never a hybrid, never corruption. Activation of a typical project SHOULD complete in ≤ 2 s; the device MAY mute outputs during the swap but MUST NOT emit unbounded transients. Certification T10 power-cycles devices mid-apply, repeatedly.
+**Atomic apply.** Activation of a new target MUST be transactional with respect to power loss and error: the device validates the target's **state closure** — the object graph reachable through the snapshot's root tree, tree entries, and list chunks; snapshot *parent* links are excluded and MAY reference objects not present — then stages and commits via a journaled step such that interruption at any point leaves either the old or the new state fully intact — never a hybrid, never corruption. (Including parent links in the closure would make every transfer carry unbounded history; history is reachable on the peer that has it, not required on the peer receiving current state.) Activation of a typical project SHOULD complete in ≤ 2 s; the device MAY mute outputs during the swap but MUST NOT emit unbounded transients. Certification T10 power-cycles devices mid-apply, repeatedly.
 
 ### 11.4 The four safe actions
 
@@ -890,7 +896,7 @@ recall-bundle = { 0 => tstr "harpb", 1 => uint version,
                   ? 6 => tstr }                     ; user note
 ```
 
-Shells MUST embed the full closure of `live/project` (typical sizes are small; patches are kilobytes) and SHOULD embed `sys/settings`. For `lib/samples`, shells embed hashes always and content optionally (user setting; sample libraries can be gigabytes) — a project with hash-only samples reopens with verification and a "fetch from device / locate library" flow rather than blind trust. Because bundles are content-addressed, a project moved to another machine, or another *unit* of the same model, restores exactly: that is the portability story, and it falls out of §10 with no extra machinery.
+Shells MUST embed the full **state closure** of `live/project` (as defined in §11.3 — snapshot parent links excluded; embedding history is OPTIONAL and usually wasteful; typical sizes are small, patches are kilobytes) and SHOULD embed `sys/settings`. For `lib/samples`, shells embed hashes always and content optionally (user setting; sample libraries can be gigabytes) — a project with hash-only samples reopens with verification and a "fetch from device / locate library" flow rather than blind trust. Because bundles are content-addressed, a project moved to another machine, or another *unit* of the same model, restores exactly: that is the portability story, and it falls out of §10 with no extra machinery.
 
 ### 15.4 Shell behavior
 
