@@ -1,37 +1,45 @@
-# Raspberry Pi 4B bring-up plan
+# Raspberry Pi 4B reference device — setup and operations
 
-Two stages; both run the same `harp-deviced`.
+Current state: **operational.** The Pi enumerates on the host as
+`1209:4852 "harp-refdev"` (serial `PI4B-0001`), USB 2.0 High Speed, with
+the framed link and the HARP stream on two bulk endpoint pairs.
 
-## Stage 1 — TCP over LAN (works the moment SSH is up)
+## Provisioning a fresh Pi (what was actually done)
+
+1. Debian 13 (trixie) arm64, ssh access, `cmake make gcc` installed.
+2. Clone/rsync this repo to `~/harp`, `cmake -B build && cmake --build build`.
+3. Peripheral mode + services: `sudo sh ~/harp/scripts/pi-stage2-install.sh`
+   — comments out `otg_mode=1` (forces xhci host mode on the Pi 4), adds
+   `dtoverlay=dwc2,dr_mode=peripheral`, installs `harp-gadget.service`
+   (configfs skeleton via `pi-gadget.sh`; UDC bind is deferred to the
+   daemon, which must write FunctionFS descriptors first) and
+   `harp-deviced-usb.service`, then reboots.
+4. Cable: the Pi's USB-C port to the Mac. **The same port is the Pi's
+   power input** — the Mac powers the board; unplugging the cable
+   power-cycles it (which the protocol survives; that's the point).
+
+`harp-deviced-usb.service` Conflicts= the TCP `harp-deviced.service`:
+one protocol stack owns the state store at a time.
+
+## Day-to-day deploy loop (no sudo needed)
 
 ```sh
-# on the Pi (Raspberry Pi OS / any Debian-ish arm64)
-sudo apt install -y cmake build-essential
-git clone <this repo> harp && cd harp
-cmake -B build && cmake --build build
-./build/harp-deviced --state-dir ~/harp-state --serial PI4B-0001
-# on the Mac
-./build/harp-probe -d <pi-ip>:47800 demo
+rsync -a --exclude build --exclude .git . jak@harp.local:~/harp/
+ssh jak@harp.local 'cmake --build ~/harp/build'
+./build/harp-probe -d usb dev-restart    # daemon exits; systemd respawns new binary
 ```
 
-## Stage 2 — USB gadget (the normative §4.3 binding)
+## Debugging notes (hard-won)
 
-The Pi 4B's USB-C port is the DWC2 OTG controller. Plan:
-
-1. `/boot/firmware/config.txt`: `dtoverlay=dwc2` (+ `modules-load=dwc2` in
-   `cmdline.txt`), reboot.
-2. configfs gadget: vendor-specific interface class `0xFF`/`0x48`/`0x01`,
-   one FunctionFS function (`ffs.harp`) exposing bulk IN/OUT for the framed
-   link; VID 0x1209 (pid.codes) for prototyping.
-3. New transport backend in `harp-deviced`: open `ep0`, write descriptors,
-   service `ep1`/`ep2` — fd-based like the socket, so the session code is
-   unchanged.
-4. Host side: libusb backend for `harp-probe` (claims the vendor interface;
-   no driver needed on macOS).
-
-Known gaps vs spec on this hardware:
-- BOS platform capability descriptor (§4.3.2) is not exposable via
-  libcomposite without kernel patches → hosts use the interface-class
-  probe fallback (§6.1 allows it).
-- Intermediate bring-up shortcut if FunctionFS fights back: gadget
-  ethernet (`g_ether`) + the stage-1 TCP transport over the USB cable.
+- **dwc2 debugfs** is the truth serum:
+  `sudo cat /sys/kernel/debug/usb/fe980000.usb/state` — `DOEPTSIZ`/
+  `DIEPTSIZ` residues show exactly how many bytes of a transfer moved
+  before a stall.
+- Which fd is a thread blocked on: `cat /proc/PID/task/TID/syscall`
+  (field 2 = fd, see `/proc/PID/fd`).
+- Bulk pairs deadlock when both sides block writing (no TCP-style
+  buffering). Host-side cure is drain-on-stall — see spec §4.2.1 (0.3.1)
+  and `host/usb_io.c` / `render_host_paced`.
+- Passwordless sudo: the NOPASSWD line lives in `/etc/sudoers` proper;
+  drop-ins under `/etc/sudoers.d/` were being wiped on reboot on this
+  image (root cause not identified).

@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "harp/audio.h"
 #include "harp/cbor.h"
 #include "harp/envelope.h"
 #include "harp/frame.h"
@@ -309,6 +310,32 @@ static void test_envelope(void) {
     harp_cbuf_free(&b);
 }
 
+static void test_audio_codec(void) {
+    harp_audio_hdr h = {HARP_AUDIO_FVER, HARP_AUDIO_DIR_H2D, 0, 7,
+                        0x123456789abcdef0ull, 256, HARP_AUDIO_FMT_F32};
+    uint8_t enc[HARP_AUDIO_HDR_LEN];
+    harp_audio_hdr_encode(&h, enc);
+    harp_audio_hdr o;
+    CHECK(harp_audio_hdr_decode(enc, &o));
+    CHECK(o.dirflags == HARP_AUDIO_DIR_H2D && o.slots == 0 && o.epoch == 7 &&
+          o.ts == 0x123456789abcdef0ull && o.nsamples == 256 &&
+          o.fmt == HARP_AUDIO_FMT_F32);
+    CHECK(harp_audio_payload_len(&o) == 0); /* slots=0 pacing frame (§8.3) */
+    o.slots = 2;
+    CHECK(harp_audio_payload_len(&o) == 2048);
+
+    enc[0] = 0x02; /* bad fver */
+    CHECK(!harp_audio_hdr_decode(enc, &o));
+    enc[0] = HARP_AUDIO_FVER;
+    enc[18] = 0xff; /* unknown fmt */
+    CHECK(!harp_audio_hdr_decode(enc, &o));
+
+    harp_audio_hdr z = h;
+    z.nsamples = 0;
+    harp_audio_hdr_encode(&z, enc);
+    CHECK(!harp_audio_hdr_decode(enc, &z));
+}
+
 int main(void) {
     test_sha256();
     test_cbor_encode();
@@ -317,6 +344,7 @@ int main(void) {
     test_objects();
     test_store();
     test_envelope();
+    test_audio_codec();
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

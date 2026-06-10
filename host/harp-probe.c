@@ -557,6 +557,14 @@ static void cmd_record(probe *p, double seconds, const char *path) {
         die("device exposes no HARP stream endpoints (record needs -d usb)");
     do_hello(p);
 
+    /* discard stale stream bytes from a previous run — must happen BEFORE
+     * audio.start: a free-running device streams immediately, so a
+     * drain-until-quiet afterwards would never go quiet */
+    {
+        uint8_t junk[16384];
+        while (harp_usb_audio_read(p->io, junk, sizeof junk, 50) > 0) {}
+    }
+
     uint32_t rate = 48000, nsamples = 256;
     harp_cbuf req, rsp;
     harp_cbuf_init(&req);
