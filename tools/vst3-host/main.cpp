@@ -234,8 +234,11 @@ int main(int argc, char **argv) {
     }
     printf("buses: %d in (%d ch), %d out (%d ch)\n", nin, in_ch, nout, out_ch);
 
-    /* ---- processing setup ---- */
-    ProcessSetup setup{kRealtime, kSample32, (int32)block, (SampleRate)rate};
+    /* ---- processing setup ----
+     * This host renders with no wall clock: declare kOffline so plugins
+     * bridging real hardware (the HARP shell) may legitimately block on
+     * their transport instead of underrunning. */
+    ProcessSetup setup{kOffline, kSample32, (int32)block, (SampleRate)rate};
     if (processor->setupProcessing(setup) != kResultOk) die("setupProcessing failed");
     HostProcessData pd;
     if (!pd.prepare(*component, (int32)block, kSample32)) die("process data prepare failed");

@@ -1,7 +1,7 @@
 # harp-vst3-host — minimal CLI VST3 host for automated, agent-driven testing.
 # Builds the VST3 SDK (hosting parts + example plugins for self-validation).
 cmake_minimum_required(VERSION 3.20)
-project(harp-vst3-host CXX)
+project(harp-vst3-host VERSION 0.1.0 LANGUAGES CXX C)
 if(APPLE)
   enable_language(OBJCXX)
 endif()
@@ -35,3 +35,35 @@ if(APPLE)
   target_link_libraries(harp-vst3-host PRIVATE "-framework CoreFoundation" "-framework Foundation")
 endif()
 target_include_directories(harp-vst3-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vst3sdk)
+
+# ---- the HARP shell plugin (shell/) — needs libusb ----
+find_package(PkgConfig QUIET)
+if(PKG_CONFIG_FOUND)
+  pkg_check_modules(LIBUSB libusb-1.0)
+endif()
+if(LIBUSB_FOUND)
+  set(HARP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+  smtg_add_vst3plugin(harp-shell
+    ${SDK_ROOT}/public.sdk/source/main/macmain.cpp
+    ${HARP_ROOT}/shell/plugin.cpp
+    ${HARP_ROOT}/shell/runtime.cpp
+    ${HARP_ROOT}/host/usb_io.c
+    ${HARP_ROOT}/core/src/cbor.c
+    ${HARP_ROOT}/core/src/sha256.c
+    ${HARP_ROOT}/core/src/frame.c
+    ${HARP_ROOT}/core/src/object.c
+    ${HARP_ROOT}/core/src/store.c
+    ${HARP_ROOT}/core/src/envelope.c
+    ${HARP_ROOT}/core/src/link.c
+    ${HARP_ROOT}/core/src/audio.c
+  )
+  target_include_directories(harp-shell PRIVATE
+    ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
+    ${LIBUSB_INCLUDE_DIRS})
+  target_compile_definitions(harp-shell PRIVATE HAVE_LIBUSB)
+  target_link_directories(harp-shell PRIVATE ${LIBUSB_LIBRARY_DIRS})
+  target_link_libraries(harp-shell PRIVATE sdk ${LIBUSB_LIBRARIES})
+  message(STATUS "harp-shell: building VST3 shell with libusb ${LIBUSB_VERSION}")
+else()
+  message(STATUS "harp-shell: libusb not found, shell not built")
+endif()
