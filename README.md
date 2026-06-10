@@ -27,13 +27,13 @@ it gets, from any conforming host:
   counters that end "it glitched" support threads with evidence.
 
 This repository holds the [specification](spec/harp-spec-draft-0.3.md)
-(draft 0.3.1, CC BY 4.0) and its reference implementation (Apache-2.0): a
+(draft 0.3.2, CC BY 4.0) and its reference implementation (Apache-2.0): a
 portable C core, a reference device daemon that turns a Raspberry Pi 4B
-into a HARP instrument over USB, and a host CLI. The recall, USB-binding,
-streaming, and deterministic-render layers are running and verified on
-that hardware today; the VST3 shell — where this becomes an instrument
-track in a DAW — is next (`docs/vst3-shell-plan.md`). Repository layout
-follows the spec's Appendix E.
+into a HARP instrument over USB, a host CLI, a CLI VST3 test host, and a
+VST3 plugin shell. **The whole stack runs today**: the Pi plays as an
+instrument track in Ableton Live 12 — knobs as automation, total recall
+through the Live set's own save/reopen, offline bounce through the
+hardware. Repository layout follows the spec's Appendix E.
 
 ## Status
 
@@ -55,11 +55,23 @@ binding** (and a TCP dev transport for simulation):
 - **`host/harp-probe`** — host CLI: the §12.2 project-open flow (pull,
   archive-before-push, CAS refset, silent path on hash match), audio
   capture and offline render over libusb.
+- **`shell/`** — the **VST3 plugin** (`HARP RefDev`, Instrument|Synth):
+  embedded §15 runtime (feeder thread, lock-free rings, host-paced
+  stream into `process()`), device params as automation,
+  `getState`/`setState` as the §15.3 Recall Bundle with
+  archive-before-push reconcile. Verified in **Ableton Live 12** and
+  closed-loop against the CLI host below.
+- **`tools/vst3-host`** — CLI VST3 host for automated, agent-driven
+  testing: params, block processing, WAV + hash, DAW-style state
+  round-trips. The SDK validator also runs on every shell build.
 - **`tests/`** — unit tests (RFC 8949 vectors included).
 
-Not yet: event plane (§9), VST3 shell + runtime/shell split (§15),
-firmware management (§13), class-audio coexistence (§8.5), TCP companion
-spec (§4.4).
+Not yet: event plane (§9 — params currently ride a vendor method;
+sample-accurate events, ramps, and echo-to-automation come with it),
+four-safe-actions UI (v0 auto-resolves by Push-with-archive), runtime/
+shell process split (§15.1), firmware management (§13), class-audio
+coexistence (§8.5), free-running ASRC path for analog devices, AU/CLAP
+ports, TCP companion spec (§4.4).
 
 ## Build & demo
 
@@ -86,6 +98,21 @@ cmake -B build && cmake --build build     # libusb-1.0 enables the USB transport
 Flags: `-d HOST:PORT|usb` (default `127.0.0.1:47800`), `-s STOREDIR`
 (default `./host-store`).
 
+```sh
+# VST3 shell + CLI test host (needs CMake >= 3.25; SDK in external/vst3sdk)
+cmake -B build-vst -S tools/vst3-host
+cmake --build build-vst --target install-live   # build, re-seal, install for Live
+./build-vst/harp-vst3-host ~/Library/Audio/Plug-Ins/VST3/harp-shell.vst3 \
+    --set 3=0.8 --seconds 2 --out take.wav      # drive the shell without a DAW
+```
+
+DAW-compatibility lore the hard way (details in git history and
+`docs/vst3-shell-plan.md`): Live requires Instrument plugins to declare
+an event input bus; the SDK's moduleinfotool breaks the codesign seal it
+just made (re-seal post-build or Live rejects the bundle); Live doesn't
+follow VST3 symlinks; a changed plugin binary needs a Live restart, not
+a rescan.
+
 ## Transport note
 
 TCP here is a **development transport** (the framed link over a socket) —
@@ -94,7 +121,7 @@ until its companion spec exists. The product path is the USB binding:
 vendor interface FF/48/01, framed link on one bulk pair, HARP stream on a
 second (§8.2), found by the §6.1 class-triple probe.
 
-## Implementation findings → spec 0.3.1
+## Implementation findings → spec 0.3.1 / 0.3.2
 
 Ambiguities and wire-level lessons from this implementation were folded
 into the spec as the 0.3.1 errata (see the changelog at the top of
@@ -107,3 +134,9 @@ mutually blocked writers deadlock with both sides locally correct, so
 hosts drain inbound whenever outbound stalls. T15 (`audio.deterministic`)
 and `audio.offline-rate` are demonstrated on this hardware: byte-identical
 double renders, 8 s bounced in 0.37 s (21.7× real time).
+
+0.3.2 came from the first DAW integration: per-edit fsync of the dirty
+flag starved the audio path on the Pi's SD card under slider drags (now:
+persist the clean→dirty transition only, coalesce the rest, flush before
+any reader), and shells must let control-plane traffic yield to stream
+service — audio outranks knobs on the host too.

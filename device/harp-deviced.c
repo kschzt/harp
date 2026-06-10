@@ -89,9 +89,24 @@ typedef struct {
 
     audio_state audio;
 
+    /* live-ref write coalescing: only the clean->dirty transition must hit
+     * storage synchronously (it's the loss-safety edge); generation bumps
+     * during continuous editing stay in memory (fsync per knob tick starves
+     * the audio path on SD cards). Flushed before any reader (§10.3:
+     * notification MAY be coalesced; terminal state must be visible). */
+    harp_ref live_cache;
+    bool live_cache_valid;
+    uint64_t last_live_ntf_ms;
+
     /* counters (§14.2) */
     uint64_t frame_errors, session_resets, snapshots_taken, audio_overruns;
 } device;
+
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
+}
 
 static device g_dev;
 
@@ -549,16 +564,33 @@ static void encode_identity(device *d, harp_cbuf *m) {
 
 /* ---------------- ref helpers ---------------- */
 
-/* Bump generation +/- dirty on the live ref and notify. */
+/* Bump generation + dirty on the live ref. Persists only the clean->dirty
+ * transition; later bumps coalesce in memory (see device struct comment). */
 static void live_ref_touch(device *d, bool dirty) {
-    harp_ref r;
-    if (harp_store_ref_read(&d->store, LIVE_REF, &r) != 0) return;
-    r.generation++;
-    r.dirty = dirty;
-    if (harp_store_ref_write(&d->store, &r) == 0) ntf_state_changed(d, &r);
+    if (!d->live_cache_valid) {
+        if (harp_store_ref_read(&d->store, LIVE_REF, &d->live_cache) != 0) return;
+        d->live_cache_valid = true;
+    }
+    bool transition = dirty && !d->live_cache.dirty;
+    d->live_cache.generation++;
+    d->live_cache.dirty = dirty;
+    if (transition) harp_store_ref_write(&d->store, &d->live_cache);
+    uint64_t now = now_ms();
+    if (transition || now - d->last_live_ntf_ms >= 250) {
+        ntf_state_changed(d, &d->live_cache);
+        d->last_live_ntf_ms = now;
+    }
+}
+
+/* Flush the coalesced live ref before anything reads it from storage. */
+static void live_cache_flush(device *d) {
+    if (!d->live_cache_valid) return;
+    harp_store_ref_write(&d->store, &d->live_cache);
+    d->live_cache_valid = false; /* re-read after external mutation */
 }
 
 static int do_snapshot(device *d, const char *msg, harp_hash *out, uint64_t *out_gen) {
+    live_cache_flush(d);
     harp_ref r;
     if (harp_store_ref_read(&d->store, LIVE_REF, &r) != 0) return -1;
     harp_hash snap;
@@ -673,6 +705,7 @@ static void refs_cb(const harp_ref *r, void *ud) {
 }
 
 static void handle_state_refs(device *d, const harp_env *e) {
+    live_cache_flush(d);
     struct refs_collect c = {{0}, 0};
     harp_cbuf_init(&c.items);
     harp_store_ref_list(&d->store, refs_cb, &c);
@@ -909,6 +942,7 @@ static void handle_state_refset(device *d, const harp_env *e) {
     }
     bool create = flags & 1, force = flags & 2;
 
+    if (strcmp(refname, LIVE_REF) == 0) live_cache_flush(d);
     harp_ref r;
     if (harp_store_ref_read(&d->store, refname, &r) != 0) {
         send_error(d, e->rid, e->method, "malformed", "bad ref name");
@@ -1290,6 +1324,7 @@ void harp_deviced_run_session(device *d, harp_io *io) {
     harp_cbuf_free(&msg);
     harp_link_free(&d->link);
     audio_stop(d); /* session gone -> stream gone (§12) */
+    live_cache_flush(d); /* persist the terminal generation (§10.3) */
     d->io = NULL;
 }
 

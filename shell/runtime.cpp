@@ -355,14 +355,25 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
 void HarpRuntime::feeder() {
     uint8_t acc[65536];
     size_t accLen = 0;
+    /* Pending knob values, coalesced to the last value per param: a slider
+     * drag floods one id; only the newest value matters. Audio outranks
+     * knobs (§9.2: event overload must never glitch audio). */
+    struct {
+        uint32_t id;
+        float value;
+    } pending[16];
+    size_t npending = 0;
     while (running_.load(std::memory_order_relaxed)) {
-        /* 1. param pushes (control plane, serialized with state ops) */
-        ParamChange pc;
         bool didWork = false;
+        /* 1. drain + coalesce param changes (no I/O yet) */
+        ParamChange pc;
         while (paramRing_.pop(pc)) {
-            std::lock_guard<std::mutex> lk(ctlMutex_);
-            pushKnob(pc.id, pc.value);
-            didWork = true;
+            size_t i = 0;
+            while (i < npending && pending[i].id != pc.id) i++;
+            if (i < npending)
+                pending[i].value = pc.value;
+            else if (npending < 16)
+                pending[npending++] = {pc.id, pc.value};
         }
 
         /* 2. pace: keep ring occupancy + in-flight under the target depth */
@@ -412,6 +423,15 @@ void HarpRuntime::feeder() {
             }
             memmove(acc, acc + off, accLen - off);
             accLen -= off;
+        }
+
+        /* 4. push at most ONE knob per iteration, and only with audio
+         * headroom — each push is a blocking control-plane round trip */
+        if (npending && audioRing_.readAvailable() / 2 >= kBlock) {
+            std::lock_guard<std::mutex> lk(ctlMutex_);
+            pushKnob(pending[0].id, pending[0].value);
+            memmove(&pending[0], &pending[1], (--npending) * sizeof pending[0]);
+            didWork = true;
         }
 
         if (!didWork) {

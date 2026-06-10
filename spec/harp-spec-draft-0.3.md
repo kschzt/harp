@@ -2,7 +2,7 @@
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 
-Specification, Draft 0.3.1 — 10 June 2026
+Specification, Draft 0.3.2 — 10 June 2026
 
 | | |
 |---|---|
@@ -13,6 +13,8 @@ Specification, Draft 0.3.1 — 10 June 2026
 | **Schema & reference code license** | Apache-2.0 |
 | **Patent policy** | Royalty-free; contributors sign a non-assertion covenant (§19) |
 | **Feedback** | via HARP Enhancement Proposals (HEPs), see §18 |
+
+> **Changes in 0.3.2** — Errata from the first DAW integration (the reference VST3 shell playing the reference device inside Ableton Live 12). Ref persistence under continuous editing: only the clean→dirty transition requires synchronous durable storage; later generation bumps MAY coalesce in memory but MUST be flushed before any observer reads the ref — synchronous storage per edit starves the audio path on slow media (§10.3). Host-side mirror of the §9.2 overload rule: control-plane traffic a shell originates (parameter pushes, state operations) MUST yield to stream service and MUST NOT run on the audio thread; in offline rendering contexts a shell MAY block on stream progress, in real-time contexts it MUST NOT (§15.1). The recall flow of §12.2 and the four-safe-actions reconcile have now been exercised through a DAW's own state save/reopen path.
 
 > **Changes in 0.3.1** — Errata from the first reference implementation (a Raspberry Pi 4B FunctionFS-gadget device against a macOS libusb host, over both a TCP dev link and the normative USB binding). Flow control: bulk endpoint pairs have no TCP-style buffering, so mutually blocked writers deadlock while each side is locally correct — hosts must drain inbound whenever outbound stalls (§4.2.1). Discovery by interface class triple promoted to MUST on hosts, because gadget-framework devices cannot author BOS platform capabilities (§4.3, §6.1). `slots = 0` pacing frames made explicit in the frame description (§8.2). Pacing backpressure defined as a pipeline-depth signal, not an error (§8.3, informative). `state.want` response defined (§11.2). Closure for refset validation and Recall Bundles defined as the *state closure*, excluding snapshot parent links (§11.3, §15.3). `expect = null` clarified as "expect unborn" (§11.3). The `audio.deterministic` (T15) and `audio.offline-rate` claims have now been demonstrated on reference hardware.
 
@@ -674,7 +676,7 @@ Standard ref namespace (devices expose those that apply):
 ntf state.changed { 0 => tstr ref-name, 1 => hash/null, 2 => uint64 generation, 3 => bool dirty }
 ```
 
-Notification rate MAY be coalesced (≥ 2 Hz under continuous editing is sufficient); the terminal state after edits stop MUST always be notified.
+Notification rate MAY be coalesced (≥ 2 Hz under continuous editing is sufficient); the terminal state after edits stop MUST always be notified. Persistence follows the same shape: the clean→dirty transition MUST be durably stored before further edits are accepted (it is the loss-safety edge), but subsequent generation bumps MAY coalesce in memory provided the stored ref is brought current before any observer can read it — at `state.refs`, `state.snapshot`, `state.refset`, and session end. A synchronous storage write per edit is not required and, on slow media, starves the audio path in violation of §9.2's no-glitch rule.
 
 ### 10.4 Snapshot-on-demand
 
@@ -877,7 +879,7 @@ Stream `log` carries structured records `{ 0 => uint64 msc-or-0, 1 => uint level
 
 ### 15.1 Runtime
 
-One runtime per machine owns transports, discovery, sessions, time correlation, the host object store, and diagnostics. It MUST support multiple simultaneous devices and multiple shells, MUST survive shell crashes without dropping device sessions, and SHOULD run user-space (no kernel components beyond OS-provided class drivers; Windows runtimes MAY additionally expose HARP stream devices through an ASIO driver for non-plugin use, outside this specification's scope). The runtime–shell IPC is implementation-defined; the *behavior* contract here is what conformance tests observe. For audio, the runtime owns a real-time transport path per device and delivers samples to shells over lock-free shared memory; the shell's audio-thread contract is hard — no blocking calls, no allocation, constant reported latency — and starvation at any boundary is counted and surfaced, never absorbed silently. The runtime performs the admission control of §8.4 on behalf of all shells.
+One runtime per machine owns transports, discovery, sessions, time correlation, the host object store, and diagnostics. It MUST support multiple simultaneous devices and multiple shells, MUST survive shell crashes without dropping device sessions, and SHOULD run user-space (no kernel components beyond OS-provided class drivers; Windows runtimes MAY additionally expose HARP stream devices through an ASIO driver for non-plugin use, outside this specification's scope). The runtime–shell IPC is implementation-defined; the *behavior* contract here is what conformance tests observe. For audio, the runtime owns a real-time transport path per device and delivers samples to shells over lock-free shared memory; the shell's audio-thread contract is hard — no blocking calls, no allocation, constant reported latency — and starvation at any boundary is counted and surfaced, never absorbed silently. Two corollaries proven necessary in practice: control-plane traffic the host originates (parameter pushes, state operations) MUST yield to stream service — the host-side mirror of §9.2's overload rule — and while an *offline* rendering context MAY block on stream progress (offline bounce legitimately waits for the wire, §8.3), a real-time context MUST NOT. The runtime performs the admission control of §8.4 on behalf of all shells.
 
 ### 15.2 Arbitration
 
