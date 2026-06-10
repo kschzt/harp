@@ -67,12 +67,20 @@ useful shell:
 - Device offline → render silence, show "offline" state, resume on
   reattach (runtime watches USB arrival; §12.3).
 
-## Testing without a DAW
+## Testing without a DAW — harness EXISTS and is validated
 
-`external/vst3sdk` ships a **validator** (`bin/validator`) — run the shell
-through it in CI fashion before any DAW. For interactive testing, ask the
-user which DAW they run (Reaper is the most scriptable if they have no
-preference).
+`tools/vst3-host` (build: `cmake -B build-vst -S tools/vst3-host`,
+needs CMake ≥ 3.25) is a CLI host proven against the SDK's adelay:
+loads a .vst3, lists/drives params via `inputParameterChanges`,
+processes generated input, writes WAV + output hash, and round-trips
+component+controller state like a DAW project save/reopen. Validated:
+param→DSP exact (impulse echo at the commanded sample), state
+round-trip exact across processes, determinism by hash. The HARP shell
+test loop is therefore: harp-vst3-host (this) ↔ shell ↔ USB ↔ Pi —
+fully agent-drivable end to end. The SDK validator
+(`build-vst/.../validator`) adds generic conformance on top. For
+interactive testing, ask the user which DAW they run (Reaper is the
+most scriptable if no preference).
 
 ## Open questions for the user
 
