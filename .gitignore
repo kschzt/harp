@@ -1,0 +1,5 @@
+build/
+host-store/
+refdev-state/
+compile_commands.json
+.cache/

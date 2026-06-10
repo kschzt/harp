@@ -1,0 +1,51 @@
+; HARP — consolidated CDDL (extracted from spec draft 0.3.0, Appendix A)
+; Schemas are normative; see spec/harp-spec-draft-0.3.md for prose.
+
+; --- framing (binary, not CBOR; given here for completeness) ---
+; frame = fver(u8) stream(u8) flags(u16le) length(u32le) payload
+
+; --- control envelope ---
+envelope = { 0 => 0..3, 1 => uint, 2 => tstr, ? 3 => any }
+error-body = { 0 => tstr, ? 1 => tstr, ? 2 => any }
+
+; --- common ---
+semver = tstr .regexp "\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.-]+)?"
+hash   = bstr .size 33
+tstamp = [uint, uint64]            ; (epoch, msc)
+
+; --- identity ---
+identity = { 0 => vendor, 1 => product, 2 => tstr, 3 => semver, 4 => engine,
+             5 => [uint, uint], 6 => [* tstr], 7 => channel-map, 8 => latency-profile,
+             ? 9 => tstr, ? 10 => uint }
+vendor   = { 0 => uint, 1 => tstr }
+product  = { 0 => uint, 1 => tstr }
+engine   = { 0 => tstr, 1 => semver, 2 => hash }
+channel-map = [* { 0 => uint, 1 => 0..1, 2 => tstr, ? 3 => tstr, ? 4 => tstr, ? 5 => bool }]
+latency-profile = [* { 0 => uint, 1 => uint, 2 => uint, ? 3 => uint }]
+
+; --- events ---
+event = [ tstamp, etype: 0..7, any ]
+param-event = { 0 => uint, 1 => float32, ? 2 => int, ? 3 => uint, ? 4 => uint }
+ramp-event  = { 0 => uint, 1 => float32, 2 => tstamp, ? 3 => uint, ? 4 => uint }
+mod-event   = { 0 => uint, 1 => float32, ? 2 => uint, ? 3 => uint }
+transport-event = { 0 => uint, ? 1 => float64, ? 2 => [uint, uint], ? 3 => uint64,
+                    ? 4 => float64, ? 5 => [float64, float64], ? 6 => float64 }
+param  = { 0 => uint, 1 => tstr, ? 2 => tstr, ? 3 => tstr, ? 4 => [float, float],
+           ? 5 => uint, ? 6 => tstr, ? 8 => uint, ? 9 => [* tstr],
+           ? 10 => [* [float32, float]], ? 11 => uint }
+params-rsp = { 0 => hash, 1 => [* param], 2 => uint, ? 3 => uint }
+
+; --- state ---
+object   = blob / list / tree / snapshot
+blob     = { 0 => 0, 1 => tstr, 2 => bstr }
+list     = { 0 => 1, 1 => tstr, 2 => [* hash] }
+tree     = { 0 => 2, 1 => { * tstr => [hash, uint] } }
+snapshot = { 0 => 3, 1 => hash, 2 => [* hash], 3 => uint, 4 => tstr,
+             5 => semver, ? 6 => tstr }
+ref      = { 0 => tstr, 1 => hash / null, 2 => uint64, 3 => bool }
+
+recall-bundle = { 0 => "harpb", 1 => uint, 2 => identity-expectation,
+                  3 => [* ref], 4 => [* object] / null,
+                  ? 5 => any, ? 6 => tstr }
+identity-expectation = { 0 => vendor, 1 => product, ? 2 => tstr,
+                         3 => engine }
