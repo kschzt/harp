@@ -177,8 +177,9 @@ harp_io *harp_usb_open(void) {
             libusb_get_string_descriptor_ascii(u->h, dd.iSerialNumber,
                                                (unsigned char *)serial, sizeof serial);
         fprintf(stderr,
-                "harp-usb: claimed %04x:%04x serial %s (iface %d, ep in %02x out %02x)\n",
-                dd.idVendor, dd.idProduct, serial, iface, ep_in, ep_out);
+                "harp-usb: claimed %04x:%04x serial %s (iface %d, link %02x/%02x, "
+                "audio %02x/%02x)\n",
+                dd.idVendor, dd.idProduct, serial, iface, ep_in, ep_out, ep_ain, ep_aout);
         libusb_free_device_list(list, 1);
         return &u->io;
     }
@@ -200,6 +201,19 @@ int harp_usb_audio_read(harp_io *io, void *buf, int len, unsigned timeout_ms) {
     if (rc == 0 || rc == LIBUSB_ERROR_TIMEOUT) return got;
     fprintf(stderr, "harp-usb: audio bulk in failed: %s\n", libusb_error_name(rc));
     return -1;
+}
+
+bool harp_usb_audio_write(harp_io *io, const void *buf, int len, unsigned timeout_ms) {
+    usb_io *u = (usb_io *)io;
+    int sent = 0;
+    int rc = libusb_bulk_transfer(u->h, u->ep_audio_out, (uint8_t *)buf, len, &sent,
+                                  timeout_ms);
+    if (rc == LIBUSB_ERROR_TIMEOUT) return false; /* expected backpressure */
+    if (rc != 0 || sent != len) {
+        fprintf(stderr, "harp-usb: audio bulk out failed: %s\n", libusb_error_name(rc));
+        return false;
+    }
+    return true;
 }
 
 void harp_usb_close(harp_io *io) {

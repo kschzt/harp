@@ -37,6 +37,7 @@ bool harp_audio_hdr_decode(const uint8_t in[HARP_AUDIO_HDR_LEN], harp_audio_hdr 
     h->fmt = get16(in + 18);
     if (h->fver != HARP_AUDIO_FVER) return false;
     if (h->fmt != HARP_AUDIO_FMT_F32) return false;
-    if (h->slots == 0 || h->nsamples == 0) return false;
+    /* slots == 0 is legal: host-paced pacing frames with no input (§8.3) */
+    if (h->nsamples == 0) return false;
     return true;
 }

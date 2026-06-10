@@ -652,6 +652,146 @@ static void cmd_record(probe *p, double seconds, const char *path) {
     harp_cbuf_free(&req);
     harp_cbuf_free(&rsp);
 }
+/* Host-paced render (§8.3 mode 1): we own the SSI timeline. Pacing frames
+ * (header-only, slots=0) name the exact sample ranges; the device renders
+ * them with no clock of its own. Pipelined a few blocks deep — the mode
+ * constrains WHAT is rendered, pipelining covers transport scheduling. */
+static double render_host_paced(probe *p, size_t want_frames, uint32_t nsamples,
+                                float *out) {
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    req_head(p, &req, "audio.start", true);
+    harp_cbor_map(&req, 6);
+    harp_cbor_uint(&req, 0);
+    harp_cbor_uint(&req, 48000);
+    harp_cbor_uint(&req, 1);
+    harp_cbor_uint(&req, nsamples);
+    harp_cbor_uint(&req, 2);
+    harp_cbor_uint(&req, 8);
+    harp_cbor_uint(&req, 3);
+    harp_cbor_array(&req, 2);
+    harp_cbor_uint(&req, 0);
+    harp_cbor_uint(&req, 1);
+    harp_cbor_uint(&req, 4);
+    harp_cbor_array(&req, 0);
+    harp_cbor_uint(&req, 5);
+    harp_cbor_uint(&req, 1); /* clock-mode: host-paced */
+    request(p, &req, &rsp, false);
+
+    /* discard any stale stream bytes from a previous run */
+    uint8_t acc[65536];
+    while (harp_usb_audio_read(p->io, acc, sizeof acc, 50) > 0) {}
+
+    const int AHEAD = 4;
+    uint64_t ssi_sent = 0, frames_sent = 0, frames_recv = 0;
+    size_t total_blocks = (want_frames + nsamples - 1) / nsamples;
+    size_t got_frames = 0, acc_len = 0;
+    uint64_t expect_ts = 0;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    int dry_spins = 0;
+    /* Effective pipeline depth: start optimistic, learn the device's real
+     * limit. A pacing-write timeout means the device is blocked mid-response
+     * waiting for US to read (the audio-pair flavor of the link's IN/OUT
+     * deadlock) — cap in-flight there and never burn the timeout again. */
+    uint64_t ahead = AHEAD;
+    while (got_frames < want_frames) {
+        while (frames_sent < total_blocks && frames_sent - frames_recv < ahead) {
+            harp_audio_hdr pace = {HARP_AUDIO_FVER, HARP_AUDIO_DIR_H2D, 0, 0,
+                                   ssi_sent, (uint16_t)nsamples, HARP_AUDIO_FMT_F32};
+            uint8_t ph[HARP_AUDIO_HDR_LEN];
+            harp_audio_hdr_encode(&pace, ph);
+            if (!harp_usb_audio_write(p->io, ph, sizeof ph, 100)) {
+                uint64_t in_flight = frames_sent - frames_recv;
+                if (in_flight >= 1 && in_flight < ahead) ahead = in_flight;
+                break;
+            }
+            ssi_sent += nsamples;
+            frames_sent++;
+            dry_spins = 0;
+        }
+        int r = harp_usb_audio_read(p->io, acc + acc_len, (int)(sizeof acc - acc_len), 1000);
+        if (r < 0) die("render stream read failed");
+        if (r == 0 && ++dry_spins > 10) die("render stream stalled (10 s)");
+        acc_len += (size_t)r;
+        size_t off = 0;
+        while (acc_len - off >= HARP_AUDIO_HDR_LEN) {
+            harp_audio_hdr h;
+            if (!harp_audio_hdr_decode(acc + off, &h)) die("malformed render frame");
+            size_t need = HARP_AUDIO_HDR_LEN + harp_audio_payload_len(&h);
+            if (acc_len - off < need) break;
+            if (h.ts != expect_ts) die("host-paced SSI mismatch — determinism broken");
+            expect_ts = h.ts + h.nsamples;
+            frames_recv++;
+            size_t take = h.nsamples;
+            if (got_frames + take > want_frames) take = want_frames - got_frames;
+            memcpy(out + got_frames * 2, acc + off + HARP_AUDIO_HDR_LEN,
+                   take * 2 * sizeof(float));
+            got_frames += take;
+            off += need;
+        }
+        memmove(acc, acc + off, acc_len - off);
+        acc_len -= off;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    req_head(p, &req, "audio.stop", false);
+    uint64_t stop_rid = p->next_rid;
+    if (harp_link_send(p->io, HARP_STREAM_CTL, req.buf, req.len) != 0)
+        die("link send failed");
+    int quiet = 0;
+    while (quiet < 2) {
+        int r = harp_usb_audio_read(p->io, acc, sizeof acc, 100);
+        if (r < 0) break;
+        quiet = (r == 0) ? quiet + 1 : 0;
+    }
+    wait_rsp(p, stop_rid, &rsp, false);
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+    return (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+}
+
+static void cmd_render(probe *p, double seconds, const char *path) {
+    if (!harp_usb_has_audio(p->io)) die("render needs -d usb");
+    do_hello(p);
+    size_t want = (size_t)(seconds * 48000);
+    float *buf = malloc(want * 2 * sizeof(float));
+    if (!buf) die("oom");
+    double wall = render_host_paced(p, want, 256, buf);
+    write_wav16(path, buf, want, 48000);
+    printf("      host-paced render: %.2f s of audio in %.2f s wall — %.1fx real time\n",
+           seconds, wall, seconds / wall);
+    printf("      offline bounce through hardware: an ordinary feature, not a stunt (§8.3)\n");
+    printf("      -> %s\n", path);
+    free(buf);
+}
+
+static void cmd_t15(probe *p, double seconds) {
+    if (!harp_usb_has_audio(p->io)) die("t15 needs -d usb");
+    do_hello(p);
+    size_t want = (size_t)(seconds * 48000);
+    float *a = malloc(want * 2 * sizeof(float));
+    float *b = malloc(want * 2 * sizeof(float));
+    if (!a || !b) die("oom");
+    printf("      T15: two host-paced renders of identical state and SSI range [0, %zu)\n",
+           want);
+    double w1 = render_host_paced(p, want, 256, a);
+    double w2 = render_host_paced(p, want, 256, b);
+    if (memcmp(a, b, want * 2 * sizeof(float)) == 0) {
+        printf("      BYTE-IDENTICAL: %zu samples x 2ch x 4B compare equal "
+               "(renders took %.2fs / %.2fs)\n",
+               want, w1, w2);
+        printf("      audio.deterministic holds — hardware behaving like a plugin\n");
+    } else {
+        size_t i = 0;
+        while (i < want * 2 && a[i] == b[i]) i++;
+        printf("      FAILED: first divergence at float index %zu\n", i);
+    }
+    free(a);
+    free(b);
+}
 #endif
 
 /* ---------------- commands ---------------- */
@@ -1006,6 +1146,18 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "record") == 0 && i + 2 < argc) {
 #ifdef HAVE_LIBUSB
         cmd_record(&p, strtod(argv[i + 1], NULL), argv[i + 2]);
+#else
+        die("built without libusb");
+#endif
+    } else if (strcmp(cmd, "render") == 0 && i + 2 < argc) {
+#ifdef HAVE_LIBUSB
+        cmd_render(&p, strtod(argv[i + 1], NULL), argv[i + 2]);
+#else
+        die("built without libusb");
+#endif
+    } else if (strcmp(cmd, "t15") == 0 && i + 1 < argc) {
+#ifdef HAVE_LIBUSB
+        cmd_t15(&p, strtod(argv[i + 1], NULL));
 #else
         die("built without libusb");
 #endif

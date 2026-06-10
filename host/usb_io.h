@@ -16,5 +16,7 @@ bool harp_usb_has_audio(harp_io *io);
 /* Read one bulk transfer from the audio IN endpoint. Returns byte count,
  * 0 on timeout, -1 on error. */
 int harp_usb_audio_read(harp_io *io, void *buf, int len, unsigned timeout_ms);
+/* Write to the audio OUT endpoint (host-paced pacing/input frames, §8.3). */
+bool harp_usb_audio_write(harp_io *io, const void *buf, int len, unsigned timeout_ms);
 
 #endif

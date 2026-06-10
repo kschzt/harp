@@ -60,13 +60,17 @@ static dev_param g_params[] = {
 };
 #define NPARAMS (sizeof g_params / sizeof g_params[0])
 
-/* audio plane state (§8): one D→H stream, free-running, MSC-timestamped */
+/* audio plane state (§8): one D→H stream.
+ * mode 0: free-running, paced by the device clock, MSC timestamps.
+ * mode 1: host-paced — no timers; renders exactly the SSI ranges the host
+ *         supplies in pacing frames on the audio OUT endpoint. */
 typedef struct {
     pthread_t thread;
     volatile bool running;
     bool thread_live;
-    int fd; /* dedicated audio endpoint, device -> host */
-    uint32_t rate, nsamples, epoch;
+    int fd;     /* audio IN endpoint: device -> host */
+    int out_fd; /* audio OUT endpoint: host -> device (pacing, mode 1) */
+    uint32_t mode, rate, nsamples, epoch;
     uint64_t reanchors;
 } audio_state;
 
@@ -145,9 +149,87 @@ static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float 
  * stream; the MSC counts rendered samples; frames carry (epoch, msc). */
 #define AUDIO_MAX_NSAMPLES 1024
 
+/* Host-paced loop (§8.3 mode 1): block on pacing frames, render the exact
+ * SSI range each one names, echo its (epoch, ts) on the output frame. The
+ * voice starts from zero at audio.start, so identical state + identical
+ * pacing -> byte-identical output (audio.deterministic, T15). Pacing faster
+ * than real time is automatic — there is no clock here (audio.offline-rate). */
+static void host_paced_loop(device *d) {
+    audio_state *a = &d->audio;
+    synth_voice voice = {0};
+    uint8_t frame[HARP_AUDIO_HDR_LEN + AUDIO_MAX_NSAMPLES * 2 * 4];
+    float samples[AUDIO_MAX_NSAMPLES * 2];
+    /* buffered endpoint reads (packet-multiple, see ffs.c) */
+    uint8_t rbuf[16384];
+    size_t rlen = 0, rpos = 0;
+
+    while (a->running) {
+        uint8_t hdr[HARP_AUDIO_HDR_LEN];
+        size_t need = sizeof hdr, got = 0;
+        while (got < need) {
+            if (rpos < rlen) {
+                size_t take = rlen - rpos;
+                if (take > need - got) take = need - got;
+                memcpy(hdr + got, rbuf + rpos, take);
+                rpos += take;
+                got += take;
+                continue;
+            }
+            ssize_t r = read(a->out_fd, rbuf, sizeof rbuf);
+            if (r <= 0) { /* endpoint died or stop */
+                fprintf(stderr, "harp-deviced: pacing read ended: %s\n",
+                        r == 0 ? "EOF" : strerror(errno));
+                return;
+            }
+            rlen = (size_t)r;
+            rpos = 0;
+        }
+        harp_audio_hdr h;
+        if (!harp_audio_hdr_decode(hdr, &h) || !(h.dirflags & HARP_AUDIO_DIR_H2D)) {
+            d->frame_errors++;
+            fprintf(stderr, "harp-deviced: malformed pacing frame (%02x %02x ...)\n",
+                    hdr[0], hdr[1]);
+            return; /* §4.2 spirit: malformed stream is fatal */
+        }
+        /* discard any input payload (this engine has no input channels) */
+        size_t skip = harp_audio_payload_len(&h);
+        while (skip) {
+            if (rpos < rlen) {
+                size_t take = rlen - rpos;
+                if (take > skip) take = skip;
+                rpos += take;
+                skip -= take;
+                continue;
+            }
+            ssize_t r = read(a->out_fd, rbuf, sizeof rbuf);
+            if (r <= 0) return;
+            rlen = (size_t)r;
+            rpos = 0;
+        }
+        uint32_t n = h.nsamples;
+        if (n > AUDIO_MAX_NSAMPLES) {
+            d->frame_errors++;
+            return;
+        }
+        engine_render(&voice, samples, n, (float)a->rate);
+        harp_audio_hdr out = {HARP_AUDIO_FVER, 0, 2, h.epoch, h.ts, (uint16_t)n,
+                              HARP_AUDIO_FMT_F32};
+        harp_audio_hdr_encode(&out, frame);
+        memcpy(frame + HARP_AUDIO_HDR_LEN, samples, (size_t)n * 2 * 4);
+        if (!harp_write_all(a->fd, frame, HARP_AUDIO_HDR_LEN + (size_t)n * 2 * 4)) return;
+    }
+}
+
 static void *audio_thread(void *arg) {
     device *d = arg;
     audio_state *a = &d->audio;
+    fprintf(stderr, "harp-deviced: audio thread up: mode=%u fd=%d out_fd=%d\n", a->mode,
+            a->fd, a->out_fd);
+    if (a->mode == 1) {
+        host_paced_loop(d);
+        fprintf(stderr, "harp-deviced: host-paced loop exited\n");
+        return NULL;
+    }
     synth_voice voice = {0};
     uint8_t frame[HARP_AUDIO_HDR_LEN + AUDIO_MAX_NSAMPLES * 2 * 4];
     float samples[AUDIO_MAX_NSAMPLES * 2];
@@ -202,6 +284,11 @@ static void *audio_thread(void *arg) {
 static void audio_stop(device *d) {
     if (!d->audio.thread_live) return;
     d->audio.running = false;
+    /* The thread may be parked in a blocking endpoint read (mode 1 pacing,
+     * or a stalled write); read/write are cancellation points, and the loop
+     * holds no resources that outlive it. A production device would use AIO
+     * with a wakeup — for the refdev, cancel is honest and simple. */
+    pthread_cancel(d->audio.thread);
     pthread_join(d->audio.thread, NULL);
     d->audio.thread_live = false;
     fprintf(stderr, "harp-deviced: audio stream stopped (%llu reanchors)\n",
@@ -418,15 +505,18 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, PROTO_MAJOR);
     harp_cbor_uint(m, PROTO_MINOR);
     harp_cbor_uint(m, 6); /* capabilities */
-    harp_cbor_array(m, 4);
+    harp_cbor_array(m, 7);
     harp_cbor_text(m, "harp-core");
     harp_cbor_text(m, "harp-recall");
     harp_cbor_text(m, "harp-stream");
+    harp_cbor_text(m, "audio.host-paced");
+    harp_cbor_text(m, "audio.deterministic");
+    harp_cbor_text(m, "audio.offline-rate");
     harp_cbor_text(m, "x.harp-refdev.sim");
     harp_cbor_uint(m, 7); /* channel map (§6.3): stereo main mix, D→H */
     harp_cbor_array(m, 2);
     for (int ch = 0; ch < 2; ch++) {
-        harp_cbor_map(m, 5);
+        harp_cbor_map(m, 6);
         harp_cbor_uint(m, 0);
         harp_cbor_uint(m, ch); /* slot */
         harp_cbor_uint(m, 1);
@@ -437,6 +527,8 @@ static void encode_identity(device *d, harp_cbuf *m) {
         harp_cbor_text(m, "Mix");
         harp_cbor_uint(m, 4);
         harp_cbor_text(m, "main");
+        harp_cbor_uint(m, 5);
+        harp_cbor_bool(m, true); /* host-paced capable: pure-digital path */
     }
     harp_cbor_uint(m, 8); /* latency profile (§6.4): pure-digital engine */
     harp_cbor_array(m, 1);
@@ -926,7 +1018,8 @@ static void handle_diag_counters(device *d, const harp_env *e) {
 }
 
 #ifdef __linux__
-int harp_ffs_audio_in_fd(void); /* device/ffs.c */
+int harp_ffs_audio_in_fd(void);  /* device/ffs.c */
+int harp_ffs_audio_out_fd(void); /* device/ffs.c */
 #endif
 
 /* audio.start (§8.2): free-running mode only, stereo D→H, USB transport only */
@@ -951,8 +1044,8 @@ static void handle_audio_start(device *d, const harp_env *e) {
             }
         }
     }
-    if (mode != 0) {
-        send_error(d, e->rid, e->method, "unsupported", "host-paced mode not yet implemented");
+    if (mode > 1) {
+        send_error(d, e->rid, e->method, "unsupported", "unknown clock mode");
         return;
     }
     if (rate != 44100 && rate != 48000 && rate != 96000) {
@@ -963,11 +1056,12 @@ static void handle_audio_start(device *d, const harp_env *e) {
         send_error(d, e->rid, e->method, "unsupported", "nsamples");
         return;
     }
-    int fd = -1;
+    int fd = -1, out_fd = -1;
 #ifdef __linux__
     fd = harp_ffs_audio_in_fd();
+    out_fd = harp_ffs_audio_out_fd();
 #endif
-    if (fd < 0) {
+    if (fd < 0 || (mode == 1 && out_fd < 0)) {
         send_error(d, e->rid, e->method, "unsupported",
                    "HARP stream requires the USB transport");
         return;
@@ -977,6 +1071,8 @@ static void handle_audio_start(device *d, const harp_env *e) {
         return;
     }
     d->audio.fd = fd;
+    d->audio.out_fd = out_fd;
+    d->audio.mode = (uint32_t)mode;
     d->audio.rate = (uint32_t)rate;
     d->audio.nsamples = (uint32_t)nsamples;
     d->audio.reanchors = 0;
@@ -987,17 +1083,19 @@ static void handle_audio_start(device *d, const harp_env *e) {
         return;
     }
     d->audio.thread_live = true;
-    fprintf(stderr, "harp-deviced: audio stream started (%u Hz, %u-sample blocks)\n",
-            d->audio.rate, d->audio.nsamples);
+    fprintf(stderr, "harp-deviced: audio stream started (%u Hz, %u-sample blocks, %s)\n",
+            d->audio.rate, d->audio.nsamples,
+            mode ? "host-paced" : "free-running");
 
     harp_cbuf m;
     harp_cbuf_init(&m);
     rsp_head(&m, e->rid, e->method, true);
     harp_cbor_map(&m, 2);
     harp_cbor_uint(&m, 0);
-    harp_cbor_uint(&m, 0); /* clock-mode in effect: free-running */
+    harp_cbor_uint(&m, mode); /* clock-mode in effect */
     harp_cbor_uint(&m, 1);
-    harp_cbor_uint(&m, d->audio.nsamples); /* device pipeline: one block */
+    /* device pipeline: one block free-running; zero host-paced (pure render) */
+    harp_cbor_uint(&m, mode ? 0 : d->audio.nsamples);
     send_ctl(d, &m);
     harp_cbuf_free(&m);
 }

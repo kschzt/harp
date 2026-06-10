@@ -36,7 +36,8 @@ typedef struct {
 } harp_audio_hdr;
 
 void harp_audio_hdr_encode(const harp_audio_hdr *h, uint8_t out[HARP_AUDIO_HDR_LEN]);
-/* false on malformed header (bad fver / unknown fmt / zero dims). */
+/* false on malformed header (bad fver / unknown fmt / zero nsamples).
+ * slots == 0 is valid: a host-paced pacing frame with no input channels. */
 bool harp_audio_hdr_decode(const uint8_t in[HARP_AUDIO_HDR_LEN], harp_audio_hdr *h);
 
 /* payload byte count for a decoded header (float32) */
