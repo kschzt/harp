@@ -82,8 +82,19 @@ fully agent-drivable end to end. The SDK validator
 interactive testing, ask the user which DAW they run (Reaper is the
 most scriptable if no preference).
 
-## Open questions for the user
+## Decisions (were open questions; settled 2026-06-10)
 
-1. Which DAW to target for the first in-DAW test?
-2. Plugin identity: vendor string/ids to use ("HARP Reference Project"?)
-   — placeholder GUIDs fine for dev, decide before anything ships.
+1. **Target DAW: Ableton Live.** Live loads VST3 from
+   `~/Library/Audio/Plug-Ins/VST3/` (install/symlink the shell there;
+   note `SMTG_CREATE_PLUGIN_LINK` is OFF in our SDK build, do it
+   manually). Live stores the class GUID in saved sets — identity below
+   is therefore frozen. Live quirks to remember: full rescan needs
+   prefs toggle or restart; instrument must declare itself
+   `kInstrumentSynth` to land in Live's instrument browser; Live offers
+   no per-sample automation (block boundaries only) — ramps (§9.4)
+   matter more there, eventually.
+2. **Plugin identity — FROZEN, never change after the first saved set:**
+   - Processor  UID: `B520EC1F-856F-4A80-A09D-645512430ACB`
+   - Controller UID: `3AF7D698-0DB0-4F6E-8F10-7EEF7480467A`
+   - Vendor: "HARP Project", url `https://github.com/kschzt/harp`
+   - Plugin name: "HARP RefDev" (category `Instrument|Synth`)
