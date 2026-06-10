@@ -63,7 +63,7 @@ typedef struct {
     harp_hash param_map_hash;
     uint64_t boot_count;
 
-    int fd;
+    harp_io *io; /* NULL when no session transport is attached */
     harp_link link;
     bool hello_done;
     bool closing;
@@ -208,11 +208,11 @@ static void compute_param_map_hash(device *d) {
 /* ---------------- wire helpers ---------------- */
 
 static int send_ctl(device *d, const harp_cbuf *msg) {
-    return harp_link_send(d->fd, HARP_STREAM_CTL, msg->buf, msg->len);
+    return harp_link_send(d->io, HARP_STREAM_CTL, msg->buf, msg->len);
 }
 
 static void ntf_state_changed(device *d, const harp_ref *r) {
-    if (d->fd < 0 || !d->hello_done) return;
+    if (!d->io || !d->hello_done) return;
     harp_cbuf m;
     harp_cbuf_init(&m);
     harp_env_head(&m, HARP_MSG_NOTIFICATION, 0, "state.changed", true);
@@ -562,7 +562,7 @@ static void handle_state_want(device *d, const harp_env *e) {
         /* §4.2.1: never exceed granted credit. The simulator grants 16 MiB up
          * front and objects are small; a full implementation would queue. */
         if (enc.len <= d->peer_credit) d->peer_credit -= enc.len;
-        harp_link_send(d->fd, HARP_STREAM_OBJ, enc.buf, enc.len);
+        harp_link_send(d->io, HARP_STREAM_OBJ, enc.buf, enc.len);
     }
     harp_cbuf_free(&enc);
 }
@@ -909,8 +909,8 @@ static void handle_obj(device *d, const uint8_t *buf, size_t len) {
 
 /* ---------------- session / main ---------------- */
 
-static void run_session(device *d, int cfd) {
-    d->fd = cfd;
+void harp_deviced_run_session(device *d, harp_io *io) {
+    d->io = io;
     d->hello_done = false;
     d->closing = false;
     harp_link_init(&d->link);
@@ -918,7 +918,7 @@ static void run_session(device *d, int cfd) {
     harp_cbuf_init(&msg);
     for (;;) {
         uint8_t stream;
-        int rc = harp_link_recv(cfd, &d->link, &stream, &msg);
+        int rc = harp_link_recv(io, &d->link, &stream, &msg);
         if (rc == -1) break; /* peer gone */
         if (rc == -2) {      /* protocol violation: session reset (§12.4) */
             d->session_resets++;
@@ -933,9 +933,19 @@ static void run_session(device *d, int cfd) {
     }
     harp_cbuf_free(&msg);
     harp_link_free(&d->link);
-    close(cfd);
-    d->fd = -1;
+    d->io = NULL;
 }
+
+#ifdef __linux__
+/* FunctionFS gadget transport (device/ffs.c) */
+int harp_ffs_serve(const char *ffs_dir, const char *gadget_path,
+                   void (*session)(void *ud, harp_io *io), void *ud);
+
+static void ffs_session_cb(void *ud, harp_io *io) {
+    harp_deviced_run_session(ud, io);
+    fprintf(stderr, "harp-deviced: usb session ended; awaiting reattach\n");
+}
+#endif
 
 static uint64_t bump_boot_count(const char *dir) {
     char path[600];
@@ -958,6 +968,8 @@ static uint64_t bump_boot_count(const char *dir) {
 int main(int argc, char **argv) {
     const char *state_dir = "./refdev-state";
     const char *serial = "SIM-0001";
+    const char *ffs_dir = NULL;
+    const char *gadget = "/sys/kernel/config/usb_gadget/harp";
     int port = 47800;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc)
@@ -966,9 +978,14 @@ int main(int argc, char **argv) {
             serial = argv[++i];
         else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
             port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ffs") == 0 && i + 1 < argc)
+            ffs_dir = argv[++i];
+        else if (strcmp(argv[i], "--gadget") == 0 && i + 1 < argc)
+            gadget = argv[++i];
         else {
             fprintf(stderr,
-                    "usage: harp-deviced [--state-dir DIR] [--serial S] [--port P]\n");
+                    "usage: harp-deviced [--state-dir DIR] [--serial S] "
+                    "[--port P | --ffs FFS_DIR [--gadget CONFIGFS_PATH]]\n");
             return 2;
         }
     }
@@ -976,7 +993,7 @@ int main(int argc, char **argv) {
 
     device *d = &g_dev;
     memset(d, 0, sizeof *d);
-    d->fd = -1;
+    d->io = NULL;
     snprintf(d->serial, sizeof d->serial, "%s", serial);
     if (harp_store_open(&d->store, state_dir) != 0) {
         fprintf(stderr, "harp-deviced: cannot open state dir %s\n", state_dir);
@@ -998,6 +1015,18 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "harp-deviced: restored live/project (gen %llu)\n",
                         (unsigned long long)live.generation);
         }
+    }
+
+    if (ffs_dir) {
+#ifdef __linux__
+        fprintf(stderr, "harp-deviced: serial %s, state %s, USB gadget via %s (boot %llu)\n",
+                d->serial, state_dir, ffs_dir, (unsigned long long)d->boot_count);
+        return harp_ffs_serve(ffs_dir, gadget, ffs_session_cb, d);
+#else
+        (void)gadget;
+        fprintf(stderr, "harp-deviced: --ffs requires Linux\n");
+        return 2;
+#endif
     }
 
     int sfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1022,7 +1051,10 @@ int main(int argc, char **argv) {
             break;
         }
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-        run_session(d, cfd);
+        harp_io_fd tio;
+        harp_io_fd_init(&tio, cfd, cfd);
+        harp_deviced_run_session(d, &tio.io);
+        close(cfd);
         fprintf(stderr, "harp-deviced: session ended; awaiting reattach\n");
     }
     return 0;

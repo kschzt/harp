@@ -28,13 +28,15 @@
 #include "harp/link.h"
 #include "harp/object.h"
 #include "harp/store.h"
+#include "usb_io.h"
 
 #define EXPECT_REF "expected/live-project"
 #define LIVE_REF "live/project"
 #define CREDIT_GRANT (16u << 20)
 
 typedef struct {
-    int fd;
+    harp_io *io;
+    harp_io_fd tcp; /* backing storage when the transport is a socket */
     harp_link link;
     harp_cbuf msg;
     uint64_t next_rid;
@@ -125,11 +127,11 @@ static void handle_ntf(probe *p, const harp_env *e) {
  * envelope unless tolerate_error. */
 static harp_env request(probe *p, harp_cbuf *out, harp_cbuf *rsp_buf, bool tolerate_error) {
     uint64_t rid = p->next_rid; /* caller used this rid in the head */
-    if (harp_link_send(p->fd, HARP_STREAM_CTL, out->buf, out->len) != 0)
+    if (harp_link_send(p->io, HARP_STREAM_CTL, out->buf, out->len) != 0)
         die("link send failed");
     for (;;) {
         uint8_t stream;
-        int rc = harp_link_recv(p->fd, &p->link, &stream, &p->msg);
+        int rc = harp_link_recv(p->io, &p->link, &stream, &p->msg);
         if (rc != 0) die("link receive failed (device gone?)");
         if (stream == HARP_STREAM_OBJ) {
             harp_store_put(&p->store, p->msg.buf, p->msg.len, NULL);
@@ -298,7 +300,7 @@ static identity do_hello(probe *p) {
     harp_cbor_map(&m, 1);
     harp_cbor_uint(&m, 0);
     harp_cbor_uint(&m, CREDIT_GRANT);
-    harp_link_send(p->fd, HARP_STREAM_CTL, m.buf, m.len);
+    harp_link_send(p->io, HARP_STREAM_CTL, m.buf, m.len);
     harp_cbuf_free(&m);
     return id;
 }
@@ -428,7 +430,7 @@ static void fetch_closure(probe *p, const harp_hash *root) {
                     if (!harp_store_have(&p->store, &want[i])) all = false;
                 if (all) break;
                 uint8_t stream;
-                if (harp_link_recv(p->fd, &p->link, &stream, &p->msg) != 0)
+                if (harp_link_recv(p->io, &p->link, &stream, &p->msg) != 0)
                     die("link receive failed during fetch");
                 if (stream == HARP_STREAM_OBJ)
                     harp_store_put(&p->store, p->msg.buf, p->msg.len, NULL);
@@ -717,7 +719,7 @@ static void do_restore(probe *p) {
             if (harp_store_get(&p->store, &closure[i], &enc) != 0)
                 die("local object vanished");
             if (enc.len <= p->peer_credit) p->peer_credit -= enc.len;
-            if (harp_link_send(p->fd, HARP_STREAM_OBJ, enc.buf, enc.len) != 0)
+            if (harp_link_send(p->io, HARP_STREAM_OBJ, enc.buf, enc.len) != 0)
                 die("object send failed");
         }
         harp_cbuf_free(&enc);
@@ -815,7 +817,19 @@ int main(int argc, char **argv) {
     const char *cmd = argv[i];
 
     probe p = {0};
-    p.fd = dial(addr);
+    int tcp_fd = -1;
+    if (strcmp(addr, "usb") == 0) {
+#ifdef HAVE_LIBUSB
+        p.io = harp_usb_open();
+        if (!p.io) return 1;
+#else
+        die("built without libusb; -d usb unavailable");
+#endif
+    } else {
+        tcp_fd = dial(addr);
+        harp_io_fd_init(&p.tcp, tcp_fd, tcp_fd);
+        p.io = &p.tcp.io;
+    }
     harp_link_init(&p.link);
     harp_cbuf_init(&p.msg);
     if (harp_store_open(&p.store, store_dir) != 0) die("cannot open local store");
@@ -842,6 +856,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "harp-probe: unknown command '%s'\n", cmd);
         return 2;
     }
-    close(p.fd);
+    if (tcp_fd >= 0) close(tcp_fd);
+#ifdef HAVE_LIBUSB
+    else
+        harp_usb_close(p.io);
+#endif
     return 0;
 }
