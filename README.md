@@ -1,7 +1,39 @@
 # HARP — Hardware Audio Runtime Protocol
 
-Reference implementation of the [HARP specification](spec/harp-spec-draft-0.3.md)
-(draft 0.3.0). Layout follows the spec's Appendix E.
+**An open standard that makes hardware instruments behave like plugins.**
+
+Hardware synths, drum machines, and effects have connected to computers for
+forty years, and the connection is still fragile in one specific way:
+*recall*. Audio mostly works, MIDI mostly works — but reopen last month's
+project and the hardware is not in the state you saved, and nothing will
+tell you. The deep integrations that fix this (multichannel USB audio,
+plugin-shell control, total recall) exist only inside closed single-vendor
+ecosystems, because every vendor must rebuild drivers, state sync, and DAW
+compatibility from scratch — and most can't afford to.
+
+HARP makes that integration a shared, open substrate. A device implementing
+it gets, from any conforming host:
+
+- **Total recall, Git-style** — device state is content-addressed and
+  hash-verified; a saved project reopens with the hardware *provably* in
+  the saved state, every overwrite preceded by a free snapshot, every
+  mismatch resolved through explicit safe actions — never silently.
+- **Audio as a plugin** — a dedicated stream into the plugin shell that
+  bypasses the OS audio stack (no aggregate-device hacks), including a
+  host-paced mode where the hardware renders *deterministically*, byte-
+  identical, faster than real time: offline bounce through a physical box.
+- **Identity, timing, diagnostics** — engine versioning that protects old
+  songs from new firmware, measured (never guessed) latency, and error
+  counters that end "it glitched" support threads with evidence.
+
+This repository holds the [specification](spec/harp-spec-draft-0.3.md)
+(draft 0.3.1, CC BY 4.0) and its reference implementation (Apache-2.0): a
+portable C core, a reference device daemon that turns a Raspberry Pi 4B
+into a HARP instrument over USB, and a host CLI. The recall, USB-binding,
+streaming, and deterministic-render layers are running and verified on
+that hardware today; the VST3 shell — where this becomes an instrument
+track in a DAW — is next (`docs/vst3-shell-plan.md`). Repository layout
+follows the spec's Appendix E.
 
 ## Status
 
