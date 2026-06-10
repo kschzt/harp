@@ -64,6 +64,23 @@ if(LIBUSB_FOUND)
   target_link_directories(harp-shell PRIVATE ${LIBUSB_LIBRARY_DIRS})
   target_link_libraries(harp-shell PRIVATE sdk ${LIBUSB_LIBRARIES})
   message(STATUS "harp-shell: building VST3 shell with libusb ${LIBUSB_VERSION}")
+
+  # SMTG signs at link time, then moduleinfotool writes into Resources and
+  # breaks the seal ("code has no resources but signature indicates they
+  # must be present" — Live refuses such bundles). Re-sign as the last step.
+  set(HARP_SHELL_BUNDLE ${CMAKE_BINARY_DIR}/VST3/Release/harp-shell.vst3)
+  add_custom_command(TARGET harp-shell POST_BUILD
+    COMMAND codesign --force --deep -s - "${HARP_SHELL_BUNDLE}"
+    COMMENT "Re-sealing harp-shell.vst3 signature")
+
+  # `cmake --build build-vst --target install-live` -> user VST3 folder
+  add_custom_target(install-live
+    COMMAND rm -rf "$ENV{HOME}/Library/Audio/Plug-Ins/VST3/harp-shell.vst3"
+    COMMAND cp -R "${HARP_SHELL_BUNDLE}" "$ENV{HOME}/Library/Audio/Plug-Ins/VST3/"
+    COMMAND codesign --force --deep -s -
+            "$ENV{HOME}/Library/Audio/Plug-Ins/VST3/harp-shell.vst3"
+    DEPENDS harp-shell
+    COMMENT "Installing harp-shell.vst3 for Ableton Live")
 else()
   message(STATUS "harp-shell: libusb not found, shell not built")
 endif()

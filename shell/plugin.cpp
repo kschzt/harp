@@ -51,6 +51,10 @@ public:
         tresult r = AudioEffect::initialize(context);
         if (r != kResultOk) return r;
         addAudioOutput(STR16("Stereo Out"), SpeakerArr::kStereo);
+        /* Live refuses Instrument-category plugins without an event input
+         * ("no valid event input bus"). Notes are ignored until §9.10 UMP
+         * carriage lands — but the bus must exist. */
+        addEventInput(STR16("MIDI In"), 16);
         return kResultOk;
     }
 
