@@ -36,6 +36,12 @@ if(APPLE)
 endif()
 target_include_directories(harp-vst3-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vst3sdk)
 
+# ---- ring unit + stress tests (no SDK, no hardware) ----
+add_executable(ring-tests ring_tests.cpp)
+target_include_directories(ring-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../shell)
+enable_testing()
+add_test(NAME rings COMMAND ring-tests)
+
 # ---- the HARP shell plugin (shell/) — needs libusb ----
 find_package(PkgConfig QUIET)
 if(PKG_CONFIG_FOUND)

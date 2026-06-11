@@ -132,16 +132,26 @@ The shell can also be driven without any DAW, which is how it is tested:
 
 Working and verified end-to-end: `harp-core`, `harp-recall`,
 `harp-stream` (free-running + host-paced with `audio.deterministic` and
-`audio.offline-rate`), the USB binding, and the VST3 shell in Ableton
-Live 12. Certification-suite behaviors exercised in miniature: T2/T3
-(unplug/replug survival), T5 (silent hash-verified reopen), T10
-(power-loss state safety), T15 (byte-identical renders).
+`audio.offline-rate`), the USB binding, the VST3 shell in Ableton
+Live 12, and the event plane (§9): parameter sets and ramps applied at
+exact sample timestamps (±1 sample verified on hardware), DAW
+automation synthesized into device-interpolated ramps, UMP note input
+(the refdev is a playable envelope+portamento synth), and front-panel
+echo — turn a knob on the device's web panel and the DAW records
+automation. The panel doubles as a live protocol inspector (refs,
+generations, dirty flag, counters). A realtime soak harness
+(`scripts/soak.sh`) floods automation + notes + panel traffic and
+asserts zero silence gaps, zero drops, bounded padding across DAW
+buffer sizes 64–1024. Certification-suite behaviors exercised in
+miniature: T2/T3 (unplug/replug), T5 (silent hash-verified reopen),
+T10 (power-loss safety), T15 (byte-identical renders), T16 (event
+timing).
 
-Not yet: event plane (§9 — sample-accurate events, ramps, knob echo into
-DAW automation recording), four-safe-actions UI (v0 auto-resolves by
-Push-with-archive), runtime/shell process split (§15.1), firmware
-management (§13), class-audio coexistence (§8.5), free-running ASRC for
-analog devices, AU/CLAP ports, TCP companion spec (§4.4).
+Not yet: transport/tempo events (§9.7 — arrives with the arpeggiator
+demo), four-safe-actions UI (v0 auto-resolves by Push-with-archive),
+runtime/shell process split (§15.1), firmware management (§13),
+class-audio coexistence (§8.5), free-running ASRC for analog devices,
+AU/CLAP/Windows-ASIO ports, TCP companion spec (§4.4).
 
 The spec is an **editor's draft**: breaking changes expected, version
 negotiated at `core.hello`. Changes flow through HARP Enhancement

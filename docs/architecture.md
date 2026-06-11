@@ -7,10 +7,13 @@
 │  ┌─ harp-shell.vst3 ─────────────────────────────────────────┐   │
 │  │  processor/controller (VST3 API, frozen UIDs)             │   │
 │  │  ┌─ embedded HARP runtime ───────────────────────────┐    │   │
-│  │  │ feeder thread: ALL USB I/O                        │    │   │
-│  │  │  · paces SSI blocks ──► lock-free ring ──► process()   │   │
-│  │  │  · param pushes (coalesced, audio outranks knobs) │    │   │
-│  │  │  · control plane: hello, refs, snapshot, CAS push │    │   │
+│  │  │ feeder thread: pacing + events + link inbound     │    │   │
+│  │  │  · paces SSI blocks (small fixed pipeline)        │    │   │
+│  │  │  · timestamped param/ramp/note events (§9)        │    │   │
+│  │  │ reader thread: audio-IN read ALWAYS pending ──►   │    │   │
+│  │  │     lock-free ring ──► process()  (pad debt keeps │    │   │
+│  │  │     latency constant across underruns)            │    │   │
+│  │  │ main thread: hello, refs, snapshot, CAS push      │    │   │
 │  │  └───────────────────────────────────────────────────┘    │   │
 │  └──────────────────────────┬────────────────────────────────┘   │
 └─────────────────────────────┼────────────────────────────────────┘
@@ -34,7 +37,7 @@ exercises every protocol flow from the command line.
 |---|---|---|
 | control | CBOR request/response/notify (`core.*`, `state.*`, `audio.*`) | framed link, stream 0 |
 | state | content-addressed objects, credit-controlled bulk | framed link, stream 2 |
-| events | UMP + parameter events (§9 — not yet implemented) | framed link, stream 1 |
+| events | UMP notes + timestamped param sets/ramps + echo (§9) | framed link, stream 1 |
 | audio | timestamped PCM frames | dedicated bulk endpoint pair |
 
 ## State model in one breath (spec §10–§11)
@@ -68,3 +71,17 @@ converters).
   while its counterpart blocks writing the other way deadlocks with both
   locally correct. Keep an inbound read pending; drain on stall
   (spec §4.2.1).
+- "Inbound read pending" applies PER PIPE: the audio stream needs its
+  own dedicated reader thread — if the device's response writes ever
+  wait for the host to post a read, its strictly-serial pacing loop
+  inherits that wait, and depth-probing a serial device injects the
+  stalls it tries to absorb.
+- Underrun policy: padded stream positions are SPENT. Late arrivals for
+  them get dropped (pad debt), or every pad permanently grows latency
+  and replays the missing moment as an "echo" while the DAW grid
+  drifts. The ring cushion scales with the DAW block size
+  (max(5×256, 2×block)); reported latency follows it.
+- Event rate is bounded at the source: one ramp per param per 256
+  samples, points folded into the next ramp's target — a 64-sample-
+  buffer DAW emits ~750 points/s/param and the wire doesn't need them
+  (the device interpolates at control rate regardless).

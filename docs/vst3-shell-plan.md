@@ -40,21 +40,16 @@ The DAW audio thread may not block, allocate, or do USB I/O. The probe's
   position (locates/loops would rewind it). Transport events (§9.7)
   carry musical position separately, later.
 
-## Device prerequisites (refdev work inside this milestone)
+## Device prerequisites — DONE (2026-06-11)
 
-The event plane (§9) does not exist yet on either side. Minimum for a
-useful shell:
-
-1. `evt.params` — descriptor set for the 8 params (names, ranges, flags;
-   the param-map-hash already exists in identity and must match, §9.3).
-2. `evt` stream carrying `param` set events H→D (etype 1), applied at
-   "now" first; sample-accurate timestamps once it works (`harp-perf`
-   later).
-3. **Echo** D→H (`evt.param.echo`): front-panel knob turns become events
-   the shell can record as automation. Today's `x.harp-refdev.knob` should
-   set values via the same internal path so echo fires.
-4. Ramps (§9.4) after point events work — VST3 sends point automation
-   per block; ramps are the optimization, not the MVP.
+The §9 event plane is implemented end to end: `evt.params` descriptors,
+timestamped param sets + ramps applied at exact sample positions
+(segmented rendering, verified ±1 sample), front-panel echo into DAW
+automation via `outputParameterChanges`, UMP note input. Hard-won
+operational rules live in `docs/architecture.md` ("threading rules that
+bit us") and the spec changelog; the realtime soak (`scripts/soak.sh`)
+enforces them. Remaining §9: transport events (§9.7), planned together
+with the arpeggiator demo.
 
 ## Shell behavior checklist (§15.4)
 

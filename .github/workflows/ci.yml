@@ -2,6 +2,22 @@ name: ci
 on: [push, pull_request]
 
 jobs:
+  shell-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: clone VST3 SDK
+        run: git clone --depth 1 --recursive
+             https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
+      - name: install libusb
+        run: brew install libusb
+      - name: build shell + tools
+        run: |
+          cmake -B build-vst -S tools/vst3-host
+          cmake --build build-vst --target harp-vst3-host harp-shell ring-tests -j3
+      - name: ring tests (incl. cross-thread stress)
+        run: ./build-vst/ring-tests
+
   core:
     runs-on: ubuntu-latest
     steps:

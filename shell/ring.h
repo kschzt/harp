@@ -17,10 +17,18 @@ public:
     }
     ~FloatRing() { delete[] buf_; }
 
+    /* consumer-side (and observer) form: acquire on head publishes the
+     * producer's buffer writes */
     size_t readAvailable() const {
         return head_.load(std::memory_order_acquire) - tail_.load(std::memory_order_relaxed);
     }
-    size_t writeAvailable() const { return cap_ - readAvailable(); }
+    /* producer-side form: acquire on TAIL — without it the producer can
+     * see a recycled slot as free before the consumer's reads of it have
+     * happened-before, and overwrite samples mid-read (found by TSan) */
+    size_t writeAvailable() const {
+        return cap_ - (head_.load(std::memory_order_relaxed) -
+                       tail_.load(std::memory_order_acquire));
+    }
 
     /* producer */
     size_t write(const float *src, size_t n) {
