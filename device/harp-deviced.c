@@ -87,12 +87,17 @@ static dev_event g_evq[DEV_EVQ_CAP];
 static size_t g_evq_n;
 static pthread_mutex_t g_evq_mu = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_touch_pending; /* dirty-flag work deferred off the render thread */
+static volatile uint64_t g_evq_drops; /* ring full — counted, never silent (§14.1) */
 
 static void evq_push(dev_event ev) {
     pthread_mutex_lock(&g_evq_mu);
-    if (g_evq_n < DEV_EVQ_CAP) g_evq[g_evq_n++] = ev;
+    if (g_evq_n < DEV_EVQ_CAP)
+        g_evq[g_evq_n++] = ev;
+    else
+        g_evq_drops++;
     pthread_mutex_unlock(&g_evq_mu);
 }
+
 
 /* per-param ramp state (§9.4); render-thread-only after activation */
 typedef struct {
@@ -101,6 +106,18 @@ typedef struct {
     float start_val, target;
 } dev_ramp;
 static dev_ramp g_ramps[NPARAMS];
+
+/* Stream state reset (§7.1 in miniature): a new stream is a new time
+ * domain — queued events and active ramps from the previous session's SSI
+ * timeline are stale BY DEFINITION and must not leak into this one.
+ * (Learned from a jammed queue of never-due zombie events silently
+ * dropping every new event.) */
+static void evq_reset_for_new_stream(void) {
+    pthread_mutex_lock(&g_evq_mu);
+    g_evq_n = 0;
+    pthread_mutex_unlock(&g_evq_mu);
+    memset(g_ramps, 0, sizeof g_ramps);
+}
 
 /* audio plane state (§8): one D→H stream.
  * mode 0: free-running, paced by the device clock, MSC timestamps.
@@ -1288,7 +1305,7 @@ static void handle_diag_counters(device *d, const harp_env *e) {
     harp_cbuf m;
     harp_cbuf_init(&m);
     rsp_head(&m, e->rid, e->method, true);
-    harp_cbor_map(&m, 12);
+    harp_cbor_map(&m, 13);
     harp_cbor_text(&m, "usb_errors");
     harp_cbor_uint(&m, 0);
     harp_cbor_text(&m, "frame_errors");
@@ -1307,6 +1324,8 @@ static void handle_diag_counters(device *d, const harp_env *e) {
     harp_cbor_uint(&m, 0);
     harp_cbor_text(&m, "evt_stale_epoch");
     harp_cbor_uint(&m, 0);
+    harp_cbor_text(&m, "x.harp-refdev.evq_drops");
+    harp_cbor_uint(&m, g_evq_drops);
     harp_cbor_text(&m, "session_resets");
     harp_cbor_uint(&m, d->session_resets);
     harp_cbor_text(&m, "storage_bytes_total");
@@ -1370,6 +1389,7 @@ static void handle_audio_start(device *d, const harp_env *e) {
         send_error(d, e->rid, e->method, "busy", "stream already running");
         return;
     }
+    evq_reset_for_new_stream();
     d->audio.fd = fd;
     d->audio.out_fd = out_fd;
     d->audio.mode = (uint32_t)mode;
@@ -1758,11 +1778,12 @@ static void panel_json_refs(device *d, char *body, size_t sz) {
 static void panel_json_counters(device *d, char *body, size_t sz) {
     snprintf(body, sz,
              "{\"frame_errors\":%llu,\"session_resets\":%llu,"
-             "\"audio_overruns\":%llu,\"snapshots\":%llu,\"boot\":%llu,"
-             "\"session\":%s,\"streaming\":%s}",
+             "\"audio_overruns\":%llu,\"snapshots\":%llu,\"evq_drops\":%llu,"
+             "\"boot\":%llu,\"session\":%s,\"streaming\":%s}",
              (unsigned long long)d->frame_errors, (unsigned long long)d->session_resets,
              (unsigned long long)d->audio_overruns, (unsigned long long)d->snapshots_taken,
-             (unsigned long long)d->boot_count, d->hello_done ? "true" : "false",
+             (unsigned long long)g_evq_drops, (unsigned long long)d->boot_count,
+             d->hello_done ? "true" : "false",
              d->audio.thread_live ? "true" : "false");
 }
 

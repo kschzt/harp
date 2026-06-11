@@ -363,13 +363,16 @@ void HarpRuntime::stop() {
 /* ---------------- audio thread side ---------------- */
 
 void HarpRuntime::queueParamSet(uint32_t id, float v, uint64_t ts) {
-    timedRing_.push({0, id, v, ts, 0});
+    if (!timedRing_.push({0, id, v, ts, 0}))
+        evDrops_.fetch_add(1, std::memory_order_relaxed);
 }
 void HarpRuntime::queueRamp(uint32_t id, float target, uint64_t start, uint64_t end) {
-    timedRing_.push({1, id, target, start, end});
+    if (!timedRing_.push({1, id, target, start, end}))
+        evDrops_.fetch_add(1, std::memory_order_relaxed);
 }
 void HarpRuntime::queueNote(uint32_t word, uint64_t ts) {
-    timedRing_.push({2, word, 0.0f, ts, 0});
+    if (!timedRing_.push({2, word, 0.0f, ts, 0}))
+        evDrops_.fetch_add(1, std::memory_order_relaxed);
 }
 
 /* UMP event (§9.10): etype 0, body = one packet, words big-endian. */
@@ -510,11 +513,18 @@ void HarpRuntime::feeder() {
             accLen -= off;
         }
 
-        /* 4. timestamped events (params, ramps, notes — §9.2/§9.4/§9.10):
+        /* 4. inbound async traffic FIRST: keeping the IN direction drained
+         * means the device is never blocked writing to us — which means OUR
+         * writes below never stall (§4.2.1; learned the hard way under
+         * automation flood) */
+        pollEcho();
+
+        /* 5. timestamped events (params, ramps, notes — §9.2/§9.4/§9.10):
          * fire-and-forget sends, order preserved, timestamps carry the
-         * timing so coalescing is neither needed nor wanted */
+         * timing. Bounded per iteration: pacing must get its turn even
+         * under automation flood — audio outranks events (§9.2). */
         TimedEv te;
-        while (timedRing_.pop(te)) {
+        for (int sent = 0; sent < 32 && timedRing_.pop(te); sent++) {
             if (te.kind == 0)
                 sendParamEvent(te.a, te.v, te.ts);
             else if (te.kind == 1)
@@ -524,8 +534,12 @@ void HarpRuntime::feeder() {
             didWork = true;
         }
 
-        /* 5. inbound async traffic: front-panel echoes -> echoRing_ */
-        pollEcho();
+        uint64_t drops = evDrops_.load(std::memory_order_relaxed);
+        if (drops != evDropsLogged_) {
+            log_msg("WARNING: %llu events dropped (ring overflow)",
+                    (unsigned long long)(drops - evDropsLogged_));
+            evDropsLogged_ = drops;
+        }
 
         if (!didWork) {
             struct timespec ts = {0, 1000000}; /* 1 ms */

@@ -19,7 +19,10 @@
 #include <string.h>
 
 #define USB_READ_CHUNK 16384
-#define USB_WRITE_RETRY_MS 250
+/* Short stall-retry: a stalled write means the device is blocked writing
+ * to US — drain fast, retry fast. 250 ms here once collapsed event
+ * throughput to ~4/s under DAW automation load. */
+#define USB_WRITE_RETRY_MS 8
 #define USB_WRITE_GIVE_UP_MS 30000
 
 typedef struct {
@@ -89,7 +92,7 @@ static bool usb_write_all(harp_io *io, const void *buf, size_t n) {
             fprintf(stderr, "harp-usb: bulk out failed: %s\n", libusb_error_name(rc));
             return false;
         }
-        if (!usb_fill(u, 50)) return false; /* unblock the device's IN writes */
+        if (!usb_fill(u, 5)) return false; /* unblock the device's IN writes */
         waited += USB_WRITE_RETRY_MS;
         if (waited >= USB_WRITE_GIVE_UP_MS) {
             fprintf(stderr, "harp-usb: bulk out stalled for %u ms, giving up\n", waited);

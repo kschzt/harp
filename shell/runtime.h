@@ -109,6 +109,8 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
     std::atomic<uint64_t> underruns_{0};
+    std::atomic<uint64_t> evDrops_{0}; /* events lost to ring overflow — never silent */
+    uint64_t evDropsLogged_ = 0;
 
     FloatRing audioRing_{1 << 15}; /* 32768 floats = 16384 stereo frames */
     TimedRing timedRing_; /* outbound: params, ramps, notes — order preserved */
