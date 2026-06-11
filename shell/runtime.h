@@ -41,6 +41,7 @@ public:
 
     /* ---- audio thread ---- */
     void setParam(uint32_t id, float normalized); /* enqueue, lock-free */
+    void queueUmp(uint32_t word);                 /* note events, lock-free */
     /* Fill n interleaved-stereo samples; pads with silence on underrun
      * (counted). Returns samples padded (0 = clean). */
     size_t pullAudio(float *interleavedLR, size_t nFrames);
@@ -79,6 +80,7 @@ private:
     bool audioStart(uint32_t rate);
     void audioStopLocked();
     void sendParamEvent(uint32_t id, float v); /* §9.4 set event, fire-and-forget */
+    void sendUmpEvent(uint32_t word);          /* §9.10 note carriage */
     void pollEcho();                           /* drain incoming evt stream */
 
     /* control-plane request/response under ctlMutex_ */
@@ -105,6 +107,7 @@ private:
     FloatRing audioRing_{1 << 15}; /* 32768 floats = 16384 stereo frames */
     ParamRing paramRing_;
     ParamRing echoRing_; /* device front-panel echoes -> outputParameterChanges */
+    ParamRing umpRing_;  /* UMP words ride the id field; value unused */
 
 public:
     /* audio thread: drain echoed device-side edits (§9.4 echo) */

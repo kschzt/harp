@@ -364,6 +364,27 @@ void HarpRuntime::stop() {
 
 void HarpRuntime::setParam(uint32_t id, float v) { paramRing_.push({id, v}); }
 
+void HarpRuntime::queueUmp(uint32_t word) { umpRing_.push({word, 0.0f}); }
+
+/* UMP event (§9.10): etype 0, body = one packet, words big-endian. */
+void HarpRuntime::sendUmpEvent(uint32_t word) {
+    uint8_t bytes[4] = {(uint8_t)(word >> 24), (uint8_t)(word >> 16),
+                        (uint8_t)(word >> 8), (uint8_t)word};
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    harp_cbor_array(&m, 3);
+    harp_cbor_array(&m, 2);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, 0); /* etype: ump */
+    harp_cbor_bytes(&m, bytes, 4);
+    {
+        std::lock_guard<std::mutex> lk(ctlMutex_);
+        harp_link_send(io_, HARP_STREAM_EVT, m.buf, m.len);
+    }
+    harp_cbuf_free(&m);
+}
+
 size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
     size_t want = nFrames * 2;
     size_t got = audioRing_.read(dst, want);
@@ -475,6 +496,13 @@ void HarpRuntime::feeder() {
         while (npending) {
             sendParamEvent(pending[npending - 1].id, pending[npending - 1].value);
             npending--;
+            didWork = true;
+        }
+
+        /* 4b. note events — never coalesced, order matters (§9.10) */
+        ParamChange ump;
+        while (umpRing_.pop(ump)) {
+            sendUmpEvent(ump.id);
             didWork = true;
         }
 

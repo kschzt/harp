@@ -25,6 +25,7 @@
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/ivstprocesscontext.h"
 #include "public.sdk/source/common/memorystream.h"
+#include "public.sdk/source/vst/hosting/eventlist.h"
 #include "public.sdk/source/vst/hosting/hostclasses.h"
 #include "public.sdk/source/vst/hosting/module.h"
 #include "public.sdk/source/vst/hosting/parameterchanges.h"
@@ -128,6 +129,7 @@ int main(int argc, char **argv) {
     std::string input_kind = "silence", out_path, save_state_path, load_state_path;
     double sine_hz = 440.0;
     std::vector<std::pair<uint32_t, double>> sets;
+    std::vector<int> notes; /* played sequentially: on at i*0.6s, off at +0.45s */
 
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
@@ -149,6 +151,15 @@ int main(int argc, char **argv) {
             if (colon != std::string::npos) {
                 sine_hz = atof(input_kind.substr(colon + 1).c_str());
                 input_kind = input_kind.substr(0, colon);
+            }
+        } else if (a == "--notes") {
+            std::string list = next();
+            size_t pos = 0;
+            while (pos < list.size()) {
+                notes.push_back(atoi(list.c_str() + pos));
+                pos = list.find(',', pos);
+                if (pos == std::string::npos) break;
+                pos++;
             }
         } else if (a == "--set") {
             std::string kv = next();
@@ -292,6 +303,31 @@ int main(int argc, char **argv) {
         pd.inputParameterChanges = &pc;
         ParameterChanges opc; /* plugin-originated changes (e.g. HARP echo) */
         pd.outputParameterChanges = &opc;
+
+        EventList evList; /* scheduled --notes falling inside this block */
+        for (size_t ni = 0; ni < notes.size(); ni++) {
+            int64_t on_at = (int64_t)((double)ni * 0.6 * rate);
+            int64_t off_at = on_at + (int64_t)(0.45 * rate);
+            if (on_at >= (int64_t)done && on_at < (int64_t)(done + n)) {
+                Event ev{};
+                ev.type = Event::kNoteOnEvent;
+                ev.sampleOffset = (int32)(on_at - (int64_t)done);
+                ev.noteOn.pitch = (int16)notes[ni];
+                ev.noteOn.velocity = 0.9f;
+                ev.noteOn.noteId = -1;
+                evList.addEvent(ev);
+            }
+            if (off_at >= (int64_t)done && off_at < (int64_t)(done + n)) {
+                Event ev{};
+                ev.type = Event::kNoteOffEvent;
+                ev.sampleOffset = (int32)(off_at - (int64_t)done);
+                ev.noteOff.pitch = (int16)notes[ni];
+                ev.noteOff.velocity = 0.f;
+                ev.noteOff.noteId = -1;
+                evList.addEvent(ev);
+            }
+        }
+        pd.inputEvents = &evList;
 
         if (processor->process(pd) != kResultOk) die("process failed");
 

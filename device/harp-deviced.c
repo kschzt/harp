@@ -58,9 +58,16 @@ typedef struct {
 static dev_param g_params[] = {
     {1, "Osc Pitch", 0.5f},   {2, "Osc Shape", 0.5f},    {3, "Filter Cutoff", 0.5f},
     {4, "Filter Reso", 0.5f}, {5, "Env Attack", 0.5f},   {6, "Env Release", 0.5f},
-    {7, "FX Send", 0.5f},     {8, "Master Level", 0.5f},
+    {7, "Drone Mix", 0.5f},   {8, "Master Level", 0.5f},
 };
 #define NPARAMS (sizeof g_params / sizeof g_params[0])
+
+/* live performance state (notes are events, not patch state — they never
+ * touch the dirty flag). Mono, last-note priority. Written by the session
+ * thread, read by the audio thread; benign word-sized races. */
+static volatile int g_note = -1;       /* sounding MIDI note, -1 = none */
+static volatile float g_note_vel = 0;  /* 0..1 */
+static volatile uint32_t g_note_seq = 0; /* bumps on every note-on (retrigger) */
 
 /* audio plane state (§8): one D→H stream.
  * mode 0: free-running, paced by the device clock, MSC timestamps.
@@ -126,8 +133,14 @@ typedef struct {
     float low_l, band_l, low_r, band_r;
     /* control-rate-smoothed parameter values (§9.3: the device interpolates
      * at its declared control rate — instant steps are zipper clicks) */
-    float s_pitch, s_shape, s_cutoff, s_reso, s_master;
+    float s_pitch, s_shape, s_cutoff, s_reso, s_master, s_drone;
     bool s_init;
+    /* note voice: envelope-gated, portamento via smoothed frequency */
+    float n_phase_l, n_phase_r;
+    float n_low_l, n_band_l, n_low_r, n_band_r;
+    float n_freq;   /* smoothed toward the sounding note */
+    float env;      /* envelope level 0..1 */
+    uint32_t seen_seq;
 } synth_voice;
 
 static float param_value(uint32_t id) {
@@ -145,6 +158,8 @@ static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float 
         v->s_cutoff = param_value(3);
         v->s_reso = param_value(4);
         v->s_master = param_value(8);
+        v->s_drone = param_value(7);
+        v->n_freq = 220.0f;
         v->s_init = true;
     }
     float detune = 1.004f;
@@ -161,23 +176,55 @@ static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float 
         v->s_cutoff += alpha * (param_value(3) - v->s_cutoff);
         v->s_reso += alpha * (param_value(4) - v->s_reso);
         v->s_master += alpha * (param_value(8) - v->s_master);
+        v->s_drone += alpha * (param_value(7) - v->s_drone);
 
-        float freq = 55.0f * exp2f(v->s_pitch * 4.0f); /* 55 Hz .. 880 Hz */
-        float fc = 60.0f * exp2f(v->s_cutoff * 6.0f);  /* 60 Hz .. ~3.8 kHz */
+        /* note voice control: gate + envelope + portamento target */
+        int note = g_note;
+        if (v->seen_seq != g_note_seq) { /* retrigger */
+            v->seen_seq = g_note_seq;
+            if (v->env < 0.05f) v->env = 0.05f; /* snappy restart, no click */
+        }
+        bool gate = note >= 0;
+        if (gate) {
+            float target = 440.0f * exp2f(((float)note - 69.0f) / 12.0f);
+            v->n_freq += alpha * (target - v->n_freq); /* portamento */
+        }
+        /* attack 1 ms..1 s, release 5 ms..3 s (exp-mapped knobs) */
+        float atk_tau = 0.001f * exp2f(param_value(5) * 10.0f);
+        float rel_tau = 0.005f * exp2f(param_value(6) * 9.2f);
+        float env_target = gate ? g_note_vel : 0.0f;
+        float env_alpha =
+            1.0f - expf(-(float)SMOOTH_SUBBLOCK / ((gate ? atk_tau : rel_tau) * rate));
+        v->env += env_alpha * (env_target - v->env);
+
+        float freq = 55.0f * exp2f(v->s_pitch * 4.0f); /* drone: 55 Hz .. 880 Hz */
+        float fc = 60.0f * exp2f(v->s_cutoff * 6.0f);
         float f = 2.0f * sinf((float)M_PI * fc / rate);
         float q = 1.0f - 0.9f * v->s_reso;
         float shape = v->s_shape, master = v->s_master;
+        float drone_lvl = v->s_drone, env = v->env;
+        float nfreq = v->n_freq;
 
         for (; i < end; i++) {
+            /* drone oscillator pair */
             v->phase_l += freq / rate;
             if (v->phase_l >= 1.0f) v->phase_l -= 1.0f;
             v->phase_r += freq * detune / rate;
             if (v->phase_r >= 1.0f) v->phase_r -= 1.0f;
-
             float osc_l = sinf(2.0f * (float)M_PI * v->phase_l);
             osc_l += ((2.0f * v->phase_l - 1.0f) - osc_l) * shape;
             float osc_r = sinf(2.0f * (float)M_PI * v->phase_r);
             osc_r += ((2.0f * v->phase_r - 1.0f) - osc_r) * shape;
+
+            /* note oscillator pair (own filter state, same patch character) */
+            v->n_phase_l += nfreq / rate;
+            if (v->n_phase_l >= 1.0f) v->n_phase_l -= 1.0f;
+            v->n_phase_r += nfreq * detune / rate;
+            if (v->n_phase_r >= 1.0f) v->n_phase_r -= 1.0f;
+            float nosc_l = sinf(2.0f * (float)M_PI * v->n_phase_l);
+            nosc_l += ((2.0f * v->n_phase_l - 1.0f) - nosc_l) * shape;
+            float nosc_r = sinf(2.0f * (float)M_PI * v->n_phase_r);
+            nosc_r += ((2.0f * v->n_phase_r - 1.0f) - nosc_r) * shape;
 
             v->low_l += f * v->band_l;
             float high_l = osc_l - v->low_l - q * v->band_l;
@@ -186,8 +233,16 @@ static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float 
             float high_r = osc_r - v->low_r - q * v->band_r;
             v->band_r += f * high_r;
 
-            interleaved[2 * i] = v->low_l * master * 0.5f;
-            interleaved[2 * i + 1] = v->low_r * master * 0.5f;
+            v->n_low_l += f * v->n_band_l;
+            float nhigh_l = nosc_l - v->n_low_l - q * v->n_band_l;
+            v->n_band_l += f * nhigh_l;
+            v->n_low_r += f * v->n_band_r;
+            float nhigh_r = nosc_r - v->n_low_r - q * v->n_band_r;
+            v->n_band_r += f * nhigh_r;
+
+            interleaved[2 * i] = (v->low_l * drone_lvl + v->n_low_l * env) * master * 0.5f;
+            interleaved[2 * i + 1] =
+                (v->low_r * drone_lvl + v->n_low_r * env) * master * 0.5f;
         }
     }
 }
@@ -1267,6 +1322,25 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
         tn != 2 || !harp_cdec_uint(&dec, &ep) || !harp_cdec_uint(&dec, &msc) ||
         !harp_cdec_uint(&dec, &etype)) {
         d->frame_errors++;
+        return;
+    }
+    if (etype == 0) { /* UMP carriage (§9.10): body = one packet, words big-endian */
+        const uint8_t *p;
+        size_t pl;
+        if (!harp_cdec_bytes(&dec, &p, &pl) || pl < 4) return;
+        uint32_t w = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 |
+                     p[3];
+        uint32_t mt = w >> 28;
+        if (mt == 2) { /* MIDI 1.0 channel voice in UMP */
+            uint32_t status = (w >> 20) & 0xf, note = (w >> 8) & 0x7f, vel = w & 0x7f;
+            if (status == 0x9 && vel > 0) { /* note on */
+                g_note_vel = (float)vel / 127.0f;
+                g_note = (int)note;
+                g_note_seq++;
+            } else if (status == 0x8 || (status == 0x9 && vel == 0)) { /* note off */
+                if (g_note == (int)note) g_note = -1;
+            }
+        }
         return;
     }
     if (etype != 1) return; /* unknown event types are skipped, not fatal */

@@ -11,6 +11,7 @@
 #include "pluginterfaces/base/ibstream.h"
 #include "pluginterfaces/base/ustring.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
+#include "pluginterfaces/vst/ivstevents.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
 #include "public.sdk/source/main/pluginfactory.h"
 #include "public.sdk/source/vst/vstaudioeffect.h"
@@ -82,6 +83,25 @@ public:
 
     tresult PLUGIN_API process(ProcessData &data) override {
         auto &rt = HarpRuntime::instance();
+
+        /* note events -> UMP (§9.10): MIDI 1.0 channel voice in UMP, group 0 */
+        if (data.inputEvents) {
+            int32 ne = data.inputEvents->getEventCount();
+            for (int32 i = 0; i < ne; i++) {
+                Event ev;
+                if (data.inputEvents->getEvent(i, ev) != kResultOk) continue;
+                if (ev.type == Event::kNoteOnEvent) {
+                    uint32_t note = (uint32_t)(ev.noteOn.pitch & 0x7f);
+                    uint32_t vel = (uint32_t)(ev.noteOn.velocity * 127.f + 0.5f);
+                    if (vel == 0) vel = 1;
+                    if (vel > 127) vel = 127;
+                    rt.queueUmp(0x20900000u | (note << 8) | vel);
+                } else if (ev.type == Event::kNoteOffEvent) {
+                    uint32_t note = (uint32_t)(ev.noteOff.pitch & 0x7f);
+                    rt.queueUmp(0x20800000u | (note << 8) | 0x40);
+                }
+            }
+        }
 
         /* parameter changes -> lock-free queue (feeder pushes to device) */
         if (data.inputParameterChanges) {
