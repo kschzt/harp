@@ -486,9 +486,12 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
     for (size_t i = 0; i < g_evq_n; i++) {
         dev_event *ev = &g_evq[i];
         if (ev->ts <= pos) {
-            /* ts > 0 and already behind the render head = late (§9.2:
-             * applied immediately and counted, §14.2 evt_late) */
-            if (ev->ts && ev->ts < pos) g_evt_late++;
+            /* late = past the musical deadline (§9.2/§14.2): for ramps the
+             * deadline is END (the start is the previous automation point,
+             * legitimately in the recent past); for everything else, ts. */
+            if (ev->kind == DEV_EV_RAMP ? (ev->end && ev->end < pos)
+                                        : (ev->ts && ev->ts < pos))
+                g_evt_late++;
             switch (ev->kind) {
                 case DEV_EV_NOTE_ON:
                     g_note_vel = ev->v;
