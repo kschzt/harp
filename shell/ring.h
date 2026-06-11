@@ -58,6 +58,39 @@ struct ParamChange {
     float value;
 };
 
+/* Timestamped outbound events (params, ramps, notes) — one ring so cross-
+ * type ordering is preserved. kind: 0 = param set, 1 = ramp, 2 = UMP word. */
+struct TimedEv {
+    uint8_t kind;
+    uint32_t a; /* param id or UMP word */
+    float v;    /* value / ramp target */
+    uint64_t ts, end;
+};
+
+class TimedRing {
+public:
+    bool push(const TimedEv &e) {
+        size_t h = head_.load(std::memory_order_relaxed);
+        size_t t = tail_.load(std::memory_order_acquire);
+        if (h - t >= kCap) return false;
+        buf_[h & (kCap - 1)] = e;
+        head_.store(h + 1, std::memory_order_release);
+        return true;
+    }
+    bool pop(TimedEv &out) {
+        size_t t = tail_.load(std::memory_order_relaxed);
+        if (t == head_.load(std::memory_order_acquire)) return false;
+        out = buf_[t & (kCap - 1)];
+        tail_.store(t + 1, std::memory_order_release);
+        return true;
+    }
+
+private:
+    static constexpr size_t kCap = 1024;
+    TimedEv buf_[kCap];
+    std::atomic<size_t> head_{0}, tail_{0};
+};
+
 class ParamRing {
 public:
     bool push(ParamChange c) { /* producer: audio thread */

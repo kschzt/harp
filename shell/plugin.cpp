@@ -84,7 +84,12 @@ public:
     tresult PLUGIN_API process(ProcessData &data) override {
         auto &rt = HarpRuntime::instance();
 
-        /* note events -> UMP (§9.10): MIDI 1.0 channel voice in UMP, group 0 */
+        /* Stream-domain "now" for this block: events at DAW offset s map to
+         * SSI base + s; the latency term is repaid by the host's PDC, so
+         * they sound exactly when the DAW intended (§9.2). */
+        uint64_t base = rt.streamPos() + rt.latencySamples();
+
+        /* note events -> UMP (§9.10), timestamped to the sample */
         if (data.inputEvents) {
             int32 ne = data.inputEvents->getEventCount();
             for (int32 i = 0; i < ne; i++) {
@@ -95,26 +100,43 @@ public:
                     uint32_t vel = (uint32_t)(ev.noteOn.velocity * 127.f + 0.5f);
                     if (vel == 0) vel = 1;
                     if (vel > 127) vel = 127;
-                    rt.queueUmp(0x20900000u | (note << 8) | vel);
+                    rt.queueNote(0x20900000u | (note << 8) | vel,
+                                 base + (uint64_t)ev.sampleOffset);
                 } else if (ev.type == Event::kNoteOffEvent) {
                     uint32_t note = (uint32_t)(ev.noteOff.pitch & 0x7f);
-                    rt.queueUmp(0x20800000u | (note << 8) | 0x40);
+                    rt.queueNote(0x20800000u | (note << 8) | 0x40,
+                                 base + (uint64_t)ev.sampleOffset);
                 }
             }
         }
 
-        /* parameter changes -> lock-free queue (feeder pushes to device) */
+        /* parameter changes -> timestamped sets; consecutive points become
+         * §9.4 ramps, the device interpolating the line between them — a
+         * DAW curve as a handful of ramps, exactly as §9.1 promises */
         if (data.inputParameterChanges) {
             int32 nq = data.inputParameterChanges->getParameterCount();
             for (int32 i = 0; i < nq; i++) {
                 IParamValueQueue *q = data.inputParameterChanges->getParameterData(i);
                 if (!q) continue;
+                uint32_t id = (uint32_t)q->getParameterId();
                 int32 np = q->getPointCount();
-                if (np <= 0) continue;
-                int32 off;
-                ParamValue v;
-                if (q->getPoint(np - 1, off, v) == kResultOk)
-                    rt.setParam((uint32_t)q->getParameterId(), (float)v);
+                size_t idx = (id >= 1 && id <= 8) ? id - 1 : SIZE_MAX;
+                for (int32 k = 0; k < np; k++) {
+                    int32 off;
+                    ParamValue v;
+                    if (q->getPoint(k, off, v) != kResultOk) continue;
+                    uint64_t ts = base + (uint64_t)off;
+                    bool ramp = idx != SIZE_MAX && hasLast_[idx] && ts > lastTs_[idx] &&
+                                ts - lastTs_[idx] <= 4800; /* >100 ms gap = a jump */
+                    if (ramp)
+                        rt.queueRamp(id, (float)v, lastTs_[idx], ts);
+                    else
+                        rt.queueParamSet(id, (float)v, ts);
+                    if (idx != SIZE_MAX) {
+                        lastTs_[idx] = ts;
+                        hasLast_[idx] = true;
+                    }
+                }
             }
         }
 
@@ -194,6 +216,9 @@ public:
 private:
     uint32_t rate_ = 48000;
     bool offline_ = false;
+    /* per-param last automation point, for ramp synthesis */
+    uint64_t lastTs_[8] = {};
+    bool hasLast_[8] = {};
 };
 
 /* ---------------- controller ---------------- */

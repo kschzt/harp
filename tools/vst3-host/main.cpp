@@ -130,6 +130,11 @@ int main(int argc, char **argv) {
     double sine_hz = 440.0;
     std::vector<std::pair<uint32_t, double>> sets;
     std::vector<int> notes; /* played sequentially: on at i*0.6s, off at +0.45s */
+    struct RampSpec {
+        uint32_t id;
+        double v0, v1;
+    };
+    std::vector<RampSpec> ramps; /* one automation point per block, linear v0->v1 */
 
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
@@ -161,6 +166,12 @@ int main(int argc, char **argv) {
                 if (pos == std::string::npos) break;
                 pos++;
             }
+        } else if (a == "--ramp") { /* ID=V0:V1 over the whole duration */
+            std::string kv = next();
+            RampSpec r{};
+            if (sscanf(kv.c_str(), "%u=%lf:%lf", &r.id, &r.v0, &r.v1) != 3)
+                die("--ramp wants ID=V0:V1");
+            ramps.push_back(r);
         } else if (a == "--set") {
             std::string kv = next();
             auto eq = kv.find('=');
@@ -290,6 +301,13 @@ int main(int argc, char **argv) {
         }
 
         ParameterChanges pc;
+        for (auto &r : ramps) { /* block-rate automation, like a DAW writes */
+            double t = total > 1 ? (double)done / (double)total : 0.0;
+            int32 qidx = 0;
+            auto *q = pc.addParameterData(r.id, qidx);
+            int32 pidx = 0;
+            if (q) q->addPoint(0, r.v0 + (r.v1 - r.v0) * t, pidx);
+        }
         if (first_block) {
             for (auto &kv : sets) {
                 int32 qidx = 0;

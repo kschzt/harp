@@ -69,6 +69,39 @@ static volatile int g_note = -1;       /* sounding MIDI note, -1 = none */
 static volatile float g_note_vel = 0;  /* 0..1 */
 static volatile uint32_t g_note_seq = 0; /* bumps on every note-on (retrigger) */
 
+/* ---- timestamped event queue (§9.2): session thread pushes, render
+ * thread pops at exact stream positions. ts is SSI (host-paced) or MSC
+ * (free-running); ts == 0 means "now". ---- */
+enum { DEV_EV_NOTE_ON, DEV_EV_NOTE_OFF, DEV_EV_PARAM_SET, DEV_EV_RAMP };
+
+typedef struct {
+    uint64_t ts;   /* apply at this stream position (0 = asap) */
+    uint8_t kind;
+    uint32_t a;    /* note number or param id */
+    float v;       /* velocity / value / ramp target */
+    uint64_t end;  /* ramp end position */
+} dev_event;
+
+#define DEV_EVQ_CAP 256
+static dev_event g_evq[DEV_EVQ_CAP];
+static size_t g_evq_n;
+static pthread_mutex_t g_evq_mu = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_touch_pending; /* dirty-flag work deferred off the render thread */
+
+static void evq_push(dev_event ev) {
+    pthread_mutex_lock(&g_evq_mu);
+    if (g_evq_n < DEV_EVQ_CAP) g_evq[g_evq_n++] = ev;
+    pthread_mutex_unlock(&g_evq_mu);
+}
+
+/* per-param ramp state (§9.4); render-thread-only after activation */
+typedef struct {
+    bool active;
+    uint64_t start, end;
+    float start_val, target;
+} dev_ramp;
+static dev_ramp g_ramps[NPARAMS];
+
 /* audio plane state (§8): one D→H stream.
  * mode 0: free-running, paced by the device clock, MSC timestamps.
  * mode 1: host-paced — no timers; renders exactly the SSI ranges the host
@@ -151,7 +184,24 @@ static float param_value(uint32_t id) {
 
 #define SMOOTH_SUBBLOCK 32 /* samples; 1.5 kHz at 48 k — the declared control rate honored */
 
-static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float rate) {
+/* Advance active ramps to stream position `pos`: the base value moves along
+ * the line (visible to echo/refs — ramps change the stored value, §9.4). */
+static void ramps_advance(uint64_t pos) {
+    for (size_t i = 0; i < NPARAMS; i++) {
+        dev_ramp *r = &g_ramps[i];
+        if (!r->active) continue;
+        if (pos >= r->end || r->end <= r->start) {
+            g_params[i].value = r->target;
+            r->active = false;
+        } else if (pos > r->start) {
+            float t = (float)(pos - r->start) / (float)(r->end - r->start);
+            g_params[i].value = r->start_val + (r->target - r->start_val) * t;
+        }
+    }
+}
+
+static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float rate,
+                          uint64_t pos) {
     if (!v->s_init) { /* first block: land on targets, no glide-in from zero */
         v->s_pitch = param_value(1);
         v->s_shape = param_value(2);
@@ -171,6 +221,7 @@ static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float 
         uint32_t end = i + SMOOTH_SUBBLOCK;
         if (end > n) end = n;
 
+        ramps_advance(pos + i);
         v->s_pitch += alpha * (param_value(1) - v->s_pitch);
         v->s_shape += alpha * (param_value(2) - v->s_shape);
         v->s_cutoff += alpha * (param_value(3) - v->s_cutoff);
@@ -251,6 +302,9 @@ static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float 
  * stream; the MSC counts rendered samples; frames carry (epoch, msc). */
 #define AUDIO_MAX_NSAMPLES 1024
 
+static void render_with_events(synth_voice *v, float *interleaved, uint32_t n,
+                               float rate, uint64_t pos);
+
 /* Host-paced loop (§8.3 mode 1): block on pacing frames, render the exact
  * SSI range each one names, echo its (epoch, ts) on the output frame. The
  * voice starts from zero at audio.start, so identical state + identical
@@ -313,7 +367,7 @@ static void host_paced_loop(device *d) {
             d->frame_errors++;
             return;
         }
-        engine_render(&voice, samples, n, (float)a->rate);
+        render_with_events(&voice, samples, n, (float)a->rate, h.ts);
         harp_audio_hdr out = {HARP_AUDIO_FVER, 0, 2, h.epoch, h.ts, (uint16_t)n,
                               HARP_AUDIO_FMT_F32};
         harp_audio_hdr_encode(&out, frame);
@@ -342,7 +396,7 @@ static void *audio_thread(void *arg) {
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
     while (a->running) {
-        engine_render(&voice, samples, a->nsamples, (float)a->rate);
+        render_with_events(&voice, samples, a->nsamples, (float)a->rate, msc);
         harp_audio_hdr h = {HARP_AUDIO_FVER, discont ? HARP_AUDIO_DISCONT : 0, 2,
                             a->epoch, msc, (uint16_t)a->nsamples, HARP_AUDIO_FMT_F32};
         discont = false;
@@ -381,6 +435,68 @@ static void *audio_thread(void *arg) {
         }
     }
     return NULL;
+}
+
+/* Apply queue events due at `pos`; return the next event timestamp inside
+ * (pos, limit) for render segmentation, or 0 if none. Render thread only. */
+static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
+    uint64_t next = 0;
+    pthread_mutex_lock(&g_evq_mu);
+    size_t w = 0;
+    for (size_t i = 0; i < g_evq_n; i++) {
+        dev_event *ev = &g_evq[i];
+        if (ev->ts <= pos) {
+            switch (ev->kind) {
+                case DEV_EV_NOTE_ON:
+                    g_note_vel = ev->v;
+                    g_note = (int)ev->a;
+                    g_note_seq++;
+                    break;
+                case DEV_EV_NOTE_OFF:
+                    if (g_note == (int)ev->a) g_note = -1;
+                    break;
+                case DEV_EV_PARAM_SET:
+                    for (size_t j = 0; j < NPARAMS; j++)
+                        if (g_params[j].id == ev->a) {
+                            g_params[j].value = ev->v;
+                            g_ramps[j].active = false; /* set supersedes ramp (§9.4) */
+                        }
+                    g_touch_pending = 1;
+                    break;
+                case DEV_EV_RAMP:
+                    for (size_t j = 0; j < NPARAMS; j++)
+                        if (g_params[j].id == ev->a) {
+                            g_ramps[j].active = true;
+                            g_ramps[j].start = pos;
+                            g_ramps[j].end = ev->end;
+                            g_ramps[j].start_val = g_params[j].value;
+                            g_ramps[j].target = ev->v;
+                        }
+                    g_touch_pending = 1;
+                    break;
+            }
+            continue; /* consumed */
+        }
+        if (ev->ts < limit && (next == 0 || ev->ts < next)) next = ev->ts;
+        g_evq[w++] = *ev;
+    }
+    g_evq_n = w;
+    pthread_mutex_unlock(&g_evq_mu);
+    return next;
+}
+
+/* Render n samples starting at stream position `pos`, splitting at event
+ * timestamps so application is sample-accurate (§9.2). */
+static void render_with_events(synth_voice *v, float *interleaved, uint32_t n,
+                               float rate, uint64_t pos) {
+    uint32_t done = 0;
+    while (done < n) {
+        uint64_t next = evq_apply_due(pos + done, pos + n);
+        uint32_t seg = next ? (uint32_t)(next - (pos + done)) : n - done;
+        if (seg > n - done) seg = n - done;
+        engine_render(v, interleaved + 2 * done, seg, rate, pos + done);
+        done += seg;
+    }
 }
 
 static void audio_stop(device *d) {
@@ -1333,14 +1449,49 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
         uint32_t mt = w >> 28;
         if (mt == 2) { /* MIDI 1.0 channel voice in UMP */
             uint32_t status = (w >> 20) & 0xf, note = (w >> 8) & 0x7f, vel = w & 0x7f;
-            if (status == 0x9 && vel > 0) { /* note on */
-                g_note_vel = (float)vel / 127.0f;
-                g_note = (int)note;
-                g_note_seq++;
-            } else if (status == 0x8 || (status == 0x9 && vel == 0)) { /* note off */
-                if (g_note == (int)note) g_note = -1;
-            }
+            dev_event ev = {msc, 0, note, 0, 0};
+            if (status == 0x9 && vel > 0) {
+                ev.kind = DEV_EV_NOTE_ON;
+                ev.v = (float)vel / 127.0f;
+            } else if (status == 0x8 || (status == 0x9 && vel == 0)) {
+                ev.kind = DEV_EV_NOTE_OFF;
+            } else
+                return;
+            evq_push(ev); /* ts 0 = asap; else applied at the exact sample (§9.2) */
         }
+        return;
+    }
+    if (etype == 5) { /* ramp (§9.4): {0 param, 1 target, 2 end tstamp} */
+        uint64_t n, key, id = 0, eep = 0, ets = 0;
+        double target = 0;
+        bool have_id = false, have_t = false, have_end = false;
+        if (!harp_cdec_map(&dec, &n)) {
+            d->frame_errors++;
+            return;
+        }
+        for (uint64_t i = 0; i < n; i++) {
+            if (!harp_cdec_uint(&dec, &key)) return;
+            if (key == 0) {
+                if (!harp_cdec_uint(&dec, &id)) return;
+                have_id = true;
+            } else if (key == 1) {
+                if (!harp_cdec_float(&dec, &target)) return;
+                have_t = true;
+            } else if (key == 2) {
+                uint64_t tn;
+                if (!harp_cdec_array(&dec, &tn) || tn != 2 || !harp_cdec_uint(&dec, &eep) ||
+                    !harp_cdec_uint(&dec, &ets))
+                    return;
+                have_end = true;
+            } else if (!harp_cdec_skip(&dec))
+                return;
+        }
+        if (!have_id || !have_t || !have_end) return;
+        if (target < 0) target = 0;
+        if (target > 1) target = 1;
+        dev_event ev = {msc, DEV_EV_RAMP, (uint32_t)id, (float)target, ets};
+        evq_push(ev);
+        live_ref_touch(d, true);
         return;
     }
     if (etype != 1) return; /* unknown event types are skipped, not fatal */
@@ -1365,8 +1516,16 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
     if (!have_id || !have_v) return;
     if (v < 0) v = 0;
     if (v > 1) v = 1;
-    for (size_t i = 0; i < NPARAMS; i++)
-        if (g_params[i].id == id) g_params[i].value = (float)v;
+    if (msc == 0) { /* "now": apply directly */
+        for (size_t i = 0; i < NPARAMS; i++)
+            if (g_params[i].id == id) {
+                g_params[i].value = (float)v;
+                g_ramps[i].active = false;
+            }
+    } else {
+        dev_event ev = {msc, DEV_EV_PARAM_SET, (uint32_t)id, (float)v, 0};
+        evq_push(ev);
+    }
     live_ref_touch(d, true);
 }
 
@@ -1421,6 +1580,11 @@ static void handle_dev_params(device *d, const harp_env *e) {
 /* ---------------- dispatch ---------------- */
 
 static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
+    /* dirty-flag work the render thread deferred (queued sets/ramps applied) */
+    if (g_touch_pending) {
+        g_touch_pending = 0;
+        live_ref_touch(d, true);
+    }
     harp_env e;
     if (!harp_env_parse(buf, len, &e)) {
         d->frame_errors++;

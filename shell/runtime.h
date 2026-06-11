@@ -39,9 +39,14 @@ public:
     void stop();
     bool connected() const { return connected_.load(std::memory_order_acquire); }
 
-    /* ---- audio thread ---- */
-    void setParam(uint32_t id, float normalized); /* enqueue, lock-free */
-    void queueUmp(uint32_t word);                 /* note events, lock-free */
+    /* ---- audio thread (all lock-free) ---- */
+    void queueParamSet(uint32_t id, float v, uint64_t ts);
+    void queueRamp(uint32_t id, float target, uint64_t start, uint64_t end);
+    void queueNote(uint32_t umpWord, uint64_t ts);
+    /* SSI of the next sample pullAudio will deliver: the stream-domain "now"
+     * for timestamping. Events for DAW offset s in the current block go to
+     * streamPos() + s + latencySamples() — PDC makes that land on time. */
+    uint64_t streamPos() const { return ssiRead_.load(std::memory_order_relaxed); }
     /* Fill n interleaved-stereo samples; pads with silence on underrun
      * (counted). Returns samples padded (0 = clean). */
     size_t pullAudio(float *interleavedLR, size_t nFrames);
@@ -79,9 +84,10 @@ private:
     bool helloAndIdentity();
     bool audioStart(uint32_t rate);
     void audioStopLocked();
-    void sendParamEvent(uint32_t id, float v); /* §9.4 set event, fire-and-forget */
-    void sendUmpEvent(uint32_t word);          /* §9.10 note carriage */
-    void pollEcho();                           /* drain incoming evt stream */
+    void sendParamEvent(uint32_t id, float v, uint64_t ts); /* §9.4 set */
+    void sendRampEvent(uint32_t id, float target, uint64_t start, uint64_t end);
+    void sendUmpEvent(uint32_t word, uint64_t ts); /* §9.10 note carriage */
+    void pollEcho();                               /* drain incoming evt stream */
 
     /* control-plane request/response under ctlMutex_ */
     bool request(harp_cbuf *req, harp_cbuf *rsp, harp_env *e);
@@ -105,9 +111,9 @@ private:
     std::atomic<uint64_t> underruns_{0};
 
     FloatRing audioRing_{1 << 15}; /* 32768 floats = 16384 stereo frames */
-    ParamRing paramRing_;
-    ParamRing echoRing_; /* device front-panel echoes -> outputParameterChanges */
-    ParamRing umpRing_;  /* UMP words ride the id field; value unused */
+    TimedRing timedRing_; /* outbound: params, ramps, notes — order preserved */
+    ParamRing echoRing_;  /* device front-panel echoes -> outputParameterChanges */
+    std::atomic<uint64_t> ssiRead_{0};
 
 public:
     /* audio thread: drain echoed device-side edits (§9.4 echo) */

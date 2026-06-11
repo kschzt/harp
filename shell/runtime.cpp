@@ -209,15 +209,14 @@ void HarpRuntime::audioStopLocked() {
 }
 
 /* Param set as a §9.4 event on the evt stream: fire-and-forget, no
- * response, no round trip — the reason slider drags stopped costing
- * anything. Timestamp (0,0) = "now" until the timestamping slice. */
-void HarpRuntime::sendParamEvent(uint32_t id, float v) {
+ * response, no round trip. ts is an SSI (0 = "now"). */
+void HarpRuntime::sendParamEvent(uint32_t id, float v, uint64_t ts) {
     harp_cbuf m;
     harp_cbuf_init(&m);
     harp_cbor_array(&m, 3);
     harp_cbor_array(&m, 2);
     harp_cbor_uint(&m, 0);
-    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, ts);
     harp_cbor_uint(&m, 1); /* etype: param */
     harp_cbor_map(&m, 2);
     harp_cbor_uint(&m, 0);
@@ -325,6 +324,7 @@ bool HarpRuntime::start(uint32_t sampleRate) {
     while (harp_usb_audio_read(io_, junk, sizeof junk, 30) > 0) {}
 
     ssi_ = framesSent_ = framesRecv_ = 0;
+    ssiRead_.store(0, std::memory_order_relaxed);
     ahead_ = 4;
     audioRing_.clear();
     running_.store(true);
@@ -362,12 +362,18 @@ void HarpRuntime::stop() {
 
 /* ---------------- audio thread side ---------------- */
 
-void HarpRuntime::setParam(uint32_t id, float v) { paramRing_.push({id, v}); }
-
-void HarpRuntime::queueUmp(uint32_t word) { umpRing_.push({word, 0.0f}); }
+void HarpRuntime::queueParamSet(uint32_t id, float v, uint64_t ts) {
+    timedRing_.push({0, id, v, ts, 0});
+}
+void HarpRuntime::queueRamp(uint32_t id, float target, uint64_t start, uint64_t end) {
+    timedRing_.push({1, id, target, start, end});
+}
+void HarpRuntime::queueNote(uint32_t word, uint64_t ts) {
+    timedRing_.push({2, word, 0.0f, ts, 0});
+}
 
 /* UMP event (§9.10): etype 0, body = one packet, words big-endian. */
-void HarpRuntime::sendUmpEvent(uint32_t word) {
+void HarpRuntime::sendUmpEvent(uint32_t word, uint64_t ts) {
     uint8_t bytes[4] = {(uint8_t)(word >> 24), (uint8_t)(word >> 16),
                         (uint8_t)(word >> 8), (uint8_t)word};
     harp_cbuf m;
@@ -375,9 +381,34 @@ void HarpRuntime::sendUmpEvent(uint32_t word) {
     harp_cbor_array(&m, 3);
     harp_cbor_array(&m, 2);
     harp_cbor_uint(&m, 0);
-    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, ts);
     harp_cbor_uint(&m, 0); /* etype: ump */
     harp_cbor_bytes(&m, bytes, 4);
+    {
+        std::lock_guard<std::mutex> lk(ctlMutex_);
+        harp_link_send(io_, HARP_STREAM_EVT, m.buf, m.len);
+    }
+    harp_cbuf_free(&m);
+}
+
+/* Ramp event (§9.4): etype 5, msg tstamp = start, body {param, target, end}. */
+void HarpRuntime::sendRampEvent(uint32_t id, float target, uint64_t start, uint64_t end) {
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    harp_cbor_array(&m, 3);
+    harp_cbor_array(&m, 2);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, start);
+    harp_cbor_uint(&m, 5); /* etype: ramp */
+    harp_cbor_map(&m, 3);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, id);
+    harp_cbor_uint(&m, 1);
+    harp_cbor_float(&m, target);
+    harp_cbor_uint(&m, 2);
+    harp_cbor_array(&m, 2);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, end);
     {
         std::lock_guard<std::mutex> lk(ctlMutex_);
         harp_link_send(io_, HARP_STREAM_EVT, m.buf, m.len);
@@ -388,6 +419,10 @@ void HarpRuntime::sendUmpEvent(uint32_t word) {
 size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
     size_t want = nFrames * 2;
     size_t got = audioRing_.read(dst, want);
+    /* ssiRead_ advances only by samples actually delivered: underrun padding
+     * is not stream time. (Consequence: a pad slips the DAW/SSI alignment by
+     * its length — rare, counted, and self-announcing in event timing.) */
+    ssiRead_.fetch_add(got / 2, std::memory_order_relaxed);
     if (got < want) {
         memset(dst + got, 0, (want - got) * sizeof(float));
         if (connected_.load(std::memory_order_acquire))
@@ -402,7 +437,9 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
     size_t got = 0;
     unsigned waited = 0;
     while (got < want) {
-        got += audioRing_.read(dst + got, want - got);
+        size_t r = audioRing_.read(dst + got, want - got);
+        ssiRead_.fetch_add(r / 2, std::memory_order_relaxed);
+        got += r;
         if (got >= want) break;
         if (!connected_.load(std::memory_order_acquire) || waited >= timeoutMs) {
             memset(dst + got, 0, (want - got) * sizeof(float));
@@ -421,26 +458,8 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
 void HarpRuntime::feeder() {
     uint8_t acc[65536];
     size_t accLen = 0;
-    /* Pending knob values, coalesced to the last value per param: a slider
-     * drag floods one id; only the newest value matters. Audio outranks
-     * knobs (§9.2: event overload must never glitch audio). */
-    struct {
-        uint32_t id;
-        float value;
-    } pending[16];
-    size_t npending = 0;
     while (running_.load(std::memory_order_relaxed)) {
         bool didWork = false;
-        /* 1. drain + coalesce param changes (no I/O yet) */
-        ParamChange pc;
-        while (paramRing_.pop(pc)) {
-            size_t i = 0;
-            while (i < npending && pending[i].id != pc.id) i++;
-            if (i < npending)
-                pending[i].value = pc.value;
-            else if (npending < 16)
-                pending[npending++] = {pc.id, pc.value};
-        }
 
         /* 2. pace: keep ring occupancy + in-flight under the target depth */
         size_t ringFrames = audioRing_.readAvailable() / 2;
@@ -491,18 +510,17 @@ void HarpRuntime::feeder() {
             accLen -= off;
         }
 
-        /* 4. param events: fire-and-forget on the evt stream (§9.4) — no
-         * round trip, so flush all coalesced values at once */
-        while (npending) {
-            sendParamEvent(pending[npending - 1].id, pending[npending - 1].value);
-            npending--;
-            didWork = true;
-        }
-
-        /* 4b. note events — never coalesced, order matters (§9.10) */
-        ParamChange ump;
-        while (umpRing_.pop(ump)) {
-            sendUmpEvent(ump.id);
+        /* 4. timestamped events (params, ramps, notes — §9.2/§9.4/§9.10):
+         * fire-and-forget sends, order preserved, timestamps carry the
+         * timing so coalescing is neither needed nor wanted */
+        TimedEv te;
+        while (timedRing_.pop(te)) {
+            if (te.kind == 0)
+                sendParamEvent(te.a, te.v, te.ts);
+            else if (te.kind == 1)
+                sendRampEvent(te.a, te.v, te.ts, te.end);
+            else
+                sendUmpEvent(te.a, te.ts);
             didWork = true;
         }
 
