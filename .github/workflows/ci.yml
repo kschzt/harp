@@ -1,0 +1,20 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: cmake -B build && cmake --build build -j
+      - name: unit tests
+        run: ./build/harp-tests
+      - name: recall flow (simulated device, TCP transport)
+        run: |
+          ./build/harp-deviced --state-dir /tmp/refdev --panel-sock "" --port 47800 &
+          sleep 1
+          ./build/harp-probe -d 127.0.0.1:47800 -s /tmp/host demo | tee demo.out
+          grep -q "recall complete" demo.out
+          ./build/harp-probe -d 127.0.0.1:47800 -s /tmp/host restore | tee restore.out
+          grep -q "SYNCED silently" restore.out

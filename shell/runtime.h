@@ -77,10 +77,16 @@ private:
     ~HarpRuntime();
     HarpRuntime(const HarpRuntime &) = delete;
 
-    static constexpr uint32_t kBlock = 256;        /* pacing block, samples */
-    static constexpr uint32_t kTargetDepthFrames = 3; /* latency = 3 blocks */
+    static constexpr uint32_t kBlock = 256; /* pacing block, samples */
+    /* Ring cushion vs host-side completion-tail jitter. Sync libusb at
+     * user priority shows occasional 20-25 ms read tails; 5 blocks
+     * (26.7 ms at 48 k) absorbs them. Going lower wants async transfers +
+     * CoreAudio workgroup integration (future). Reported latency derives
+     * from this. */
+    static constexpr uint32_t kTargetDepthFrames = 5;
 
     void feeder();
+    void reader();
     bool helloAndIdentity();
     bool audioStart(uint32_t rate);
     void audioStopLocked();
@@ -106,13 +112,17 @@ private:
     bool storeOk_ = false;
 
     std::thread feederThread_;
+    std::thread readerThread_; /* always-pending audio-IN read: the device's
+                                  response writes must never wait for us */
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
     std::atomic<uint64_t> underruns_{0};
-    std::atomic<uint64_t> evDrops_{0}; /* events lost to ring overflow — never silent */
+    std::atomic<uint64_t> padSamples_{0}; /* total silence padded — severity, not count */
+    std::atomic<uint64_t> evDrops_{0};    /* events lost to ring overflow — never silent */
     uint64_t evDropsLogged_ = 0;
 
     FloatRing audioRing_{1 << 15}; /* 32768 floats = 16384 stereo frames */
+    std::atomic<uint64_t> framesRecvAtomic_{0}; /* written by reader, read by feeder */
     TimedRing timedRing_; /* outbound: params, ramps, notes — order preserved */
     ParamRing echoRing_;  /* device front-panel echoes -> outputParameterChanges */
     std::atomic<uint64_t> ssiRead_{0};
@@ -130,7 +140,7 @@ public:
 private:
     uint64_t ssi_ = 0;
     uint64_t framesSent_ = 0, framesRecv_ = 0;
-    uint64_t ahead_ = 4; /* adaptive in-flight cap (learned, §8.3 note) */
+    uint64_t ahead_ = 2; /* fixed small pipeline; reader thread keeps RTT short */
 
     /* identity (for the bundle's identity-expectation) */
     std::string serial_, vendorName_, productName_, engineId_, engineVer_;

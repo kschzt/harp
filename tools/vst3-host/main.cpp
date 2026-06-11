@@ -13,6 +13,9 @@
 
 #include <cmath>
 #include <cstdint>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -118,12 +121,13 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "usage: harp-vst3-host PLUGIN.vst3 [--list] [--rate N] [--block N]\n"
                 "       [--seconds S] [--input sine[:HZ]|impulse|silence]\n"
-                "       [--set ID=NORMVALUE]... [--out FILE.wav] [--hash]\n"
+                "       [--set ID=NORMVALUE]... [--ramp ID=V0:V1]... [--notes N,N,..]\n"
+                "       [--realtime] [--out FILE.wav] [--hash]\n"
                 "       [--save-state FILE] [--load-state FILE]\n");
         return 2;
     }
     std::string plugin_path = argv[1];
-    bool do_list = false, do_hash = false;
+    bool do_list = false, do_hash = false, realtime = false;
     uint32_t rate = 48000, block = 256;
     double seconds = 2.0;
     std::string input_kind = "silence", out_path, save_state_path, load_state_path;
@@ -144,6 +148,7 @@ int main(int argc, char **argv) {
         };
         if (a == "--list") do_list = true;
         else if (a == "--hash") do_hash = true;
+        else if (a == "--realtime") realtime = true;
         else if (a == "--rate") rate = (uint32_t)atoi(next().c_str());
         else if (a == "--block") block = (uint32_t)atoi(next().c_str());
         else if (a == "--seconds") seconds = atof(next().c_str());
@@ -257,10 +262,12 @@ int main(int argc, char **argv) {
     printf("buses: %d in (%d ch), %d out (%d ch)\n", nin, in_ch, nout, out_ch);
 
     /* ---- processing setup ----
-     * This host renders with no wall clock: declare kOffline so plugins
-     * bridging real hardware (the HARP shell) may legitimately block on
-     * their transport instead of underrunning. */
-    ProcessSetup setup{kOffline, kSample32, (int32)block, (SampleRate)rate};
+     * Default: no wall clock, declared kOffline so plugins bridging real
+     * hardware may legitimately block on their transport. --realtime paces
+     * process() against the wall clock like a DAW — the mode that exposes
+     * backpressure/congestion bugs offline rendering hides. */
+    ProcessSetup setup{realtime ? kRealtime : kOffline, kSample32, (int32)block,
+                       (SampleRate)rate};
     if (processor->setupProcessing(setup) != kResultOk) die("setupProcessing failed");
     HostProcessData pd;
     if (!pd.prepare(*component, (int32)block, kSample32)) die("process data prepare failed");
@@ -280,7 +287,27 @@ int main(int argc, char **argv) {
     double phase = 0;
     bool first_block = true;
 
+#ifdef __APPLE__
+    if (realtime) /* compete like a DAW audio thread, not a background job */
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    struct timespec rt0;
+    clock_gettime(CLOCK_MONOTONIC, &rt0);
     while (done < total) {
+        if (realtime) { /* wall-clock pacing: process() at DAW cadence */
+            double target = (double)done / rate;
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double elapsed =
+                (double)(now.tv_sec - rt0.tv_sec) + (now.tv_nsec - rt0.tv_nsec) / 1e9;
+            if (target > elapsed) {
+                struct timespec slp;
+                double wait = target - elapsed;
+                slp.tv_sec = (time_t)wait;
+                slp.tv_nsec = (long)((wait - (double)slp.tv_sec) * 1e9);
+                nanosleep(&slp, nullptr);
+            }
+        }
         size_t n = std::min((size_t)block, total - done);
         pd.numSamples = (int32)n;
 

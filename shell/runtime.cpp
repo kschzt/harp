@@ -1,5 +1,8 @@
 #include "runtime.h"
 
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -324,12 +327,14 @@ bool HarpRuntime::start(uint32_t sampleRate) {
     while (harp_usb_audio_read(io_, junk, sizeof junk, 30) > 0) {}
 
     ssi_ = framesSent_ = framesRecv_ = 0;
+    framesRecvAtomic_.store(0, std::memory_order_relaxed);
     ssiRead_.store(0, std::memory_order_relaxed);
-    ahead_ = 4;
+    ahead_ = 2; /* small fixed pipeline; the reader thread keeps RTT short */
     audioRing_.clear();
     running_.store(true);
     connected_.store(true, std::memory_order_release);
     feederThread_ = std::thread([this] { feeder(); });
+    readerThread_ = std::thread([this] { reader(); });
     return true;
 }
 
@@ -342,6 +347,7 @@ void HarpRuntime::stop() {
         return;
     }
     if (feederThread_.joinable()) feederThread_.join();
+    if (readerThread_.joinable()) readerThread_.join();
     {
         std::lock_guard<std::mutex> lk(ctlMutex_);
         audioStopLocked();
@@ -357,7 +363,9 @@ void HarpRuntime::stop() {
     connected_.store(false, std::memory_order_release);
     harp_usb_close(io_);
     io_ = nullptr;
-    log_msg("stopped (underruns: %llu)", (unsigned long long)underruns_.load());
+    log_msg("stopped (underruns: %llu, padded samples: %llu)",
+            (unsigned long long)underruns_.load(),
+            (unsigned long long)padSamples_.load());
 }
 
 /* ---------------- audio thread side ---------------- */
@@ -428,8 +436,10 @@ size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
     ssiRead_.fetch_add(got / 2, std::memory_order_relaxed);
     if (got < want) {
         memset(dst + got, 0, (want - got) * sizeof(float));
-        if (connected_.load(std::memory_order_acquire))
+        if (connected_.load(std::memory_order_acquire)) {
             underruns_.fetch_add(1, std::memory_order_relaxed);
+            padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
+        }
         return (want - got) / 2;
     }
     return 0;
@@ -447,6 +457,7 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
         if (!connected_.load(std::memory_order_acquire) || waited >= timeoutMs) {
             memset(dst + got, 0, (want - got) * sizeof(float));
             underruns_.fetch_add(1, std::memory_order_relaxed);
+            padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
             return (want - got) / 2;
         }
         struct timespec ts = {0, 500000}; /* 0.5 ms */
@@ -459,59 +470,36 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
 /* ---------------- feeder thread ---------------- */
 
 void HarpRuntime::feeder() {
-    uint8_t acc[65536];
-    size_t accLen = 0;
+#ifdef __APPLE__
+    /* The feeder does the time-critical pacing for the whole plugin; at
+     * default QoS it loses races to everything the DAW runs elevated. */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     while (running_.load(std::memory_order_relaxed)) {
         bool didWork = false;
 
-        /* 2. pace: keep ring occupancy + in-flight under the target depth */
+        /* 2. pace: ring to target depth, small fixed pipeline on top. The
+         * reader thread keeps an audio-IN read permanently pending, so the
+         * device's response writes land instantly and its pacing turnaround
+         * is just render time — no depth probing needed (probing a serial
+         * device injected the very stalls it tried to absorb). */
         size_t ringFrames = audioRing_.readAvailable() / 2;
         uint64_t inFlight = framesSent_ - framesRecv_;
-        while (ringFrames + (inFlight + 1) * kBlock <= (size_t)kTargetDepthFrames * kBlock &&
-               inFlight < ahead_) {
+        while (ringFrames < (size_t)kTargetDepthFrames * kBlock && inFlight < ahead_) {
             harp_audio_hdr pace = {HARP_AUDIO_FVER, HARP_AUDIO_DIR_H2D, 0,    0,
                                    ssi_,            (uint16_t)kBlock,   HARP_AUDIO_FMT_F32};
             uint8_t ph[HARP_AUDIO_HDR_LEN];
             harp_audio_hdr_encode(&pace, ph);
-            if (!harp_usb_audio_write(io_, ph, sizeof ph, 50)) {
-                if (inFlight >= 1 && inFlight < ahead_) ahead_ = inFlight;
-                break;
-            }
+            if (!harp_usb_audio_write(io_, ph, sizeof ph, 8)) break;
             ssi_ += kBlock;
             framesSent_++;
             inFlight++;
             didWork = true;
         }
 
-        /* 3. drain rendered frames into the ring */
-        if (framesSent_ > framesRecv_) {
-            int r = harp_usb_audio_read(io_, acc + accLen, (int)(sizeof acc - accLen), 20);
-            if (r < 0) {
-                log_msg("audio stream read failed; device gone?");
-                connected_.store(false, std::memory_order_release);
-                break;
-            }
-            accLen += (size_t)r;
-            size_t off = 0;
-            while (accLen - off >= HARP_AUDIO_HDR_LEN) {
-                harp_audio_hdr h;
-                if (!harp_audio_hdr_decode(acc + off, &h)) {
-                    log_msg("malformed stream frame; resyncing");
-                    accLen = 0;
-                    off = 0;
-                    break;
-                }
-                size_t need = HARP_AUDIO_HDR_LEN + harp_audio_payload_len(&h);
-                if (accLen - off < need) break;
-                audioRing_.write((const float *)(acc + off + HARP_AUDIO_HDR_LEN),
-                                 (size_t)h.nsamples * 2);
-                framesRecv_++;
-                off += need;
-                didWork = true;
-            }
-            memmove(acc, acc + off, accLen - off);
-            accLen -= off;
-        }
+        /* 3. (audio draining lives on the reader thread now — the device's
+         * response writes must never wait for a host read to be posted) */
+        framesRecv_ = framesRecvAtomic_.load(std::memory_order_acquire);
 
         /* 4. inbound async traffic FIRST: keeping the IN direction drained
          * means the device is never blocked writing to us — which means OUR
@@ -545,6 +533,44 @@ void HarpRuntime::feeder() {
             struct timespec ts = {0, 1000000}; /* 1 ms */
             nanosleep(&ts, nullptr);
         }
+    }
+}
+
+/* Audio-IN reader: one blocking read always pending. This is what makes the
+ * device's response writes complete immediately — the §4.2.1 always-pending
+ * inbound rule applied to the stream pair. */
+void HarpRuntime::reader() {
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    uint8_t acc[65536];
+    size_t accLen = 0;
+    while (running_.load(std::memory_order_relaxed)) {
+        int r = harp_usb_audio_read(io_, acc + accLen, (int)(sizeof acc - accLen), 100);
+        if (r < 0) {
+            log_msg("audio stream read failed; device gone?");
+            connected_.store(false, std::memory_order_release);
+            break;
+        }
+        size_t off = 0;
+        accLen += (size_t)r;
+        while (accLen - off >= HARP_AUDIO_HDR_LEN) {
+            harp_audio_hdr h;
+            if (!harp_audio_hdr_decode(acc + off, &h)) {
+                log_msg("malformed stream frame; resyncing");
+                accLen = 0;
+                off = 0;
+                break;
+            }
+            size_t need = HARP_AUDIO_HDR_LEN + harp_audio_payload_len(&h);
+            if (accLen - off < need) break;
+            audioRing_.write((const float *)(acc + off + HARP_AUDIO_HDR_LEN),
+                             (size_t)h.nsamples * 2);
+            framesRecvAtomic_.fetch_add(1, std::memory_order_release);
+            off += need;
+        }
+        memmove(acc, acc + off, accLen - off);
+        accLen -= off;
     }
 }
 
