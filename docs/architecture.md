@@ -85,3 +85,16 @@ converters).
   samples, points folded into the next ramp's target — a 64-sample-
   buffer DAW emits ~750 points/s/param and the wire doesn't need them
   (the device interpolates at control rate regardless).
+- Events go to the wire BEFORE the pacing frames covering their
+  timestamps (a pacing frame triggers the render of its range), they're
+  batched into one framed write per feeder cycle (per-event writes
+  starve pacing), and reported latency includes a DAW block of event
+  headroom (spec 0.3.3, normative).
+- Notes are performance state OF A STREAM: they die at stream
+  start/stop/session-end, note-offs are never droppable (overflow
+  escalates to all-notes-off), and CC 120/123 panic works at every
+  layer. A stuck note is always a bug.
+- Late-event accounting: `evt_late` (notes/sets) is zero-tolerance;
+  ramp-end misses are budgeted separately (`ramp_late`) because a
+  ramp's start anchors at the previous automation point — one block of
+  structural margin.

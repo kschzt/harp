@@ -138,11 +138,16 @@ exact sample timestamps (±1 sample verified on hardware), DAW
 automation synthesized into device-interpolated ramps, UMP note input
 (the refdev is a playable envelope+portamento synth), and front-panel
 echo — turn a knob on the device's web panel and the DAW records
-automation. The panel doubles as a live protocol inspector (refs,
-generations, dirty flag, counters). A realtime soak harness
-(`scripts/soak.sh`) floods automation + notes + panel traffic and
-asserts zero silence gaps, zero drops, bounded padding across DAW
-buffer sizes 64–1024. Certification-suite behaviors exercised in
+automation. The panel doubles as a live protocol inspector with
+actions: refs with ticking generations, the dirty flag, counters, plus
+Snapshot, Panic, and one-click Load of any archived state (patch
+time-travel; current state is archived first — nothing is ever lost).
+The hardware conformance kit (`scripts/hw-tests.sh`) runs recall
+round-trips, note-timing checks (±1 sample pitch arrival, zero late
+events), and a realtime soak that floods automation + notes + panel
+traffic asserting zero silence gaps, zero drops, and bounded padding
+across DAW buffer sizes 64–1024. Note-offs are unloseable by design,
+and the DAW's panic (CC 120/123) reaches the hardware. Certification-suite behaviors exercised in
 miniature: T2/T3 (unplug/replug), T5 (silent hash-verified reopen),
 T10 (power-loss safety), T15 (byte-identical renders), T16 (event
 timing).
