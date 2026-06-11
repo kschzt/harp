@@ -101,10 +101,13 @@ private:
     bool helloAndIdentity();
     bool audioStart(uint32_t rate);
     void audioStopLocked();
-    void sendParamEvent(uint32_t id, float v, uint64_t ts); /* §9.4 set */
-    void sendRampEvent(uint32_t id, float target, uint64_t start, uint64_t end);
-    void sendUmpEvent(uint32_t word, uint64_t ts); /* §9.10 note carriage */
-    void pollEcho();                               /* drain incoming evt stream */
+    /* encode one event message into `out` (no I/O) — the feeder batches
+     * many messages into a single framed bulk write per cycle */
+    static void encodeParamEvent(harp_cbuf *out, uint32_t id, float v, uint64_t ts);
+    static void encodeRampEvent(harp_cbuf *out, uint32_t id, float target,
+                                uint64_t start, uint64_t end);
+    static void encodeUmpEvent(harp_cbuf *out, uint32_t word, uint64_t ts);
+    void pollEcho(); /* drain incoming evt stream */
 
     /* control-plane request/response under ctlMutex_ */
     bool request(harp_cbuf *req, harp_cbuf *rsp, harp_env *e);

@@ -211,26 +211,19 @@ void HarpRuntime::audioStopLocked() {
     harp_cbuf_free(&rsp);
 }
 
-/* Param set as a §9.4 event on the evt stream: fire-and-forget, no
- * response, no round trip. ts is an SSI (0 = "now"). */
-void HarpRuntime::sendParamEvent(uint32_t id, float v, uint64_t ts) {
-    harp_cbuf m;
-    harp_cbuf_init(&m);
-    harp_cbor_array(&m, 3);
-    harp_cbor_array(&m, 2);
-    harp_cbor_uint(&m, 0);
-    harp_cbor_uint(&m, ts);
-    harp_cbor_uint(&m, 1); /* etype: param */
-    harp_cbor_map(&m, 2);
-    harp_cbor_uint(&m, 0);
-    harp_cbor_uint(&m, id);
-    harp_cbor_uint(&m, 1);
-    harp_cbor_float(&m, v);
-    {
-        std::lock_guard<std::mutex> lk(ctlMutex_);
-        harp_link_send(io_, HARP_STREAM_EVT, m.buf, m.len);
-    }
-    harp_cbuf_free(&m);
+/* Param set as a §9.4 event message: fire-and-forget, no response.
+ * ts is an SSI (0 = "now"). Encode-only; the feeder frames and batches. */
+void HarpRuntime::encodeParamEvent(harp_cbuf *m, uint32_t id, float v, uint64_t ts) {
+    harp_cbor_array(m, 3);
+    harp_cbor_array(m, 2);
+    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, ts);
+    harp_cbor_uint(m, 1); /* etype: param */
+    harp_cbor_map(m, 2);
+    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, id);
+    harp_cbor_uint(m, 1);
+    harp_cbor_float(m, v);
 }
 
 /* Drain any asynchronous inbound link traffic: evt echoes (-> echoRing_)
@@ -385,47 +378,34 @@ void HarpRuntime::queueNote(uint32_t word, uint64_t ts) {
 }
 
 /* UMP event (§9.10): etype 0, body = one packet, words big-endian. */
-void HarpRuntime::sendUmpEvent(uint32_t word, uint64_t ts) {
+void HarpRuntime::encodeUmpEvent(harp_cbuf *m, uint32_t word, uint64_t ts) {
     uint8_t bytes[4] = {(uint8_t)(word >> 24), (uint8_t)(word >> 16),
                         (uint8_t)(word >> 8), (uint8_t)word};
-    harp_cbuf m;
-    harp_cbuf_init(&m);
-    harp_cbor_array(&m, 3);
-    harp_cbor_array(&m, 2);
-    harp_cbor_uint(&m, 0);
-    harp_cbor_uint(&m, ts);
-    harp_cbor_uint(&m, 0); /* etype: ump */
-    harp_cbor_bytes(&m, bytes, 4);
-    {
-        std::lock_guard<std::mutex> lk(ctlMutex_);
-        harp_link_send(io_, HARP_STREAM_EVT, m.buf, m.len);
-    }
-    harp_cbuf_free(&m);
+    harp_cbor_array(m, 3);
+    harp_cbor_array(m, 2);
+    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, ts);
+    harp_cbor_uint(m, 0); /* etype: ump */
+    harp_cbor_bytes(m, bytes, 4);
 }
 
 /* Ramp event (§9.4): etype 5, msg tstamp = start, body {param, target, end}. */
-void HarpRuntime::sendRampEvent(uint32_t id, float target, uint64_t start, uint64_t end) {
-    harp_cbuf m;
-    harp_cbuf_init(&m);
-    harp_cbor_array(&m, 3);
-    harp_cbor_array(&m, 2);
-    harp_cbor_uint(&m, 0);
-    harp_cbor_uint(&m, start);
-    harp_cbor_uint(&m, 5); /* etype: ramp */
-    harp_cbor_map(&m, 3);
-    harp_cbor_uint(&m, 0);
-    harp_cbor_uint(&m, id);
-    harp_cbor_uint(&m, 1);
-    harp_cbor_float(&m, target);
-    harp_cbor_uint(&m, 2);
-    harp_cbor_array(&m, 2);
-    harp_cbor_uint(&m, 0);
-    harp_cbor_uint(&m, end);
-    {
-        std::lock_guard<std::mutex> lk(ctlMutex_);
-        harp_link_send(io_, HARP_STREAM_EVT, m.buf, m.len);
-    }
-    harp_cbuf_free(&m);
+void HarpRuntime::encodeRampEvent(harp_cbuf *m, uint32_t id, float target,
+                                  uint64_t start, uint64_t end) {
+    harp_cbor_array(m, 3);
+    harp_cbor_array(m, 2);
+    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, start);
+    harp_cbor_uint(m, 5); /* etype: ramp */
+    harp_cbor_map(m, 3);
+    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, id);
+    harp_cbor_uint(m, 1);
+    harp_cbor_float(m, target);
+    harp_cbor_uint(m, 2);
+    harp_cbor_array(m, 2);
+    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, end);
 }
 
 /* Padded stream positions are SPENT: ssiRead_ always advances by the full
@@ -524,18 +504,38 @@ void HarpRuntime::feeder() {
         pollEcho();
 
         /* 5. timestamped events (params, ramps, notes — §9.2/§9.4/§9.10):
-         * fire-and-forget sends, order preserved, timestamps carry the
-         * timing. Bounded per iteration: pacing must get its turn even
-         * under automation flood — audio outranks events (§9.2). */
-        TimedEv te;
-        for (int sent = 0; sent < 32 && timedRing_.pop(te); sent++) {
-            if (te.kind == 0)
-                sendParamEvent(te.a, te.v, te.ts);
-            else if (te.kind == 1)
-                sendRampEvent(te.a, te.v, te.ts, te.end);
-            else
-                sendUmpEvent(te.a, te.ts);
-            didWork = true;
+         * batched into ONE framed bulk write per cycle — per-event writes
+         * cost a syscall+URB each, and at 3 ramped params × small DAW
+         * buffers (~560 events/s) the write overhead alone starved pacing.
+         * Bounded per iteration: audio outranks events (§9.2). */
+        {
+            harp_cbuf msgbuf, batch;
+            harp_cbuf_init(&msgbuf);
+            harp_cbuf_init(&batch);
+            TimedEv te;
+            int sent = 0;
+            for (; sent < 32 && timedRing_.pop(te); sent++) {
+                harp_cbuf_reset(&msgbuf);
+                if (te.kind == 0)
+                    encodeParamEvent(&msgbuf, te.a, te.v, te.ts);
+                else if (te.kind == 1)
+                    encodeRampEvent(&msgbuf, te.a, te.v, te.ts, te.end);
+                else
+                    encodeUmpEvent(&msgbuf, te.a, te.ts);
+                harp_frame_hdr h = {HARP_FRAME_FVER, HARP_STREAM_EVT, HARP_FLAG_FIN,
+                                    (uint32_t)msgbuf.len};
+                uint8_t hdr[HARP_FRAME_HDR_LEN];
+                harp_frame_hdr_encode(&h, hdr);
+                harp_cbuf_put(&batch, hdr, sizeof hdr);
+                harp_cbuf_put(&batch, msgbuf.buf, msgbuf.len);
+            }
+            if (sent) {
+                std::lock_guard<std::mutex> lk(ctlMutex_);
+                io_->write_all(io_, batch.buf, batch.len);
+                didWork = true;
+            }
+            harp_cbuf_free(&msgbuf);
+            harp_cbuf_free(&batch);
         }
 
         uint64_t drops = evDrops_.load(std::memory_order_relaxed);
