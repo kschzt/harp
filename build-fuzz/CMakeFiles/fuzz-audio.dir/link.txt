@@ -1,0 +1,1 @@
+/usr/bin/cc -O2 -g -DNDEBUG -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names -fsanitize=address "CMakeFiles/fuzz-audio.dir/fuzz/fuzz_audio.c.o" "CMakeFiles/fuzz-audio.dir/fuzz/standalone_driver.c.o" -o fuzz-audio  libharpcore.a -lm

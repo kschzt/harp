@@ -1,0 +1,1 @@
+/usr/bin/cc -O2 -g -DNDEBUG -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names -fsanitize=address "CMakeFiles/gen-corpus.dir/fuzz/gen_corpus.c.o" -o gen-corpus  libharpcore.a -lm

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/jak/src/harp/build-fuzz/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

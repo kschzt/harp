@@ -98,3 +98,15 @@ converters).
   ramp-end misses are budgeted separately (`ramp_late`) because a
   ramp's start anchors at the previous automation point — one block of
   structural margin.
+- Sessions are disposable; the supervisor is not. The shell's supervisor
+  thread owns connect/run/reconnect: a transport death tears the session
+  down (reader reaped, claim released) and the next attempt is just the
+  connect path again — fresh link reassembly state, fresh rid space, new
+  SSI time domain, project bundle re-asserted. Unplug/replug and a
+  device firmware restart are the same code path, tested on hardware
+  (scripts/replug-test.sh).
+- Parsers are fuzzed (spec §16/T9): every byte a peer can send passes
+  through code in fuzz/'s targets — framed-link reassembly, CBOR,
+  envelopes, objects, audio headers — under ASan in CI, plus a live
+  protocol-abuse test that asserts hostile traffic ends in session
+  resets, never crashes (scripts/abuse-test.sh).

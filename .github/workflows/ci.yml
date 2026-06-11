@@ -39,3 +39,22 @@ jobs:
           grep -q "recall complete" demo.out
           ./build/harp-probe -d 127.0.0.1:47800 -s /tmp/host restore | tee restore.out
           grep -q "SYNCED silently" restore.out
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build fuzz tree (clang, ASan everywhere, libFuzzer engines)
+        run: |
+          CC=clang cmake -B build-fuzz -DHARP_FUZZ=ON
+          cmake --build build-fuzz -j
+      - name: fuzz smoke (coverage-guided, seeded; §16/T9)
+        run: |
+          mkdir -p corpus && ./build-fuzz/gen-corpus corpus
+          for t in cbor envelope object link audio; do
+            echo "=== fuzz-$t"
+            ./build-fuzz/fuzz-$t -runs=30000 -max_len=4096 -seed=1 corpus
+          done
+      - name: protocol abuse vs sanitized daemon (T9-lite)
+        run: DEVICED=build-fuzz/harp-deviced PROBE=build-fuzz/harp-probe
+             ./scripts/abuse-test.sh

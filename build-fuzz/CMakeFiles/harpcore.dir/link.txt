@@ -1,0 +1,2 @@
+/usr/bin/ar qc libharpcore.a CMakeFiles/harpcore.dir/core/src/cbor.c.o CMakeFiles/harpcore.dir/core/src/sha256.c.o CMakeFiles/harpcore.dir/core/src/frame.c.o CMakeFiles/harpcore.dir/core/src/object.c.o CMakeFiles/harpcore.dir/core/src/store.c.o CMakeFiles/harpcore.dir/core/src/envelope.c.o CMakeFiles/harpcore.dir/core/src/link.c.o CMakeFiles/harpcore.dir/core/src/audio.c.o
+/usr/bin/ranlib libharpcore.a

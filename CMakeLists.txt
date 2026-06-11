@@ -10,6 +10,19 @@ endif()
 
 add_compile_options(-Wall -Wextra)
 
+# Fuzz tree (spec §16 / T9): cmake -B build-fuzz -DHARP_FUZZ=ON.
+# ASan goes tree-wide (every binary in this tree is sanitized — the abuse
+# test runs the sanitized daemon); the libFuzzer engine is added per
+# fuzz target below, on toolchains that ship it.
+option(HARP_FUZZ "Build fuzz targets for the wire-facing parsers" OFF)
+if(HARP_FUZZ)
+  if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "HARP_FUZZ needs clang")
+  endif()
+  add_compile_options(-fsanitize=address -g -O1)
+  add_link_options(-fsanitize=address)
+endif()
+
 add_library(harpcore STATIC
   core/src/cbor.c
   core/src/sha256.c
@@ -55,3 +68,25 @@ enable_testing()
 add_executable(harp-tests tests/harp_tests.c)
 target_link_libraries(harp-tests harpcore m)
 add_test(NAME core COMMAND harp-tests)
+
+# Fuzz targets. Apple clang ships no libFuzzer runtime -> a standalone
+# corpus-replay driver stands in there; coverage-guided runs happen on
+# Linux (CI). gen-corpus seeds both with valid wire bytes.
+if(HARP_FUZZ)
+  if(APPLE)
+    set(FUZZ_DRIVER fuzz/standalone_driver.c)
+  else()
+    set(FUZZ_DRIVER "")
+    target_compile_options(harpcore PRIVATE -fsanitize=fuzzer-no-link)
+  endif()
+  foreach(t cbor envelope object link audio)
+    add_executable(fuzz-${t} fuzz/fuzz_${t}.c ${FUZZ_DRIVER})
+    target_link_libraries(fuzz-${t} harpcore m)
+    if(NOT APPLE)
+      target_compile_options(fuzz-${t} PRIVATE -fsanitize=fuzzer)
+      target_link_options(fuzz-${t} PRIVATE -fsanitize=fuzzer)
+    endif()
+  endforeach()
+  add_executable(gen-corpus fuzz/gen_corpus.c)
+  target_link_libraries(gen-corpus harpcore m)
+endif()

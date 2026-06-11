@@ -144,13 +144,19 @@ Snapshot, Panic, and one-click Load of any archived state (patch
 time-travel; current state is archived first — nothing is ever lost).
 The hardware conformance kit (`scripts/hw-tests.sh`) runs recall
 round-trips, note-timing checks (±1 sample pitch arrival, zero late
-events), and a realtime soak that floods automation + notes + panel
+events), a realtime soak that floods automation + notes + panel
 traffic asserting zero silence gaps, zero drops, and bounded padding
-across DAW buffer sizes 64–1024. Note-offs are unloseable by design,
-and the DAW's panic (CC 120/123) reaches the hardware. Certification-suite behaviors exercised in
-miniature: T2/T3 (unplug/replug), T5 (silent hash-verified reopen),
-T10 (power-loss safety), T15 (byte-identical renders), T16 (event
-timing).
+across DAW buffer sizes 64–1024, and an automated replug test: the
+device detaches mid-stream and the shell reconnects on its own —
+session re-established, project state re-asserted, audio back.
+Note-offs are unloseable by design, and the DAW's panic (CC 120/123)
+reaches the hardware. Every wire-facing parser is fuzzed (libFuzzer +
+ASan in CI; `fuzz/`), and a protocol-abuse test slams a live daemon
+with hostile traffic asserting sessions reset and nothing crashes.
+Certification-suite behaviors exercised in miniature: T2/T3
+(unplug/replug), T5 (silent hash-verified reopen), T9 (malformed
+input), T10 (power-loss safety), T15 (byte-identical renders), T16
+(event timing).
 
 Not yet: transport/tempo events (§9.7 — arrives with the arpeggiator
 demo), four-safe-actions UI (v0 auto-resolves by Push-with-archive),

@@ -134,7 +134,11 @@ void HarpRuntime::pollEcho() {
     if (!harp_usb_link_poll(io_, 1)) return;
     while (harp_usb_link_pending(io_) > 0) {
         uint8_t stream;
-        if (harp_link_recv(io_, &link_, &stream, &msg_) != 0) return;
+        if (harp_link_recv(io_, &link_, &stream, &msg_) != 0) {
+            log_msg("link receive failed; device gone?");
+            connected_.store(false, std::memory_order_release);
+            return;
+        }
         if (stream == HARP_STREAM_EVT) {
             harp_cdec dec;
             harp_cdec_init(&dec, msg_.buf, msg_.len);
@@ -166,28 +170,29 @@ void HarpRuntime::pollEcho() {
 
 /* ---------------- lifecycle ---------------- */
 
-bool HarpRuntime::start(uint32_t sampleRate) {
-    if (running_.load()) return connected();
-    rate_ = sampleRate;
+/* One connection attempt: claim, hello, re-assert the project bundle,
+ * start the stream, spawn the reader. Caller: start() or supervisor(). */
+bool HarpRuntime::sessionUp() {
     io_ = harp_usb_open();
-    if (!io_) {
-        log_msg("no HARP device on the bus; rendering silence");
-        return false;
-    }
+    if (!io_) return false;
     if (!harp_usb_has_audio(io_)) {
-        log_msg("device has no HARP stream endpoints");
         harp_usb_close(io_);
         io_ = nullptr;
         return false;
     }
-    /* fresh client per session: rid space and credit restart with hello */
-    harp_client_free(&client_);
-    harp_client_init(&client_, io_, &link_, storeOk_ ? &store_ : nullptr, nullptr,
-                     nullptr);
     {
         std::lock_guard<std::mutex> lk(ctlMutex_);
+        /* fresh per session: rid space, credit, AND the link reassembly
+         * state — a half-assembled frame from a dead session must not
+         * poison the next one */
+        harp_link_free(&link_);
+        harp_link_init(&link_);
+        harp_client_free(&client_);
+        harp_client_init(&client_, io_, &link_, storeOk_ ? &store_ : nullptr, nullptr,
+                         nullptr);
         if (!helloAndIdentity()) {
             log_msg("hello failed");
+            harp_client_free(&client_);
             harp_usb_close(io_);
             io_ = nullptr;
             return false;
@@ -195,24 +200,26 @@ bool HarpRuntime::start(uint32_t sampleRate) {
         log_msg("connected: %s %s (serial %s, engine %s %s)", vendorName_.c_str(),
                 productName_.c_str(), serial_.c_str(), engineId_.c_str(),
                 engineVer_.c_str());
-        /* apply staged recall from a setState that arrived pre-connect.
-         * Copy the target out first: pushStateLocked clears the staged
-         * flag under stagedMutex_ itself. */
-        bool staged = false;
+        /* re-assert the project's bundle ("Live wins") — covers both a
+         * setState that arrived pre-connect and state the device grew
+         * while unplugged. Copy the target out: pushStateLocked takes
+         * bundleMutex_ itself. */
+        bool haveBundle = false;
         harp_hash target{};
         {
-            std::lock_guard<std::mutex> slk(stagedMutex_);
-            staged = hasStaged_;
-            target = stagedTarget_;
+            std::lock_guard<std::mutex> blk(bundleMutex_);
+            haveBundle = hasBundle_;
+            target = bundleTarget_;
         }
-        if (staged) {
+        if (haveBundle) {
             if (pushStateLocked(target))
-                log_msg("staged project state applied");
+                log_msg("project state re-asserted");
             else
-                log_msg("staged state apply failed (left staged)");
+                log_msg("project state apply failed (will retry on reconnect)");
         }
         if (!audioStart(rate_)) {
             log_msg("audio.start failed");
+            harp_client_free(&client_);
             harp_usb_close(io_);
             io_ = nullptr;
             return false;
@@ -222,40 +229,26 @@ bool HarpRuntime::start(uint32_t sampleRate) {
     uint8_t junk[16384];
     while (harp_usb_audio_read(io_, junk, sizeof junk, 30) > 0) {}
 
+    /* new session = new stream = new SSI time domain (§7.1) */
     ssi_ = framesSent_ = framesRecv_ = 0;
     framesRecvAtomic_.store(0, std::memory_order_relaxed);
     ssiRead_.store(0, std::memory_order_relaxed);
     padDebtFloats_ = 0;
     ahead_ = 2; /* small fixed pipeline; the reader thread keeps RTT short */
     audioRing_.clear();
-    running_.store(true);
-    connected_.store(true, std::memory_order_release);
-    feederThread_ = std::thread([this] { feeder(); });
     readerThread_ = std::thread([this] { reader(); });
+    connected_.store(true, std::memory_order_release);
     return true;
 }
 
-void HarpRuntime::stop() {
-    /* Flush in-flight events before teardown: the DAW's final note-offs
-     * arrive in the last process() blocks, and killing the feeder with
-     * them still queued is how notes get stuck. Bounded wait. */
-    if (running_.load(std::memory_order_acquire)) {
-        for (int i = 0; i < 100 && !timedRing_.empty(); i++) {
-            struct timespec ts = {0, 1000000};
-            nanosleep(&ts, nullptr);
-        }
-    }
-    if (!running_.exchange(false)) {
-        if (io_) {
-            harp_usb_close(io_);
-            io_ = nullptr;
-        }
-        return;
-    }
-    if (feederThread_.joinable()) feederThread_.join();
+/* Tear a session down: reap the reader, orderly audio.stop if the device
+ * is still talking to us, release the claim. Safe on a dead transport. */
+void HarpRuntime::sessionDown() {
+    bool wasConnected = connected_.exchange(false, std::memory_order_acq_rel);
     if (readerThread_.joinable()) readerThread_.join();
-    {
-        std::lock_guard<std::mutex> lk(ctlMutex_);
+    if (!io_) return;
+    std::lock_guard<std::mutex> lk(ctlMutex_);
+    if (wasConnected) {
         audioStopLocked();
         /* drain the tail of the stream so the device thread can park */
         uint8_t junk[16384];
@@ -266,10 +259,64 @@ void HarpRuntime::stop() {
             quiet = (r == 0) ? quiet + 1 : 0;
         }
     }
-    connected_.store(false, std::memory_order_release);
-    harp_client_free(&client_); /* idempotent; start() re-inits per session */
+    harp_client_free(&client_);
     harp_usb_close(io_);
     io_ = nullptr;
+}
+
+/* The supervisor owns the session for the plugin's whole active life:
+ * run the feeder while connected, reconnect (1 s cadence) when the
+ * transport dies or no device was present at start. Replug recovery is
+ * just the connect path again — same hello, same bundle re-assert. */
+void HarpRuntime::supervisor() {
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    bool everConnected = connected_.load(std::memory_order_acquire);
+    while (running_.load(std::memory_order_acquire)) {
+        if (connected_.load(std::memory_order_acquire)) {
+            everConnected = true;
+            feeder(); /* returns when !running_ or the transport died */
+            continue;
+        }
+        sessionDown(); /* reap whatever is left of the dead session */
+        if (!running_.load(std::memory_order_acquire)) break;
+        if (sessionUp()) {
+            /* a reconnect is news; the very first attach already logged */
+            if (everConnected) log_msg("device reconnected; stream re-established");
+            else log_msg("device attached; stream established");
+            continue;
+        }
+        for (int i = 0; i < 10 && running_.load(std::memory_order_acquire); i++) {
+            struct timespec ts = {0, 100000000}; /* 1 s total, stop-responsive */
+            nanosleep(&ts, nullptr);
+        }
+    }
+    sessionDown();
+}
+
+bool HarpRuntime::start(uint32_t sampleRate) {
+    if (running_.load()) return connected();
+    rate_ = sampleRate;
+    running_.store(true);
+    bool now = sessionUp(); /* fast path: report a present device immediately */
+    if (!now) log_msg("no HARP device on the bus; supervising for hot-plug");
+    supervisorThread_ = std::thread([this] { supervisor(); });
+    return now;
+}
+
+void HarpRuntime::stop() {
+    /* Flush in-flight events before teardown: the DAW's final note-offs
+     * arrive in the last process() blocks, and killing the feeder with
+     * them still queued is how notes get stuck. Bounded wait. */
+    if (running_.load(std::memory_order_acquire) && connected()) {
+        for (int i = 0; i < 100 && !timedRing_.empty(); i++) {
+            struct timespec ts = {0, 1000000};
+            nanosleep(&ts, nullptr);
+        }
+    }
+    if (!running_.exchange(false)) return;
+    if (supervisorThread_.joinable()) supervisorThread_.join(); /* final sessionDown */
     log_msg("stopped (underruns: %llu, padded samples: %llu)",
             (unsigned long long)underruns_.load(),
             (unsigned long long)padSamples_.load());
@@ -386,12 +433,10 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
 /* ---------------- feeder thread ---------------- */
 
 void HarpRuntime::feeder() {
-#ifdef __APPLE__
-    /* The feeder does the time-critical pacing for the whole plugin; at
-     * default QoS it loses races to everything the DAW runs elevated. */
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
-    while (running_.load(std::memory_order_relaxed)) {
+    /* (QoS is set by the supervisor thread, which runs this.) Exits when
+     * the plugin stops OR the session dies — the supervisor reconnects. */
+    while (running_.load(std::memory_order_relaxed) &&
+           connected_.load(std::memory_order_relaxed)) {
         bool didWork = false;
 
         /* 1. inbound async traffic FIRST: keeping the IN direction drained
@@ -442,7 +487,10 @@ void HarpRuntime::feeder() {
             }
             if (sent) {
                 std::lock_guard<std::mutex> lk(ctlMutex_);
-                io_->write_all(io_, batch.buf, batch.len);
+                if (!io_->write_all(io_, batch.buf, batch.len)) {
+                    log_msg("event write failed; device gone?");
+                    connected_.store(false, std::memory_order_release);
+                }
                 didWork = true;
             }
             harp_cbuf_free(&msgbuf);
@@ -656,7 +704,7 @@ bool HarpRuntime::getStateBundle(std::vector<uint8_t> &out) {
     if (!storeOk_) return false;
     if (!connected()) {
         /* offline: re-emit staged bundle if we have one */
-        std::lock_guard<std::mutex> slk(stagedMutex_);
+        std::lock_guard<std::mutex> slk(bundleMutex_);
         return false; /* v0: nothing meaningful to save offline */
     }
     std::lock_guard<std::mutex> lk(ctlMutex_);
@@ -691,9 +739,9 @@ bool HarpRuntime::getStateBundle(std::vector<uint8_t> &out) {
     out.assign(b.buf, b.buf + b.len);
     harp_cbuf_free(&b);
     { /* a save moves the project's reference point to what it captured */
-        std::lock_guard<std::mutex> slk(stagedMutex_);
-        hasStaged_ = true;
-        stagedTarget_ = head;
+        std::lock_guard<std::mutex> slk(bundleMutex_);
+        hasBundle_ = true;
+        bundleTarget_ = head;
     }
     char hex[2 * HARP_HASH_LEN + 1];
     harp_hash_hex(&head, hex);
@@ -758,10 +806,10 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
 
     /* surface knob values for the controller (find the params blob) */
     {
-        std::lock_guard<std::mutex> slk(stagedMutex_);
-        hasStaged_ = true;
-        stagedTarget_ = target;
-        stagedParams_.clear();
+        std::lock_guard<std::mutex> slk(bundleMutex_);
+        hasBundle_ = true;
+        bundleTarget_ = target;
+        bundleParams_.clear();
         harp_cbuf enc;
         harp_cbuf_init(&enc);
         harp_hash root;
@@ -797,7 +845,7 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
                                         if (!harp_cdec_uint(&pd, &id) ||
                                             !harp_cdec_float(&pd, &v))
                                             break;
-                                        rt->stagedParams_.push_back(
+                                        rt->bundleParams_.push_back(
                                             {(uint32_t)id, (float)v});
                                     }
                                 }
@@ -821,9 +869,9 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
     return true;
 }
 
-bool HarpRuntime::stagedParam(uint32_t id, float &value) {
-    std::lock_guard<std::mutex> slk(stagedMutex_);
-    for (auto &kv : stagedParams_)
+bool HarpRuntime::bundleParam(uint32_t id, float &value) {
+    std::lock_guard<std::mutex> slk(bundleMutex_);
+    for (auto &kv : bundleParams_)
         if (kv.first == id) {
             value = kv.second;
             return true;

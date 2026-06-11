@@ -45,8 +45,11 @@ public:
         targetFrames_ = needed > floor_ ? needed : floor_;
     }
 
-    /* Claim the device, hello, start the host-paced stream. False if no
-     * device (the shell then renders silence and may retry). */
+    /* Begin supervising: claim the device, hello, start the host-paced
+     * stream — and keep a supervisor thread retrying/reconnecting for as
+     * long as the plugin is active (unplug -> silence + retry; replug ->
+     * session re-established and the project's bundle re-asserted).
+     * Returns whether a device is connected RIGHT NOW. */
     bool start(uint32_t sampleRate);
     void stop();
     bool connected() const { return connected_.load(std::memory_order_acquire); }
@@ -84,8 +87,8 @@ public:
      * (spec wants a user choice; the shell has no UI yet — the archive
      * step keeps it loss-free). */
     bool setStateBundle(const uint8_t *data, size_t len);
-    /* Knob values from the staged/last bundle, for controller display. */
-    bool stagedParam(uint32_t id, float &value);
+    /* Knob values from the project's bundle, for controller display. */
+    bool bundleParam(uint32_t id, float &value);
 
     std::string serial() const { return serial_; }
 
@@ -102,7 +105,10 @@ private:
      * from this. */
     static constexpr uint32_t kTargetDepthFrames = 5;
 
-    void feeder();
+    void supervisor(); /* owns session lifecycle: connect, run, reconnect */
+    bool sessionUp();  /* one attempt: open, hello, re-push bundle, stream */
+    void sessionDown(); /* reap reader, orderly stop if alive, close usb */
+    void feeder();      /* runs on the supervisor thread while connected */
     void reader();
     void settlePadDebt(); /* drop late arrivals for already-padded SSIs */
     bool helloAndIdentity();
@@ -133,9 +139,10 @@ private:
     harp_store store_;
     bool storeOk_ = false;
 
-    std::thread feederThread_;
+    std::thread supervisorThread_; /* runs supervisor(): feeder + reconnect */
     std::thread readerThread_; /* always-pending audio-IN read: the device's
-                                  response writes must never wait for us */
+                                  response writes must never wait for us;
+                                  spawned per session by sessionUp() */
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
     std::atomic<uint64_t> underruns_{0};
@@ -174,11 +181,13 @@ private:
     uint32_t vendorId_ = 0, productId_ = 0;
     harp_hash paramMapHash_{};
 
-    /* staged recall state (from setState before/without a device) */
-    std::mutex stagedMutex_;
-    bool hasStaged_ = false;
-    harp_hash stagedTarget_{};
-    std::vector<std::pair<uint32_t, float>> stagedParams_;
+    /* the project's recall bundle: PERSISTENT, not consumed — the DAW
+     * project's notion of state re-asserts on every (re)connect ("Live
+     * wins", archive-before-push keeps it loss-free) */
+    std::mutex bundleMutex_;
+    bool hasBundle_ = false;
+    harp_hash bundleTarget_{};
+    std::vector<std::pair<uint32_t, float>> bundleParams_;
 
     uint32_t rate_ = 48000;
 };

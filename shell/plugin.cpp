@@ -312,7 +312,7 @@ public:
         rt.setStateBundle(bundle.data(), bundle.size());
         for (auto &p : kParams) {
             float v;
-            if (rt.stagedParam(p.id, v)) setParamNormalized(p.id, v);
+            if (rt.bundleParam(p.id, v)) setParamNormalized(p.id, v);
         }
         return kResultOk;
     }

@@ -7,8 +7,8 @@ Living document; items leave by being fixed, not forgotten.
 |---|------|----------|--------|
 | 1 | `harp-deviced.c` monolith (2,137 lines, 14 globals) | high | DONE — split into engine/state/session/panel + device.h (mechanical move, A/B-verified byte-identical render vs old binary). Follow-up: engine globals behind accessors |
 | 2 | protocol client duplicated (probe vs shell runtime) | high | DONE — `host/client.{h,c}` (hello/identity, refs, snapshot, closure fetch/push, refset CAS, rid correlation); probe and shell both consume it. Net −700 lines |
-| 3 | parsers never fuzzed (spec §16/T9 requires it) | high | IN PROGRESS — libFuzzer targets + CI smoke runs |
-| 4 | shell: no reconnect on device replug; log-and-continue error paths; `staged*` naming is stale | medium | IN PROGRESS — reconnect loop, renames |
+| 3 | parsers never fuzzed (spec §16/T9 requires it) | high | DONE — fuzz/ targets for cbor/envelope/object/link/audio; libFuzzer+ASan smoke in CI (Linux), ASan corpus replay locally (Apple clang has no fuzzer runtime); gen-corpus seeds from canonical encoders; scripts/abuse-test.sh slams a live daemon (T9-lite). Follow-up: continuous fuzzing (OSS-Fuzz-style) once public |
+| 4 | shell: no reconnect on device replug; log-and-continue error paths; `staged*` naming is stale | medium | DONE — supervisor thread owns session lifecycle: hot-plug attach, unplug -> silence + 1 s retry, replug -> hello + bundle re-assert + stream (scripts/replug-test.sh proves it on hardware); staged* renamed bundle* |
 | 5 | debt tracked informally | low | this file |
 | 6 | §15.1 runtime/shell process split (full client unification) | medium | deferred — item 2 is the stepping stone |
 | 7 | free-running mode unexercised by any DAW path (no analog device yet) | low | deferred until a converter HAT / real analog device |
