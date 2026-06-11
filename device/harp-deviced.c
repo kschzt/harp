@@ -124,6 +124,10 @@ static device g_dev;
 typedef struct {
     float phase_l, phase_r;
     float low_l, band_l, low_r, band_r;
+    /* control-rate-smoothed parameter values (§9.3: the device interpolates
+     * at its declared control rate — instant steps are zipper clicks) */
+    float s_pitch, s_shape, s_cutoff, s_reso, s_master;
+    bool s_init;
 } synth_voice;
 
 static float param_value(uint32_t id) {
@@ -132,37 +136,59 @@ static float param_value(uint32_t id) {
     return 0.0f;
 }
 
+#define SMOOTH_SUBBLOCK 32 /* samples; 1.5 kHz at 48 k — the declared control rate honored */
+
 static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float rate) {
-    float pitch = param_value(1), shape = param_value(2);
-    float cutoff = param_value(3), reso = param_value(4);
-    float master = param_value(8);
-
-    float freq = 55.0f * exp2f(pitch * 4.0f);            /* 55 Hz .. 880 Hz */
-    float fc = 60.0f * exp2f(cutoff * 6.0f);             /* 60 Hz .. ~3.8 kHz */
-    float f = 2.0f * sinf((float)M_PI * fc / rate);
-    float q = 1.0f - 0.9f * reso;
+    if (!v->s_init) { /* first block: land on targets, no glide-in from zero */
+        v->s_pitch = param_value(1);
+        v->s_shape = param_value(2);
+        v->s_cutoff = param_value(3);
+        v->s_reso = param_value(4);
+        v->s_master = param_value(8);
+        v->s_init = true;
+    }
     float detune = 1.004f;
+    /* one-pole toward targets per sub-block; tau ~= 12 ms */
+    float alpha = 1.0f - expf(-(float)SMOOTH_SUBBLOCK / (0.012f * rate));
 
-    for (uint32_t i = 0; i < n; i++) {
-        v->phase_l += freq / rate;
-        if (v->phase_l >= 1.0f) v->phase_l -= 1.0f;
-        v->phase_r += freq * detune / rate;
-        if (v->phase_r >= 1.0f) v->phase_r -= 1.0f;
+    uint32_t i = 0;
+    while (i < n) {
+        uint32_t end = i + SMOOTH_SUBBLOCK;
+        if (end > n) end = n;
 
-        float osc_l = sinf(2.0f * (float)M_PI * v->phase_l);
-        osc_l += ((2.0f * v->phase_l - 1.0f) - osc_l) * shape;
-        float osc_r = sinf(2.0f * (float)M_PI * v->phase_r);
-        osc_r += ((2.0f * v->phase_r - 1.0f) - osc_r) * shape;
+        v->s_pitch += alpha * (param_value(1) - v->s_pitch);
+        v->s_shape += alpha * (param_value(2) - v->s_shape);
+        v->s_cutoff += alpha * (param_value(3) - v->s_cutoff);
+        v->s_reso += alpha * (param_value(4) - v->s_reso);
+        v->s_master += alpha * (param_value(8) - v->s_master);
 
-        v->low_l += f * v->band_l;
-        float high_l = osc_l - v->low_l - q * v->band_l;
-        v->band_l += f * high_l;
-        v->low_r += f * v->band_r;
-        float high_r = osc_r - v->low_r - q * v->band_r;
-        v->band_r += f * high_r;
+        float freq = 55.0f * exp2f(v->s_pitch * 4.0f); /* 55 Hz .. 880 Hz */
+        float fc = 60.0f * exp2f(v->s_cutoff * 6.0f);  /* 60 Hz .. ~3.8 kHz */
+        float f = 2.0f * sinf((float)M_PI * fc / rate);
+        float q = 1.0f - 0.9f * v->s_reso;
+        float shape = v->s_shape, master = v->s_master;
 
-        interleaved[2 * i] = v->low_l * master * 0.5f;
-        interleaved[2 * i + 1] = v->low_r * master * 0.5f;
+        for (; i < end; i++) {
+            v->phase_l += freq / rate;
+            if (v->phase_l >= 1.0f) v->phase_l -= 1.0f;
+            v->phase_r += freq * detune / rate;
+            if (v->phase_r >= 1.0f) v->phase_r -= 1.0f;
+
+            float osc_l = sinf(2.0f * (float)M_PI * v->phase_l);
+            osc_l += ((2.0f * v->phase_l - 1.0f) - osc_l) * shape;
+            float osc_r = sinf(2.0f * (float)M_PI * v->phase_r);
+            osc_r += ((2.0f * v->phase_r - 1.0f) - osc_r) * shape;
+
+            v->low_l += f * v->band_l;
+            float high_l = osc_l - v->low_l - q * v->band_l;
+            v->band_l += f * high_l;
+            v->low_r += f * v->band_r;
+            float high_r = osc_r - v->low_r - q * v->band_r;
+            v->band_r += f * high_r;
+
+            interleaved[2 * i] = v->low_l * master * 0.5f;
+            interleaved[2 * i + 1] = v->low_r * master * 0.5f;
+        }
     }
 }
 
