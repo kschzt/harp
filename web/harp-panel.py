@@ -97,6 +97,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             name = q.get("name", [""])[0]
             self._send(200, "application/json",
                        DAEMON.cmd(f"revert {name}").encode())
+        elif u.path == "/api/snapshot":
+            self._send(200, "application/json", DAEMON.cmd("snapshot").encode())
+        elif u.path == "/api/panic":
+            self._send(200, "application/json", DAEMON.cmd("panic").encode())
         elif u.path == "/api/stream":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")

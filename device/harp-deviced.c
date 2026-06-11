@@ -1881,7 +1881,22 @@ static void panel_serve_conn(device *d, int fd) {
                 panel_json_refs(d, body, sizeof body);
             else if (strcmp(buf, "counters") == 0)
                 panel_json_counters(d, body, sizeof body);
-            else if (strncmp(buf, "revert ", 7) == 0) {
+            else if (strcmp(buf, "snapshot") == 0) {
+                /* the front-panel save button (§10.4 snapshot-on-demand) */
+                harp_hash snap;
+                uint64_t gen;
+                if (do_snapshot(d, "front panel", &snap, &gen) == 0) {
+                    char hex[2 * HARP_HASH_LEN + 1];
+                    harp_hash_hex(&snap, hex);
+                    hex[12] = 0;
+                    snprintf(body, sizeof body, "{\"ok\":true,\"hash\":\"%s\",\"gen\":%llu}",
+                             hex, (unsigned long long)gen);
+                } else
+                    snprintf(body, sizeof body, "{\"ok\":false,\"error\":\"storage\"}");
+            } else if (strcmp(buf, "panic") == 0) {
+                g_note = -1; /* same engine path the CC 120/123 handler takes */
+                snprintf(body, sizeof body, "{\"ok\":true}");
+            } else if (strncmp(buf, "revert ", 7) == 0) {
                 if (panel_revert(d, buf + 7))
                     snprintf(body, sizeof body, "{\"ok\":true}");
                 else

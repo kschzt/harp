@@ -21,10 +21,20 @@ td.g{color:#9ab;text-align:right}th.g{text-align:right}
 .dot{color:#e96}.clean-dot{color:#7c7}
 #counters{font-size:.8em;color:#888;line-height:1.7}
 #counters b{color:#aab;font-weight:500}
+button{background:#223;color:#9ab;border:1px solid #345;border-radius:.4em;
+       padding:.15em .7em;font:inherit;font-size:.85em;cursor:pointer}
+button:hover{background:#2a3a4a;color:#cde}
+button.danger{border-color:#543;color:#c97}
+#actions{float:right}
+td button{font-size:.75em;padding:.05em .5em}
 #conn{float:right;font-size:.75em;color:#555}
 footer{margin-top:2em;font-size:.72em;color:#555;line-height:1.5}
 </style></head><body>
-<h1>harp-refdev <span id="dirty">–</span> <span id="conn">connecting…</span></h1>
+<h1>harp-refdev <span id="dirty">–</span> <span id="conn">connecting…</span>
+<span id="actions">
+<button onclick="fetch('/api/snapshot')" title="commit current state (§10.4)">Snapshot</button>
+<button class="danger" onclick="fetch('/api/panic')" title="all notes off">Panic</button>
+</span></h1>
 <h2>Front panel</h2>
 <div id="params"></div>
 <h2>State refs <span style="text-transform:none;color:#556">— the recall model, live (spec §10.3)</span></h2>
@@ -82,7 +92,11 @@ function render(s) {
     `<tr><td>${r.name}</td><td class="h">${r.hash || '(unborn)'}…</td>` +
     `<td class="g">${r.gen}</td>` +
     `<td>${r.dirty ? '<span class="dot">● dirty</span>'
-                   : '<span class="clean-dot">● clean</span>'}</td></tr>`).join('');
+                   : '<span class="clean-dot">● clean</span>'}` +
+    `${r.name !== 'live/project' ?
+      ` <button onclick="fetch('/api/revert?name=${encodeURIComponent(r.name)}')"` +
+      ` title="load this state into the live engine (current state is archived first if dirty)">Load</button>`
+      : ''}</td></tr>`).join('');
   const k = s.counters;
   document.getElementById('counters').innerHTML =
     `serial <b>${s.params.serial}</b> · boot <b>${k.boot}</b> · ` +
