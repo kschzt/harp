@@ -62,6 +62,10 @@ public:
     tresult PLUGIN_API setupProcessing(ProcessSetup &setup) override {
         rate_ = (uint32_t)setup.sampleRate;
         offline_ = setup.processMode == kOffline;
+        /* the ring cushion (and thus reported latency) scales with the
+         * DAW's block size — a 1024-sample pull needs a deeper ring than
+         * a 64-sample one */
+        HarpRuntime::instance().configure(rate_, (uint32_t)setup.maxSamplesPerBlock);
         return AudioEffect::setupProcessing(setup);
     }
 
@@ -111,8 +115,19 @@ public:
         }
 
         /* parameter changes -> timestamped sets; consecutive points become
-         * §9.4 ramps, the device interpolating the line between them — a
-         * DAW curve as a handful of ramps, exactly as §9.1 promises */
+         * §9.4 ramps — a DAW curve as a handful of ramps (§9.1). Thinned to
+         * one emission per param per 256 samples: at 64-sample buffers a
+         * DAW sends ~750 points/s/param, and ramps spanning 64 samples say
+         * nothing a 256-sample ramp doesn't (the device interpolates at
+         * control rate regardless). Skipped points fold into the next
+         * ramp's target; a pending final value flushes the next block. */
+        for (size_t idx = 0; idx < 8; idx++) { /* flush matured pendings */
+            if (pendHas_[idx] && base >= pendTs_[idx]) {
+                rt.queueRamp((uint32_t)idx + 1, pendVal_[idx], lastTs_[idx], pendTs_[idx]);
+                lastTs_[idx] = pendTs_[idx];
+                pendHas_[idx] = false;
+            }
+        }
         if (data.inputParameterChanges) {
             int32 nq = data.inputParameterChanges->getParameterCount();
             for (int32 i = 0; i < nq; i++) {
@@ -126,16 +141,25 @@ public:
                     ParamValue v;
                     if (q->getPoint(k, off, v) != kResultOk) continue;
                     uint64_t ts = base + (uint64_t)off;
-                    bool ramp = idx != SIZE_MAX && hasLast_[idx] && ts > lastTs_[idx] &&
+                    if (idx == SIZE_MAX) {
+                        rt.queueParamSet(id, (float)v, ts);
+                        continue;
+                    }
+                    if (hasLast_[idx] && ts > lastTs_[idx] && ts - lastTs_[idx] < 256) {
+                        pendHas_[idx] = true; /* too soon: fold into next ramp */
+                        pendTs_[idx] = ts;
+                        pendVal_[idx] = (float)v;
+                        continue;
+                    }
+                    bool ramp = hasLast_[idx] && ts > lastTs_[idx] &&
                                 ts - lastTs_[idx] <= 4800; /* >100 ms gap = a jump */
                     if (ramp)
                         rt.queueRamp(id, (float)v, lastTs_[idx], ts);
                     else
                         rt.queueParamSet(id, (float)v, ts);
-                    if (idx != SIZE_MAX) {
-                        lastTs_[idx] = ts;
-                        hasLast_[idx] = true;
-                    }
+                    lastTs_[idx] = ts;
+                    hasLast_[idx] = true;
+                    pendHas_[idx] = false;
                 }
             }
         }
@@ -216,9 +240,13 @@ public:
 private:
     uint32_t rate_ = 48000;
     bool offline_ = false;
-    /* per-param last automation point, for ramp synthesis */
+    /* per-param ramp-synthesis state: last emitted point + pending folded
+     * point awaiting the 256-sample thinning interval */
     uint64_t lastTs_[8] = {};
     bool hasLast_[8] = {};
+    bool pendHas_[8] = {};
+    uint64_t pendTs_[8] = {};
+    float pendVal_[8] = {};
 };
 
 /* ---------------- controller ---------------- */

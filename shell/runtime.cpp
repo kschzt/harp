@@ -329,6 +329,7 @@ bool HarpRuntime::start(uint32_t sampleRate) {
     ssi_ = framesSent_ = framesRecv_ = 0;
     framesRecvAtomic_.store(0, std::memory_order_relaxed);
     ssiRead_.store(0, std::memory_order_relaxed);
+    padDebtFloats_ = 0;
     ahead_ = 2; /* small fixed pipeline; the reader thread keeps RTT short */
     audioRing_.clear();
     running_.store(true);
@@ -427,15 +428,29 @@ void HarpRuntime::sendRampEvent(uint32_t id, float target, uint64_t start, uint6
     harp_cbuf_free(&m);
 }
 
+/* Padded stream positions are SPENT: ssiRead_ always advances by the full
+ * request, and the late-arriving samples for those positions are dropped
+ * (padDebtFloats_) when they show up. The wrong policy — playing late
+ * arrivals anyway — grows latency by every pad and audibly "echoes" the
+ * missing moment while the DAW grid drifts. */
+void HarpRuntime::settlePadDebt() {
+    while (padDebtFloats_) {
+        float scratch[1024];
+        size_t take = padDebtFloats_ < 1024 ? padDebtFloats_ : 1024;
+        size_t got = audioRing_.read(scratch, take);
+        if (!got) break; /* not arrived yet; keep owing */
+        padDebtFloats_ -= got;
+    }
+}
+
 size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
+    settlePadDebt();
     size_t want = nFrames * 2;
     size_t got = audioRing_.read(dst, want);
-    /* ssiRead_ advances only by samples actually delivered: underrun padding
-     * is not stream time. (Consequence: a pad slips the DAW/SSI alignment by
-     * its length — rare, counted, and self-announcing in event timing.) */
-    ssiRead_.fetch_add(got / 2, std::memory_order_relaxed);
+    ssiRead_.fetch_add(nFrames, std::memory_order_relaxed);
     if (got < want) {
         memset(dst + got, 0, (want - got) * sizeof(float));
+        padDebtFloats_ += want - got;
         if (connected_.load(std::memory_order_acquire)) {
             underruns_.fetch_add(1, std::memory_order_relaxed);
             padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
@@ -446,16 +461,17 @@ size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
 }
 
 size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeoutMs) {
+    settlePadDebt();
     size_t want = nFrames * 2;
     size_t got = 0;
     unsigned waited = 0;
+    ssiRead_.fetch_add(nFrames, std::memory_order_relaxed);
     while (got < want) {
-        size_t r = audioRing_.read(dst + got, want - got);
-        ssiRead_.fetch_add(r / 2, std::memory_order_relaxed);
-        got += r;
+        got += audioRing_.read(dst + got, want - got);
         if (got >= want) break;
         if (!connected_.load(std::memory_order_acquire) || waited >= timeoutMs) {
             memset(dst + got, 0, (want - got) * sizeof(float));
+            padDebtFloats_ += want - got;
             underruns_.fetch_add(1, std::memory_order_relaxed);
             padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
             return (want - got) / 2;
@@ -485,7 +501,7 @@ void HarpRuntime::feeder() {
          * device injected the very stalls it tried to absorb). */
         size_t ringFrames = audioRing_.readAvailable() / 2;
         uint64_t inFlight = framesSent_ - framesRecv_;
-        while (ringFrames < (size_t)kTargetDepthFrames * kBlock && inFlight < ahead_) {
+        while (ringFrames < (size_t)targetFrames_ && inFlight < ahead_) {
             harp_audio_hdr pace = {HARP_AUDIO_FVER, HARP_AUDIO_DIR_H2D, 0,    0,
                                    ssi_,            (uint16_t)kBlock,   HARP_AUDIO_FMT_F32};
             uint8_t ph[HARP_AUDIO_HDR_LEN];

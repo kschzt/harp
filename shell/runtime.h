@@ -33,6 +33,16 @@ class HarpRuntime {
 public:
     static HarpRuntime &instance();
 
+    /* Called from setupProcessing: the ring cushion must scale with the
+     * DAW's block size (a 1024-sample pull through a 1280-sample cushion
+     * leaves 5 ms of headroom — stutter at large buffers). */
+    void configure(uint32_t sampleRate, uint32_t maxDawBlock) {
+        rate_ = sampleRate;
+        uint32_t needed = 2 * maxDawBlock;
+        uint32_t floor_ = kTargetDepthFrames * kBlock;
+        targetFrames_ = needed > floor_ ? needed : floor_;
+    }
+
     /* Claim the device, hello, start the host-paced stream. False if no
      * device (the shell then renders silence and may retry). */
     bool start(uint32_t sampleRate);
@@ -55,7 +65,7 @@ public:
      * may legitimately wait for the wire. */
     size_t pullAudioBlocking(float *interleavedLR, size_t nFrames, unsigned timeoutMs);
 
-    uint32_t latencySamples() const { return kTargetDepthFrames * kBlock; }
+    uint32_t latencySamples() const { return targetFrames_; }
     uint64_t underruns() const { return underruns_.load(std::memory_order_relaxed); }
 
     /* ---- state (main thread; blocking, not RT-safe) ---- */
@@ -87,6 +97,7 @@ private:
 
     void feeder();
     void reader();
+    void settlePadDebt(); /* drop late arrivals for already-padded SSIs */
     bool helloAndIdentity();
     bool audioStart(uint32_t rate);
     void audioStopLocked();
@@ -141,6 +152,9 @@ private:
     uint64_t ssi_ = 0;
     uint64_t framesSent_ = 0, framesRecv_ = 0;
     uint64_t ahead_ = 2; /* fixed small pipeline; reader thread keeps RTT short */
+    uint32_t targetFrames_ = kTargetDepthFrames * kBlock; /* see configure() */
+    size_t padDebtFloats_ = 0; /* late arrivals owed to already-padded SSIs;
+                                  audio thread only */
 
     /* identity (for the bundle's identity-expectation) */
     std::string serial_, vendorName_, productName_, engineId_, engineVer_;

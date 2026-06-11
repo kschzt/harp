@@ -23,7 +23,7 @@ C0=$(curl -s --max-time 3 "http://$HOST:8080/api/counters") || fail "panel unrea
     sleep 0.4
   done ) & KNOBPID=$!
 
-"$HOSTBIN" "$VST" --realtime \
+"$HOSTBIN" "$VST" --realtime --block "${BLOCK:-256}" \
     --set 7=0.4 --set 8=0.5 --ramp 3=0.15:0.9 --ramp 4=0.2:0.6 --ramp 1=0.35:0.6 \
     --notes "$NOTES" --seconds "$S" --out "$OUT" > "$LOG" 2>&1
 RC=$?
