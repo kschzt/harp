@@ -93,6 +93,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             val = q.get("value", [""])[0]
             self._send(200, "application/json",
                        DAEMON.cmd(f"knob {pid} {val}").encode())
+        elif u.path == "/api/revert":
+            name = q.get("name", [""])[0]
+            self._send(200, "application/json",
+                       DAEMON.cmd(f"revert {name}").encode())
         elif u.path == "/api/stream":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")

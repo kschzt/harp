@@ -757,8 +757,6 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
     if (!refsLocked(&live)) return false;
     if (!live.unborn && !live.dirty && harp_hash_eq(&live.hash, &target)) {
         log_msg("recall: hash match, clean -> SYNCED silently");
-        std::lock_guard<std::mutex> slk2(stagedMutex_);
-        hasStaged_ = false;
         return true;
     }
     log_msg("recall: mismatch%s -> Push with archive (v0 auto-resolve)",
@@ -893,11 +891,11 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
     ok = request(&req, &rsp, &e);
     harp_cbuf_free(&req);
     harp_cbuf_free(&rsp);
-    if (ok) {
-        log_msg("recall: live/project restored");
-        std::lock_guard<std::mutex> slk(stagedMutex_);
-        hasStaged_ = false;
-    }
+    if (ok) log_msg("recall: live/project restored");
+    /* The bundle reference is PERSISTENT, not consumed: the DAW project's
+     * notion of state re-asserts on every reconnect ("Live wins") — with
+     * the archive step keeping it loss-free. It only moves when a save
+     * pulls a new head (getStateBundle) or a new set loads. */
     return ok;
 }
 
@@ -989,6 +987,11 @@ bool HarpRuntime::getStateBundle(std::vector<uint8_t> &out) {
                   engineVer_, paramMapHash_, expected, &store_, clo);
     out.assign(b.buf, b.buf + b.len);
     harp_cbuf_free(&b);
+    { /* a save moves the project's reference point to what it captured */
+        std::lock_guard<std::mutex> slk(stagedMutex_);
+        hasStaged_ = true;
+        stagedTarget_ = head;
+    }
     char hex[2 * HARP_HASH_LEN + 1];
     harp_hash_hex(&head, hex);
     hex[12] = 0;

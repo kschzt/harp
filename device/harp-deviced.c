@@ -1833,6 +1833,34 @@ static void panel_json_counters(device *d, char *body, size_t sz) {
              d->audio.thread_live ? "true" : "false");
 }
 
+/* Front-panel patch load: point live/project at a stored ref's state (the
+ * §11.4 asymmetry applies to front panels too — snapshot-if-dirty first, so
+ * reverting never loses anything). Echoes all params so an attached DAW's
+ * knobs follow. */
+static bool panel_revert(device *d, const char *refname) {
+    harp_ref src;
+    if (harp_store_ref_read(&d->store, refname, &src) != 0 || src.unborn) return false;
+    live_cache_flush(d);
+    harp_ref live;
+    if (harp_store_ref_read(&d->store, LIVE_REF, &live) != 0) return false;
+    if (live.dirty) {
+        harp_hash snap;
+        if (do_snapshot(d, "pre-revert", &snap, NULL) != 0) return false;
+    }
+    if (engine_load_snapshot(d, &src.hash) != 0) return false;
+    live_cache_flush(d);
+    harp_store_ref_read(&d->store, LIVE_REF, &live);
+    live.unborn = false;
+    live.hash = src.hash;
+    live.generation++;
+    live.dirty = false;
+    if (harp_store_ref_write(&d->store, &live) != 0) return false;
+    ntf_state_changed(d, &live);
+    for (size_t i = 0; i < NPARAMS; i++)
+        evt_echo_param(d, g_params[i].id, g_params[i].value);
+    return true;
+}
+
 /* One panel-API connection at a time (the sidecar holds one persistent
  * connection); line in, JSON line out. */
 static void panel_serve_conn(device *d, int fd) {
@@ -1853,7 +1881,13 @@ static void panel_serve_conn(device *d, int fd) {
                 panel_json_refs(d, body, sizeof body);
             else if (strcmp(buf, "counters") == 0)
                 panel_json_counters(d, body, sizeof body);
-            else if (strncmp(buf, "knob ", 5) == 0) {
+            else if (strncmp(buf, "revert ", 7) == 0) {
+                if (panel_revert(d, buf + 7))
+                    snprintf(body, sizeof body, "{\"ok\":true}");
+                else
+                    snprintf(body, sizeof body,
+                             "{\"ok\":false,\"error\":\"unknown ref or load failed\"}");
+            } else if (strncmp(buf, "knob ", 5) == 0) {
                 unsigned id = 0;
                 double v = -1;
                 if (sscanf(buf + 5, "%u %lf", &id, &v) == 2 && v >= 0 && v <= 1 &&
