@@ -26,6 +26,11 @@ jobs:
         run: cmake -B build && cmake --build build -j
       - name: unit tests
         run: ./build/harp-tests
+      - name: ring tests under ThreadSanitizer
+        run: |
+          clang++ -std=c++17 -fsanitize=thread -O1 -g -I shell \
+              tools/vst3-host/ring_tests.cpp -o /tmp/ring-tsan
+          /tmp/ring-tsan
       - name: recall flow (simulated device, TCP transport)
         run: |
           ./build/harp-deviced --state-dir /tmp/refdev --panel-sock "" --port 47800 &

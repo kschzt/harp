@@ -25,13 +25,15 @@ button{background:#223;color:#9ab;border:1px solid #345;border-radius:.4em;
        padding:.15em .7em;font:inherit;font-size:.85em;cursor:pointer}
 button:hover{background:#2a3a4a;color:#cde}
 button.danger{border-color:#543;color:#c97}
-#actions{float:right}
+#actions{float:right;display:flex;gap:.5em;align-items:center}
+#conn{font-size:.7em;color:#555;font-weight:400;margin-right:.4em}
 td button{font-size:.75em;padding:.05em .5em}
 #conn{float:right;font-size:.75em;color:#555}
 footer{margin-top:2em;font-size:.72em;color:#555;line-height:1.5}
 </style></head><body>
-<h1>harp-refdev <span id="dirty">–</span> <span id="conn">connecting…</span>
+<h1>harp-refdev <span id="dirty">–</span>
 <span id="actions">
+<span id="conn">connecting…</span>
 <button onclick="fetch('/api/snapshot')" title="commit current state (§10.4)">Snapshot</button>
 <button class="danger" onclick="fetch('/api/panic')" title="all notes off">Panic</button>
 </span></h1>
