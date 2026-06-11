@@ -19,4 +19,9 @@ int harp_usb_audio_read(harp_io *io, void *buf, int len, unsigned timeout_ms);
 /* Write to the audio OUT endpoint (host-paced pacing/input frames, §8.3). */
 bool harp_usb_audio_write(harp_io *io, const void *buf, int len, unsigned timeout_ms);
 
+/* Asynchronous link traffic (event echoes, notifications): one short-
+ * timeout bulk read into the link buffer; true if bytes are now pending. */
+bool harp_usb_link_poll(harp_io *io, unsigned timeout_ms);
+size_t harp_usb_link_pending(harp_io *io);
+
 #endif

@@ -290,8 +290,20 @@ int main(int argc, char **argv) {
             first_block = false;
         }
         pd.inputParameterChanges = &pc;
+        ParameterChanges opc; /* plugin-originated changes (e.g. HARP echo) */
+        pd.outputParameterChanges = &opc;
 
         if (processor->process(pd) != kResultOk) die("process failed");
+
+        for (int32 i = 0; i < opc.getParameterCount(); i++) {
+            IParamValueQueue *q = opc.getParameterData(i);
+            if (!q || q->getPointCount() <= 0) continue;
+            int32 off;
+            ParamValue v;
+            if (q->getPoint(q->getPointCount() - 1, off, v) == kResultOk)
+                printf("echo: param %u -> %.4f (block %zu)\n", q->getParameterId(), v,
+                       done / block);
+        }
 
         for (size_t s = 0; s < n; s++)
             for (int32 c = 0; c < out_ch; c++)

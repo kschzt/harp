@@ -129,6 +129,23 @@ public:
             remaining -= chunk;
         }
         data.outputs[0].silenceFlags = 0;
+
+        /* device front-panel echoes (§9.4) -> output parameter changes:
+         * the sanctioned RT path for plugin-originated edits; the host
+         * updates the controller and records automation when armed */
+        {
+            uint32_t id;
+            float v;
+            while (rt.popEcho(id, v)) {
+                if (!data.outputParameterChanges) continue; /* drain regardless */
+                int32 qi = 0;
+                IParamValueQueue *q = data.outputParameterChanges->addParameterData(id, qi);
+                if (q) {
+                    int32 pi = 0;
+                    q->addPoint(0, v, pi);
+                }
+            }
+        }
         return kResultOk;
     }
 

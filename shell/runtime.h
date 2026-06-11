@@ -78,7 +78,8 @@ private:
     bool helloAndIdentity();
     bool audioStart(uint32_t rate);
     void audioStopLocked();
-    bool pushKnob(uint32_t id, float v);
+    void sendParamEvent(uint32_t id, float v); /* §9.4 set event, fire-and-forget */
+    void pollEcho();                           /* drain incoming evt stream */
 
     /* control-plane request/response under ctlMutex_ */
     bool request(harp_cbuf *req, harp_cbuf *rsp, harp_env *e);
@@ -103,6 +104,19 @@ private:
 
     FloatRing audioRing_{1 << 15}; /* 32768 floats = 16384 stereo frames */
     ParamRing paramRing_;
+    ParamRing echoRing_; /* device front-panel echoes -> outputParameterChanges */
+
+public:
+    /* audio thread: drain echoed device-side edits (§9.4 echo) */
+    bool popEcho(uint32_t &id, float &v) {
+        ParamChange c;
+        if (!echoRing_.pop(c)) return false;
+        id = c.id;
+        v = c.value;
+        return true;
+    }
+
+private:
     uint64_t ssi_ = 0;
     uint64_t framesSent_ = 0, framesRecv_ = 0;
     uint64_t ahead_ = 4; /* adaptive in-flight cap (learned, §8.3 note) */

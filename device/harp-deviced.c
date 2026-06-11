@@ -98,6 +98,10 @@ typedef struct {
     bool live_cache_valid;
     uint64_t last_live_ntf_ms;
 
+    /* knob sources are multi-threaded now (session loop, HTTP panel):
+     * send_mu serializes link writes; state_mu guards the live-ref cache */
+    pthread_mutex_t send_mu, state_mu;
+
     /* counters (§14.2) */
     uint64_t frame_errors, session_resets, snapshots_taken, audio_overruns;
 } device;
@@ -424,17 +428,26 @@ fail:
     return -1;
 }
 
+/* Canonical parameter descriptor array (§9.3). param-map-hash is the
+ * SHA-256 of this exact deterministic encoding — identity and evt.params
+ * MUST agree. */
+static void encode_param_array(harp_cbuf *b) {
+    harp_cbor_array(b, NPARAMS);
+    for (size_t i = 0; i < NPARAMS; i++) {
+        harp_cbor_map(b, 3);
+        harp_cbor_uint(b, 0);
+        harp_cbor_uint(b, g_params[i].id);
+        harp_cbor_uint(b, 1);
+        harp_cbor_text(b, g_params[i].name);
+        harp_cbor_uint(b, 8);
+        harp_cbor_uint(b, 0x1); /* flags: automatable */
+    }
+}
+
 static void compute_param_map_hash(device *d) {
     harp_cbuf b;
     harp_cbuf_init(&b);
-    harp_cbor_array(&b, NPARAMS);
-    for (size_t i = 0; i < NPARAMS; i++) {
-        harp_cbor_map(&b, 2);
-        harp_cbor_uint(&b, 0);
-        harp_cbor_uint(&b, g_params[i].id);
-        harp_cbor_uint(&b, 1);
-        harp_cbor_text(&b, g_params[i].name);
-    }
+    encode_param_array(&b);
     d->param_map_hash = harp_hash_compute(b.buf, b.len);
     harp_cbuf_free(&b);
 }
@@ -442,7 +455,34 @@ static void compute_param_map_hash(device *d) {
 /* ---------------- wire helpers ---------------- */
 
 static int send_ctl(device *d, const harp_cbuf *msg) {
-    return harp_link_send(d->io, HARP_STREAM_CTL, msg->buf, msg->len);
+    pthread_mutex_lock(&d->send_mu);
+    int rc = harp_link_send(d->io, HARP_STREAM_CTL, msg->buf, msg->len);
+    pthread_mutex_unlock(&d->send_mu);
+    return rc;
+}
+
+/* Echo a base-value change as a param event on the evt stream (§9.4:
+ * REQUIRED for front-panel and internally-driven changes; host-driven
+ * param events are NOT echoed back). Timestamp (0,0) = "now" until the
+ * timestamping slice lands. */
+static void evt_echo_param(device *d, uint32_t id, float v) {
+    if (!d->io || !d->hello_done) return;
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    harp_cbor_array(&m, 3);
+    harp_cbor_array(&m, 2);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, 1); /* etype: param */
+    harp_cbor_map(&m, 2);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, id);
+    harp_cbor_uint(&m, 1);
+    harp_cbor_float(&m, v);
+    pthread_mutex_lock(&d->send_mu);
+    harp_link_send(d->io, HARP_STREAM_EVT, m.buf, m.len);
+    pthread_mutex_unlock(&d->send_mu);
+    harp_cbuf_free(&m);
 }
 
 static void ntf_state_changed(device *d, const harp_ref *r) {
@@ -520,13 +560,15 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, PROTO_MAJOR);
     harp_cbor_uint(m, PROTO_MINOR);
     harp_cbor_uint(m, 6); /* capabilities */
-    harp_cbor_array(m, 7);
+    harp_cbor_array(m, 9);
     harp_cbor_text(m, "harp-core");
     harp_cbor_text(m, "harp-recall");
     harp_cbor_text(m, "harp-stream");
     harp_cbor_text(m, "audio.host-paced");
     harp_cbor_text(m, "audio.deterministic");
     harp_cbor_text(m, "audio.offline-rate");
+    harp_cbor_text(m, "evt.param");
+    harp_cbor_text(m, "evt.param.echo");
     harp_cbor_text(m, "x.harp-refdev.sim");
     harp_cbor_uint(m, 7); /* channel map (§6.3): stereo main mix, D→H */
     harp_cbor_array(m, 2);
@@ -567,8 +609,12 @@ static void encode_identity(device *d, harp_cbuf *m) {
 /* Bump generation + dirty on the live ref. Persists only the clean->dirty
  * transition; later bumps coalesce in memory (see device struct comment). */
 static void live_ref_touch(device *d, bool dirty) {
+    pthread_mutex_lock(&d->state_mu);
     if (!d->live_cache_valid) {
-        if (harp_store_ref_read(&d->store, LIVE_REF, &d->live_cache) != 0) return;
+        if (harp_store_ref_read(&d->store, LIVE_REF, &d->live_cache) != 0) {
+            pthread_mutex_unlock(&d->state_mu);
+            return;
+        }
         d->live_cache_valid = true;
     }
     bool transition = dirty && !d->live_cache.dirty;
@@ -576,17 +622,38 @@ static void live_ref_touch(device *d, bool dirty) {
     d->live_cache.dirty = dirty;
     if (transition) harp_store_ref_write(&d->store, &d->live_cache);
     uint64_t now = now_ms();
-    if (transition || now - d->last_live_ntf_ms >= 250) {
-        ntf_state_changed(d, &d->live_cache);
-        d->last_live_ntf_ms = now;
-    }
+    bool do_ntf = transition || now - d->last_live_ntf_ms >= 250;
+    harp_ref snapshot_ref = d->live_cache;
+    if (do_ntf) d->last_live_ntf_ms = now;
+    pthread_mutex_unlock(&d->state_mu);
+    if (do_ntf) ntf_state_changed(d, &snapshot_ref);
 }
 
 /* Flush the coalesced live ref before anything reads it from storage. */
 static void live_cache_flush(device *d) {
-    if (!d->live_cache_valid) return;
-    harp_store_ref_write(&d->store, &d->live_cache);
-    d->live_cache_valid = false; /* re-read after external mutation */
+    pthread_mutex_lock(&d->state_mu);
+    if (d->live_cache_valid) {
+        harp_store_ref_write(&d->store, &d->live_cache);
+        d->live_cache_valid = false; /* re-read after external mutation */
+    }
+    pthread_mutex_unlock(&d->state_mu);
+}
+
+/* The one true front-panel path: web panel, vendor knob method, and any
+ * future GPIO encoders all come through here — set, dirty, echo. */
+static bool front_panel_set(device *d, uint32_t id, double v) {
+    bool found = false;
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    for (size_t i = 0; i < NPARAMS; i++)
+        if (g_params[i].id == id) {
+            g_params[i].value = (float)v;
+            found = true;
+        }
+    if (!found) return false;
+    live_ref_touch(d, true);
+    evt_echo_param(d, id, (float)v);
+    return true;
 }
 
 static int do_snapshot(device *d, const char *msg, harp_hash *out, uint64_t *out_gen) {
@@ -1143,6 +1210,64 @@ static void handle_audio_stop(device *d, const harp_env *e) {
     harp_cbuf_free(&m);
 }
 
+/* evt.params (§9.3): the descriptor set */
+static void handle_evt_params(device *d, const harp_env *e) {
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, true);
+    harp_cbor_map(&m, 4);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_bytes(&m, d->param_map_hash.b, HARP_HASH_LEN);
+    harp_cbor_uint(&m, 1);
+    encode_param_array(&m);
+    harp_cbor_uint(&m, 2);
+    harp_cbor_uint(&m, 1000); /* control rate, Hz */
+    harp_cbor_uint(&m, 3);
+    harp_cbor_uint(&m, 4000); /* max sustained events/s */
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+
+/* evt stream (§9.2): timestamped event messages. Slice 1: etype 1 (param
+ * set) applied at "now"; other types skipped. Events have no responses.
+ * Host-driven sets do NOT echo (§9.4). */
+static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
+    harp_cdec dec;
+    harp_cdec_init(&dec, buf, len);
+    uint64_t alen, tn, ep, msc, etype;
+    if (!harp_cdec_array(&dec, &alen) || alen < 3 || !harp_cdec_array(&dec, &tn) ||
+        tn != 2 || !harp_cdec_uint(&dec, &ep) || !harp_cdec_uint(&dec, &msc) ||
+        !harp_cdec_uint(&dec, &etype)) {
+        d->frame_errors++;
+        return;
+    }
+    if (etype != 1) return; /* unknown event types are skipped, not fatal */
+    uint64_t n, key, id = 0;
+    double v = 0;
+    bool have_id = false, have_v = false;
+    if (!harp_cdec_map(&dec, &n)) {
+        d->frame_errors++;
+        return;
+    }
+    for (uint64_t i = 0; i < n; i++) {
+        if (!harp_cdec_uint(&dec, &key)) return;
+        if (key == 0) {
+            if (!harp_cdec_uint(&dec, &id)) return;
+            have_id = true;
+        } else if (key == 1) {
+            if (!harp_cdec_float(&dec, &v)) return;
+            have_v = true;
+        } else if (!harp_cdec_skip(&dec))
+            return;
+    }
+    if (!have_id || !have_v) return;
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    for (size_t i = 0; i < NPARAMS; i++)
+        if (g_params[i].id == id) g_params[i].value = (float)v;
+    live_ref_touch(d, true);
+}
+
 /* x.harp-refdev.knob {0: param-id, 1: value} — front-panel simulation */
 static void handle_knob(device *d, const harp_env *e) {
     uint64_t id = 0;
@@ -1163,20 +1288,10 @@ static void handle_knob(device *d, const harp_env *e) {
         send_error(d, e->rid, e->method, "malformed", NULL);
         return;
     }
-    bool found = false;
-    for (size_t i = 0; i < NPARAMS; i++) {
-        if (g_params[i].id == id) {
-            if (v < 0) v = 0;
-            if (v > 1) v = 1;
-            g_params[i].value = (float)v;
-            found = true;
-        }
-    }
-    if (!found) {
+    if (!front_panel_set(d, (uint32_t)id, v)) {
         send_error(d, e->rid, e->method, "not-found", "no such param");
         return;
     }
-    live_ref_touch(d, true); /* any knob turn: dirty=true, generation++ (§10.3) */
     harp_cbuf m;
     harp_cbuf_init(&m);
     rsp_head(&m, e->rid, e->method, false);
@@ -1261,6 +1376,8 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
         handle_state_send(d, &e);
     else if (strcmp(e.method, "state.refset") == 0)
         handle_state_refset(d, &e);
+    else if (strcmp(e.method, "evt.params") == 0)
+        handle_evt_params(d, &e);
     else if (strcmp(e.method, "audio.start") == 0)
         handle_audio_start(d, &e);
     else if (strcmp(e.method, "audio.stop") == 0)
@@ -1297,6 +1414,152 @@ static void handle_obj(device *d, const uint8_t *buf, size_t len) {
     if (d->granted < CREDIT_GRANT / 2) grant_credit(d);
 }
 
+/* ---------------- web panel (device frontend) ----------------
+ *
+ * The refdev's "front panel": a browser page of sliders served by the
+ * device itself, plus a JSON API (curl-able, agent-drivable). Changes made
+ * here are front-panel edits in the §3.3 sense: they dirty the live ref
+ * and echo as param events, exactly like hands on hardware knobs.
+ *
+ *   GET  /                      the panel
+ *   GET  /api/params            {"product","serial","dirty","params":[..]}
+ *   GET  /api/knob?id=N&value=F set one param (also accepts POST)
+ */
+
+static const char *PANEL_HTML =
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>harp-refdev</title><style>"
+    "body{background:#111;color:#ddd;font-family:ui-monospace,monospace;"
+    "max-width:560px;margin:2em auto;padding:0 1em}"
+    "h1{font-size:1.1em;font-weight:600}#dirty{display:inline-block;"
+    "padding:.1em .5em;border-radius:.6em;font-size:.8em;margin-left:.6em;"
+    "background:#243;color:#7c7}#dirty.on{background:#421;color:#e96}"
+    ".p{display:flex;align-items:center;gap:.8em;margin:.7em 0}"
+    ".p label{flex:0 0 9em}.p input{flex:1;accent-color:#7ac}"
+    ".p span{flex:0 0 3.5em;text-align:right;color:#9ab}"
+    "footer{margin-top:2em;font-size:.75em;color:#666}"
+    "</style></head><body><h1>harp-refdev <span id='dirty'>clean</span></h1>"
+    "<div id='params'></div>"
+    "<footer>HARP reference device · front panel · edits dirty the live ref "
+    "and echo to the host as events</footer>"
+    "<script>\n"
+    "let dragging=null;\n"
+    "async function load(){const r=await fetch('/api/params');const s=await r.json();\n"
+    " document.getElementById('dirty').textContent=s.dirty?'dirty':'clean';\n"
+    " document.getElementById('dirty').className=s.dirty?'on':'';\n"
+    " const c=document.getElementById('params');\n"
+    " if(!c.childElementCount){for(const p of s.params){\n"
+    "  const d=document.createElement('div');d.className='p';\n"
+    "  d.innerHTML=`<label>${p.name}</label><input type='range' min='0' max='1000' "
+    "data-id='${p.id}' value='${Math.round(p.value*1000)}'>"
+    "<span>${p.value.toFixed(3)}</span>`;\n"
+    "  const inp=d.querySelector('input'),sp=d.querySelector('span');\n"
+    "  inp.oninput=()=>{const v=inp.value/1000;sp.textContent=v.toFixed(3);\n"
+    "   dragging=p.id;fetch(`/api/knob?id=${p.id}&value=${v}`);};\n"
+    "  inp.onchange=()=>{dragging=null;};\n"
+    "  c.appendChild(d);}}\n"
+    " else{for(const p of s.params){if(p.id===dragging)continue;\n"
+    "  const inp=c.querySelector(`input[data-id='${p.id}']`);\n"
+    "  if(inp&&document.activeElement!==inp){inp.value=Math.round(p.value*1000);\n"
+    "   inp.nextElementSibling.textContent=p.value.toFixed(3);}}}\n"
+    "}\n"
+    "load();setInterval(load,300);\n"
+    "</script></body></html>";
+
+static void http_reply(int fd, const char *status, const char *ctype, const char *body) {
+    char hdr[256];
+    size_t blen = strlen(body);
+    int n = snprintf(hdr, sizeof hdr,
+                     "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+                     "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+                     status, ctype, blen);
+    harp_write_all(fd, hdr, (size_t)n);
+    harp_write_all(fd, body, blen);
+}
+
+static void http_handle(device *d, int fd) {
+    char req[2048];
+    ssize_t n = read(fd, req, sizeof req - 1);
+    if (n <= 0) return;
+    req[n] = 0;
+    char path[512] = "";
+    if (sscanf(req, "GET %511s", path) != 1 && sscanf(req, "POST %511s", path) != 1) {
+        http_reply(fd, "400 Bad Request", "text/plain", "bad request\n");
+        return;
+    }
+    if (strcmp(path, "/") == 0) {
+        http_reply(fd, "200 OK", "text/html; charset=utf-8", PANEL_HTML);
+    } else if (strcmp(path, "/api/params") == 0) {
+        char body[2048];
+        size_t off = 0;
+        pthread_mutex_lock(&d->state_mu);
+        bool dirty = d->live_cache_valid ? d->live_cache.dirty : false;
+        if (!d->live_cache_valid) {
+            harp_ref r;
+            if (harp_store_ref_read(&d->store, LIVE_REF, &r) == 0) dirty = r.dirty;
+        }
+        pthread_mutex_unlock(&d->state_mu);
+        off += (size_t)snprintf(body + off, sizeof body - off,
+                                "{\"product\":\"harp-refdev\",\"serial\":\"%s\","
+                                "\"dirty\":%s,\"params\":[",
+                                d->serial, dirty ? "true" : "false");
+        for (size_t i = 0; i < NPARAMS; i++)
+            off += (size_t)snprintf(body + off, sizeof body - off,
+                                    "%s{\"id\":%u,\"name\":\"%s\",\"value\":%.4f}",
+                                    i ? "," : "", g_params[i].id, g_params[i].name,
+                                    g_params[i].value);
+        snprintf(body + off, sizeof body - off, "]}");
+        http_reply(fd, "200 OK", "application/json", body);
+    } else if (strncmp(path, "/api/knob?", 10) == 0) {
+        unsigned id = 0;
+        double v = -1;
+        const char *q = path + 10;
+        const char *idp = strstr(q, "id=");
+        const char *vp = strstr(q, "value=");
+        if (idp) id = (unsigned)strtoul(idp + 3, NULL, 10);
+        if (vp) v = strtod(vp + 6, NULL);
+        if (!idp || !vp || v < 0 || v > 1 || !front_panel_set(d, id, v))
+            http_reply(fd, "400 Bad Request", "application/json",
+                       "{\"ok\":false,\"error\":\"id 1..8, value 0..1\"}");
+        else
+            http_reply(fd, "200 OK", "application/json", "{\"ok\":true}");
+    } else {
+        http_reply(fd, "404 Not Found", "text/plain", "not found\n");
+    }
+}
+
+struct http_args {
+    device *d;
+    int port;
+};
+
+static void *http_main(void *arg) {
+    struct http_args *a = arg;
+    int sfd = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)a->port);
+    if (bind(sfd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(sfd, 8) != 0) {
+        fprintf(stderr, "harp-deviced: web panel: cannot listen on %d\n", a->port);
+        return NULL;
+    }
+    fprintf(stderr, "harp-deviced: web panel on http://0.0.0.0:%d/\n", a->port);
+    for (;;) {
+        int cfd = accept(sfd, NULL, NULL);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        http_handle(a->d, cfd);
+        close(cfd);
+    }
+    return NULL;
+}
+
 /* ---------------- session / main ---------------- */
 
 void harp_deviced_run_session(device *d, harp_io *io) {
@@ -1318,7 +1581,8 @@ void harp_deviced_run_session(device *d, harp_io *io) {
             handle_ctl(d, msg.buf, msg.len);
         else if (stream == HARP_STREAM_OBJ)
             handle_obj(d, msg.buf, msg.len);
-        /* evt/log: not yet */
+        else if (stream == HARP_STREAM_EVT)
+            handle_evt_msg(d, msg.buf, msg.len);
         if (d->closing) break;
     }
     harp_cbuf_free(&msg);
@@ -1363,6 +1627,7 @@ int main(int argc, char **argv) {
     const char *ffs_dir = NULL;
     const char *gadget = "/sys/kernel/config/usb_gadget/harp";
     int port = 47800;
+    int http_port = 8080; /* 0 disables the web panel */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc)
             state_dir = argv[++i];
@@ -1374,9 +1639,11 @@ int main(int argc, char **argv) {
             ffs_dir = argv[++i];
         else if (strcmp(argv[i], "--gadget") == 0 && i + 1 < argc)
             gadget = argv[++i];
+        else if (strcmp(argv[i], "--http") == 0 && i + 1 < argc)
+            http_port = atoi(argv[++i]);
         else {
             fprintf(stderr,
-                    "usage: harp-deviced [--state-dir DIR] [--serial S] "
+                    "usage: harp-deviced [--state-dir DIR] [--serial S] [--http PORT] "
                     "[--port P | --ffs FFS_DIR [--gadget CONFIGFS_PATH]]\n");
             return 2;
         }
@@ -1393,6 +1660,17 @@ int main(int argc, char **argv) {
     }
     d->boot_count = bump_boot_count(state_dir);
     compute_param_map_hash(d);
+    pthread_mutex_init(&d->send_mu, NULL);
+    pthread_mutex_init(&d->state_mu, NULL);
+
+    if (http_port > 0) {
+        static struct http_args ha;
+        ha.d = d;
+        ha.port = http_port;
+        pthread_t ht;
+        pthread_create(&ht, NULL, http_main, &ha);
+        pthread_detach(ht);
+    }
 
     /* Recall across power cycles: load the live ref if clean; first boot
      * snapshots the factory state so the ref is born. */

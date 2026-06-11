@@ -203,6 +203,20 @@ int harp_usb_audio_read(harp_io *io, void *buf, int len, unsigned timeout_ms) {
     return -1;
 }
 
+bool harp_usb_link_poll(harp_io *io, unsigned timeout_ms) {
+    usb_io *u = (usb_io *)io;
+    if (u->pos < u->pend.len) return true;
+    harp_cbuf_reset(&u->pend);
+    u->pos = 0;
+    if (!usb_fill(u, timeout_ms ? timeout_ms : 1)) return false;
+    return u->pend.len > u->pos;
+}
+
+size_t harp_usb_link_pending(harp_io *io) {
+    usb_io *u = (usb_io *)io;
+    return u->pend.len - u->pos;
+}
+
 bool harp_usb_audio_write(harp_io *io, const void *buf, int len, unsigned timeout_ms) {
     usb_io *u = (usb_io *)io;
     int sent = 0;

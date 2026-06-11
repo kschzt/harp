@@ -208,21 +208,66 @@ void HarpRuntime::audioStopLocked() {
     harp_cbuf_free(&rsp);
 }
 
-bool HarpRuntime::pushKnob(uint32_t id, float v) {
-    harp_cbuf req, rsp;
-    harp_cbuf_init(&req);
-    harp_cbuf_init(&rsp);
-    req_head(&req, ++nextRid_, "x.harp-refdev.knob", true);
-    harp_cbor_map(&req, 2);
-    harp_cbor_uint(&req, 0);
-    harp_cbor_uint(&req, id);
-    harp_cbor_uint(&req, 1);
-    harp_cbor_float(&req, v);
-    harp_env e;
-    bool ok = request(&req, &rsp, &e);
-    harp_cbuf_free(&req);
-    harp_cbuf_free(&rsp);
-    return ok;
+/* Param set as a §9.4 event on the evt stream: fire-and-forget, no
+ * response, no round trip — the reason slider drags stopped costing
+ * anything. Timestamp (0,0) = "now" until the timestamping slice. */
+void HarpRuntime::sendParamEvent(uint32_t id, float v) {
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    harp_cbor_array(&m, 3);
+    harp_cbor_array(&m, 2);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, 1); /* etype: param */
+    harp_cbor_map(&m, 2);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, id);
+    harp_cbor_uint(&m, 1);
+    harp_cbor_float(&m, v);
+    {
+        std::lock_guard<std::mutex> lk(ctlMutex_);
+        harp_link_send(io_, HARP_STREAM_EVT, m.buf, m.len);
+    }
+    harp_cbuf_free(&m);
+}
+
+/* Drain any asynchronous inbound link traffic: evt echoes (-> echoRing_)
+ * and notifications. Non-blocking-ish: one short-timeout fill, then
+ * consume complete messages. */
+void HarpRuntime::pollEcho() {
+    std::unique_lock<std::mutex> lk(ctlMutex_, std::try_to_lock);
+    if (!lk.owns_lock()) return; /* a state op owns the link; echoes wait */
+    if (!harp_usb_link_poll(io_, 1)) return;
+    while (harp_usb_link_pending(io_) > 0) {
+        uint8_t stream;
+        if (harp_link_recv(io_, &link_, &stream, &msg_) != 0) return;
+        if (stream == HARP_STREAM_EVT) {
+            harp_cdec dec;
+            harp_cdec_init(&dec, msg_.buf, msg_.len);
+            uint64_t alen, tn, ep, ts, etype;
+            if (!harp_cdec_array(&dec, &alen) || alen < 3 ||
+                !harp_cdec_array(&dec, &tn) || tn != 2 || !harp_cdec_uint(&dec, &ep) ||
+                !harp_cdec_uint(&dec, &ts) || !harp_cdec_uint(&dec, &etype))
+                continue;
+            if (etype != 1) continue;
+            uint64_t n, key, id = 0;
+            double v = 0;
+            bool ok = harp_cdec_map(&dec, &n);
+            for (uint64_t i = 0; ok && i < n; i++) {
+                if (!harp_cdec_uint(&dec, &key)) break;
+                if (key == 0)
+                    ok = harp_cdec_uint(&dec, &id);
+                else if (key == 1)
+                    ok = harp_cdec_float(&dec, &v);
+                else
+                    ok = harp_cdec_skip(&dec);
+            }
+            if (ok) echoRing_.push({(uint32_t)id, (float)v});
+        } else if (stream == HARP_STREAM_OBJ && storeOk_) {
+            harp_store_put(&store_, msg_.buf, msg_.len, nullptr);
+        }
+        /* ctl notifications: tolerated and dropped for now */
+    }
 }
 
 /* ---------------- lifecycle ---------------- */
@@ -425,14 +470,16 @@ void HarpRuntime::feeder() {
             accLen -= off;
         }
 
-        /* 4. push at most ONE knob per iteration, and only with audio
-         * headroom — each push is a blocking control-plane round trip */
-        if (npending && audioRing_.readAvailable() / 2 >= kBlock) {
-            std::lock_guard<std::mutex> lk(ctlMutex_);
-            pushKnob(pending[0].id, pending[0].value);
-            memmove(&pending[0], &pending[1], (--npending) * sizeof pending[0]);
+        /* 4. param events: fire-and-forget on the evt stream (§9.4) — no
+         * round trip, so flush all coalesced values at once */
+        while (npending) {
+            sendParamEvent(pending[npending - 1].id, pending[npending - 1].value);
+            npending--;
             didWork = true;
         }
+
+        /* 5. inbound async traffic: front-panel echoes -> echoRing_ */
+        pollEcho();
 
         if (!didWork) {
             struct timespec ts = {0, 1000000}; /* 1 ms */
