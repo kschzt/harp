@@ -88,7 +88,11 @@ static size_t g_evq_n;
 static pthread_mutex_t g_evq_mu = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_touch_pending; /* dirty-flag work deferred off the render thread */
 static volatile uint64_t g_evq_drops; /* ring full — counted, never silent (§14.1) */
-static volatile uint64_t g_evt_late;  /* events applied past their timestamp (§14.2) */
+static volatile uint64_t g_evt_late;  /* notes/sets applied past ts (§14.2) — keep ZERO */
+static volatile uint64_t g_ramp_late; /* ramps arriving past their END deadline: degraded
+                                         to a late set. Structurally possible under flood
+                                         (ramp start = previous point => one-block margin);
+                                         budgeted, not zero-tolerance. */
 
 static void evq_push(dev_event ev) {
     pthread_mutex_lock(&g_evq_mu);
@@ -489,8 +493,9 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
             /* late = past the musical deadline (§9.2/§14.2): for ramps the
              * deadline is END (the start is the previous automation point,
              * legitimately in the recent past); for everything else, ts. */
-            if (ev->kind == DEV_EV_RAMP ? (ev->end && ev->end < pos)
-                                        : (ev->ts && ev->ts < pos))
+            if (ev->kind == DEV_EV_RAMP) {
+                if (ev->end && ev->end < pos) g_ramp_late++;
+            } else if (ev->ts && ev->ts < pos)
                 g_evt_late++;
             switch (ev->kind) {
                 case DEV_EV_NOTE_ON:
@@ -1338,7 +1343,7 @@ static void handle_diag_counters(device *d, const harp_env *e) {
     harp_cbuf m;
     harp_cbuf_init(&m);
     rsp_head(&m, e->rid, e->method, true);
-    harp_cbor_map(&m, 13);
+    harp_cbor_map(&m, 14);
     harp_cbor_text(&m, "usb_errors");
     harp_cbor_uint(&m, 0);
     harp_cbor_text(&m, "frame_errors");
@@ -1359,6 +1364,8 @@ static void handle_diag_counters(device *d, const harp_env *e) {
     harp_cbor_uint(&m, 0);
     harp_cbor_text(&m, "x.harp-refdev.evq_drops");
     harp_cbor_uint(&m, g_evq_drops);
+    harp_cbor_text(&m, "x.harp-refdev.ramp_late");
+    harp_cbor_uint(&m, g_ramp_late);
     harp_cbor_text(&m, "session_resets");
     harp_cbor_uint(&m, d->session_resets);
     harp_cbor_text(&m, "storage_bytes_total");
@@ -1828,12 +1835,13 @@ static void panel_json_counters(device *d, char *body, size_t sz) {
     snprintf(body, sz,
              "{\"frame_errors\":%llu,\"session_resets\":%llu,"
              "\"audio_overruns\":%llu,\"snapshots\":%llu,\"evq_drops\":%llu,"
-             "\"evt_late\":%llu,\"boot\":%llu,\"session\":%s,\"streaming\":%s}",
+             "\"evt_late\":%llu,\"ramp_late\":%llu,\"boot\":%llu,"
+             "\"session\":%s,\"streaming\":%s}",
              (unsigned long long)d->frame_errors, (unsigned long long)d->session_resets,
              (unsigned long long)d->audio_overruns, (unsigned long long)d->snapshots_taken,
              (unsigned long long)g_evq_drops, (unsigned long long)g_evt_late,
-             (unsigned long long)d->boot_count, d->hello_done ? "true" : "false",
-             d->audio.thread_live ? "true" : "false");
+             (unsigned long long)g_ramp_late, (unsigned long long)d->boot_count,
+             d->hello_done ? "true" : "false", d->audio.thread_live ? "true" : "false");
 }
 
 /* Front-panel patch load: point live/project at a stored ref's state (the

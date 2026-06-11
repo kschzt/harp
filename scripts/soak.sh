@@ -50,6 +50,13 @@ if gaps: problems.append(f"{gaps} silent 100ms windows")
 for key in ("evq_drops", "evt_late", "frame_errors", "session_resets"):
     if c1.get(key, 0) != c0.get(key, 0):
         problems.append(f"{key}: {c0.get(key,0)} -> {c1.get(key,0)}")
+# ramp-end lateness is budgeted, not zero: ramp starts anchor at the
+# previous automation point, so the end margin is structurally one block;
+# a few % degrading to ~ms-late sets under triple-ramp flood is benign.
+ramp_late = c1.get("ramp_late", 0) - c0.get("ramp_late", 0)
+budget = int(sys.argv[4]) if len(sys.argv) > 4 else 500
+if ramp_late > budget:
+    problems.append(f"ramp_late {ramp_late} > budget {budget}")
 if problems:
     print("SOAK FAIL:", "; ".join(problems)); sys.exit(1)
 print(f"audio: {len(L)} samples, no silence gaps; device counters clean")

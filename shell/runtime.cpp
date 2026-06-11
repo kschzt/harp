@@ -61,7 +61,29 @@ bool HarpRuntime::request(harp_cbuf *req, harp_cbuf *rsp, harp_env *e) {
         if (pe.msgtype == HARP_MSG_NOTIFICATION) continue;
         if (pe.rid != rid) continue;
         if (pe.msgtype == HARP_MSG_ERROR) {
-            log_msg("device error on %s", pe.method);
+            char code[64] = "?", emsg[128] = "";
+            if (pe.has_body) {
+                harp_cdec b;
+                harp_cdec_init(&b, pe.body, pe.body_len);
+                uint64_t n, key;
+                const char *s;
+                size_t sl;
+                if (harp_cdec_map(&b, &n)) {
+                    for (uint64_t i = 0; i < n; i++) {
+                        if (!harp_cdec_uint(&b, &key)) break;
+                        if (key == 0 && harp_cdec_text(&b, &s, &sl) && sl < sizeof code) {
+                            memcpy(code, s, sl);
+                            code[sl] = 0;
+                        } else if (key == 1 && harp_cdec_text(&b, &s, &sl) &&
+                                   sl < sizeof emsg) {
+                            memcpy(emsg, s, sl);
+                            emsg[sl] = 0;
+                        } else if (key > 1 && !harp_cdec_skip(&b))
+                            break;
+                    }
+                }
+            }
+            log_msg("device error on %s: %s %s", pe.method, code, emsg);
             return false;
         }
         harp_cbuf_reset(rsp);
