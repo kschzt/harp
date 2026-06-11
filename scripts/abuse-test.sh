@@ -11,6 +11,10 @@ cd "$(dirname "$0")/.."
 DEVICED=${DEVICED:-build/harp-deviced}
 PROBE=${PROBE:-build/harp-probe}
 PORT=${PORT:-47821}
+# ASan builds: this test is about crashes/UB under hostile input, not
+# CLI-tool exit leaks (Linux ASan turns leak detection on by default and
+# would fail the probe's demo for unrelated reasons)
+export ASAN_OPTIONS="detect_leaks=0${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
 STATE=$(mktemp -d /tmp/harp-abuse.XXXXXX)
 STORE=$(mktemp -d /tmp/harp-abuse-store.XXXXXX)
 
@@ -95,10 +99,11 @@ EOF
 kill -0 "$DPID" || { echo "ABUSE FAIL: daemon died"; exit 1; }
 
 # ...and still serve a well-behaved client end-to-end
-"$PROBE" -d 127.0.0.1:"$PORT" -s "$STORE" demo >/dev/null 2>&1 || {
+if ! "$PROBE" -d 127.0.0.1:"$PORT" -s "$STORE" demo >/tmp/abuse-demo.log 2>&1; then
     echo "ABUSE FAIL: daemon unresponsive after abuse"
+    tail -15 /tmp/abuse-demo.log
     exit 1
-}
+fi
 
 RESETS=$("$PROBE" -d 127.0.0.1:"$PORT" -s "$STORE" counters 2>/dev/null \
     | grep -E 'session_resets|frame_errors' | tr -d ' ' || true)
