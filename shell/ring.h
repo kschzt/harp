@@ -92,6 +92,10 @@ public:
         tail_.store(t + 1, std::memory_order_release);
         return true;
     }
+    bool empty() const {
+        return tail_.load(std::memory_order_relaxed) ==
+               head_.load(std::memory_order_acquire);
+    }
 
 private:
     static constexpr size_t kCap = 1024;

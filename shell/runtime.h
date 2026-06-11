@@ -140,6 +140,7 @@ private:
     std::atomic<uint64_t> padSamples_{0}; /* total silence padded — severity, not count */
     std::atomic<uint64_t> evDrops_{0};    /* events lost to ring overflow — never silent */
     uint64_t evDropsLogged_ = 0;
+    std::atomic<bool> panicPending_{false}; /* a note-off was lost: all-off NOW */
 
     FloatRing audioRing_{1 << 15}; /* 32768 floats = 16384 stereo frames */
     std::atomic<uint64_t> framesRecvAtomic_{0}; /* written by reader, read by feeder */

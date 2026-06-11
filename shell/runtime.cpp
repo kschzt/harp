@@ -333,6 +333,15 @@ bool HarpRuntime::start(uint32_t sampleRate) {
 }
 
 void HarpRuntime::stop() {
+    /* Flush in-flight events before teardown: the DAW's final note-offs
+     * arrive in the last process() blocks, and killing the feeder with
+     * them still queued is how notes get stuck. Bounded wait. */
+    if (running_.load(std::memory_order_acquire)) {
+        for (int i = 0; i < 100 && !timedRing_.empty(); i++) {
+            struct timespec ts = {0, 1000000};
+            nanosleep(&ts, nullptr);
+        }
+    }
     if (!running_.exchange(false)) {
         if (io_) {
             harp_usb_close(io_);
@@ -373,8 +382,15 @@ void HarpRuntime::queueRamp(uint32_t id, float target, uint64_t start, uint64_t 
         evDrops_.fetch_add(1, std::memory_order_relaxed);
 }
 void HarpRuntime::queueNote(uint32_t word, uint64_t ts) {
-    if (!timedRing_.push({2, word, 0.0f, ts, 0}))
+    if (!timedRing_.push({2, word, 0.0f, ts, 0})) {
         evDrops_.fetch_add(1, std::memory_order_relaxed);
+        /* A dropped note-ON is a missing note; a dropped note-OFF is a
+         * note that never stops. If anything but a note-on is lost,
+         * escalate to all-notes-off — silence beats a stuck drone. */
+        uint32_t status = (word >> 20) & 0xf, vel = word & 0x7f;
+        bool isNoteOn = status == 0x9 && vel > 0;
+        if (!isNoteOn) panicPending_.store(true, std::memory_order_release);
+    }
 }
 
 /* UMP event (§9.10): etype 0, body = one packet, words big-endian. */
@@ -479,6 +495,18 @@ void HarpRuntime::feeder() {
          * writes below never stall (§4.2.1; learned the hard way under
          * automation flood) */
         pollEcho();
+
+        /* 1b. escalated panic: a note-off was lost to overflow — send
+         * all-notes-off (CC 123) ahead of everything else */
+        if (panicPending_.exchange(false, std::memory_order_acq_rel)) {
+            harp_cbuf m;
+            harp_cbuf_init(&m);
+            encodeUmpEvent(&m, 0x20B07B00u, 0); /* CC 123, now */
+            std::lock_guard<std::mutex> lk(ctlMutex_);
+            harp_link_send(io_, HARP_STREAM_EVT, m.buf, m.len);
+            harp_cbuf_free(&m);
+            log_msg("WARNING: note-off lost to overflow; sent all-notes-off");
+        }
 
         /* 2. timestamped events (params, ramps, notes — §9.2/§9.4/§9.10),
          * sent BEFORE pacing: a pacing frame triggers the render of its

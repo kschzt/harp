@@ -72,7 +72,7 @@ static volatile uint32_t g_note_seq = 0; /* bumps on every note-on (retrigger) *
 /* ---- timestamped event queue (§9.2): session thread pushes, render
  * thread pops at exact stream positions. ts is SSI (host-paced) or MSC
  * (free-running); ts == 0 means "now". ---- */
-enum { DEV_EV_NOTE_ON, DEV_EV_NOTE_OFF, DEV_EV_PARAM_SET, DEV_EV_RAMP };
+enum { DEV_EV_NOTE_ON, DEV_EV_NOTE_OFF, DEV_EV_PARAM_SET, DEV_EV_RAMP, DEV_EV_ALL_OFF };
 
 typedef struct {
     uint64_t ts;   /* apply at this stream position (0 = asap) */
@@ -118,6 +118,9 @@ static void evq_reset_for_new_stream(void) {
     g_evq_n = 0;
     pthread_mutex_unlock(&g_evq_mu);
     memset(g_ramps, 0, sizeof g_ramps);
+    /* notes are performance state OF A STREAM: a note held across a stream
+     * stop/restart is a stuck note (its note-off died with the old stream) */
+    g_note = -1;
 }
 
 /* audio plane state (§8): one D→H stream.
@@ -495,6 +498,9 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                 case DEV_EV_NOTE_OFF:
                     if (g_note == (int)ev->a) g_note = -1;
                     break;
+                case DEV_EV_ALL_OFF:
+                    g_note = -1;
+                    break;
                 case DEV_EV_PARAM_SET:
                     for (size_t j = 0; j < NPARAMS; j++)
                         if (g_params[j].id == ev->a) {
@@ -549,6 +555,7 @@ static void audio_stop(device *d) {
     pthread_cancel(d->audio.thread);
     pthread_join(d->audio.thread, NULL);
     d->audio.thread_live = false;
+    g_note = -1; /* never let a note outlive its stream */
     fprintf(stderr, "harp-deviced: audio stream stopped (%llu reanchors)\n",
             (unsigned long long)d->audio.reanchors);
 }
@@ -1498,8 +1505,24 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
                 ev.v = (float)vel / 127.0f;
             } else if (status == 0x8 || (status == 0x9 && vel == 0)) {
                 ev.kind = DEV_EV_NOTE_OFF;
+            } else if (status == 0xB && (note == 120 || note == 123)) {
+                /* CC 120 all-sound-off / 123 all-notes-off: PANIC. Applied
+                 * immediately AND queued — belt and suspenders. */
+                ev.kind = DEV_EV_ALL_OFF;
+                g_note = -1;
             } else
                 return;
+            /* note-offs must never be lost: if the queue is full, apply NOW
+             * (slightly early beats stuck forever) */
+            if (ev.kind != DEV_EV_NOTE_ON) {
+                pthread_mutex_lock(&g_evq_mu);
+                bool full = g_evq_n >= DEV_EVQ_CAP;
+                pthread_mutex_unlock(&g_evq_mu);
+                if (full) {
+                    if (ev.kind == DEV_EV_ALL_OFF || g_note == (int)note) g_note = -1;
+                    return;
+                }
+            }
             evq_push(ev); /* ts 0 = asap; else applied at the exact sample (§9.2) */
         }
         return;

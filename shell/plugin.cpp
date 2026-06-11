@@ -12,6 +12,7 @@
 #include "pluginterfaces/base/ustring.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstevents.h"
+#include "pluginterfaces/vst/ivstmidicontrollers.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
 #include "public.sdk/source/main/pluginfactory.h"
 #include "public.sdk/source/vst/vstaudioeffect.h"
@@ -37,6 +38,8 @@ static const DevParam kParams[] = {
     {5, "Env Attack"},  {6, "Env Release"}, {7, "FX Send"},       {8, "Master Level"},
 };
 static constexpr int kNumParams = sizeof(kParams) / sizeof(kParams[0]);
+/* hidden parameter the DAW's panic (CC 120/123) maps onto via IMidiMapping */
+static constexpr uint32_t kPanicParamId = 99;
 
 /* ---------------- processor ---------------- */
 
@@ -141,6 +144,10 @@ public:
                     ParamValue v;
                     if (q->getPoint(k, off, v) != kResultOk) continue;
                     uint64_t ts = base + (uint64_t)off;
+                    if (id == kPanicParamId) { /* DAW panic -> all-notes-off */
+                        rt.queueNote(0x20B07B00u, 0);
+                        continue;
+                    }
                     if (idx == SIZE_MAX) {
                         rt.queueParamSet(id, (float)v, ts);
                         continue;
@@ -251,7 +258,7 @@ private:
 
 /* ---------------- controller ---------------- */
 
-class HarpController : public EditController {
+class HarpController : public EditController, public IMidiMapping {
 public:
     static FUnknown *createInstance(void *) {
         return (IEditController *)new HarpController();
@@ -265,8 +272,28 @@ public:
             parameters.addParameter(title, nullptr, 0, 0.5,
                                     ParameterInfo::kCanAutomate, p.id);
         }
+        parameters.addParameter(STR16("Panic"), nullptr, 0, 0,
+                                ParameterInfo::kIsHidden, kPanicParamId);
         return kResultOk;
     }
+
+    /* DAW panic reaches plugins as CC 120/123 through the MIDI mapping —
+     * route both onto the hidden Panic param */
+    tresult PLUGIN_API getMidiControllerAssignment(int32 busIndex, int16 /*channel*/,
+                                                   CtrlNumber cc,
+                                                   ParamID &id) override {
+        if (busIndex == 0 && (cc == kCtrlAllSoundsOff || cc == kCtrlAllNotesOff)) {
+            id = kPanicParamId;
+            return kResultTrue;
+        }
+        return kResultFalse;
+    }
+
+    OBJ_METHODS(HarpController, EditController)
+    DEFINE_INTERFACES
+    DEF_INTERFACE(IMidiMapping)
+    END_DEFINE_INTERFACES(EditController)
+    REFCOUNT_METHODS(EditController)
 
     /* component state arrives here too on project load: surface the saved
      * knob positions so the DAW shows what the device will hold */
