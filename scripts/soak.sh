@@ -47,7 +47,7 @@ for k in range(5, len(L) // 4800):
 c0, c1 = json.loads(sys.argv[2]), json.loads(sys.argv[3])
 problems = []
 if gaps: problems.append(f"{gaps} silent 100ms windows")
-for key in ("evq_drops", "frame_errors", "session_resets"):
+for key in ("evq_drops", "evt_late", "frame_errors", "session_resets"):
     if c1.get(key, 0) != c0.get(key, 0):
         problems.append(f"{key}: {c0.get(key,0)} -> {c1.get(key,0)}")
 if problems:

@@ -133,7 +133,8 @@ int main(int argc, char **argv) {
     std::string input_kind = "silence", out_path, save_state_path, load_state_path;
     double sine_hz = 440.0;
     std::vector<std::pair<uint32_t, double>> sets;
-    std::vector<int> notes; /* played sequentially: on at i*0.6s, off at +0.45s */
+    std::vector<int> notes;    /* played sequentially at note_period spacing */
+    double note_period = 0.6;  /* s between note-ons; gate = 75% of period */
     struct RampSpec {
         uint32_t id;
         double v0, v1;
@@ -171,6 +172,8 @@ int main(int argc, char **argv) {
                 if (pos == std::string::npos) break;
                 pos++;
             }
+        } else if (a == "--note-period") {
+            note_period = atof(next().c_str());
         } else if (a == "--ramp") { /* ID=V0:V1 over the whole duration */
             std::string kv = next();
             RampSpec r{};
@@ -351,8 +354,8 @@ int main(int argc, char **argv) {
 
         EventList evList; /* scheduled --notes falling inside this block */
         for (size_t ni = 0; ni < notes.size(); ni++) {
-            int64_t on_at = (int64_t)((double)ni * 0.6 * rate);
-            int64_t off_at = on_at + (int64_t)(0.45 * rate);
+            int64_t on_at = (int64_t)((double)ni * note_period * rate);
+            int64_t off_at = on_at + (int64_t)(0.75 * note_period * rate);
             if (on_at >= (int64_t)done && on_at < (int64_t)(done + n)) {
                 Event ev{};
                 ev.type = Event::kNoteOnEvent;

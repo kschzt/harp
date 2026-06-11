@@ -38,6 +38,7 @@ public:
      * leaves 5 ms of headroom — stutter at large buffers). */
     void configure(uint32_t sampleRate, uint32_t maxDawBlock) {
         rate_ = sampleRate;
+        maxDawBlock_ = maxDawBlock;
         uint32_t needed = 2 * maxDawBlock;
         uint32_t floor_ = kTargetDepthFrames * kBlock;
         targetFrames_ = needed > floor_ ? needed : floor_;
@@ -65,7 +66,12 @@ public:
      * may legitimately wait for the wire. */
     size_t pullAudioBlocking(float *interleavedLR, size_t nFrames, unsigned timeoutMs);
 
-    uint32_t latencySamples() const { return targetFrames_; }
+    /* Reported latency = ring target + one DAW block of EVENT HEADROOM:
+     * event timestamps are streamPos + offset + latency, and they must
+     * beat the pacing of their own SSIs to the wire — with latency equal
+     * to the ring target exactly, intra-block offsets could land in
+     * already-paced territory and apply a block late (audible slop). */
+    uint32_t latencySamples() const { return targetFrames_ + maxDawBlock_; }
     uint64_t underruns() const { return underruns_.load(std::memory_order_relaxed); }
 
     /* ---- state (main thread; blocking, not RT-safe) ---- */
@@ -156,6 +162,7 @@ private:
     uint64_t framesSent_ = 0, framesRecv_ = 0;
     uint64_t ahead_ = 2; /* fixed small pipeline; reader thread keeps RTT short */
     uint32_t targetFrames_ = kTargetDepthFrames * kBlock; /* see configure() */
+    uint32_t maxDawBlock_ = 1024;                          /* event headroom */
     size_t padDebtFloats_ = 0; /* late arrivals owed to already-padded SSIs;
                                   audio thread only */
 

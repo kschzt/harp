@@ -88,6 +88,7 @@ static size_t g_evq_n;
 static pthread_mutex_t g_evq_mu = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_touch_pending; /* dirty-flag work deferred off the render thread */
 static volatile uint64_t g_evq_drops; /* ring full — counted, never silent (§14.1) */
+static volatile uint64_t g_evt_late;  /* events applied past their timestamp (§14.2) */
 
 static void evq_push(dev_event ev) {
     pthread_mutex_lock(&g_evq_mu);
@@ -190,6 +191,7 @@ typedef struct {
     float n_low_l, n_band_l, n_low_r, n_band_r;
     float n_freq;   /* smoothed toward the sounding note */
     float env;      /* envelope level 0..1 */
+    uint8_t env_reset; /* sub-blocks of fast decay before a fresh attack */
     uint32_t seen_seq;
 } synth_voice;
 
@@ -255,7 +257,12 @@ static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float 
         bool retrig = v->seen_seq != g_note_seq;
         if (retrig) {
             v->seen_seq = g_note_seq;
-            if (v->env < 0.05f) v->env = 0.05f; /* snappy restart, no click */
+            /* Envelope RESETS per note: without this, articulation depends
+             * on how far the previous release decayed (measured transient
+             * depth 0.06..0.99 across one take — heard as timing slop).
+             * Two fast-decay sub-blocks (~1.3 ms) to near-zero, click-free,
+             * then a uniform attack. */
+            if (v->env > 0.07f) v->env_reset = 2;
         }
         bool gate = note >= 0;
         if (gate) {
@@ -268,10 +275,15 @@ static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float 
         /* attack 1 ms..1 s, release 5 ms..3 s (exp-mapped knobs) */
         float atk_tau = 0.001f * exp2f(param_value(5) * 10.0f);
         float rel_tau = 0.005f * exp2f(param_value(6) * 9.2f);
-        float env_target = gate ? g_note_vel : 0.0f;
-        float env_alpha =
-            1.0f - expf(-(float)SMOOTH_SUBBLOCK / ((gate ? atk_tau : rel_tau) * rate));
-        v->env += env_alpha * (env_target - v->env);
+        if (v->env_reset) {
+            v->env *= 0.25f; /* fast decay sub-block */
+            v->env_reset--;
+        } else {
+            float env_target = gate ? g_note_vel : 0.0f;
+            float env_alpha =
+                1.0f - expf(-(float)SMOOTH_SUBBLOCK / ((gate ? atk_tau : rel_tau) * rate));
+            v->env += env_alpha * (env_target - v->env);
+        }
 
         float freq = 55.0f * exp2f(v->s_pitch * 4.0f); /* drone: 55 Hz .. 880 Hz */
         float fc = 60.0f * exp2f(v->s_cutoff * 6.0f);
@@ -471,6 +483,9 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
     for (size_t i = 0; i < g_evq_n; i++) {
         dev_event *ev = &g_evq[i];
         if (ev->ts <= pos) {
+            /* ts > 0 and already behind the render head = late (§9.2:
+             * applied immediately and counted, §14.2 evt_late) */
+            if (ev->ts && ev->ts < pos) g_evt_late++;
             switch (ev->kind) {
                 case DEV_EV_NOTE_ON:
                     g_note_vel = ev->v;
@@ -1329,7 +1344,7 @@ static void handle_diag_counters(device *d, const harp_env *e) {
     harp_cbor_text(&m, "clock_drift_ppb");
     harp_cbor_int(&m, 0);
     harp_cbor_text(&m, "evt_late");
-    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, g_evt_late);
     harp_cbor_text(&m, "evt_stale_epoch");
     harp_cbor_uint(&m, 0);
     harp_cbor_text(&m, "x.harp-refdev.evq_drops");
@@ -1787,11 +1802,11 @@ static void panel_json_counters(device *d, char *body, size_t sz) {
     snprintf(body, sz,
              "{\"frame_errors\":%llu,\"session_resets\":%llu,"
              "\"audio_overruns\":%llu,\"snapshots\":%llu,\"evq_drops\":%llu,"
-             "\"boot\":%llu,\"session\":%s,\"streaming\":%s}",
+             "\"evt_late\":%llu,\"boot\":%llu,\"session\":%s,\"streaming\":%s}",
              (unsigned long long)d->frame_errors, (unsigned long long)d->session_resets,
              (unsigned long long)d->audio_overruns, (unsigned long long)d->snapshots_taken,
-             (unsigned long long)g_evq_drops, (unsigned long long)d->boot_count,
-             d->hello_done ? "true" : "false",
+             (unsigned long long)g_evq_drops, (unsigned long long)g_evt_late,
+             (unsigned long long)d->boot_count, d->hello_done ? "true" : "false",
              d->audio.thread_live ? "true" : "false");
 }
 

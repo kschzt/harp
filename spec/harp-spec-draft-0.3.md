@@ -2,7 +2,7 @@
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 
-Specification, Draft 0.3.2 — 10 June 2026
+Specification, Draft 0.3.3 — 11 June 2026
 
 | | |
 |---|---|
@@ -13,6 +13,8 @@ Specification, Draft 0.3.2 — 10 June 2026
 | **Schema & reference code license** | Apache-2.0 |
 | **Patent policy** | Royalty-free; contributors sign a non-assertion covenant (§19) |
 | **Feedback** | via HARP Enhancement Proposals (HEPs), see §18 |
+
+> **Changes in 0.3.3** — Event-plane errata from implementing §9 end to end and playing it in a DAW. Wire ordering in host-paced mode: a pacing frame triggers the rendering of its SSI range, so hosts MUST transmit events timestamped within a range before transmitting that range's pacing frame, and SHOULD report plugin latency with at least one host-block of event headroom beyond the elastic buffer target — without it, intra-block event offsets race their own audio and intermittently apply late (§9.2). The `evt_late` counter (§14.2) is the conformance probe for exactly this. Stream-domain timestamps come from delivered-stream position, not DAW project position (loops and locates rewind the latter; §9.2 note).
 
 > **Changes in 0.3.2** — Errata from the first DAW integration (the reference VST3 shell playing the reference device inside Ableton Live 12). Ref persistence under continuous editing: only the clean→dirty transition requires synchronous durable storage; later generation bumps MAY coalesce in memory but MUST be flushed before any observer reads the ref — synchronous storage per edit starves the audio path on slow media (§10.3). Host-side mirror of the §9.2 overload rule: control-plane traffic a shell originates (parameter pushes, state operations) MUST yield to stream service and MUST NOT run on the audio thread; in offline rendering contexts a shell MAY block on stream progress, in real-time contexts it MUST NOT (§15.1). The recall flow of §12.2 and the four-safe-actions reconcile have now been exercised through a DAW's own state save/reopen path.
 
@@ -518,7 +520,7 @@ etype: 0 = ump, 1 = param, 2 = txn-begin, 3 = txn-commit, 4 = txn-abort,
        5 = ramp, 6 = mod, 7 = transport
 ```
 
-Receivers apply events at the stated timestamp. Devices claiming `harp-perf` MUST apply events within ±1 sample of the stated time when it is ≥ 1 ms in the future at receipt; late events are applied immediately and counted (`evt_late`). Hosts SHOULD schedule one audio block ahead. In host-paced mode (§8.3) timestamps are SSIs and therefore already live in the DAW's sample domain — sample-accurate automation by construction.
+Receivers apply events at the stated timestamp. Devices claiming `harp-perf` MUST apply events within ±1 sample of the stated time when it is ≥ 1 ms in the future at receipt; late events are applied immediately and counted (`evt_late`). Hosts SHOULD schedule one audio block ahead. In host-paced mode (§8.3) timestamps are SSIs and therefore already live in the DAW's sample domain — sample-accurate automation by construction — with two ordering obligations the mode creates: because a pacing frame triggers the rendering of its SSI range, a host MUST transmit events timestamped within a range *before* transmitting that range's pacing frame, and SHOULD include at least one host-block of event headroom in its reported plugin latency beyond the elastic buffer target (event timestamps derive from delivered-stream position plus reported latency; without headroom, intra-block offsets race the pacing of their own audio and intermittently apply late — `evt_late` is the conformance probe). Stream timestamps are computed from delivered-stream position, never from DAW project position, which loops and locates rewind.
 
 Bandwidth: devices declaring `evt.param` MUST sustain ≥ 2 000 events/s aggregate and declare their actual sustained rate (§9.3). Event-plane overload MUST never glitch audio: events go late and are counted; audio does not.
 
