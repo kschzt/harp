@@ -35,7 +35,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_sources(harp-deviced PRIVATE device/ffs.c) # USB gadget transport (§4.3)
 endif()
 
-add_executable(harp-probe host/harp-probe.c)
+add_executable(harp-probe host/harp-probe.c host/client.c)
 target_link_libraries(harp-probe harpcore m)
 
 find_package(PkgConfig QUIET)

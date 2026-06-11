@@ -26,6 +26,7 @@ extern "C" {
 #include "harp/link.h"
 #include "harp/object.h"
 #include "harp/store.h"
+#include "client.h"
 #include "usb_io.h"
 }
 
@@ -115,7 +116,8 @@ private:
     static void encodeUmpEvent(harp_cbuf *out, uint32_t word, uint64_t ts);
     void pollEcho(); /* drain incoming evt stream */
 
-    /* control-plane request/response under ctlMutex_ */
+    /* control-plane ops under ctlMutex_ (protocol work lives in the shared
+     * host client — host/client.h; these wrap it with shell policy/logging) */
     bool request(harp_cbuf *req, harp_cbuf *rsp, harp_env *e);
     bool refsLocked(harp_ref *live);
     bool snapshotLocked(harp_hash *out);
@@ -123,9 +125,9 @@ private:
     bool pushStateLocked(const harp_hash &target);
 
     harp_io *io_ = nullptr;
-    harp_link link_;
-    harp_cbuf msg_;
-    uint64_t nextRid_ = 0;
+    harp_link link_;   /* rx reassembly: shared by client_ and pollEcho */
+    harp_cbuf msg_;    /* pollEcho rx scratch */
+    harp_client client_{};
     std::mutex ctlMutex_;
 
     harp_store store_;

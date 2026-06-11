@@ -54,6 +54,7 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/shell/plugin.cpp
     ${HARP_ROOT}/shell/runtime.cpp
     ${HARP_ROOT}/host/usb_io.c
+    ${HARP_ROOT}/host/client.c
     ${HARP_ROOT}/core/src/cbor.c
     ${HARP_ROOT}/core/src/sha256.c
     ${HARP_ROOT}/core/src/frame.c

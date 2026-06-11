@@ -6,7 +6,7 @@ Living document; items leave by being fixed, not forgotten.
 | # | item | severity | status |
 |---|------|----------|--------|
 | 1 | `harp-deviced.c` monolith (2,137 lines, 14 globals) | high | DONE — split into engine/state/session/panel + device.h (mechanical move, A/B-verified byte-identical render vs old binary). Follow-up: engine globals behind accessors |
-| 2 | protocol client duplicated (probe vs shell runtime) | high | IN PROGRESS — extracting shared host client library |
+| 2 | protocol client duplicated (probe vs shell runtime) | high | DONE — `host/client.{h,c}` (hello/identity, refs, snapshot, closure fetch/push, refset CAS, rid correlation); probe and shell both consume it. Net −700 lines |
 | 3 | parsers never fuzzed (spec §16/T9 requires it) | high | IN PROGRESS — libFuzzer targets + CI smoke runs |
 | 4 | shell: no reconnect on device replug; log-and-continue error paths; `staged*` naming is stale | medium | IN PROGRESS — reconnect loop, renames |
 | 5 | debt tracked informally | low | this file |
@@ -15,3 +15,4 @@ Living document; items leave by being fixed, not forgotten.
 | 8 | recall-test transient failure after cold boot (one occurrence, error codes now logged) | watch | monitoring |
 | 9 | sub-ms PDC accuracy: reported latency vs ring-occupancy mean differs by ≲1 block | low | acceptable; revisit with async transport work |
 | 10 | macOS RT path is sync libusb at user QoS; async transfers + CoreAudio workgroups would cut latency floor | medium | deferred, documented in architecture.md |
+| 11 | timing-test pitch-arrival spread sits exactly at its 5 ms limit (wall-clock realtime test) — occasional at-limit failures under load | watch | monitoring; tighten the engine or loosen the limit with data, not vibes |
