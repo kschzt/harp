@@ -23,7 +23,13 @@ add_library(harpcore STATIC
 target_include_directories(harpcore PUBLIC core/include)
 
 find_package(Threads REQUIRED)
-add_executable(harp-deviced device/harp-deviced.c)
+add_executable(harp-deviced
+  device/harp-deviced.c # main + transports
+  device/engine.c       # synth, event queue, audio threads
+  device/state.c        # engine <-> content-addressed objects
+  device/session.c      # protocol handlers + session loop
+  device/panel.c        # front-panel unix-socket API
+)
 target_link_libraries(harp-deviced harpcore m Threads::Threads)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_sources(harp-deviced PRIVATE device/ffs.c) # USB gadget transport (§4.3)
