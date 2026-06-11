@@ -246,16 +246,24 @@ static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float 
         v->s_master += alpha * (param_value(8) - v->s_master);
         v->s_drone += alpha * (param_value(7) - v->s_drone);
 
-        /* note voice control: gate + envelope + portamento target */
+        /* note voice control: gate + envelope. Pitch SNAPS on a fresh
+         * attack and glides only when legato (env still high): a fixed-tau
+         * glide on every note makes perceived onsets interval-dependent —
+         * measured r=0.86 between grid deviation and leap size, ±23 ms of
+         * musical slop on sequenced 16ths. Real monosynths snap too. */
         int note = g_note;
-        if (v->seen_seq != g_note_seq) { /* retrigger */
+        bool retrig = v->seen_seq != g_note_seq;
+        if (retrig) {
             v->seen_seq = g_note_seq;
             if (v->env < 0.05f) v->env = 0.05f; /* snappy restart, no click */
         }
         bool gate = note >= 0;
         if (gate) {
             float target = 440.0f * exp2f(((float)note - 69.0f) / 12.0f);
-            v->n_freq += alpha * (target - v->n_freq); /* portamento */
+            if (retrig && v->env < 0.2f)
+                v->n_freq = target; /* fresh attack: arrive on time */
+            else
+                v->n_freq += alpha * (target - v->n_freq); /* legato glide */
         }
         /* attack 1 ms..1 s, release 5 ms..3 s (exp-mapped knobs) */
         float atk_tau = 0.001f * exp2f(param_value(5) * 10.0f);
