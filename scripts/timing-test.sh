@@ -15,6 +15,11 @@ VST=${VST:-$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3}
 HOSTBIN=${HOSTBIN:-./build-vst/harp-vst3-host}
 fail() { echo "TIMING FAIL: $1"; exit 1; }
 
+# the device is exclusive: a DAW holding the claim makes every test render
+# silence and fail confusingly (cost us a debugging detour) — guard first
+"$HOSTBIN" "$VST" --seconds 0.05 2>&1 | grep -q "connected:" \
+    || { echo "TIMING SKIP: device unclaimed check failed (DAW running?)"; exit 2; }
+
 # ---- 1+2: offline render, mixed intervals up to 15 semitones ----
 # settle device into a known state first (drone off, sine, fast envelope)
 "$HOSTBIN" "$VST" --set 7=0 --set 2=0 --set 3=0.8 --set 5=0.05 --set 6=0.15 \
