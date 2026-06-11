@@ -34,7 +34,11 @@ grep -q "WARNING" "$LOG" && { grep WARNING "$LOG"; fail "shell dropped events"; 
 grep -q "connected:" "$LOG" || fail "never connected to device"
 
 C1=$(curl -s --max-time 3 "http://$HOST:8080/api/counters")
-python3 - "$OUT" "$C0" "$C1" <<'EOF'
+# ramp_late accrues at a structural RATE under flood (~4/s: ramp starts
+# anchor one block back), so its budget scales with run length — the 500
+# baseline was calibrated for the 30 s default
+RAMP_BUDGET=$((500 * S / 30))
+python3 - "$OUT" "$C0" "$C1" "$RAMP_BUDGET" <<'EOF'
 import json, math, struct, sys, wave
 w = wave.open(sys.argv[1])
 raw = w.readframes(w.getnframes())

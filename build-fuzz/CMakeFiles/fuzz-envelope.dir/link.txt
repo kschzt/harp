@@ -1,1 +1,0 @@
-/usr/bin/cc -O2 -g -DNDEBUG -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names -fsanitize=address "CMakeFiles/fuzz-envelope.dir/fuzz/fuzz_envelope.c.o" "CMakeFiles/fuzz-envelope.dir/fuzz/standalone_driver.c.o" -o fuzz-envelope  libharpcore.a -lm

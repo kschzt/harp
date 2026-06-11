@@ -1,1 +1,0 @@
-/usr/bin/cc -O2 -g -DNDEBUG -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names -fsanitize=address "CMakeFiles/harp-tests.dir/tests/harp_tests.c.o" -o harp-tests  libharpcore.a -lm

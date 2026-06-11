@@ -1,1 +1,0 @@
-/usr/bin/cc -O2 -g -DNDEBUG -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names -fsanitize=address "CMakeFiles/fuzz-link.dir/fuzz/fuzz_link.c.o" "CMakeFiles/fuzz-link.dir/fuzz/standalone_driver.c.o" -o fuzz-link  libharpcore.a -lm
