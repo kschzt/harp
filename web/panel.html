@@ -1,0 +1,103 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>harp-refdev</title>
+<style>
+body{background:#111;color:#ddd;font-family:ui-monospace,SFMono-Regular,monospace;
+     max-width:640px;margin:2em auto;padding:0 1em}
+h1{font-size:1.1em;font-weight:600}
+h2{font-size:.85em;color:#789;margin:1.6em 0 .4em;text-transform:uppercase;letter-spacing:.08em}
+#dirty{display:inline-block;padding:.1em .55em;border-radius:.6em;font-size:.8em;
+       margin-left:.6em;background:#243;color:#7c7;transition:background .15s}
+#dirty.on{background:#421;color:#e96}
+.p{display:flex;align-items:center;gap:.8em;margin:.55em 0}
+.p label{flex:0 0 9em}.p input{flex:1;accent-color:#7ac}
+.p span{flex:0 0 3.5em;text-align:right;color:#9ab}
+table{width:100%;border-collapse:collapse;font-size:.85em}
+td,th{text-align:left;padding:.25em .5em;border-bottom:1px solid #222}
+th{color:#789;font-weight:500}
+td.h{color:#a96;font-family:inherit}
+td.g{color:#9ab;text-align:right}th.g{text-align:right}
+.dot{color:#e96}.clean-dot{color:#7c7}
+#counters{font-size:.8em;color:#888;line-height:1.7}
+#counters b{color:#aab;font-weight:500}
+#conn{float:right;font-size:.75em;color:#555}
+footer{margin-top:2em;font-size:.72em;color:#555;line-height:1.5}
+</style></head><body>
+<h1>harp-refdev <span id="dirty">–</span> <span id="conn">connecting…</span></h1>
+<h2>Front panel</h2>
+<div id="params"></div>
+<h2>State refs <span style="text-transform:none;color:#556">— the recall model, live (spec §10.3)</span></h2>
+<table><thead><tr><th>ref</th><th>target</th><th class="g">generation</th><th></th></tr></thead>
+<tbody id="refs"></tbody></table>
+<h2>Device</h2>
+<div id="counters"></div>
+<footer>Edits here are front-panel edits in the protocol's sense: they dirty the
+live ref, bump its generation, and echo to the host as §9.4 events — a DAW
+records them as automation. Watch <i>generation</i> tick as you drag; watch an
+<i>archive/*</i> ref appear when a host pushes over your edits.</footer>
+<script>
+let dragging = null, lastSend = 0, trailing = null;
+
+function sendKnob(id, v) {            // throttle to ~25 Hz with trailing send
+  const now = performance.now();
+  if (now - lastSend >= 40) {
+    lastSend = now;
+    fetch(`/api/knob?id=${id}&value=${v}`);
+  } else {
+    clearTimeout(trailing);
+    trailing = setTimeout(() => { lastSend = performance.now();
+      fetch(`/api/knob?id=${id}&value=${v}`); }, 45);
+  }
+}
+
+function render(s) {
+  document.getElementById('dirty').textContent = s.params.dirty ? 'dirty' : 'clean';
+  document.getElementById('dirty').className = s.params.dirty ? 'on' : '';
+  const c = document.getElementById('params');
+  if (!c.childElementCount) {
+    for (const p of s.params.params) {
+      const d = document.createElement('div'); d.className = 'p';
+      d.innerHTML = `<label>${p.name}</label>` +
+        `<input type="range" min="0" max="1000" data-id="${p.id}" ` +
+        `value="${Math.round(p.value*1000)}"><span>${p.value.toFixed(3)}</span>`;
+      const inp = d.querySelector('input'), sp = d.querySelector('span');
+      inp.oninput = () => { const v = inp.value/1000;
+        sp.textContent = v.toFixed(3); dragging = p.id; sendKnob(p.id, v); };
+      inp.onchange = () => { dragging = null; };
+      c.appendChild(d);
+    }
+  } else {
+    for (const p of s.params.params) {
+      if (p.id === dragging) continue;
+      const inp = c.querySelector(`input[data-id="${p.id}"]`);
+      if (inp && document.activeElement !== inp) {
+        inp.value = Math.round(p.value*1000);
+        inp.nextElementSibling.textContent = p.value.toFixed(3);
+      }
+    }
+  }
+  const tb = document.getElementById('refs');
+  tb.innerHTML = s.refs.refs.map(r =>
+    `<tr><td>${r.name}</td><td class="h">${r.hash || '(unborn)'}…</td>` +
+    `<td class="g">${r.gen}</td>` +
+    `<td>${r.dirty ? '<span class="dot">● dirty</span>'
+                   : '<span class="clean-dot">● clean</span>'}</td></tr>`).join('');
+  const k = s.counters;
+  document.getElementById('counters').innerHTML =
+    `serial <b>${s.params.serial}</b> · boot <b>${k.boot}</b> · ` +
+    `host session <b>${k.session ? 'up' : 'down'}</b> · ` +
+    `stream <b>${k.streaming ? 'running' : 'idle'}</b><br>` +
+    `frame_errors <b>${k.frame_errors}</b> · session_resets <b>${k.session_resets}</b> · ` +
+    `audio_overruns <b>${k.audio_overruns}</b> · snapshots <b>${k.snapshots}</b>`;
+}
+
+function connect() {
+  const es = new EventSource('/api/stream');
+  es.onopen = () => document.getElementById('conn').textContent = 'live';
+  es.onmessage = e => render(JSON.parse(e.data));
+  es.onerror = () => { document.getElementById('conn').textContent = 'reconnecting…';
+    es.close(); setTimeout(connect, 1500); };
+}
+connect();
+</script></body></html>

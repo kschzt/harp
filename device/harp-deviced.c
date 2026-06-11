@@ -28,7 +28,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1414,147 +1416,159 @@ static void handle_obj(device *d, const uint8_t *buf, size_t len) {
     if (d->granted < CREDIT_GRANT / 2) grant_credit(d);
 }
 
-/* ---------------- web panel (device frontend) ----------------
+/* ---------------- panel API (device frontend boundary) ----------------
  *
- * The refdev's "front panel": a browser page of sliders served by the
- * device itself, plus a JSON API (curl-able, agent-drivable). Changes made
- * here are front-panel edits in the §3.3 sense: they dirty the live ref
- * and echo as param events, exactly like hands on hardware knobs.
+ * Line-oriented JSON over a Unix socket: the single sanctioned boundary
+ * for every frontend — web sidecar, future GPIO encoders, MIDI control
+ * surfaces. Frontends reach the engine ONLY through front_panel_set
+ * (the device-side mirror of the spec's no-SysEx-side-doors rule):
+ * edits here dirty the live ref and echo as §9.4 events, exactly like
+ * hands on hardware.
  *
- *   GET  /                      the panel
- *   GET  /api/params            {"product","serial","dirty","params":[..]}
- *   GET  /api/knob?id=N&value=F set one param (also accepts POST)
+ *   request line             response line (JSON)
+ *   params                   {"product","serial","dirty","params":[..]}
+ *   knob <id> <value01>      {"ok":true} | {"ok":false,...}
+ *   refs                     {"refs":[{"name","hash","gen","dirty"},..]}
+ *   counters                 {"frame_errors",...}
+ *
+ * The web server lives in a sidecar (web/harp-panel.py) — HTTP robustness
+ * is a solved problem there; this stays dependency-free C.
  */
 
-static const char *PANEL_HTML =
-    "<!doctype html><html><head><meta charset='utf-8'>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>harp-refdev</title><style>"
-    "body{background:#111;color:#ddd;font-family:ui-monospace,monospace;"
-    "max-width:560px;margin:2em auto;padding:0 1em}"
-    "h1{font-size:1.1em;font-weight:600}#dirty{display:inline-block;"
-    "padding:.1em .5em;border-radius:.6em;font-size:.8em;margin-left:.6em;"
-    "background:#243;color:#7c7}#dirty.on{background:#421;color:#e96}"
-    ".p{display:flex;align-items:center;gap:.8em;margin:.7em 0}"
-    ".p label{flex:0 0 9em}.p input{flex:1;accent-color:#7ac}"
-    ".p span{flex:0 0 3.5em;text-align:right;color:#9ab}"
-    "footer{margin-top:2em;font-size:.75em;color:#666}"
-    "</style></head><body><h1>harp-refdev <span id='dirty'>clean</span></h1>"
-    "<div id='params'></div>"
-    "<footer>HARP reference device · front panel · edits dirty the live ref "
-    "and echo to the host as events</footer>"
-    "<script>\n"
-    "let dragging=null;\n"
-    "async function load(){const r=await fetch('/api/params');const s=await r.json();\n"
-    " document.getElementById('dirty').textContent=s.dirty?'dirty':'clean';\n"
-    " document.getElementById('dirty').className=s.dirty?'on':'';\n"
-    " const c=document.getElementById('params');\n"
-    " if(!c.childElementCount){for(const p of s.params){\n"
-    "  const d=document.createElement('div');d.className='p';\n"
-    "  d.innerHTML=`<label>${p.name}</label><input type='range' min='0' max='1000' "
-    "data-id='${p.id}' value='${Math.round(p.value*1000)}'>"
-    "<span>${p.value.toFixed(3)}</span>`;\n"
-    "  const inp=d.querySelector('input'),sp=d.querySelector('span');\n"
-    "  inp.oninput=()=>{const v=inp.value/1000;sp.textContent=v.toFixed(3);\n"
-    "   dragging=p.id;fetch(`/api/knob?id=${p.id}&value=${v}`);};\n"
-    "  inp.onchange=()=>{dragging=null;};\n"
-    "  c.appendChild(d);}}\n"
-    " else{for(const p of s.params){if(p.id===dragging)continue;\n"
-    "  const inp=c.querySelector(`input[data-id='${p.id}']`);\n"
-    "  if(inp&&document.activeElement!==inp){inp.value=Math.round(p.value*1000);\n"
-    "   inp.nextElementSibling.textContent=p.value.toFixed(3);}}}\n"
-    "}\n"
-    "load();setInterval(load,300);\n"
-    "</script></body></html>";
-
-static void http_reply(int fd, const char *status, const char *ctype, const char *body) {
-    char hdr[256];
-    size_t blen = strlen(body);
-    int n = snprintf(hdr, sizeof hdr,
-                     "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
-                     "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
-                     status, ctype, blen);
-    harp_write_all(fd, hdr, (size_t)n);
-    harp_write_all(fd, body, blen);
+static void panel_json_params(device *d, char *body, size_t sz) {
+    size_t off = 0;
+    pthread_mutex_lock(&d->state_mu);
+    bool dirty = d->live_cache_valid ? d->live_cache.dirty : false;
+    if (!d->live_cache_valid) {
+        harp_ref r;
+        if (harp_store_ref_read(&d->store, LIVE_REF, &r) == 0) dirty = r.dirty;
+    }
+    pthread_mutex_unlock(&d->state_mu);
+    off += (size_t)snprintf(body + off, sz - off,
+                            "{\"product\":\"harp-refdev\",\"serial\":\"%s\","
+                            "\"dirty\":%s,\"params\":[",
+                            d->serial, dirty ? "true" : "false");
+    for (size_t i = 0; i < NPARAMS; i++)
+        off += (size_t)snprintf(body + off, sz - off,
+                                "%s{\"id\":%u,\"name\":\"%s\",\"value\":%.4f}",
+                                i ? "," : "", g_params[i].id, g_params[i].name,
+                                g_params[i].value);
+    snprintf(body + off, sz - off, "]}");
 }
 
-static void http_handle(device *d, int fd) {
-    char req[2048];
-    ssize_t n = read(fd, req, sizeof req - 1);
-    if (n <= 0) return;
-    req[n] = 0;
-    char path[512] = "";
-    if (sscanf(req, "GET %511s", path) != 1 && sscanf(req, "POST %511s", path) != 1) {
-        http_reply(fd, "400 Bad Request", "text/plain", "bad request\n");
-        return;
-    }
-    if (strcmp(path, "/") == 0) {
-        http_reply(fd, "200 OK", "text/html; charset=utf-8", PANEL_HTML);
-    } else if (strcmp(path, "/api/params") == 0) {
-        char body[2048];
-        size_t off = 0;
-        pthread_mutex_lock(&d->state_mu);
-        bool dirty = d->live_cache_valid ? d->live_cache.dirty : false;
-        if (!d->live_cache_valid) {
-            harp_ref r;
-            if (harp_store_ref_read(&d->store, LIVE_REF, &r) == 0) dirty = r.dirty;
-        }
-        pthread_mutex_unlock(&d->state_mu);
-        off += (size_t)snprintf(body + off, sizeof body - off,
-                                "{\"product\":\"harp-refdev\",\"serial\":\"%s\","
-                                "\"dirty\":%s,\"params\":[",
-                                d->serial, dirty ? "true" : "false");
-        for (size_t i = 0; i < NPARAMS; i++)
-            off += (size_t)snprintf(body + off, sizeof body - off,
-                                    "%s{\"id\":%u,\"name\":\"%s\",\"value\":%.4f}",
-                                    i ? "," : "", g_params[i].id, g_params[i].name,
-                                    g_params[i].value);
-        snprintf(body + off, sizeof body - off, "]}");
-        http_reply(fd, "200 OK", "application/json", body);
-    } else if (strncmp(path, "/api/knob?", 10) == 0) {
-        unsigned id = 0;
-        double v = -1;
-        const char *q = path + 10;
-        const char *idp = strstr(q, "id=");
-        const char *vp = strstr(q, "value=");
-        if (idp) id = (unsigned)strtoul(idp + 3, NULL, 10);
-        if (vp) v = strtod(vp + 6, NULL);
-        if (!idp || !vp || v < 0 || v > 1 || !front_panel_set(d, id, v))
-            http_reply(fd, "400 Bad Request", "application/json",
-                       "{\"ok\":false,\"error\":\"id 1..8, value 0..1\"}");
-        else
-            http_reply(fd, "200 OK", "application/json", "{\"ok\":true}");
-    } else {
-        http_reply(fd, "404 Not Found", "text/plain", "not found\n");
-    }
-}
-
-struct http_args {
+struct refs_json {
     device *d;
-    int port;
+    char *body;
+    size_t sz, off;
+    int n;
 };
 
-static void *http_main(void *arg) {
-    struct http_args *a = arg;
-    int sfd = socket(AF_INET, SOCK_STREAM, 0);
-    int one = 1;
-    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons((uint16_t)a->port);
-    if (bind(sfd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(sfd, 8) != 0) {
-        fprintf(stderr, "harp-deviced: web panel: cannot listen on %d\n", a->port);
+static void panel_refs_cb(const harp_ref *r, void *ud) {
+    struct refs_json *j = ud;
+    harp_ref shown = *r;
+    /* the live ref may be ahead on the coalesced in-memory cache */
+    pthread_mutex_lock(&j->d->state_mu);
+    if (j->d->live_cache_valid && strcmp(r->name, LIVE_REF) == 0)
+        shown = j->d->live_cache;
+    pthread_mutex_unlock(&j->d->state_mu);
+    char hex[2 * HARP_HASH_LEN + 1] = "";
+    if (!shown.unborn) {
+        harp_hash_hex(&shown.hash, hex);
+        hex[12] = 0;
+    }
+    j->off += (size_t)snprintf(j->body + j->off, j->sz - j->off,
+                               "%s{\"name\":\"%s\",\"hash\":\"%s\",\"gen\":%llu,"
+                               "\"dirty\":%s}",
+                               j->n++ ? "," : "", shown.name, hex,
+                               (unsigned long long)shown.generation,
+                               shown.dirty ? "true" : "false");
+}
+
+static void panel_json_refs(device *d, char *body, size_t sz) {
+    struct refs_json j = {d, body, sz, 0, 0};
+    j.off = (size_t)snprintf(body, sz, "{\"refs\":[");
+    harp_store_ref_list(&d->store, panel_refs_cb, &j);
+    snprintf(body + j.off, sz - j.off, "]}");
+}
+
+static void panel_json_counters(device *d, char *body, size_t sz) {
+    snprintf(body, sz,
+             "{\"frame_errors\":%llu,\"session_resets\":%llu,"
+             "\"audio_overruns\":%llu,\"snapshots\":%llu,\"boot\":%llu,"
+             "\"session\":%s,\"streaming\":%s}",
+             (unsigned long long)d->frame_errors, (unsigned long long)d->session_resets,
+             (unsigned long long)d->audio_overruns, (unsigned long long)d->snapshots_taken,
+             (unsigned long long)d->boot_count, d->hello_done ? "true" : "false",
+             d->audio.thread_live ? "true" : "false");
+}
+
+/* One panel-API connection at a time (the sidecar holds one persistent
+ * connection); line in, JSON line out. */
+static void panel_serve_conn(device *d, int fd) {
+    char buf[512];
+    size_t len = 0;
+    char body[4096];
+    for (;;) {
+        ssize_t r = read(fd, buf + len, sizeof buf - 1 - len);
+        if (r <= 0) return;
+        len += (size_t)r;
+        buf[len] = 0;
+        char *nl;
+        while ((nl = memchr(buf, '\n', len))) {
+            *nl = 0;
+            if (strcmp(buf, "params") == 0)
+                panel_json_params(d, body, sizeof body);
+            else if (strcmp(buf, "refs") == 0)
+                panel_json_refs(d, body, sizeof body);
+            else if (strcmp(buf, "counters") == 0)
+                panel_json_counters(d, body, sizeof body);
+            else if (strncmp(buf, "knob ", 5) == 0) {
+                unsigned id = 0;
+                double v = -1;
+                if (sscanf(buf + 5, "%u %lf", &id, &v) == 2 && v >= 0 && v <= 1 &&
+                    front_panel_set(d, id, v))
+                    snprintf(body, sizeof body, "{\"ok\":true}");
+                else
+                    snprintf(body, sizeof body,
+                             "{\"ok\":false,\"error\":\"knob <id 1..8> <value 0..1>\"}");
+            } else
+                snprintf(body, sizeof body, "{\"error\":\"unknown command\"}");
+            size_t blen = strlen(body);
+            body[blen] = '\n';
+            if (!harp_write_all(fd, body, blen + 1)) return;
+            size_t consumed = (size_t)(nl + 1 - buf);
+            memmove(buf, nl + 1, len - consumed);
+            len -= consumed;
+        }
+        if (len >= sizeof buf - 1) return; /* oversized request line */
+    }
+}
+
+struct panel_args {
+    device *d;
+    const char *path;
+};
+
+static void *panel_main(void *arg) {
+    struct panel_args *a = arg;
+    unlink(a->path);
+    int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s", a->path);
+    if (bind(sfd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(sfd, 4) != 0) {
+        fprintf(stderr, "harp-deviced: panel api: cannot listen on %s\n", a->path);
         return NULL;
     }
-    fprintf(stderr, "harp-deviced: web panel on http://0.0.0.0:%d/\n", a->port);
+    chmod(a->path, 0666); /* sidecar runs unprivileged */
+    fprintf(stderr, "harp-deviced: panel api on %s\n", a->path);
     for (;;) {
         int cfd = accept(sfd, NULL, NULL);
         if (cfd < 0) {
             if (errno == EINTR) continue;
             break;
         }
-        http_handle(a->d, cfd);
+        panel_serve_conn(a->d, cfd);
         close(cfd);
     }
     return NULL;
@@ -1627,7 +1641,7 @@ int main(int argc, char **argv) {
     const char *ffs_dir = NULL;
     const char *gadget = "/sys/kernel/config/usb_gadget/harp";
     int port = 47800;
-    int http_port = 8080; /* 0 disables the web panel */
+    const char *panel_sock = "/tmp/harp-panel.sock"; /* "" disables */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc)
             state_dir = argv[++i];
@@ -1639,11 +1653,12 @@ int main(int argc, char **argv) {
             ffs_dir = argv[++i];
         else if (strcmp(argv[i], "--gadget") == 0 && i + 1 < argc)
             gadget = argv[++i];
-        else if (strcmp(argv[i], "--http") == 0 && i + 1 < argc)
-            http_port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--panel-sock") == 0 && i + 1 < argc)
+            panel_sock = argv[++i];
         else {
             fprintf(stderr,
-                    "usage: harp-deviced [--state-dir DIR] [--serial S] [--http PORT] "
+                    "usage: harp-deviced [--state-dir DIR] [--serial S] "
+                    "[--panel-sock PATH] "
                     "[--port P | --ffs FFS_DIR [--gadget CONFIGFS_PATH]]\n");
             return 2;
         }
@@ -1663,13 +1678,13 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&d->send_mu, NULL);
     pthread_mutex_init(&d->state_mu, NULL);
 
-    if (http_port > 0) {
-        static struct http_args ha;
-        ha.d = d;
-        ha.port = http_port;
-        pthread_t ht;
-        pthread_create(&ht, NULL, http_main, &ha);
-        pthread_detach(ht);
+    if (panel_sock[0]) {
+        static struct panel_args pa;
+        pa.d = d;
+        pa.path = panel_sock;
+        pthread_t pt;
+        pthread_create(&pt, NULL, panel_main, &pa);
+        pthread_detach(pt);
     }
 
     /* Recall across power cycles: load the live ref if clean; first boot

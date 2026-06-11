@@ -68,6 +68,15 @@ The `demo` walks the canonical project-open flow (spec §12.2): save,
 front-panel edits dirtying state, mismatch detection on reopen,
 archive-before-push, hash-verified restore.
 
+For the visual version, start the web panel (the device's "front panel"
+plus a live protocol inspector — refs, generations, the dirty flag in
+real time):
+
+```sh
+python3 web/harp-panel.py /tmp/harp-panel.sock 8080 &
+open http://localhost:8080      # drag sliders, watch the state model react
+```
+
 ### Path 2 — a real device (Raspberry Pi 4B)
 
 `scripts/pi-bringup.md` is the runbook: provision a Pi as a USB gadget

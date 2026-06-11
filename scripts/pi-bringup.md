@@ -21,6 +21,15 @@ the framed link and the HARP stream on two bulk endpoint pairs.
 `harp-deviced-usb.service` Conflicts= the TCP `harp-deviced.service`:
 one protocol stack owns the state store at a time.
 
+## Web panel
+
+`harp-panel.service` runs `web/harp-panel.py` (Python sidecar) against
+the daemon's panel API (`/tmp/harp-panel.sock`); browse
+`http://harp.local:8080` — front panel sliders + live protocol
+inspector. Frontends reach the engine only through the panel API's
+`knob` command (the `front_panel_set` path): edits dirty the live ref
+and echo to the host as §9.4 events.
+
 ## Day-to-day deploy loop (no sudo needed)
 
 ```sh
