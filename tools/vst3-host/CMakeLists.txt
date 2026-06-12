@@ -76,9 +76,11 @@ if(LIBUSB_FOUND)
   # breaks the seal ("code has no resources but signature indicates they
   # must be present" — Live refuses such bundles). Re-sign as the last step.
   set(HARP_SHELL_BUNDLE ${CMAKE_BINARY_DIR}/VST3/Release/harp-shell.vst3)
-  add_custom_command(TARGET harp-shell POST_BUILD
-    COMMAND codesign --force --deep -s - "${HARP_SHELL_BUNDLE}"
-    COMMENT "Re-sealing harp-shell.vst3 signature")
+  if(APPLE)
+    add_custom_command(TARGET harp-shell POST_BUILD
+      COMMAND codesign --force --deep -s - "${HARP_SHELL_BUNDLE}"
+      COMMENT "Re-sealing harp-shell.vst3 signature")
+  endif()
 
   # `cmake --build build-vst --target install-live` -> user VST3 folder
   add_custom_target(install-live
