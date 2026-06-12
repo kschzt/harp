@@ -76,6 +76,29 @@ converters).
   wait for the host to post a read, its strictly-serial pacing loop
   inherits that wait, and depth-probing a serial device injects the
   stalls it tries to absorb.
+- The transport is async libusb (second generation): one event thread
+  owns completion reaping at elevated QoS, both IN pipes keep transfers
+  always pending into byte FIFOs, pacing writes are fire-and-forget
+  slots. This killed the sync transport's 20-25 ms completion tails and
+  let the ring cushion drop 5 -> 2 blocks: 16 ms total reported latency
+  at DAW blocks <= 256, and the §4.2.1 drain-on-stall dance is gone by
+  construction. Debugging it taught: a die() mid-stream with transfers
+  pending can corrupt bus state (toggle desync) that survives
+  process death and makes EVERY subsequent run fail — heal with a
+  bus-level reattach (daemon restart) before trusting any A/B result.
+- The frontier cap is event-timing law: the pacing frontier never
+  advances past read + target + (headroom − dawBlock), bounded at the
+  frame END, so the earliest timestamp a block can mint clears every
+  in-flight frame by at least one DAW block. Without it, small-block
+  sessions mint timestamps into already-paced ranges and no wire
+  ordering can save them (measured at 64: mid-frame events applied a
+  frame late while fence_timeouts stayed zero — delivery was perfect,
+  the math wasn't).
+- Synthesized-event hygiene: never emit a timestamp the stream has
+  already passed. The ramp-thinning pend flush once emitted 64-sample
+  ramps whose END equaled "now" (~1100/s at 64-sample buffers); a pend
+  with no successor for a pacing block is a finished gesture and
+  flushes as a "now" SET of the final value.
 - Underrun policy: padded stream positions are SPENT. Late arrivals for
   them get dropped (pad debt), or every pad permanently grows latency
   and replays the missing moment as an "echo" while the DAW grid

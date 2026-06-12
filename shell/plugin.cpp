@@ -123,10 +123,18 @@ public:
          * DAW sends ~750 points/s/param, and ramps spanning 64 samples say
          * nothing a 256-sample ramp doesn't (the device interpolates at
          * control rate regardless). Skipped points fold into the next
-         * ramp's target; a pending final value flushes the next block. */
-        for (size_t idx = 0; idx < 8; idx++) { /* flush matured pendings */
-            if (pendHas_[idx] && base >= pendTs_[idx]) {
-                rt.queueRamp((uint32_t)idx + 1, pendVal_[idx], lastTs_[idx], pendTs_[idx]);
+         * ramp's target; a pend with no successor flushes below. */
+        for (size_t idx = 0; idx < 8; idx++) {
+            /* Flush a pending fold only when the gesture is OVER — no
+             * successor point for a full pacing block. Flushing one DAW
+             * block after the fold (the original logic) emitted 64-sample
+             * ramps whose END was already at "now": ~1100/s of
+             * guaranteed-stale timestamps at 64-sample buffers (measured;
+             * invisible at >= 256 where folding never triggers). The pend
+             * holds a gesture's final settling value; a "now" set delivers
+             * it without inventing a timestamp the stream already passed. */
+            if (pendHas_[idx] && base >= pendTs_[idx] + 256) {
+                rt.queueParamSet((uint32_t)idx + 1, pendVal_[idx], 0);
                 lastTs_[idx] = pendTs_[idx];
                 pendHas_[idx] = false;
             }

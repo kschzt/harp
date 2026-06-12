@@ -474,7 +474,21 @@ void HarpRuntime::feeder() {
          * is just render time. */
         size_t ringFrames = audioRing_.readAvailable() / 2;
         uint64_t inFlight = framesSent_ - framesRecv_;
-        while (ringFrames < (size_t)targetFrames_ && inFlight < ahead_) {
+        /* The frontier cap is event-timing law, not flow control: event
+         * timestamps carry target + one-pacing-block of headroom, so the
+         * pacing frontier must never advance past target + kBlock beyond
+         * the DAW's read position — or timestamps land in already-paced
+         * ranges at queue time and apply late no matter how fast the wire
+         * is (measured at DAW block 64: nearly every ramp END fell behind
+         * the frontier's in-flight overshoot; fence_timeouts stayed 0 —
+         * delivery was perfect, the math wasn't). */
+        uint64_t frontierCap = ssiRead_.load(std::memory_order_relaxed) +
+                               targetFrames_ + (eventHeadroom() - maxDawBlock_);
+        /* the cap bounds the frame END: a frame starting under the cap but
+         * extending past it would cover timestamps the current block can
+         * still mint (measured: mid-frame note-ons applied a frame late) */
+        while (ringFrames < (size_t)targetFrames_ && inFlight < ahead_ &&
+               ssi_ + kBlock <= frontierCap) {
             /* every pacing frame carries the event fence (§8.3.1): the
              * count of events queued so far this session. Any event queued
              * before this instant is guaranteed consumed device-side

@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -41,7 +42,15 @@ public:
         rate_ = sampleRate;
         maxDawBlock_ = maxDawBlock;
         uint32_t needed = 2 * maxDawBlock;
-        uint32_t floor_ = kTargetDepthFrames * kBlock;
+        uint32_t depth = kTargetDepthFrames;
+        /* measurement/field override: HARP_CUSHION_BLOCKS=N (min 2). The
+         * default is data-driven per transport generation — see the
+         * kTargetDepthFrames comment. */
+        if (const char *e = getenv("HARP_CUSHION_BLOCKS")) {
+            int v = atoi(e);
+            if (v >= 2 && v <= 64) depth = (uint32_t)v;
+        }
+        uint32_t floor_ = depth * kBlock;
         targetFrames_ = needed > floor_ ? needed : floor_;
     }
 
@@ -70,12 +79,16 @@ public:
      * may legitimately wait for the wire. */
     size_t pullAudioBlocking(float *interleavedLR, size_t nFrames, unsigned timeoutMs);
 
-    /* Reported latency = ring target + one DAW block of EVENT HEADROOM:
-     * event timestamps are streamPos + offset + latency, and they must
-     * beat the pacing of their own SSIs to the wire — with latency equal
-     * to the ring target exactly, intra-block offsets could land in
-     * already-paced territory and apply a block late (audible slop). */
-    uint32_t latencySamples() const { return targetFrames_ + maxDawBlock_; }
+    /* Reported latency = ring target + EVENT HEADROOM of one block — and
+     * "block" means whichever is larger, the DAW's or the 256-sample
+     * pacing block. Event timestamps are streamPos + offset + latency and
+     * must stay ahead of the pacing frontier, which overshoots the ring
+     * target by up to one PACING block; with only a 64-sample DAW block
+     * of headroom, a fraction of timestamps land in already-paced
+     * territory at queue time — no wire ordering can save an event whose
+     * covering frame already went out (measured at block 64: evt_late
+     * ~100 per 45 s flood; blocks >= 256 unaffected). */
+    uint32_t latencySamples() const { return targetFrames_ + eventHeadroom(); }
     uint64_t underruns() const { return underruns_.load(std::memory_order_relaxed); }
 
     /* ---- state (main thread; blocking, not RT-safe) ---- */
@@ -98,12 +111,27 @@ private:
     HarpRuntime(const HarpRuntime &) = delete;
 
     static constexpr uint32_t kBlock = 256; /* pacing block, samples */
-    /* Ring cushion vs host-side completion-tail jitter. Sync libusb at
-     * user priority shows occasional 20-25 ms read tails; 5 blocks
-     * (26.7 ms at 48 k) absorbs them. Going lower wants async transfers +
-     * CoreAudio workgroup integration (future). Reported latency derives
-     * from this. */
-    static constexpr uint32_t kTargetDepthFrames = 5;
+
+    /* Event headroom: one block, whichever flavor is larger. Together with
+     * the feeder's frontier cap (cap = read + target + headroom − dawBlock)
+     * this gives the timing INVARIANT: the earliest event timestamp a
+     * block can produce (offset 0 -> read + target + headroom) clears the
+     * pacing frontier by at least one DAW block, for every block size —
+     * so no event is ever born into already-paced territory. (At DAW
+     * block 64 the soak's note period divides evenly into blocks: every
+     * note hit offset 0 and raced the cap edge — ~30% applied late until
+     * the strict margin closed it.) */
+    uint32_t eventHeadroom() const {
+        return maxDawBlock_ > kBlock ? maxDawBlock_ : kBlock;
+    }
+    /* Ring cushion vs host-side jitter. The sync-libusb transport needed
+     * 5 blocks (26.7 ms) against its 20-25 ms completion tails; the async
+     * transport (dedicated event thread, always-pending transfers) killed
+     * the tails, and 2 blocks passed the full flood matrix at every DAW
+     * block size 64-1024 with only the startup underrun. Reported latency
+     * derives from this: 16 ms total at DAW blocks <= 256 (48 k).
+     * HARP_CUSHION_BLOCKS overrides for measurement. */
+    static constexpr uint32_t kTargetDepthFrames = 2;
 
     void supervisor(); /* owns session lifecycle: connect, run, reconnect */
     bool sessionUp();  /* one attempt: open, hello, re-push bundle, stream */
