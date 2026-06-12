@@ -158,8 +158,16 @@ Certification-suite behaviors exercised in miniature: T2/T3
 input), T10 (power-loss safety), T15 (byte-identical renders), T16
 (event timing).
 
-Not yet: transport/tempo events (§9.7 — arrives with the arpeggiator
-demo), four-safe-actions UI (v0 auto-resolves by Push-with-archive),
+The arpeggiator demo is in: the device declares `evt.transport` (§9.7)
+and follows the DAW's musical timeline — a note-latch arp whose step
+clock derives from the (timestamp, PPQ, tempo) anchor, landing steps on
+division boundaries sample-exactly by construction. Params grew to 12
+(the first param-map-hash change; old projects map onto matching ids
+with a warning, §9.3). The conformance kit gained T17: grid-exactness,
+loop-wrap survival, and a byte-identical "groove hash" — two renders of
+the same chord and transport are the same file.
+
+Not yet: four-safe-actions UI (v0 auto-resolves by Push-with-archive),
 runtime/shell process split (§15.1), firmware management (§13),
 class-audio coexistence (§8.5), free-running ASRC for analog devices,
 AU/CLAP/Windows-ASIO ports, TCP companion spec (§4.4).

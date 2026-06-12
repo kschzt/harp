@@ -131,13 +131,24 @@ fail:
 void encode_param_array(harp_cbuf *b) {
     harp_cbor_array(b, NPARAMS);
     for (size_t i = 0; i < NPARAMS; i++) {
-        harp_cbor_map(b, 3);
+        const dev_param *p = &g_params[i];
+        bool stepped = p->steps > 0;
+        harp_cbor_map(b, stepped ? 5 : 3);
         harp_cbor_uint(b, 0);
-        harp_cbor_uint(b, g_params[i].id);
+        harp_cbor_uint(b, p->id);
         harp_cbor_uint(b, 1);
-        harp_cbor_text(b, g_params[i].name);
+        harp_cbor_text(b, p->name);
+        if (stepped) { /* §9.3 keys 5 + 9: step count, enum labels */
+            harp_cbor_uint(b, 5);
+            harp_cbor_uint(b, p->steps);
+        }
         harp_cbor_uint(b, 8);
         harp_cbor_uint(b, 0x1); /* flags: automatable */
+        if (stepped) {
+            harp_cbor_uint(b, 9);
+            harp_cbor_array(b, p->steps);
+            for (int s = 0; s < p->steps; s++) harp_cbor_text(b, p->labels[s]);
+        }
     }
 }
 

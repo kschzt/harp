@@ -51,6 +51,8 @@
 typedef struct {
     uint32_t id;
     const char *name;
+    uint8_t steps;          /* 0 = continuous; else stepped (§9.3 key 5) */
+    const char *const *labels; /* enum labels, count == steps (§9.3 key 9) */
     _Atomic float value; /* written by render (ramps), session (loads),
                             panel (knobs); read everywhere. Last-write-wins
                             is the intended semantic; relaxed — ordering for
@@ -66,7 +68,7 @@ static inline void param_put(dev_param *p, float v) {
 
 /* fixed count so sizeof tricks aren't needed across modules; the arp
  * session grows this to 12 (params 9-12) — one place to change */
-#define NPARAMS 8
+#define NPARAMS 12
 extern dev_param g_params[NPARAMS];
 
 /* Live performance note state is PRIVATE to engine.c (mono, last-note
@@ -79,14 +81,22 @@ void engine_note_off_if(uint32_t note);   /* overflow escalation path */
 /* ---- timestamped event queue (§9.2): session thread pushes, render
  * thread pops at exact stream positions. ts is SSI (host-paced) or MSC
  * (free-running); ts == 0 means "now". ---- */
-enum { DEV_EV_NOTE_ON, DEV_EV_NOTE_OFF, DEV_EV_PARAM_SET, DEV_EV_RAMP, DEV_EV_ALL_OFF };
+enum {
+    DEV_EV_NOTE_ON,
+    DEV_EV_NOTE_OFF,
+    DEV_EV_PARAM_SET,
+    DEV_EV_RAMP,
+    DEV_EV_ALL_OFF,
+    DEV_EV_TRANSPORT /* §9.7 anchor: (ts, ppq, tempo) defines musical time */
+};
 
 typedef struct {
     uint64_t ts;   /* apply at this stream position (0 = asap) */
     uint8_t kind;
-    uint32_t a;    /* note number or param id */
-    float v;       /* velocity / value / ramp target */
+    uint32_t a;    /* note number / param id / transport flags */
+    float v;       /* velocity / value / ramp target / tempo BPM */
     uint64_t end;  /* ramp end position */
+    double ppq;    /* transport: song position at ts (§9.7 key 4) */
 } dev_event;
 
 #define DEV_EVQ_CAP 256

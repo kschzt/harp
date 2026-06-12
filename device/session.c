@@ -125,7 +125,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, PROTO_MAJOR);
     harp_cbor_uint(m, PROTO_MINOR);
     harp_cbor_uint(m, 6); /* capabilities */
-    harp_cbor_array(m, 9);
+    harp_cbor_array(m, 10);
     harp_cbor_text(m, "harp-core");
     harp_cbor_text(m, "harp-recall");
     harp_cbor_text(m, "harp-stream");
@@ -134,6 +134,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_text(m, "audio.offline-rate");
     harp_cbor_text(m, "evt.param");
     harp_cbor_text(m, "evt.param.echo");
+    harp_cbor_text(m, "evt.transport");
     harp_cbor_text(m, "x.harp-refdev.sim");
     harp_cbor_uint(m, 7); /* channel map (§6.3): stereo main mix, D→H */
     harp_cbor_array(m, 2);
@@ -720,7 +721,7 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
         uint32_t mt = w >> 28;
         if (mt == 2) { /* MIDI 1.0 channel voice in UMP */
             uint32_t status = (w >> 20) & 0xf, note = (w >> 8) & 0x7f, vel = w & 0x7f;
-            dev_event ev = {msc, 0, note, 0, 0};
+            dev_event ev = {msc, 0, note, 0, 0, 0};
             if (status == 0x9 && vel > 0) {
                 ev.kind = DEV_EV_NOTE_ON;
                 ev.v = (float)vel / 127.0f;
@@ -774,9 +775,31 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
         if (!have_id || !have_t || !have_end) return;
         if (target < 0) target = 0;
         if (target > 1) target = 1;
-        dev_event ev = {msc, DEV_EV_RAMP, (uint32_t)id, (float)target, ets};
+        dev_event ev = {msc, DEV_EV_RAMP, (uint32_t)id, (float)target, ets, 0};
         evq_push(ev);
         live_ref_touch(d, true);
+        return;
+    }
+    if (etype == 7) { /* transport (§9.7): the (ts, ppq, tempo) anchor */
+        uint64_t n, key, flags = 0;
+        double tempo = 0, ppq = 0;
+        if (!harp_cdec_map(&dec, &n)) {
+            CTR_INC(d->frame_errors);
+            return;
+        }
+        for (uint64_t i = 0; i < n; i++) {
+            if (!harp_cdec_uint(&dec, &key)) return;
+            if (key == 0) {
+                if (!harp_cdec_uint(&dec, &flags)) return;
+            } else if (key == 1) {
+                if (!harp_cdec_float(&dec, &tempo)) return;
+            } else if (key == 4) {
+                if (!harp_cdec_float(&dec, &ppq)) return;
+            } else if (!harp_cdec_skip(&dec))
+                return;
+        }
+        dev_event ev = {msc, DEV_EV_TRANSPORT, (uint32_t)flags, (float)tempo, 0, ppq};
+        evq_push(ev);
         return;
     }
     if (etype != 1) return; /* unknown event types are skipped, not fatal */
@@ -804,7 +827,7 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
     /* ts 0 = "now" = next render subblock; routing it through the queue
      * (instead of the old direct write) keeps ramp state render-owned —
      * the direct path raced ramps_advance on g_ramps[i].active */
-    dev_event ev = {msc, DEV_EV_PARAM_SET, (uint32_t)id, (float)v, 0};
+    dev_event ev = {msc, DEV_EV_PARAM_SET, (uint32_t)id, (float)v, 0, 0};
     evq_push(ev);
     live_ref_touch(d, true);
 }

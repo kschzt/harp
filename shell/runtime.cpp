@@ -362,6 +362,33 @@ void HarpRuntime::queueNote(uint32_t word, uint64_t ts) {
     }
 }
 
+void HarpRuntime::queueTransport(uint32_t flags, double tempo, double ppq,
+                                 uint64_t ts) {
+    uint64_t ppqBits;
+    memcpy(&ppqBits, &ppq, sizeof ppqBits);
+    if (timedRing_.push({3, flags, (float)tempo, ts, ppqBits}))
+        evtQueuedSeq_.fetch_add(1, std::memory_order_release);
+    else
+        evDrops_.fetch_add(1, std::memory_order_relaxed);
+}
+
+/* transport event (§9.7): etype 7, body {0 flags, 1 tempo, 4 ppq} */
+void HarpRuntime::encodeTransportEvent(harp_cbuf *m, uint32_t flags, double tempo,
+                                       double ppq, uint64_t ts) {
+    harp_cbor_array(m, 3);
+    harp_cbor_array(m, 2);
+    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, ts);
+    harp_cbor_uint(m, 7); /* etype: transport */
+    harp_cbor_map(m, 3);
+    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, flags);
+    harp_cbor_uint(m, 1);
+    harp_cbor_float(m, tempo);
+    harp_cbor_uint(m, 4);
+    harp_cbor_float(m, ppq);
+}
+
 /* UMP event (§9.10): etype 0, body = one packet, words big-endian. */
 void HarpRuntime::encodeUmpEvent(harp_cbuf *m, uint32_t word, uint64_t ts) {
     uint8_t bytes[4] = {(uint8_t)(word >> 24), (uint8_t)(word >> 16),
@@ -582,7 +609,11 @@ void HarpRuntime::eventPump() {
                 encodeParamEvent(&msgbuf, te.a, te.v, te.ts);
             else if (te.kind == 1)
                 encodeRampEvent(&msgbuf, te.a, te.v, te.ts, te.end);
-            else
+            else if (te.kind == 3) {
+                double ppq;
+                memcpy(&ppq, &te.end, sizeof ppq);
+                encodeTransportEvent(&msgbuf, te.a, te.v, ppq, te.ts);
+            } else
                 encodeUmpEvent(&msgbuf, te.a, te.ts);
             harp_frame_hdr h = {HARP_FRAME_FVER, HARP_STREAM_EVT, HARP_FLAG_FIN,
                                 (uint32_t)msgbuf.len};
@@ -843,6 +874,38 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
                 size_t sl;
                 if (!harp_cdec_text(&d, &s, &sl)) return false;
                 magicOk = sl == 5 && memcmp(s, BUNDLE_MAGIC, 5) == 0;
+                break;
+            }
+            case 2: { /* identity-expectation: warn on param-map drift
+                       * (§9.3: shells MUST warn and map conservatively —
+                       * the device maps by id, so old automation lands on
+                       * matching ids and new params keep their values) */
+                uint64_t in;
+                if (!harp_cdec_map(&d, &in)) return false;
+                for (uint64_t j = 0; j < in; j++) {
+                    uint64_t ik;
+                    if (!harp_cdec_uint(&d, &ik)) return false;
+                    if (ik == 3) { /* engine map */
+                        uint64_t en;
+                        if (!harp_cdec_map(&d, &en)) return false;
+                        for (uint64_t k2 = 0; k2 < en; k2++) {
+                            uint64_t ek;
+                            if (!harp_cdec_uint(&d, &ek)) return false;
+                            if (ek == 2) {
+                                const uint8_t *hp;
+                                size_t hl;
+                                if (!harp_cdec_bytes(&d, &hp, &hl)) return false;
+                                if (hl == HARP_HASH_LEN && connected() &&
+                                    memcmp(hp, paramMapHash_.b, HARP_HASH_LEN) != 0)
+                                    log_msg("recall: project's param map differs "
+                                            "from the device's (engine update?) — "
+                                            "applying matching ids only");
+                            } else if (!harp_cdec_skip(&d))
+                                return false;
+                        }
+                    } else if (!harp_cdec_skip(&d))
+                        return false;
+                }
                 break;
             }
             case 3: { /* refs */

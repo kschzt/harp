@@ -1,7 +1,7 @@
 # Technical debt ledger
 
 Living document; items leave by being fixed, not forgotten.
-(Status as of 2026-06-11 overnight quality block.)
+(Started 2026-06-11; updated through the arp session, 2026-06-12.)
 
 | # | item | severity | status |
 |---|------|----------|--------|

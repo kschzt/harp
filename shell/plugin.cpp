@@ -32,10 +32,17 @@ static const FUID kHarpControllerUID(0x3AF7D698, 0x0DB04F6E, 0x8F107EEF, 0x74804
 struct DevParam {
     uint32_t id;
     const char *name;
+    int32 stepCount;   /* 0 = continuous (VST3: stepCount = steps - 1) */
+    double defaultVal; /* must mirror the device defaults (recall sanity) */
 };
 static const DevParam kParams[] = {
-    {1, "Osc Pitch"},   {2, "Osc Shape"},  {3, "Filter Cutoff"}, {4, "Filter Reso"},
-    {5, "Env Attack"},  {6, "Env Release"}, {7, "FX Send"},       {8, "Master Level"},
+    {1, "Osc Pitch", 0, 0.5},    {2, "Osc Shape", 0, 0.5},
+    {3, "Filter Cutoff", 0, 0.5}, {4, "Filter Reso", 0, 0.5},
+    {5, "Env Attack", 0, 0.5},   {6, "Env Release", 0, 0.5},
+    {7, "FX Send", 0, 0.5},      {8, "Master Level", 0, 0.5},
+    /* the arp (device params 9-12; param-map-hash changed with these) */
+    {9, "Arp Mode", 4, 0.0},     {10, "Arp Division", 5, 0.6},
+    {11, "Arp Gate", 0, 0.5},    {12, "Arp Octaves", 3, 0.0},
 };
 static constexpr int kNumParams = sizeof(kParams) / sizeof(kParams[0]);
 /* hidden parameter the DAW's panic (CC 120/123) maps onto via IMidiMapping */
@@ -96,6 +103,43 @@ public:
          * they sound exactly when the DAW intended (§9.2). */
         uint64_t base = rt.streamPos() + rt.latencySamples();
 
+        /* transport (§9.7): an event on every CHANGE — play/stop, tempo,
+         * locate or loop wrap (detected as a discontinuity between this
+         * block's musical position and the last block's prediction) — plus
+         * a >= 1 Hz refresh while playing (spec MUST). PPQ is anchored at
+         * `base`, this block's start in the stream domain: after PDC that
+         * is exactly when Live hears this block, so the device's musical
+         * grid aligns with the project grid by construction. */
+        if (data.processContext) {
+            const ProcessContext &pc = *data.processContext;
+            bool playing = (pc.state & ProcessContext::kPlaying) != 0;
+            bool tempoV = (pc.state & ProcessContext::kTempoValid) != 0;
+            bool posV = (pc.state & ProcessContext::kProjectTimeMusicValid) != 0;
+            double tempo = tempoV ? pc.tempo : 0.0;
+            double ppq = posV ? pc.projectTimeMusic : 0.0;
+
+            bool discont = false;
+            if (playing && lastPlaying_ && posV)
+                /* half a MIDI tick of slack: anything bigger is a jump */
+                discont = ppq + 1e-3 < lastEndPpq_ || ppq > lastEndPpq_ + 1e-3;
+            samplesSinceTransport_ += (uint64_t)data.numSamples;
+            bool change = playing != lastPlaying_ ||
+                          (tempoV && tempo != lastTempo_) || discont;
+            bool refresh = playing && samplesSinceTransport_ >= rate_;
+            if (change || refresh || !transportSent_) {
+                uint32_t flags = (playing ? 1u : 0) | (tempoV ? 1u << 3 : 0) |
+                                 (posV ? 1u << 5 : 0);
+                rt.queueTransport(flags, tempo, ppq, base);
+                transportSent_ = true;
+                samplesSinceTransport_ = 0;
+            }
+            lastPlaying_ = playing;
+            lastTempo_ = tempo;
+            lastEndPpq_ = playing && tempoV && posV
+                              ? ppq + data.numSamples * tempo / (60.0 * rate_)
+                              : ppq;
+        }
+
         /* note events -> UMP (§9.10), timestamped to the sample */
         if (data.inputEvents) {
             int32 ne = data.inputEvents->getEventCount();
@@ -124,7 +168,7 @@ public:
          * nothing a 256-sample ramp doesn't (the device interpolates at
          * control rate regardless). Skipped points fold into the next
          * ramp's target; a pend with no successor flushes below. */
-        for (size_t idx = 0; idx < 8; idx++) {
+        for (size_t idx = 0; idx < kNumParams; idx++) {
             /* Flush a pending fold only when the gesture is OVER — no
              * successor point for a full pacing block. Flushing one DAW
              * block after the fold (the original logic) emitted 64-sample
@@ -146,7 +190,7 @@ public:
                 if (!q) continue;
                 uint32_t id = (uint32_t)q->getParameterId();
                 int32 np = q->getPointCount();
-                size_t idx = (id >= 1 && id <= 8) ? id - 1 : SIZE_MAX;
+                size_t idx = (id >= 1 && id <= kNumParams) ? id - 1 : SIZE_MAX;
                 for (int32 k = 0; k < np; k++) {
                     int32 off;
                     ParamValue v;
@@ -257,11 +301,17 @@ private:
     bool offline_ = false;
     /* per-param ramp-synthesis state: last emitted point + pending folded
      * point awaiting the 256-sample thinning interval */
-    uint64_t lastTs_[8] = {};
-    bool hasLast_[8] = {};
-    bool pendHas_[8] = {};
-    uint64_t pendTs_[8] = {};
-    float pendVal_[8] = {};
+    uint64_t lastTs_[kNumParams] = {};
+    bool hasLast_[kNumParams] = {};
+    bool pendHas_[kNumParams] = {};
+    uint64_t pendTs_[kNumParams] = {};
+    float pendVal_[kNumParams] = {};
+
+    /* §9.7 transport change detection */
+    bool lastPlaying_ = false;
+    bool transportSent_ = false;
+    double lastTempo_ = 0, lastEndPpq_ = 0;
+    uint64_t samplesSinceTransport_ = 0;
 };
 
 /* ---------------- controller ---------------- */
@@ -277,7 +327,7 @@ public:
         if (r != kResultOk) return r;
         for (auto &p : kParams) {
             UString256 title(p.name);
-            parameters.addParameter(title, nullptr, 0, 0.5,
+            parameters.addParameter(title, nullptr, p.stepCount, p.defaultVal,
                                     ParameterInfo::kCanAutomate, p.id);
         }
         parameters.addParameter(STR16("Panic"), nullptr, 0, 0,

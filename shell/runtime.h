@@ -67,6 +67,10 @@ public:
     void queueParamSet(uint32_t id, float v, uint64_t ts);
     void queueRamp(uint32_t id, float target, uint64_t start, uint64_t end);
     void queueNote(uint32_t umpWord, uint64_t ts);
+    /* §9.7 transport anchor: (ts, ppq, tempo) defines musical time on the
+     * device until superseded. ppq travels as bit-cast u64 (the ring's
+     * fields are fixed); flags per spec key 0. */
+    void queueTransport(uint32_t flags, double tempo, double ppq, uint64_t ts);
     /* SSI of the next sample pullAudio will deliver: the stream-domain "now"
      * for timestamping. Events for DAW offset s in the current block go to
      * streamPos() + s + latencySamples() — PDC makes that land on time. */
@@ -152,6 +156,8 @@ private:
     static void encodeRampEvent(harp_cbuf *out, uint32_t id, float target,
                                 uint64_t start, uint64_t end);
     static void encodeUmpEvent(harp_cbuf *out, uint32_t word, uint64_t ts);
+    static void encodeTransportEvent(harp_cbuf *out, uint32_t flags, double tempo,
+                                     double ppq, uint64_t ts);
     void pollEcho(); /* drain incoming evt stream */
 
     /* control-plane ops under ctlMutex_ (protocol work lives in the shared

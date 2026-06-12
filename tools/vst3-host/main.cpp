@@ -122,6 +122,7 @@ int main(int argc, char **argv) {
                 "usage: harp-vst3-host PLUGIN.vst3 [--list] [--rate N] [--block N]\n"
                 "       [--seconds S] [--input sine[:HZ]|impulse|silence]\n"
                 "       [--set ID=NORMVALUE]... [--ramp ID=V0:V1]... [--notes N,N,..]\n"
+                "       [--bpm B] [--chord N,N,..] [--loop STARTPPQ:ENDPPQ]\n"
                 "       [--realtime] [--out FILE.wav] [--hash]\n"
                 "       [--save-state FILE] [--load-state FILE]\n");
         return 2;
@@ -134,6 +135,9 @@ int main(int argc, char **argv) {
     double sine_hz = 440.0;
     std::vector<std::pair<uint32_t, double>> sets;
     std::vector<int> notes;    /* played sequentially at note_period spacing */
+    std::vector<int> chord;    /* held from 0.1 s to the end (arp fodder) */
+    double bpm = 0;            /* >0: emit a playing transport (tempo, PPQ) */
+    double loop_a = -1, loop_b = -1; /* PPQ loop region: jump b -> a */
     double note_period = 0.6;  /* s between note-ons; gate = 75% of period */
     struct RampSpec {
         uint32_t id;
@@ -163,6 +167,20 @@ int main(int argc, char **argv) {
                 sine_hz = atof(input_kind.substr(colon + 1).c_str());
                 input_kind = input_kind.substr(0, colon);
             }
+        } else if (a == "--bpm") {
+            bpm = atof(argv[++i]);
+        } else if (a == "--chord") {
+            std::string list = argv[++i];
+            size_t pos = 0;
+            while (pos < list.size()) {
+                chord.push_back(atoi(list.c_str() + pos));
+                pos = list.find(',', pos);
+                if (pos == std::string::npos) break;
+                pos++;
+            }
+        } else if (a == "--loop") {
+            if (sscanf(argv[++i], "%lf:%lf", &loop_a, &loop_b) != 2)
+                die("--loop wants STARTPPQ:ENDPPQ");
         } else if (a == "--notes") {
             std::string list = next();
             size_t pos = 0;
@@ -281,6 +299,11 @@ int main(int argc, char **argv) {
     ProcessContext ctx{};
     ctx.sampleRate = rate;
     ctx.state = ProcessContext::kPlaying;
+    if (bpm > 0) {
+        ctx.state |= ProcessContext::kTempoValid | ProcessContext::kProjectTimeMusicValid;
+        ctx.tempo = bpm;
+        ctx.projectTimeMusic = 0;
+    }
     pd.processContext = &ctx;
 
     size_t total = (size_t)(seconds * rate);
@@ -313,6 +336,15 @@ int main(int argc, char **argv) {
         }
         size_t n = std::min((size_t)block, total - done);
         pd.numSamples = (int32)n;
+        if (bpm > 0) {
+            ctx.projectTimeSamples = (TSamples)done;
+            /* loop simulation: when the block START passes the loop end,
+             * jump back — like Live, the wrap lands on a block boundary
+             * and the new position is announced in this block's context */
+            if (loop_b > loop_a && loop_a >= 0 &&
+                ctx.projectTimeMusic + 1e-9 >= loop_b)
+                ctx.projectTimeMusic = loop_a + (ctx.projectTimeMusic - loop_b);
+        }
 
         if (nin > 0 && pd.inputs) {
             for (int32 c = 0; c < in_ch; c++) {
@@ -353,6 +385,30 @@ int main(int argc, char **argv) {
         pd.outputParameterChanges = &opc;
 
         EventList evList; /* scheduled --notes falling inside this block */
+        if (!chord.empty()) {
+            size_t onAt = (size_t)(0.1 * rate);
+            bool last = done + n >= total;
+            for (int cn : chord) {
+                if (onAt >= done && onAt < done + n) {
+                    Event ev{};
+                    ev.type = Event::kNoteOnEvent;
+                    ev.sampleOffset = (int32)(onAt - done);
+                    ev.noteOn.channel = 0;
+                    ev.noteOn.pitch = (int16)cn;
+                    ev.noteOn.velocity = 0.8f;
+                    evList.addEvent(ev);
+                }
+                if (last) {
+                    Event ev{};
+                    ev.type = Event::kNoteOffEvent;
+                    ev.sampleOffset = (int32)(n > 0 ? n - 1 : 0);
+                    ev.noteOff.channel = 0;
+                    ev.noteOff.pitch = (int16)cn;
+                    ev.noteOff.velocity = 0;
+                    evList.addEvent(ev);
+                }
+            }
+        }
         for (size_t ni = 0; ni < notes.size(); ni++) {
             int64_t on_at = (int64_t)((double)ni * note_period * rate);
             int64_t off_at = on_at + (int64_t)(0.75 * note_period * rate);
@@ -392,6 +448,7 @@ int main(int argc, char **argv) {
         for (size_t s = 0; s < n; s++)
             for (int32 c = 0; c < out_ch; c++)
                 capture.push_back(pd.outputs[0].channelBuffers32[c][s]);
+        if (bpm > 0) ctx.projectTimeMusic += (double)n * bpm / (60.0 * rate);
         done += n;
         ctx.projectTimeSamples += (TSamples)n;
     }

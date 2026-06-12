@@ -15,6 +15,7 @@ run() {
 run scripts/recall-test.sh
 run scripts/timing-test.sh
 run scripts/soak.sh "${SOAK_SECONDS:-30}"
+run scripts/tempo-lock-test.sh
 run scripts/replug-test.sh
 echo "════ hw-tests: $PASS passed, $FAIL failed, $SKIP skipped"
 [ $FAIL -eq 0 ]
