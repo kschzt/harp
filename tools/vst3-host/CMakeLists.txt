@@ -100,6 +100,50 @@ if(LIBUSB_FOUND)
       DEPENDS harp-shell
       COMMENT "Installing harp-shell.vst3 to ~/.vst3")
   endif()
+
+  # ---- the Audio Unit shell (macOS): same runtime, second format ----
+  if(APPLE)
+    add_library(harp-au MODULE
+      ${HARP_ROOT}/shell/au/harp_au.mm
+      ${HARP_ROOT}/shell/runtime.cpp
+      ${HARP_ROOT}/host/usb_io.c
+      ${HARP_ROOT}/host/client.c
+      ${HARP_ROOT}/core/src/cbor.c
+      ${HARP_ROOT}/core/src/sha256.c
+      ${HARP_ROOT}/core/src/frame.c
+      ${HARP_ROOT}/core/src/object.c
+      ${HARP_ROOT}/core/src/store.c
+      ${HARP_ROOT}/core/src/envelope.c
+      ${HARP_ROOT}/core/src/link.c
+      ${HARP_ROOT}/core/src/audio.c)
+    target_include_directories(harp-au PRIVATE
+      ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
+      ${LIBUSB_INCLUDE_DIRS})
+    # os_workgroup_t must mean the same thing in runtime.cpp (C++) and
+    # harp_au.mm (ObjC++): force the C-struct flavor of OS objects
+    target_compile_definitions(harp-au PRIVATE HAVE_LIBUSB OS_OBJECT_USE_OBJC=0)
+    target_link_directories(harp-au PRIVATE ${LIBUSB_LIBRARY_DIRS})
+    target_link_libraries(harp-au PRIVATE ${LIBUSB_LIBRARIES}
+      "-framework AudioToolbox" "-framework CoreFoundation" "-framework Foundation")
+    set_target_properties(harp-au PROPERTIES
+      BUNDLE TRUE
+      BUNDLE_EXTENSION "component"
+      OUTPUT_NAME "harp-au"
+      MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/../au-host/au-info.plist.in)
+
+    add_executable(au-host ${CMAKE_CURRENT_SOURCE_DIR}/../au-host/main.mm)
+    target_link_libraries(au-host PRIVATE
+      "-framework AudioToolbox" "-framework CoreFoundation")
+
+    add_custom_target(install-au
+      COMMAND rm -rf "$ENV{HOME}/Library/Audio/Plug-Ins/Components/harp-au.component"
+      COMMAND cp -R "$<TARGET_BUNDLE_DIR:harp-au>"
+              "$ENV{HOME}/Library/Audio/Plug-Ins/Components/"
+      COMMAND codesign --force --deep -s -
+              "$ENV{HOME}/Library/Audio/Plug-Ins/Components/harp-au.component"
+      DEPENDS harp-au
+      COMMENT "Installing harp-au.component")
+  endif()
 else()
   message(STATUS "harp-shell: libusb not found, shell not built")
 endif()

@@ -113,32 +113,10 @@ public:
          * grid aligns with the project grid by construction. */
         if (data.processContext) {
             const ProcessContext &pc = *data.processContext;
-            bool playing = (pc.state & ProcessContext::kPlaying) != 0;
-            bool tempoV = (pc.state & ProcessContext::kTempoValid) != 0;
-            bool posV = (pc.state & ProcessContext::kProjectTimeMusicValid) != 0;
-            double tempo = tempoV ? pc.tempo : 0.0;
-            double ppq = posV ? pc.projectTimeMusic : 0.0;
-
-            bool discont = false;
-            if (playing && lastPlaying_ && posV)
-                /* half a MIDI tick of slack: anything bigger is a jump */
-                discont = ppq + 1e-3 < lastEndPpq_ || ppq > lastEndPpq_ + 1e-3;
-            samplesSinceTransport_ += (uint64_t)data.numSamples;
-            bool change = playing != lastPlaying_ ||
-                          (tempoV && tempo != lastTempo_) || discont;
-            bool refresh = playing && samplesSinceTransport_ >= rate_;
-            if (change || refresh || !transportSent_) {
-                uint32_t flags = (playing ? 1u : 0) | (tempoV ? 1u << 3 : 0) |
-                                 (posV ? 1u << 5 : 0);
-                rt.queueTransport(flags, tempo, ppq, base);
-                transportSent_ = true;
-                samplesSinceTransport_ = 0;
-            }
-            lastPlaying_ = playing;
-            lastTempo_ = tempo;
-            lastEndPpq_ = playing && tempoV && posV
-                              ? ppq + data.numSamples * tempo / (60.0 * rate_)
-                              : ppq;
+            rt.feedTransport((pc.state & ProcessContext::kPlaying) != 0,
+                             (pc.state & ProcessContext::kTempoValid) != 0, pc.tempo,
+                             (pc.state & ProcessContext::kProjectTimeMusicValid) != 0,
+                             pc.projectTimeMusic, (uint32_t)data.numSamples, base);
         }
 
         /* note events -> UMP (§9.10), timestamped to the sample */
@@ -308,11 +286,7 @@ private:
     uint64_t pendTs_[kNumParams] = {};
     float pendVal_[kNumParams] = {};
 
-    /* §9.7 transport change detection */
-    bool lastPlaying_ = false;
-    bool transportSent_ = false;
-    double lastTempo_ = 0, lastEndPpq_ = 0;
-    uint64_t samplesSinceTransport_ = 0;
+
 };
 
 /* ---------------- controller ---------------- */

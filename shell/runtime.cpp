@@ -168,6 +168,43 @@ void HarpRuntime::pollEcho() {
     }
 }
 
+#ifdef __APPLE__
+void HarpRuntime::setWorkgroup(os_workgroup_t wg) {
+    std::lock_guard<std::mutex> lk(wgMutex_);
+    if (wg == wg_) return;
+    if (wg) os_retain(wg);
+    if (wg_) os_release(wg_);
+    wg_ = wg;
+    wgGen_.fetch_add(1, std::memory_order_release);
+    log_msg(wg ? "joined the host's audio workgroup" : "left the audio workgroup");
+}
+
+void HarpRuntime::wgMaintain(WgState &st) {
+    uint64_t gen = wgGen_.load(std::memory_order_acquire);
+    if (gen == st.gen) return;
+    if (st.joined) {
+        os_workgroup_leave(st.joined, &st.token);
+        os_release(st.joined);
+        st.joined = nullptr;
+    }
+    os_workgroup_t target = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(wgMutex_);
+        target = wg_;
+        if (target) os_retain(target);
+        gen = wgGen_.load(std::memory_order_relaxed);
+    }
+    if (target) {
+        if (os_workgroup_join(target, &st.token) == 0) {
+            st.joined = target;
+        } else { /* cancelled workgroup: drop the ref, stay unjoined */
+            os_release(target);
+        }
+    }
+    st.gen = gen;
+}
+#endif
+
 /* ---------------- lifecycle ---------------- */
 
 /* One connection attempt: claim, hello, re-assert the project bundle,
@@ -372,6 +409,31 @@ void HarpRuntime::queueTransport(uint32_t flags, double tempo, double ppq,
         evDrops_.fetch_add(1, std::memory_order_relaxed);
 }
 
+void HarpRuntime::feedTransport(bool playing, bool tempoValid, double tempo,
+                                bool posValid, double ppq, uint32_t blockSamples,
+                                uint64_t base) {
+    bool discont = false;
+    if (playing && tpLastPlaying_ && posValid)
+        /* half a MIDI tick of slack: anything bigger is a jump */
+        discont = ppq + 1e-3 < tpLastEndPpq_ || ppq > tpLastEndPpq_ + 1e-3;
+    tpSamplesSince_ += blockSamples;
+    bool change =
+        playing != tpLastPlaying_ || (tempoValid && tempo != tpLastTempo_) || discont;
+    bool refresh = playing && tpSamplesSince_ >= rate_;
+    if (change || refresh || !tpSent_) {
+        uint32_t flags =
+            (playing ? 1u : 0) | (tempoValid ? 1u << 3 : 0) | (posValid ? 1u << 5 : 0);
+        queueTransport(flags, tempo, ppq, base);
+        tpSent_ = true;
+        tpSamplesSince_ = 0;
+    }
+    tpLastPlaying_ = playing;
+    tpLastTempo_ = tempo;
+    tpLastEndPpq_ = playing && tempoValid && posValid
+                        ? ppq + blockSamples * tempo / (60.0 * rate_)
+                        : ppq;
+}
+
 /* transport event (§9.7): etype 7, body {0 flags, 1 tempo, 4 ppq} */
 void HarpRuntime::encodeTransportEvent(harp_cbuf *m, uint32_t flags, double tempo,
                                        double ppq, uint64_t ts) {
@@ -480,8 +542,14 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
 void HarpRuntime::feeder() {
     /* (QoS is set by the supervisor thread, which runs this.) Exits when
      * the plugin stops OR the session dies — the supervisor reconnects. */
+#ifdef __APPLE__
+    WgState wg;
+#endif
     while (running_.load(std::memory_order_relaxed) &&
            connected_.load(std::memory_order_relaxed)) {
+#ifdef __APPLE__
+        wgMaintain(wg);
+#endif
         bool didWork = false;
 
         /* 1. inbound async traffic FIRST: keeping the IN direction drained
@@ -580,8 +648,14 @@ void HarpRuntime::eventPump() {
     harp_cbuf msgbuf, batch;
     harp_cbuf_init(&msgbuf);
     harp_cbuf_init(&batch);
+#ifdef __APPLE__
+    WgState wg;
+#endif
     while (running_.load(std::memory_order_relaxed) &&
            connected_.load(std::memory_order_relaxed)) {
+#ifdef __APPLE__
+        wgMaintain(wg);
+#endif
         bool didWork = false;
 
         /* escalated panic: a note-off was lost to overflow — all-notes-off
@@ -647,7 +721,13 @@ void HarpRuntime::reader() {
 #endif
     uint8_t acc[65536];
     size_t accLen = 0;
+#ifdef __APPLE__
+    WgState wg;
+#endif
     while (running_.load(std::memory_order_relaxed)) {
+#ifdef __APPLE__
+        wgMaintain(wg);
+#endif
         int r = harp_usb_audio_read(io_, acc + accLen, (int)(sizeof acc - accLen), 100);
         if (r < 0) {
             log_msg("audio stream read failed; device gone?");

@@ -17,6 +17,16 @@ jobs:
           cmake --build build-vst --target harp-vst3-host harp-shell ring-tests -j3
       - name: ring tests (incl. cross-thread stress)
         run: ./build-vst/ring-tests
+      - name: AU shell + auval (Apple's own validation gate)
+        run: |
+          cmake --build build-vst --target harp-au au-host -j3
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R "$(find build-vst -name 'harp-au.component' -maxdepth 3 | head -1)" \
+                ~/Library/Audio/Plug-Ins/Components/
+          codesign --force --deep -s - ~/Library/Audio/Plug-Ins/Components/harp-au.component
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          sleep 2
+          auval -v aumu rfdv HARP
 
   core:
     runs-on: ubuntu-latest

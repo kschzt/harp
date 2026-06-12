@@ -13,6 +13,9 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#ifdef __APPLE__
+#include <os/workgroup.h>
+#endif
 #include <mutex>
 #include <string>
 #include <thread>
@@ -71,6 +74,14 @@ public:
      * device until superseded. ppq travels as bit-cast u64 (the ring's
      * fields are fixed); flags per spec key 0. */
     void queueTransport(uint32_t flags, double tempo, double ppq, uint64_t ts);
+    /* §9.7 synthesis shared by every shell (VST3, AU): feed the host's
+     * per-block transport snapshot; emits an event on change (play/stop,
+     * tempo, position discontinuity = locate/loop wrap) plus the >= 1 Hz
+     * refresh. Audio-thread safe: detection state is audio-thread-owned,
+     * emission is a lock-free ring push. `base` = this block's start in
+     * the stream domain (streamPos + latency). */
+    void feedTransport(bool playing, bool tempoValid, double tempo, bool posValid,
+                       double ppq, uint32_t blockSamples, uint64_t base);
     /* SSI of the next sample pullAudio will deliver: the stream-domain "now"
      * for timestamping. Events for DAW offset s in the current block go to
      * streamPos() + s + latencySamples() — PDC makes that land on time. */
@@ -109,6 +120,14 @@ public:
 
     std::string serial() const { return serial_; }
 
+#ifdef __APPLE__
+    /* CoreAudio workgroup handoff (AU shells; VST3 has no API for it):
+     * the host's render-context observer calls this with its workgroup;
+     * the reader/pump/feeder threads join so the USB path is scheduled
+     * WITH the audio graph. nullptr = leave. */
+    void setWorkgroup(os_workgroup_t wg);
+#endif
+
 private:
     HarpRuntime();
     ~HarpRuntime();
@@ -136,6 +155,21 @@ private:
      * derives from this: 16 ms total at DAW blocks <= 256 (48 k).
      * HARP_CUSHION_BLOCKS overrides for measurement. */
     static constexpr uint32_t kTargetDepthFrames = 2;
+
+#ifdef __APPLE__
+    /* per-thread workgroup membership; loops call wgMaintain() each pass
+     * (a relaxed generation check) and join/leave on their OWN stack —
+     * os_workgroup_join must run on the joining thread */
+    struct WgState {
+        uint64_t gen = 0;
+        os_workgroup_t joined = nullptr;
+        os_workgroup_join_token_s token{};
+    };
+    void wgMaintain(WgState &st);
+    std::mutex wgMutex_;
+    os_workgroup_t wg_ = nullptr; /* retained; under wgMutex_ */
+    std::atomic<uint64_t> wgGen_{0};
+#endif
 
     void supervisor(); /* owns session lifecycle: connect, run, reconnect */
     bool sessionUp();  /* one attempt: open, hello, re-push bundle, stream */
@@ -189,6 +223,12 @@ private:
     std::atomic<uint64_t> evDrops_{0};    /* events lost to ring overflow — never silent */
     uint64_t evDropsLogged_ = 0;
     std::atomic<bool> panicPending_{false}; /* a note-off was lost: all-off NOW */
+
+    /* §9.7 transport change detection (audio-thread-owned) */
+    bool tpLastPlaying_ = false;
+    bool tpSent_ = false;
+    double tpLastTempo_ = 0, tpLastEndPpq_ = 0;
+    uint64_t tpSamplesSince_ = 0;
 
     /* event fence sequence (§8.3.1): count of events QUEUED this session
      * (not yet written — queue time is what a racing pacing frame must

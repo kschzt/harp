@@ -3,9 +3,10 @@
 ## The shape of the system
 
 ```
-┌─ DAW (Ableton Live, …) ──────────────────────────────────────────┐
-│  ┌─ harp-shell.vst3 ─────────────────────────────────────────┐   │
-│  │  processor/controller (VST3 API, frozen UIDs)             │   │
+┌─ DAW (Ableton Live, Logic, …) ───────────────────────────────────┐
+│  ┌─ harp-shell.vst3 / harp-au.component ─────────────────────┐   │
+│  │  thin format shells (VST3 processor/controller; AUv2      │   │
+│  │  dispatch + workgroup join) over ONE embedded runtime     │   │
 │  │  ┌─ embedded HARP runtime ───────────────────────────┐    │   │
 │  │  │ feeder thread: pacing + events + link inbound     │    │   │
 │  │  │  · paces SSI blocks (small fixed pipeline)        │    │   │

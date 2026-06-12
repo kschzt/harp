@@ -73,11 +73,15 @@ device/           harp-deviced — the reference device daemon: an 8-knob
                   TCP (simulation, any OS) and FunctionFS USB gadget (Linux)
 host/             harp-probe — host-side CLI: recall flows, audio capture,
                   offline render, determinism checks (libusb)
-shell/            the VST3 plugin ("HARP RefDev"): embedded host runtime,
-                  host-paced audio into process(), params as automation,
-                  getState/setState = Recall Bundle
+shell/            the plugin shells over one embedded runtime:
+                  VST3 ("HARP RefDev") and Audio Unit (shell/au) — same
+                  params, same Recall Bundle in the project file; the AU
+                  also joins the host's CoreAudio workgroup. Both render
+                  BYTE-IDENTICAL audio from the same drive (asserted by
+                  the conformance kit)
 tools/vst3-host/  CLI VST3 host for automated testing of any plugin —
                   params, block processing, WAV+hash, state round-trips
+tools/au-host/    its Audio Unit twin (drives the AU shell; same hashes)
 tests/            unit tests for the core (RFC 8949 vectors included)
 docs/             architecture one-pager, VST3 shell design plan
 scripts/          Raspberry Pi provisioning + operations runbook

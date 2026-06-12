@@ -130,4 +130,17 @@ if bad:
 print(f"   {len(onsets)} onsets, every interval on-grid across the wrap")
 EOF
 
+# cross-format determinism: the same groove through the AU shell must
+# hash byte-identically to the VST3 renders above (one runtime, one
+# device, two formats — the strongest claim either shell can make)
+if [ -x build-vst/au-host ] && [ -d "$HOME/Library/Audio/Plug-Ins/Components/harp-au.component" ]; then
+    build-vst/au-host $ARP --seconds 0.5 >/dev/null 2>&1
+    H3=$(build-vst/au-host $ARP --bpm 120 --chord "60,64,67" --seconds 4 --hash 2>/dev/null          | grep output-hash)
+    [ "$H3" = "$H1" ] || {
+        echo "TEMPO-LOCK FAIL: AU groove differs from VST3 ($H3 vs $H1)"
+        exit 1
+    }
+    echo "   AU shell groove: byte-identical to VST3"
+fi
+
 echo "TEMPO-LOCK PASS (T17: grid-exact, deterministic, wrap-safe)"
