@@ -17,23 +17,54 @@ it gets, from any conforming host:
 - **Total recall, Git-style** — device state is content-addressed and
   hash-verified; a saved project reopens with the hardware *provably* in
   the saved state, every overwrite preceded by a free snapshot, every
-  mismatch resolved through explicit safe actions — never silently.
+  mismatch resolved through explicit safe actions — never silently. The
+  archive doubles as patch time-travel: every state the box has ever been
+  pushed over is one click away.
 - **Audio as a plugin** — a dedicated stream into the plugin shell that
   bypasses the OS audio stack (no aggregate-device hacks), including a
   host-paced mode where the hardware renders *deterministically*, byte-
-  identical, faster than real time: offline bounce through a physical box.
-- **Identity, timing, diagnostics** — engine versioning that protects old
-  songs from new firmware, measured (never guessed) latency, and error
-  counters that end "it glitched" support threads with evidence.
+  identical, faster than real time: offline bounce through a physical box
+  at ~25× real time, **16 ms total reported latency** at typical buffer
+  sizes — in the neighborhood of a good audio interface.
+- **Sample-accurate everything (§9)** — DAW automation becomes
+  device-interpolated ramps applied within ±1 sample; notes travel as UMP;
+  an event *fence* makes "applied late" structurally impossible rather
+  than statistically rare. Turn a knob on the hardware and the DAW records
+  the automation (echo).
+- **Musical time (§9.7)** — devices follow the DAW's transport: tempo,
+  position, loops. The reference device's arpeggiator locks to Live's grid
+  sample-exactly, survives loop wraps, and renders a *byte-identical
+  groove* — determinism extended to musical time.
+- **Identity, timing, diagnostics** — engine versioning and parameter-map
+  hashing protect old songs from new firmware, latency is measured (never
+  guessed), and error counters at every layer end "it glitched" support
+  threads with evidence.
+- **Roadie-proof sessions** — unplug the cable mid-song and plug it back:
+  the shell reconnects, re-asserts the project's state, and audio resumes.
+  Hostile or corrupt wire input ends in a clean session reset, never a
+  crash (every parser is fuzzed; a live abuse test is part of CI).
 
 **The whole stack runs today**: a Raspberry Pi 4B plays as an instrument
 track in Ableton Live 12 — knobs as automation lanes, total recall through
-the Live set's own save/reopen, offline bounce through the hardware.
+the Live set's own save/reopen, a tempo-locked arpeggiator, offline bounce
+through the hardware.
+
+**Degree of completeness:** the four protocol planes (control, state,
+events, audio) are implemented end-to-end and verified on real hardware by
+a conformance kit — recall round-trips, ±1-sample event timing, realtime
+floods across buffer sizes 64–1024, hot-replug, tempo lock, determinism
+hashes — plus fuzzed parsers and a ThreadSanitizer-clean device. The
+specification is an **editor's draft** (0.3.4): breaking changes are
+expected and versions are negotiated at hello; its changelog records what
+implementation taught us. One reference device, one DAW (Live), one OS
+(macOS) so far — multi-device support, the four-actions recall UI, AU/CLAP
+ports, and the Ethernet binding are next (see [Status](#status) for the
+full honest list).
 
 ## Repository map
 
 ```
-spec/             the specification (draft 0.3.2) + machine-readable CDDL
+spec/             the specification (draft 0.3.4) + machine-readable CDDL
 core/             portable C11 protocol library, no dependencies:
                   framing, deterministic CBOR, SHA-256, content-addressed
                   objects, crash-atomic ref store, audio frame codec
@@ -87,7 +118,7 @@ hardware — plus audio:
 ```sh
 ./build/harp-probe -d usb demo                 # recall, over the wire
 ./build/harp-probe -d usb record 4 take.wav    # free-running capture, MSC-verified
-./build/harp-probe -d usb render 8 bounce.wav  # host-paced offline bounce (~20x realtime)
+./build/harp-probe -d usb render 8 bounce.wav  # host-paced offline bounce (~25x realtime)
 ./build/harp-probe -d usb t15 4                # determinism: render twice, byte-compare
 ```
 
