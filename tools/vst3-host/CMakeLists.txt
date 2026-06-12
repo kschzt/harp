@@ -88,6 +88,16 @@ if(LIBUSB_FOUND)
             "$ENV{HOME}/Library/Audio/Plug-Ins/VST3/harp-shell.vst3"
     DEPENDS harp-shell
     COMMENT "Installing harp-shell.vst3 for Ableton Live")
+
+  # Linux: VST3 bundles land in ~/.vst3 (Bitwig, Reaper, Ardour pick it up)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_custom_target(install-linux
+      COMMAND rm -rf "$ENV{HOME}/.vst3/harp-shell.vst3"
+      COMMAND mkdir -p "$ENV{HOME}/.vst3"
+      COMMAND cp -R "${HARP_SHELL_BUNDLE}" "$ENV{HOME}/.vst3/"
+      DEPENDS harp-shell
+      COMMENT "Installing harp-shell.vst3 to ~/.vst3")
+  endif()
 else()
   message(STATUS "harp-shell: libusb not found, shell not built")
 endif()

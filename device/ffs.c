@@ -36,12 +36,18 @@
 
 struct ffs_descs {
     struct usb_functionfs_descs_head_v2 header;
-    __le32 fs_count, hs_count;
+    __le32 fs_count, hs_count, os_count;
     struct {
         struct usb_interface_descriptor intf;
         /* link pair (§4.3), then dedicated audio pair (§8.2) */
         struct usb_endpoint_descriptor_no_audio ep_in, ep_out, ep_audio_in, ep_audio_out;
     } __attribute__((packed)) fs, hs;
+    /* MS OS 1.0 Extended Compat ID: Windows auto-binds WinUSB to the
+     * interface, so libusb works there with zero driver ceremony (no
+     * Zadig). Inert for every other host OS. Pairs with the gadget's
+     * configfs os_desc block (scripts/pi-gadget.sh). */
+    struct usb_os_desc_header os_hdr;
+    struct usb_ext_compat_desc os_compat;
 } __attribute__((packed));
 
 struct ffs_strings {
@@ -56,10 +62,12 @@ static int write_descriptors(int ep0) {
     struct ffs_descs d;
     memset(&d, 0, sizeof d);
     d.header.magic = htole32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2);
-    d.header.flags = htole32(FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC);
+    d.header.flags = htole32(FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC |
+                             FUNCTIONFS_HAS_MS_OS_DESC);
     d.header.length = htole32(sizeof d);
     d.fs_count = htole32(5);
     d.hs_count = htole32(5);
+    d.os_count = htole32(1);
 
     struct usb_interface_descriptor intf = {
         .bLength = sizeof(struct usb_interface_descriptor),
@@ -101,6 +109,13 @@ static int write_descriptors(int ep0) {
     d.hs.ep_out.wMaxPacketSize = htole16(512);
     d.hs.ep_audio_in.wMaxPacketSize = htole16(512);
     d.hs.ep_audio_out.wMaxPacketSize = htole16(512);
+
+    d.os_hdr.interface = 1; /* per kernel docs: interface COUNT for ext-compat */
+    d.os_hdr.dwLength = htole32(sizeof d.os_hdr + sizeof d.os_compat);
+    d.os_hdr.bcdVersion = htole16(0x0100);
+    d.os_hdr.wIndex = htole16(4); /* extended compat ID */
+    d.os_hdr.wCount = htole16(1);
+    memcpy(d.os_compat.CompatibleID, "WINUSB\0\0", 8);
 
     if (write(ep0, &d, sizeof d) != (ssize_t)sizeof d) return -1;
 

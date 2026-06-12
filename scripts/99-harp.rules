@@ -1,0 +1,4 @@
+# HARP devices: user-space access without root (libusb).
+#   sudo cp scripts/99-harp.rules /etc/udev/rules.d/ && sudo udevadm control --reload
+# 1209:4852 = pid.codes prototype VID / "HR"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="4852", MODE="0666", TAG+="uaccess"

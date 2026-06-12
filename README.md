@@ -124,13 +124,17 @@ hardware — plus audio:
 
 ### Path 3 — the DAW (VST3 shell)
 
-Requires CMake ≥ 3.25, libusb (`brew install libusb`), and the VST3 SDK
+Requires CMake ≥ 3.25, libusb (macOS: `brew install libusb`; Linux:
+`apt install libusb-1.0-0-dev` plus
+`sudo cp scripts/99-harp.rules /etc/udev/rules.d/` for rootless device
+access), and the VST3 SDK
 cloned to `external/vst3sdk` (`git clone --recursive
 https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk`).
 
 ```sh
 cmake -B build-vst -S tools/vst3-host
-cmake --build build-vst --target install-live   # build, sign, install for Live
+cmake --build build-vst --target install-live   # macOS: build, sign, install
+cmake --build build-vst --target install-linux  # Linux: install to ~/.vst3
 ```
 
 Rescan plug-ins in your DAW and drop **HARP RefDev** on a track. The
