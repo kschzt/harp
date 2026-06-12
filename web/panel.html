@@ -106,7 +106,9 @@ function render(s) {
     `stream <b>${k.streaming ? 'running' : 'idle'}</b><br>` +
     `frame_errors <b>${k.frame_errors}</b> · session_resets <b>${k.session_resets}</b> · ` +
     `audio_overruns <b>${k.audio_overruns}</b> · evq_drops <b>${k.evq_drops}</b> · ` +
-    `snapshots <b>${k.snapshots}</b>`;
+    `snapshots <b>${k.snapshots}</b><br>` +
+    `evt_late <b>${k.evt_late}</b> · ramp_late <b>${k.ramp_late}</b> · ` +
+    `fence_waits <b>${k.fence_waits}</b> · fence_timeouts <b>${k.fence_timeouts}</b>`;
 }
 
 function connect() {
