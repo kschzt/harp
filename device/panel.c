@@ -53,7 +53,7 @@ static void panel_json_params(device *d, char *body, size_t sz) {
         off += (size_t)snprintf(body + off, sz - off,
                                 "%s{\"id\":%u,\"name\":\"%s\",\"value\":%.4f}",
                                 i ? "," : "", g_params[i].id, g_params[i].name,
-                                g_params[i].value);
+                                param_get(&g_params[i]));
     snprintf(body + off, sz - off, "]}");
 }
 
@@ -99,12 +99,19 @@ static void panel_json_counters(device *d, char *body, size_t sz) {
              "\"evt_late\":%llu,\"ramp_late\":%llu,"
              "\"fence_waits\":%llu,\"fence_timeouts\":%llu,\"boot\":%llu,"
              "\"session\":%s,\"streaming\":%s}",
-             (unsigned long long)d->frame_errors, (unsigned long long)d->session_resets,
-             (unsigned long long)d->audio_overruns, (unsigned long long)d->snapshots_taken,
-             (unsigned long long)g_evq_drops, (unsigned long long)g_evt_late,
-             (unsigned long long)g_ramp_late, (unsigned long long)g_fence_waits,
-             (unsigned long long)g_fence_timeouts, (unsigned long long)d->boot_count,
-             d->hello_done ? "true" : "false", d->audio.thread_live ? "true" : "false");
+             (unsigned long long)CTR_GET(d->frame_errors),
+             (unsigned long long)CTR_GET(d->session_resets),
+             (unsigned long long)CTR_GET(d->audio_overruns),
+             (unsigned long long)CTR_GET(d->snapshots_taken),
+             (unsigned long long)CTR_GET(g_evq_drops),
+             (unsigned long long)CTR_GET(g_evt_late),
+             (unsigned long long)CTR_GET(g_ramp_late),
+             (unsigned long long)CTR_GET(g_fence_waits),
+             (unsigned long long)CTR_GET(g_fence_timeouts),
+             (unsigned long long)d->boot_count,
+             atomic_load_explicit(&d->hello_done, memory_order_acquire) ? "true" : "false",
+             atomic_load_explicit(&d->audio.thread_live, memory_order_relaxed) ? "true"
+                                                                               : "false");
 }
 
 /* Front-panel patch load: point live/project at a stored ref's state (the
@@ -131,7 +138,7 @@ static bool panel_revert(device *d, const char *refname) {
     if (harp_store_ref_write(&d->store, &live) != 0) return false;
     ntf_state_changed(d, &live);
     for (size_t i = 0; i < NPARAMS; i++)
-        evt_echo_param(d, g_params[i].id, g_params[i].value);
+        evt_echo_param(d, g_params[i].id, param_get(&g_params[i]));
     return true;
 }
 
@@ -168,7 +175,7 @@ static void panel_serve_conn(device *d, int fd) {
                 } else
                     snprintf(body, sizeof body, "{\"ok\":false,\"error\":\"storage\"}");
             } else if (strcmp(buf, "panic") == 0) {
-                g_note = -1; /* same engine path the CC 120/123 handler takes */
+                engine_all_notes_off(); /* same path the CC 120/123 handler takes */
                 snprintf(body, sizeof body, "{\"ok\":true}");
             } else if (strncmp(buf, "revert ", 7) == 0) {
                 if (panel_revert(d, buf + 7))

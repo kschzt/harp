@@ -94,6 +94,13 @@ converters).
   ordering can save them (measured at 64: mid-frame events applied a
   frame late while fence_timeouts stayed zero — delivery was perfect,
   the math wasn't).
+- Device cross-thread state is C11 atomics with explicit, commented
+  orderings — no "benign race" volatiles (UB, and TSan-opaque). Engine
+  note/queue/ramp state is private to engine.c; other threads get
+  panic-grade operations that must work even when the queue cannot
+  (all-notes-off, note-off-if, full-check). TSan runs on the Pi against
+  production USB traffic; instrumented builds render different floats
+  than release builds, so oracles are only ever captured from release.
 - Synthesized-event hygiene: never emit a timestamp the stream has
   already passed. The ramp-thinning pend flush once emitted 64-sample
   ramps whose END equaled "now" (~1100/s at 64-sample buffers); a pend

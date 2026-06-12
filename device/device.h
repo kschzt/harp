@@ -21,6 +21,7 @@
 #define HARP_DEVICED_DEVICE_H
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -42,23 +43,38 @@
 
 /* ---------------- engine data (engine.c owns the definitions) -------- */
 
+/* Cross-thread scalars are C11 atomics with EXPLICIT orderings; relaxed
+ * unless a comment states the pairing. (The old "benign word-sized race"
+ * volatiles were pragmatically fine on arm64/x86 but formally UB and
+ * TSan-opaque — this device is meant to be the conformance reference.) */
+
 typedef struct {
     uint32_t id;
     const char *name;
-    float value;
+    _Atomic float value; /* written by render (ramps), session (loads),
+                            panel (knobs); read everywhere. Last-write-wins
+                            is the intended semantic; relaxed — ordering for
+                            timestamped changes comes from the event queue */
 } dev_param;
+
+static inline float param_get(const dev_param *p) {
+    return atomic_load_explicit(&p->value, memory_order_relaxed);
+}
+static inline void param_put(dev_param *p, float v) {
+    atomic_store_explicit(&p->value, v, memory_order_relaxed);
+}
 
 /* fixed count so sizeof tricks aren't needed across modules; the arp
  * session grows this to 12 (params 9-12) — one place to change */
 #define NPARAMS 8
 extern dev_param g_params[NPARAMS];
 
-/* live performance state (notes are events, not patch state — they never
- * touch the dirty flag). Mono, last-note priority. Written by the session
- * thread, read by the audio thread; benign word-sized races. */
-extern volatile int g_note;        /* sounding MIDI note, -1 = none */
-extern volatile float g_note_vel;  /* 0..1 */
-extern volatile uint32_t g_note_seq; /* bumps on every note-on (retrigger) */
+/* Live performance note state is PRIVATE to engine.c (mono, last-note
+ * priority; notes are events, not patch state — they never touch the
+ * dirty flag). Other threads reach it only through the panic-grade
+ * operations below, which must work even when the event queue cannot. */
+void engine_all_notes_off(void);          /* CC 120/123 / panel panic */
+void engine_note_off_if(uint32_t note);   /* overflow escalation path */
 
 /* ---- timestamped event queue (§9.2): session thread pushes, render
  * thread pops at exact stream positions. ts is SSI (host-paced) or MSC
@@ -74,31 +90,32 @@ typedef struct {
 } dev_event;
 
 #define DEV_EVQ_CAP 256
-extern size_t g_evq_n;             /* under g_evq_mu */
-extern pthread_mutex_t g_evq_mu;
-extern volatile int g_touch_pending;   /* dirty-flag work deferred off the render thread */
-extern volatile uint64_t g_evq_drops;  /* ring full — counted, never silent (§14.1) */
-extern volatile uint64_t g_evt_late;   /* notes/sets applied past ts (§14.2) — keep ZERO */
-extern volatile uint64_t g_ramp_late;  /* ramps past their END deadline; budgeted, not zero-tolerance */
+/* the queue itself (storage, count, mutex) and the per-param ramp state
+ * are private to engine.c; sessions interact through these: */
+bool evq_full(void); /* the never-drop-a-note-off escalation check */
+
+extern _Atomic int g_touch_pending;       /* dirty-flag work deferred off the
+                                             render thread; set release, read
+                                             acquire (pairs with param_put) */
+extern _Atomic uint64_t g_evq_drops;      /* ring full — counted, never silent (§14.1) */
+extern _Atomic uint64_t g_evt_late;       /* notes/sets applied past ts (§14.2) — keep ZERO */
+extern _Atomic uint64_t g_ramp_late;      /* ramps past their END deadline; budgeted */
 
 /* event fence (§8.3.1): the render loop may not pass a fenced pacing
  * frame until the session thread has consumed this many evt messages.
- * Written by the session thread (release), read by the audio thread
- * (acquire); reset with the stream. */
-extern volatile uint32_t g_evt_consumed;
-extern volatile uint64_t g_fence_waits;    /* fences that actually waited */
-extern volatile uint64_t g_fence_timeouts; /* waits that hit the bound (events
-                                              still in flight after 5 ms — the
-                                              range may render with a late
-                                              event; evt_late will say) */
+ * fetch_add release in the session loop, load acquire in the render
+ * loop (the pairing that makes queued events visible); reset with the
+ * stream. */
+extern _Atomic uint32_t g_evt_consumed;
+extern _Atomic uint64_t g_fence_waits;    /* fences that actually waited */
+extern _Atomic uint64_t g_fence_timeouts; /* waits that hit the bound (events
+                                             still in flight after 5 ms — the
+                                             range may render with a late
+                                             event; evt_late will say) */
 
-/* per-param ramp state (§9.4); render-thread-only after activation */
-typedef struct {
-    bool active;
-    uint64_t start, end;
-    float start_val, target;
-} dev_ramp;
-extern dev_ramp g_ramps[NPARAMS];
+/* counter convenience: relaxed increments/reads (counters order nothing) */
+#define CTR_INC(c) atomic_fetch_add_explicit(&(c), 1, memory_order_relaxed)
+#define CTR_GET(c) atomic_load_explicit(&(c), memory_order_relaxed)
 
 /* ---------------- audio plane + device ---------------- */
 
@@ -112,8 +129,8 @@ extern dev_ramp g_ramps[NPARAMS];
  *         supplies in pacing frames on the audio OUT endpoint. */
 typedef struct {
     pthread_t thread;
-    volatile bool running;
-    bool thread_live;
+    _Atomic bool running;    /* session stores false to stop; render polls */
+    _Atomic bool thread_live; /* session writes; panel reads for display */
     int fd;     /* audio IN endpoint: device -> host */
     int out_fd; /* audio OUT endpoint: host -> device (pacing, mode 1) */
     uint32_t mode, rate, nsamples, epoch;
@@ -126,10 +143,13 @@ typedef struct {
     harp_hash param_map_hash;
     uint64_t boot_count;
 
-    harp_io *io; /* NULL when no session transport is attached */
+    harp_io *io; /* NULL when no session transport is attached. Written by
+                    the session loop and read by panel-thread echo paths:
+                    ALL access (set, check, send) happens under send_mu —
+                    checking outside it is a use-after-teardown. */
     harp_link link;
-    bool hello_done;
-    bool closing;
+    _Atomic bool hello_done; /* session writes; panel reads (echo gate) */
+    bool closing;            /* session thread only */
     uint64_t peer_credit;   /* bytes we may still send on obj */
     uint64_t granted;       /* unconsumed credit we granted the peer */
 
@@ -148,8 +168,9 @@ typedef struct {
      * send_mu serializes link writes; state_mu guards the live-ref cache */
     pthread_mutex_t send_mu, state_mu;
 
-    /* counters (§14.2) */
-    uint64_t frame_errors, session_resets, snapshots_taken, audio_overruns;
+    /* counters (§14.2): frame_errors has render + session writers;
+     * snapshots_taken has session + panel writers; all read cross-thread */
+    _Atomic uint64_t frame_errors, session_resets, snapshots_taken, audio_overruns;
 } device;
 
 extern device g_dev;

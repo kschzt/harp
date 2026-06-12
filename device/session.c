@@ -19,7 +19,7 @@
 
 int send_ctl(device *d, const harp_cbuf *msg) {
     pthread_mutex_lock(&d->send_mu);
-    int rc = harp_link_send(d->io, HARP_STREAM_CTL, msg->buf, msg->len);
+    int rc = d->io ? harp_link_send(d->io, HARP_STREAM_CTL, msg->buf, msg->len) : -1;
     pthread_mutex_unlock(&d->send_mu);
     return rc;
 }
@@ -29,7 +29,9 @@ int send_ctl(device *d, const harp_cbuf *msg) {
  * param events are NOT echoed back). Timestamp (0,0) = "now" until the
  * timestamping slice lands. */
 void evt_echo_param(device *d, uint32_t id, float v) {
-    if (!d->io || !d->hello_done) return;
+    /* hello gate is atomic; the io check lives under send_mu below (the
+     * panel thread echoes concurrently with session teardown) */
+    if (!atomic_load_explicit(&d->hello_done, memory_order_acquire)) return;
     harp_cbuf m;
     harp_cbuf_init(&m);
     harp_cbor_array(&m, 3);
@@ -43,13 +45,13 @@ void evt_echo_param(device *d, uint32_t id, float v) {
     harp_cbor_uint(&m, 1);
     harp_cbor_float(&m, v);
     pthread_mutex_lock(&d->send_mu);
-    harp_link_send(d->io, HARP_STREAM_EVT, m.buf, m.len);
+    if (d->io) harp_link_send(d->io, HARP_STREAM_EVT, m.buf, m.len);
     pthread_mutex_unlock(&d->send_mu);
     harp_cbuf_free(&m);
 }
 
 void ntf_state_changed(device *d, const harp_ref *r) {
-    if (!d->io || !d->hello_done) return;
+    if (!atomic_load_explicit(&d->hello_done, memory_order_acquire)) return;
     harp_cbuf m;
     harp_cbuf_init(&m);
     harp_env_head(&m, HARP_MSG_NOTIFICATION, 0, "state.changed", true);
@@ -200,7 +202,7 @@ static void handle_hello(device *d, const harp_env *e) {
     }
     /* §5.4: hello resets all per-session state — including a running stream */
     audio_stop(d);
-    d->hello_done = true;
+    atomic_store_explicit(&d->hello_done, true, memory_order_release);
     d->peer_credit = 0;
     d->granted = 0;
 
@@ -550,17 +552,17 @@ static void handle_diag_counters(device *d, const harp_env *e) {
     rsp_head(&m, e->rid, e->method, true);
     harp_cbor_map(&m, 16);
     harp_cbor_text(&m, "x.harp-refdev.fence_waits");
-    harp_cbor_uint(&m, g_fence_waits);
+    harp_cbor_uint(&m, CTR_GET(g_fence_waits));
     harp_cbor_text(&m, "x.harp-refdev.fence_timeouts");
-    harp_cbor_uint(&m, g_fence_timeouts);
+    harp_cbor_uint(&m, CTR_GET(g_fence_timeouts));
     harp_cbor_text(&m, "usb_errors");
     harp_cbor_uint(&m, 0);
     harp_cbor_text(&m, "frame_errors");
-    harp_cbor_uint(&m, d->frame_errors);
+    harp_cbor_uint(&m, CTR_GET(d->frame_errors));
     harp_cbor_text(&m, "audio_underruns");
     harp_cbor_uint(&m, 0);
     harp_cbor_text(&m, "audio_overruns");
-    harp_cbor_uint(&m, d->audio_overruns);
+    harp_cbor_uint(&m, CTR_GET(d->audio_overruns));
     harp_cbor_text(&m, "audio_late_frames");
     harp_cbor_uint(&m, 0);
     harp_cbor_text(&m, "msc_discontinuities");
@@ -568,15 +570,15 @@ static void handle_diag_counters(device *d, const harp_env *e) {
     harp_cbor_text(&m, "clock_drift_ppb");
     harp_cbor_int(&m, 0);
     harp_cbor_text(&m, "evt_late");
-    harp_cbor_uint(&m, g_evt_late);
+    harp_cbor_uint(&m, CTR_GET(g_evt_late));
     harp_cbor_text(&m, "evt_stale_epoch");
     harp_cbor_uint(&m, 0);
     harp_cbor_text(&m, "x.harp-refdev.evq_drops");
-    harp_cbor_uint(&m, g_evq_drops);
+    harp_cbor_uint(&m, CTR_GET(g_evq_drops));
     harp_cbor_text(&m, "x.harp-refdev.ramp_late");
-    harp_cbor_uint(&m, g_ramp_late);
+    harp_cbor_uint(&m, CTR_GET(g_ramp_late));
     harp_cbor_text(&m, "session_resets");
-    harp_cbor_uint(&m, d->session_resets);
+    harp_cbor_uint(&m, CTR_GET(d->session_resets));
     harp_cbor_text(&m, "storage_bytes_total");
     harp_cbor_uint(&m, total);
     harp_cbor_text(&m, "storage_bytes_free");
@@ -634,7 +636,7 @@ static void handle_audio_start(device *d, const harp_env *e) {
                    "HARP stream requires the USB transport");
         return;
     }
-    if (d->audio.thread_live) {
+    if (atomic_load_explicit(&d->audio.thread_live, memory_order_relaxed)) {
         send_error(d, e->rid, e->method, "busy", "stream already running");
         return;
     }
@@ -645,13 +647,13 @@ static void handle_audio_start(device *d, const harp_env *e) {
     d->audio.rate = (uint32_t)rate;
     d->audio.nsamples = (uint32_t)nsamples;
     d->audio.reanchors = 0;
-    d->audio.running = true;
+    atomic_store_explicit(&d->audio.running, true, memory_order_relaxed);
     if (pthread_create(&d->audio.thread, NULL, audio_thread, d) != 0) {
-        d->audio.running = false;
+        atomic_store_explicit(&d->audio.running, false, memory_order_relaxed);
         send_error(d, e->rid, e->method, "internal", "thread");
         return;
     }
-    d->audio.thread_live = true;
+    atomic_store_explicit(&d->audio.thread_live, true, memory_order_relaxed);
     fprintf(stderr, "harp-deviced: audio stream started (%u Hz, %u-sample blocks, %s)\n",
             d->audio.rate, d->audio.nsamples,
             mode ? "host-paced" : "free-running");
@@ -706,7 +708,7 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
     if (!harp_cdec_array(&dec, &alen) || alen < 3 || !harp_cdec_array(&dec, &tn) ||
         tn != 2 || !harp_cdec_uint(&dec, &ep) || !harp_cdec_uint(&dec, &msc) ||
         !harp_cdec_uint(&dec, &etype)) {
-        d->frame_errors++;
+        CTR_INC(d->frame_errors);
         return;
     }
     if (etype == 0) { /* UMP carriage (§9.10): body = one packet, words big-endian */
@@ -728,19 +730,17 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
                 /* CC 120 all-sound-off / 123 all-notes-off: PANIC. Applied
                  * immediately AND queued — belt and suspenders. */
                 ev.kind = DEV_EV_ALL_OFF;
-                g_note = -1;
+                engine_all_notes_off();
             } else
                 return;
             /* note-offs must never be lost: if the queue is full, apply NOW
              * (slightly early beats stuck forever) */
-            if (ev.kind != DEV_EV_NOTE_ON) {
-                pthread_mutex_lock(&g_evq_mu);
-                bool full = g_evq_n >= DEV_EVQ_CAP;
-                pthread_mutex_unlock(&g_evq_mu);
-                if (full) {
-                    if (ev.kind == DEV_EV_ALL_OFF || g_note == (int)note) g_note = -1;
-                    return;
-                }
+            if (ev.kind != DEV_EV_NOTE_ON && evq_full()) {
+                if (ev.kind == DEV_EV_ALL_OFF)
+                    engine_all_notes_off();
+                else
+                    engine_note_off_if(note);
+                return;
             }
             evq_push(ev); /* ts 0 = asap; else applied at the exact sample (§9.2) */
         }
@@ -751,7 +751,7 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
         double target = 0;
         bool have_id = false, have_t = false, have_end = false;
         if (!harp_cdec_map(&dec, &n)) {
-            d->frame_errors++;
+            CTR_INC(d->frame_errors);
             return;
         }
         for (uint64_t i = 0; i < n; i++) {
@@ -784,7 +784,7 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
     double v = 0;
     bool have_id = false, have_v = false;
     if (!harp_cdec_map(&dec, &n)) {
-        d->frame_errors++;
+        CTR_INC(d->frame_errors);
         return;
     }
     for (uint64_t i = 0; i < n; i++) {
@@ -801,16 +801,11 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
     if (!have_id || !have_v) return;
     if (v < 0) v = 0;
     if (v > 1) v = 1;
-    if (msc == 0) { /* "now": apply directly */
-        for (size_t i = 0; i < NPARAMS; i++)
-            if (g_params[i].id == id) {
-                g_params[i].value = (float)v;
-                g_ramps[i].active = false;
-            }
-    } else {
-        dev_event ev = {msc, DEV_EV_PARAM_SET, (uint32_t)id, (float)v, 0};
-        evq_push(ev);
-    }
+    /* ts 0 = "now" = next render subblock; routing it through the queue
+     * (instead of the old direct write) keeps ramp state render-owned —
+     * the direct path raced ramps_advance on g_ramps[i].active */
+    dev_event ev = {msc, DEV_EV_PARAM_SET, (uint32_t)id, (float)v, 0};
+    evq_push(ev);
     live_ref_touch(d, true);
 }
 
@@ -856,7 +851,7 @@ static void handle_dev_params(device *d, const harp_env *e) {
         harp_cbor_array(&m, 3);
         harp_cbor_uint(&m, g_params[i].id);
         harp_cbor_text(&m, g_params[i].name);
-        harp_cbor_float(&m, g_params[i].value);
+        harp_cbor_float(&m, param_get(&g_params[i]));
     }
     send_ctl(d, &m);
     harp_cbuf_free(&m);
@@ -866,13 +861,12 @@ static void handle_dev_params(device *d, const harp_env *e) {
 
 static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
     /* dirty-flag work the render thread deferred (queued sets/ramps applied) */
-    if (g_touch_pending) {
-        g_touch_pending = 0;
+    if (atomic_exchange_explicit(&g_touch_pending, 0, memory_order_acquire)) {
         live_ref_touch(d, true);
     }
     harp_env e;
     if (!harp_env_parse(buf, len, &e)) {
-        d->frame_errors++;
+        CTR_INC(d->frame_errors);
         return;
     }
     if (e.msgtype == HARP_MSG_NOTIFICATION) {
@@ -888,7 +882,8 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
     }
     if (e.msgtype != HARP_MSG_REQUEST) return;
 
-    if (!d->hello_done && strcmp(e.method, "core.hello") != 0) {
+    if (!atomic_load_explicit(&d->hello_done, memory_order_acquire) &&
+        strcmp(e.method, "core.hello") != 0) {
         send_error(d, e.rid, e.method, "denied", "core.hello required first");
         return;
     }
@@ -957,7 +952,7 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
 
 static void handle_obj(device *d, const uint8_t *buf, size_t len) {
     /* one object per obj-stream message; verify-on-receipt is intrinsic */
-    if (harp_store_put(&d->store, buf, len, NULL) != 0) d->frame_errors++;
+    if (harp_store_put(&d->store, buf, len, NULL) != 0) CTR_INC(d->frame_errors);
     if (d->granted >= len)
         d->granted -= len;
     else
@@ -968,8 +963,10 @@ static void handle_obj(device *d, const uint8_t *buf, size_t len) {
 /* ---------------- session / main ---------------- */
 
 void harp_deviced_run_session(device *d, harp_io *io) {
+    pthread_mutex_lock(&d->send_mu);
     d->io = io;
-    d->hello_done = false;
+    pthread_mutex_unlock(&d->send_mu);
+    atomic_store_explicit(&d->hello_done, false, memory_order_release);
     d->closing = false;
     harp_link_init(&d->link);
     harp_cbuf msg;
@@ -979,7 +976,7 @@ void harp_deviced_run_session(device *d, harp_io *io) {
         int rc = harp_link_recv(io, &d->link, &stream, &msg);
         if (rc == -1) break; /* peer gone */
         if (rc == -2) {      /* protocol violation: session reset (§12.4) */
-            d->session_resets++;
+            CTR_INC(d->session_resets);
             break;
         }
         if (stream == HARP_STREAM_CTL)
@@ -992,7 +989,7 @@ void harp_deviced_run_session(device *d, harp_io *io) {
              * is FULLY processed (events visible in evq) — including ones
              * handle_evt_msg rejected, or a malformed message would leave
              * the host's sequence unreachable and wedge every later fence */
-            __atomic_add_fetch(&g_evt_consumed, 1, __ATOMIC_RELEASE);
+            atomic_fetch_add_explicit(&g_evt_consumed, 1, memory_order_release);
         }
         if (d->closing) break;
     }
@@ -1000,6 +997,8 @@ void harp_deviced_run_session(device *d, harp_io *io) {
     harp_link_free(&d->link);
     audio_stop(d); /* session gone -> stream gone (§12) */
     live_cache_flush(d); /* persist the terminal generation (§10.3) */
+    pthread_mutex_lock(&d->send_mu);
     d->io = NULL;
+    pthread_mutex_unlock(&d->send_mu);
 }
 

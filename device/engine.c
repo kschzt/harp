@@ -20,31 +20,62 @@ dev_param g_params[NPARAMS] = {
     {7, "Drone Mix", 0.5f},   {8, "Master Level", 0.5f},
 };
 
-volatile int g_note = -1;
-volatile float g_note_vel = 0;
-volatile uint32_t g_note_seq = 0;
+/* note state: g_note crosses threads (panic paths from session/panel);
+ * vel and seq are render-thread-only (event application happens on the
+ * render thread) and stay plain */
+static _Atomic int g_note = -1;
+static float g_note_vel = 0;
+static uint32_t g_note_seq = 0;
+
+static inline int note_get(void) {
+    return atomic_load_explicit(&g_note, memory_order_relaxed);
+}
+static inline void note_put(int n) {
+    atomic_store_explicit(&g_note, n, memory_order_relaxed);
+}
+
+void engine_all_notes_off(void) { note_put(-1); }
+void engine_note_off_if(uint32_t note) {
+    int cur = note_get();
+    if (cur == (int)note) note_put(-1); /* benign CAS-free: worst case a
+                                           racing note-on wins, which is the
+                                           musically correct outcome */
+}
 
 static dev_event g_evq[DEV_EVQ_CAP];
-size_t g_evq_n;
-pthread_mutex_t g_evq_mu = PTHREAD_MUTEX_INITIALIZER;
-volatile int g_touch_pending;
-volatile uint64_t g_evq_drops;
-volatile uint64_t g_evt_late;
-volatile uint64_t g_ramp_late;
-volatile uint32_t g_evt_consumed;
-volatile uint64_t g_fence_waits;
-volatile uint64_t g_fence_timeouts;
+static size_t g_evq_n; /* under g_evq_mu */
+static pthread_mutex_t g_evq_mu = PTHREAD_MUTEX_INITIALIZER;
+_Atomic int g_touch_pending;
+_Atomic uint64_t g_evq_drops;
+_Atomic uint64_t g_evt_late;
+_Atomic uint64_t g_ramp_late;
+_Atomic uint32_t g_evt_consumed;
+_Atomic uint64_t g_fence_waits;
+_Atomic uint64_t g_fence_timeouts;
 
 void evq_push(dev_event ev) {
     pthread_mutex_lock(&g_evq_mu);
     if (g_evq_n < DEV_EVQ_CAP)
         g_evq[g_evq_n++] = ev;
     else
-        g_evq_drops++;
+        CTR_INC(g_evq_drops);
     pthread_mutex_unlock(&g_evq_mu);
 }
 
-dev_ramp g_ramps[NPARAMS];
+bool evq_full(void) {
+    pthread_mutex_lock(&g_evq_mu);
+    bool full = g_evq_n >= DEV_EVQ_CAP;
+    pthread_mutex_unlock(&g_evq_mu);
+    return full;
+}
+
+/* per-param ramp state (§9.4); render-thread-only after activation */
+typedef struct {
+    bool active;
+    uint64_t start, end;
+    float start_val, target;
+} dev_ramp;
+static dev_ramp g_ramps[NPARAMS];
 
 /* Stream state reset (§7.1 in miniature): a new stream is a new time
  * domain — queued events and active ramps from the previous session's SSI
@@ -58,10 +89,10 @@ void evq_reset_for_new_stream(void) {
     memset(g_ramps, 0, sizeof g_ramps);
     /* notes are performance state OF A STREAM: a note held across a stream
      * stop/restart is a stuck note (its note-off died with the old stream) */
-    g_note = -1;
+    note_put(-1);
     /* fence sequence space restarts with the stream (host resets its
      * queued-event counter at session start; both sides count from 0) */
-    __atomic_store_n(&g_evt_consumed, 0, __ATOMIC_RELEASE);
+    atomic_store_explicit(&g_evt_consumed, 0, memory_order_release);
 }
 /* ---------------- the sound engine ---------------- */
 
@@ -86,7 +117,7 @@ typedef struct {
 
 static float param_value(uint32_t id) {
     for (size_t i = 0; i < NPARAMS; i++)
-        if (g_params[i].id == id) return g_params[i].value;
+        if (g_params[i].id == id) return param_get(&g_params[i]);
     return 0.0f;
 }
 
@@ -99,11 +130,11 @@ static void ramps_advance(uint64_t pos) {
         dev_ramp *r = &g_ramps[i];
         if (!r->active) continue;
         if (pos >= r->end || r->end <= r->start) {
-            g_params[i].value = r->target;
+            param_put(&g_params[i], r->target);
             r->active = false;
         } else if (pos > r->start) {
             float t = (float)(pos - r->start) / (float)(r->end - r->start);
-            g_params[i].value = r->start_val + (r->target - r->start_val) * t;
+            param_put(&g_params[i], r->start_val + (r->target - r->start_val) * t);
         }
     }
 }
@@ -142,7 +173,7 @@ static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float 
          * glide on every note makes perceived onsets interval-dependent —
          * measured r=0.86 between grid deviation and leap size, ±23 ms of
          * musical slop on sequenced 16ths. Real monosynths snap too. */
-        int note = g_note;
+        int note = note_get();
         bool retrig = v->seen_seq != g_note_seq;
         if (retrig) {
             v->seen_seq = g_note_seq;
@@ -244,7 +275,7 @@ static void host_paced_loop(device *d) {
     uint8_t rbuf[16384];
     size_t rlen = 0, rpos = 0;
 
-    while (a->running) {
+    while (atomic_load_explicit(&a->running, memory_order_relaxed)) {
         uint8_t hdr[HARP_AUDIO_HDR_LEN];
         size_t need = sizeof hdr, got = 0;
         while (got < need) {
@@ -267,7 +298,7 @@ static void host_paced_loop(device *d) {
         }
         harp_audio_hdr h;
         if (!harp_audio_hdr_decode(hdr, &h) || !(h.dirflags & HARP_AUDIO_DIR_H2D)) {
-            d->frame_errors++;
+            CTR_INC(d->frame_errors);
             fprintf(stderr, "harp-deviced: malformed pacing frame (%02x %02x ...)\n",
                     hdr[0], hdr[1]);
             return; /* §4.2 spirit: malformed stream is fatal */
@@ -299,19 +330,21 @@ static void host_paced_loop(device *d) {
             }
             uint32_t want = (uint32_t)fb[0] | ((uint32_t)fb[1] << 8) |
                             ((uint32_t)fb[2] << 16) | ((uint32_t)fb[3] << 24);
-            if ((int32_t)(want - __atomic_load_n(&g_evt_consumed, __ATOMIC_ACQUIRE)) >
-                0) {
-                g_fence_waits++;
+            if ((int32_t)(want - atomic_load_explicit(&g_evt_consumed,
+                                                      memory_order_acquire)) > 0) {
+                CTR_INC(g_fence_waits);
                 int spins = 0;
                 struct timespec fts = {0, 50000}; /* 50 µs */
-                while ((int32_t)(want -
-                                 __atomic_load_n(&g_evt_consumed, __ATOMIC_ACQUIRE)) >
-                           0 &&
-                       spins++ < 100 && a->running)
+                while ((int32_t)(want - atomic_load_explicit(
+                                            &g_evt_consumed,
+                                            memory_order_acquire)) > 0 &&
+                       spins++ < 100 &&
+                       atomic_load_explicit(&a->running, memory_order_relaxed))
                     nanosleep(&fts, NULL);
-                if ((int32_t)(want -
-                              __atomic_load_n(&g_evt_consumed, __ATOMIC_ACQUIRE)) > 0)
-                    g_fence_timeouts++;
+                if ((int32_t)(want - atomic_load_explicit(
+                                         &g_evt_consumed,
+                                         memory_order_acquire)) > 0)
+                    CTR_INC(g_fence_timeouts);
             }
         }
         /* discard any input payload (this engine has no input channels) */
@@ -331,7 +364,7 @@ static void host_paced_loop(device *d) {
         }
         uint32_t n = h.nsamples;
         if (n > AUDIO_MAX_NSAMPLES) {
-            d->frame_errors++;
+            CTR_INC(d->frame_errors);
             return;
         }
         render_with_events(&voice, samples, n, (float)a->rate, h.ts);
@@ -362,7 +395,7 @@ void *audio_thread(void *arg) {
 
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
-    while (a->running) {
+    while (atomic_load_explicit(&a->running, memory_order_relaxed)) {
         render_with_events(&voice, samples, a->nsamples, (float)a->rate, msc);
         harp_audio_hdr h = {HARP_AUDIO_FVER, discont ? HARP_AUDIO_DISCONT : 0, 2,
                             a->epoch, msc, (uint16_t)a->nsamples, HARP_AUDIO_FMT_F32};
@@ -387,7 +420,7 @@ void *audio_thread(void *arg) {
         if (behind_ns > 50 * 1000000ll) {
             /* transport stalled: re-anchor, surface it (§8.3 — never silent) */
             next = now;
-            d->audio_overruns++;
+            CTR_INC(d->audio_overruns);
             a->reanchors++;
             discont = true;
         } else {
@@ -417,28 +450,29 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
              * deadline is END (the start is the previous automation point,
              * legitimately in the recent past); for everything else, ts. */
             if (ev->kind == DEV_EV_RAMP) {
-                if (ev->end && ev->end < pos) g_ramp_late++;
+                if (ev->end && ev->end < pos) CTR_INC(g_ramp_late);
             } else if (ev->ts && ev->ts < pos)
-                g_evt_late++;
+                CTR_INC(g_evt_late);
             switch (ev->kind) {
                 case DEV_EV_NOTE_ON:
                     g_note_vel = ev->v;
-                    g_note = (int)ev->a;
+                    note_put((int)ev->a);
                     g_note_seq++;
                     break;
                 case DEV_EV_NOTE_OFF:
-                    if (g_note == (int)ev->a) g_note = -1;
+                    if (note_get() == (int)ev->a) note_put(-1);
                     break;
                 case DEV_EV_ALL_OFF:
-                    g_note = -1;
+                    note_put(-1);
                     break;
                 case DEV_EV_PARAM_SET:
                     for (size_t j = 0; j < NPARAMS; j++)
                         if (g_params[j].id == ev->a) {
-                            g_params[j].value = ev->v;
+                            param_put(&g_params[j], ev->v);
                             g_ramps[j].active = false; /* set supersedes ramp (§9.4) */
                         }
-                    g_touch_pending = 1;
+                    atomic_store_explicit(&g_touch_pending, 1,
+                                          memory_order_release);
                     break;
                 case DEV_EV_RAMP:
                     for (size_t j = 0; j < NPARAMS; j++)
@@ -446,10 +480,11 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                             g_ramps[j].active = true;
                             g_ramps[j].start = pos;
                             g_ramps[j].end = ev->end;
-                            g_ramps[j].start_val = g_params[j].value;
+                            g_ramps[j].start_val = param_get(&g_params[j]);
                             g_ramps[j].target = ev->v;
                         }
-                    g_touch_pending = 1;
+                    atomic_store_explicit(&g_touch_pending, 1,
+                                          memory_order_release);
                     break;
             }
             continue; /* consumed */
@@ -477,7 +512,7 @@ static void render_with_events(synth_voice *v, float *interleaved, uint32_t n,
 }
 
 void audio_stop(device *d) {
-    if (!d->audio.thread_live) return;
+    if (!atomic_load_explicit(&d->audio.thread_live, memory_order_relaxed)) return;
     d->audio.running = false;
     /* The thread may be parked in a blocking endpoint read (mode 1 pacing,
      * or a stalled write); read/write are cancellation points, and the loop
@@ -485,8 +520,8 @@ void audio_stop(device *d) {
      * with a wakeup — for the refdev, cancel is honest and simple. */
     pthread_cancel(d->audio.thread);
     pthread_join(d->audio.thread, NULL);
-    d->audio.thread_live = false;
-    g_note = -1; /* never let a note outlive its stream */
+    atomic_store_explicit(&d->audio.thread_live, false, memory_order_relaxed);
+    note_put(-1); /* never let a note outlive its stream */
     fprintf(stderr, "harp-deviced: audio stream stopped (%llu reanchors)\n",
             (unsigned long long)d->audio.reanchors);
 }

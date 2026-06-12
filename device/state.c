@@ -19,7 +19,7 @@ static void engine_encode_params_blob(harp_cbuf *out) {
     harp_cbor_map(&payload, NPARAMS);
     for (size_t i = 0; i < NPARAMS; i++) { /* ascending ids == deterministic order */
         harp_cbor_uint(&payload, g_params[i].id);
-        harp_cbor_float(&payload, g_params[i].value);
+        harp_cbor_float(&payload, param_get(&g_params[i]));
     }
     harp_obj_encode_blob(out, PARAMS_MEDIA, payload.buf, payload.len);
     harp_cbuf_free(&payload);
@@ -111,13 +111,13 @@ int engine_load_snapshot(device *d, const harp_hash *snap_h) {
         goto fail;
     }
     struct load_ctx ctx = {d, {0}, true};
-    for (size_t i = 0; i < NPARAMS; i++) ctx.staged[i] = g_params[i].value;
+    for (size_t i = 0; i < NPARAMS; i++) ctx.staged[i] = param_get(&g_params[i]);
     bool walked = harp_obj_tree_foreach(tree_enc.buf, tree_enc.len, load_tree_entry, &ctx);
     harp_cbuf_free(&tree_enc);
     if (!walked || !ctx.ok) goto fail;
 
     /* stage, then commit: all-or-nothing into the live engine */
-    for (size_t i = 0; i < NPARAMS; i++) g_params[i].value = ctx.staged[i];
+    for (size_t i = 0; i < NPARAMS; i++) param_put(&g_params[i], ctx.staged[i]);
     harp_cbuf_free(&enc);
     return 0;
 fail:
@@ -192,7 +192,7 @@ bool front_panel_set(device *d, uint32_t id, double v) {
     if (v > 1) v = 1;
     for (size_t i = 0; i < NPARAMS; i++)
         if (g_params[i].id == id) {
-            g_params[i].value = (float)v;
+            param_put(&g_params[i], (float)v);
             found = true;
         }
     if (!found) return false;
@@ -212,7 +212,7 @@ int do_snapshot(device *d, const char *msg, harp_hash *out, uint64_t *out_gen) {
     r.generation++;
     r.dirty = false;
     if (harp_store_ref_write(&d->store, &r) != 0) return -1;
-    d->snapshots_taken++;
+    CTR_INC(d->snapshots_taken);
     ntf_state_changed(d, &r);
     *out = snap;
     if (out_gen) *out_gen = r.generation;
