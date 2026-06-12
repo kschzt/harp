@@ -334,6 +334,17 @@ static void test_audio_codec(void) {
     z.nsamples = 0;
     harp_audio_hdr_encode(&z, enc);
     CHECK(!harp_audio_hdr_decode(enc, &z));
+
+    /* event fence flag (§8.3.1, spec 0.3.4): a fenced pacing frame
+     * round-trips the flag; the 4-byte fence word travels after the
+     * header and never perturbs payload accounting */
+    harp_audio_hdr f = {HARP_AUDIO_FVER, HARP_AUDIO_DIR_H2D | HARP_AUDIO_FENCE,
+                        0, 0, 12345, 256, HARP_AUDIO_FMT_F32};
+    harp_audio_hdr_encode(&f, enc);
+    harp_audio_hdr fo;
+    CHECK(harp_audio_hdr_decode(enc, &fo));
+    CHECK((fo.dirflags & HARP_AUDIO_FENCE) && (fo.dirflags & HARP_AUDIO_DIR_H2D));
+    CHECK(harp_audio_payload_len(&fo) == 0); /* fence word is not payload */
 }
 
 int main(void) {

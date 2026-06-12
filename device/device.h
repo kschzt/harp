@@ -81,6 +81,17 @@ extern volatile uint64_t g_evq_drops;  /* ring full — counted, never silent (�
 extern volatile uint64_t g_evt_late;   /* notes/sets applied past ts (§14.2) — keep ZERO */
 extern volatile uint64_t g_ramp_late;  /* ramps past their END deadline; budgeted, not zero-tolerance */
 
+/* event fence (§8.3.1): the render loop may not pass a fenced pacing
+ * frame until the session thread has consumed this many evt messages.
+ * Written by the session thread (release), read by the audio thread
+ * (acquire); reset with the stream. */
+extern volatile uint32_t g_evt_consumed;
+extern volatile uint64_t g_fence_waits;    /* fences that actually waited */
+extern volatile uint64_t g_fence_timeouts; /* waits that hit the bound (events
+                                              still in flight after 5 ms — the
+                                              range may render with a late
+                                              event; evt_late will say) */
+
 /* per-param ramp state (§9.4); render-thread-only after activation */
 typedef struct {
     bool active;

@@ -23,6 +23,14 @@
 #define HARP_AUDIO_FVER 0x01
 #define HARP_AUDIO_DIR_H2D 0x01
 #define HARP_AUDIO_DISCONT 0x02
+/* Event fence (§8.3.1, spec 0.3.4): this host-paced pacing frame carries a
+ * 4-byte LE event-sequence number AFTER the header (before any payload).
+ * The device MUST NOT render the frame's range until it has consumed that
+ * many event-stream messages this stream — closing the cross-pipe race
+ * between the link endpoint (events) and the audio endpoint (pacing) BY
+ * CONSTRUCTION instead of by timing headroom. */
+#define HARP_AUDIO_FENCE 0x04
+#define HARP_AUDIO_FENCE_LEN 4
 #define HARP_AUDIO_FMT_F32 0x0001
 
 typedef struct {

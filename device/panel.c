@@ -96,12 +96,14 @@ static void panel_json_counters(device *d, char *body, size_t sz) {
     snprintf(body, sz,
              "{\"frame_errors\":%llu,\"session_resets\":%llu,"
              "\"audio_overruns\":%llu,\"snapshots\":%llu,\"evq_drops\":%llu,"
-             "\"evt_late\":%llu,\"ramp_late\":%llu,\"boot\":%llu,"
+             "\"evt_late\":%llu,\"ramp_late\":%llu,"
+             "\"fence_waits\":%llu,\"fence_timeouts\":%llu,\"boot\":%llu,"
              "\"session\":%s,\"streaming\":%s}",
              (unsigned long long)d->frame_errors, (unsigned long long)d->session_resets,
              (unsigned long long)d->audio_overruns, (unsigned long long)d->snapshots_taken,
              (unsigned long long)g_evq_drops, (unsigned long long)g_evt_late,
-             (unsigned long long)g_ramp_late, (unsigned long long)d->boot_count,
+             (unsigned long long)g_ramp_late, (unsigned long long)g_fence_waits,
+             (unsigned long long)g_fence_timeouts, (unsigned long long)d->boot_count,
              d->hello_done ? "true" : "false", d->audio.thread_live ? "true" : "false");
 }
 

@@ -31,6 +31,9 @@ volatile int g_touch_pending;
 volatile uint64_t g_evq_drops;
 volatile uint64_t g_evt_late;
 volatile uint64_t g_ramp_late;
+volatile uint32_t g_evt_consumed;
+volatile uint64_t g_fence_waits;
+volatile uint64_t g_fence_timeouts;
 
 void evq_push(dev_event ev) {
     pthread_mutex_lock(&g_evq_mu);
@@ -56,6 +59,9 @@ void evq_reset_for_new_stream(void) {
     /* notes are performance state OF A STREAM: a note held across a stream
      * stop/restart is a stuck note (its note-off died with the old stream) */
     g_note = -1;
+    /* fence sequence space restarts with the stream (host resets its
+     * queued-event counter at session start; both sides count from 0) */
+    __atomic_store_n(&g_evt_consumed, 0, __ATOMIC_RELEASE);
 }
 /* ---------------- the sound engine ---------------- */
 
@@ -265,6 +271,48 @@ static void host_paced_loop(device *d) {
             fprintf(stderr, "harp-deviced: malformed pacing frame (%02x %02x ...)\n",
                     hdr[0], hdr[1]);
             return; /* §4.2 spirit: malformed stream is fatal */
+        }
+        /* event fence (§8.3.1): events ride the link endpoint, pacing rides
+         * this one — two pipes, no ordering between them. A fenced frame
+         * names how many evt messages must be consumed before its range may
+         * render; ordering becomes structural instead of probabilistic.
+         * The wait is wire+parse time of in-flight events (typically µs,
+         * absorbed by the host's ring cushion); the 5 ms bound keeps a
+         * stalled host from wedging the stream — a timeout means a possibly
+         * late event, and evt_late tells the truth about that. */
+        if (h.dirflags & HARP_AUDIO_FENCE) {
+            uint8_t fb[HARP_AUDIO_FENCE_LEN];
+            size_t fgot = 0;
+            while (fgot < sizeof fb) {
+                if (rpos < rlen) {
+                    size_t take = rlen - rpos;
+                    if (take > sizeof fb - fgot) take = sizeof fb - fgot;
+                    memcpy(fb + fgot, rbuf + rpos, take);
+                    rpos += take;
+                    fgot += take;
+                    continue;
+                }
+                ssize_t r = read(a->out_fd, rbuf, sizeof rbuf);
+                if (r <= 0) return;
+                rlen = (size_t)r;
+                rpos = 0;
+            }
+            uint32_t want = (uint32_t)fb[0] | ((uint32_t)fb[1] << 8) |
+                            ((uint32_t)fb[2] << 16) | ((uint32_t)fb[3] << 24);
+            if ((int32_t)(want - __atomic_load_n(&g_evt_consumed, __ATOMIC_ACQUIRE)) >
+                0) {
+                g_fence_waits++;
+                int spins = 0;
+                struct timespec fts = {0, 50000}; /* 50 µs */
+                while ((int32_t)(want -
+                                 __atomic_load_n(&g_evt_consumed, __ATOMIC_ACQUIRE)) >
+                           0 &&
+                       spins++ < 100 && a->running)
+                    nanosleep(&fts, NULL);
+                if ((int32_t)(want -
+                              __atomic_load_n(&g_evt_consumed, __ATOMIC_ACQUIRE)) > 0)
+                    g_fence_timeouts++;
+            }
         }
         /* discard any input payload (this engine has no input channels) */
         size_t skip = harp_audio_payload_len(&h);

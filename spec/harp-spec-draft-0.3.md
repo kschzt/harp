@@ -2,7 +2,7 @@
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 
-Specification, Draft 0.3.3 — 11 June 2026
+Specification, Draft 0.3.4 — 12 June 2026
 
 | | |
 |---|---|
@@ -13,6 +13,8 @@ Specification, Draft 0.3.3 — 11 June 2026
 | **Schema & reference code license** | Apache-2.0 |
 | **Patent policy** | Royalty-free; contributors sign a non-assertion covenant (§19) |
 | **Feedback** | via HARP Enhancement Proposals (HEPs), see §18 |
+
+> **Changes in 0.3.4** — The **event fence** (§8.3.1): events and pacing travel on different pipes (framed link vs. audio endpoint pair), so the 0.3.3 transmit-order rule constrains each pipe but cannot order them against each other — the gap was measured, not hypothesized (decoupling a host's event writes from its pacing writes tripled `evt_late` under flood until the fence closed it). A host-paced pacing frame MAY carry a 4-byte event-sequence fence (dirflags bit 2); the device MUST NOT render that frame's range until it has consumed that many event-stream messages this stream. Ordering becomes structural rather than a timing budget; `evt_late` stays the conformance probe, and the new `fence_timeouts` counter reports a peer that fences faster than it feeds.
 
 > **Changes in 0.3.3** — Event-plane errata from implementing §9 end to end and playing it in a DAW. Wire ordering in host-paced mode: a pacing frame triggers the rendering of its SSI range, so hosts MUST transmit events timestamped within a range before transmitting that range's pacing frame, and SHOULD report plugin latency with at least one host-block of event headroom beyond the elastic buffer target — without it, intra-block event offsets race their own audio and intermittently apply late (§9.2). The `evt_late` counter (§14.2) is the conformance probe for exactly this. Stream-domain timestamps come from delivered-stream position, not DAW project position (loops and locates rewind the latter; §9.2 note).
 
@@ -425,13 +427,15 @@ Transport: a dedicated bulk IN and bulk OUT endpoint pair (USB binding), separat
 ```
 audio frame
   u8   fver        = 0x01
-  u8   dirflags    bit 0: direction (0 D→H, 1 H→D); bit 1: discontinuity follows; rest 0
+  u8   dirflags    bit 0: direction (0 D→H, 1 H→D); bit 1: discontinuity follows;
+                   bit 2: event fence follows the header (H→D host-paced only, §8.3.1); rest 0
   u16  slots       channel count in this frame (0 = pacing-only H→D frame, §8.3)
   u32  epoch
   u64  ts          stream timestamp of first sample — device MSC (free-running)
                    or host SSI (host-paced), per §8.3
   u16  nsamples    samples per channel (per-frame block size)
   u16  fmt         0x0001 = float32 LE; 0x0002 = int24 LE packed; others reserved
+  fence            u32 LE event-sequence fence — present only when dirflags bit 2 set (§8.3.1)
   payload          interleaved by slot index, nsamples × slots
 ```
 
@@ -459,6 +463,16 @@ The stream runs in one of two clock modes, selected at `audio.start`; per-channe
 Host-paced mode admits two further OPTIONAL capabilities: `audio.deterministic` — byte-identical output for identical state, event schedule, and SSI range, certifiable under T15 — and `audio.offline-rate` — willingness to be paced faster or slower than real time, which turns offline bounce *through hardware* into an ordinary host feature rather than a stunt.
 
 Pipelining note (informative): host-paced does not mean synchronous RPC per DAW callback. The runtime keeps the device a small, fixed number of blocks ahead; the mode constrains *what* the device renders, while modest pipelining covers transport scheduling. Typical added latency is two to four blocks, constant and reported. A device MAY service pacing strictly serially — accepting no new pacing frame until its previous response is fully drained — so hosts SHOULD treat backpressure on pacing writes as a pipeline-depth signal and adapt their in-flight count, never as an error; an effective depth of one is normal and still far above real time over USB High Speed. (The first reference implementation rendered 21× real time at depth one.)
+
+#### 8.3.1 The event fence
+
+Host-paced mode creates an ordering problem the transmit-order rule of §9.2 cannot solve alone: events travel on the framed link while pacing frames travel on the audio endpoint pair, and **two pipes have no mutual ordering** — a device may service a pacing frame before an event message that was written to the link first, rendering the range before the event lands. Hosts that serialize the two writes in one loop narrow the race to scheduling jitter; hosts that (correctly, see §4.2.1) decouple them widen it to a coin flip.
+
+The fence closes it by construction. A host MAY set dirflags bit 2 on a host-paced pacing frame and append a 4-byte little-endian **event-sequence fence** immediately after the header: the count, modulo 2³², of event-stream messages the host has committed to the link for this stream so far. A device receiving a fenced frame MUST NOT render the frame's range until it has consumed at least that many event-stream messages since `audio.start` (comparison is wraparound-safe: the difference cast to a signed 32-bit value). Every received event message counts, including ones rejected as malformed — otherwise a bad message would wedge every subsequent fence.
+
+The wait is normally the wire-plus-parse time of events already in flight — microseconds, absorbed by the host's elastic buffer. Devices MUST bound the wait (a few milliseconds) so a host that fences beyond what it feeds cannot wedge the stream, and MUST count expirations (`fence_timeouts`, §14.2): an expired fence means the range may render with a late event, and `evt_late` remains the probe that tells the truth about it. Sequence space resets with the stream (`audio.start`), on both sides.
+
+Hosts SHOULD fence every pacing frame when they emit timestamped events at all (the fence is free when no events are in flight: the comparison already holds). Devices claiming `harp-perf` in host-paced mode SHOULD implement the fence; it converts the §9.2 headroom recommendation from a probabilistic safety margin into a correctness guarantee without adding reported latency.
 
 ### 8.4 Many devices at once
 

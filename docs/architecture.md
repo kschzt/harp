@@ -87,9 +87,21 @@ converters).
   (the device interpolates at control rate regardless).
 - Events go to the wire BEFORE the pacing frames covering their
   timestamps (a pacing frame triggers the render of its range), they're
-  batched into one framed write per feeder cycle (per-event writes
-  starve pacing), and reported latency includes a DAW block of event
-  headroom (spec 0.3.3, normative).
+  batched into one framed write per cycle (per-event writes starve the
+  pipe), and reported latency includes a DAW block of event headroom
+  (spec 0.3.3, normative).
+- Events get their OWN thread (the event pump) — their wire deadline is
+  ~one DAW block while a pacing write can stall 8 ms in drain-on-stall,
+  and sharing a loop spends the event budget on someone else's stall.
+  But decoupling alone is WORSE than sharing: events and pacing ride
+  different USB pipes with no mutual ordering, and the in-loop ordering
+  was silently load-bearing (measured: pump-alone tripled evt_late).
+  The event fence (spec 0.3.4, §8.3.1) restores order by construction:
+  every pacing frame names the count of events queued so far; the
+  device won't render the range until it has consumed that many. Fence
+  waits are µs; timeouts are harmless overshoot (the fence counts
+  events timestamped blocks in the future) and counted. Flood-verified:
+  evt_late zero, ramp_late rate down 10×.
 - Notes are performance state OF A STREAM: they die at stream
   start/stop/session-end, note-offs are never droppable (overflow
   escalates to all-notes-off), and CC 120/123 panic works at every

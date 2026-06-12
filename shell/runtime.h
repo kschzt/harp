@@ -107,9 +107,13 @@ private:
 
     void supervisor(); /* owns session lifecycle: connect, run, reconnect */
     bool sessionUp();  /* one attempt: open, hello, re-push bundle, stream */
-    void sessionDown(); /* reap reader, orderly stop if alive, close usb */
+    void sessionDown(); /* reap reader+pump, orderly stop if alive, close usb */
     void feeder();      /* runs on the supervisor thread while connected */
     void reader();
+    void eventPump();   /* dedicated event->wire thread: an event's deadline
+                           budget is ~one DAW block (5.3 ms at 256), while a
+                           pacing write can stall 8 ms in drain-on-stall —
+                           events must never wait behind audio head-of-line */
     void settlePadDebt(); /* drop late arrivals for already-padded SSIs */
     bool helloAndIdentity();
     bool audioStart(uint32_t rate);
@@ -143,6 +147,7 @@ private:
     std::thread readerThread_; /* always-pending audio-IN read: the device's
                                   response writes must never wait for us;
                                   spawned per session by sessionUp() */
+    std::thread eventPumpThread_; /* per session, like the reader */
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
     std::atomic<uint64_t> underruns_{0};
@@ -150,6 +155,13 @@ private:
     std::atomic<uint64_t> evDrops_{0};    /* events lost to ring overflow — never silent */
     uint64_t evDropsLogged_ = 0;
     std::atomic<bool> panicPending_{false}; /* a note-off was lost: all-off NOW */
+
+    /* event fence sequence (§8.3.1): count of events QUEUED this session
+     * (not yet written — queue time is what a racing pacing frame must
+     * respect). Audio thread increments; feeder stamps it into fenced
+     * pacing frames; the device renders a range only after consuming that
+     * many evt messages. Resets with the session, like the SSI domain. */
+    std::atomic<uint32_t> evtQueuedSeq_{0};
 
     FloatRing audioRing_{1 << 15}; /* 32768 floats = 16384 stereo frames */
     std::atomic<uint64_t> framesRecvAtomic_{0}; /* written by reader, read by feeder */

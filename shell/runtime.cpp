@@ -229,15 +229,26 @@ bool HarpRuntime::sessionUp() {
     uint8_t junk[16384];
     while (harp_usb_audio_read(io_, junk, sizeof junk, 30) > 0) {}
 
-    /* new session = new stream = new SSI time domain (§7.1) */
+    /* new session = new stream = new SSI time domain (§7.1). Events still
+     * queued from the previous session carry STALE timestamps — drain
+     * them (no pump is running yet, so consuming here is safe), and the
+     * fence sequence space restarts from zero on both sides. */
+    {
+        TimedEv stale;
+        while (timedRing_.pop(stale)) {}
+    }
+    evtQueuedSeq_.store(0, std::memory_order_release);
     ssi_ = framesSent_ = framesRecv_ = 0;
     framesRecvAtomic_.store(0, std::memory_order_relaxed);
     ssiRead_.store(0, std::memory_order_relaxed);
     padDebtFloats_ = 0;
     ahead_ = 2; /* small fixed pipeline; the reader thread keeps RTT short */
     audioRing_.clear();
-    readerThread_ = std::thread([this] { reader(); });
+    /* connected_ goes true BEFORE the pump spawns: its run loop gates on
+     * it, and spawning first would race a clean instant exit */
     connected_.store(true, std::memory_order_release);
+    readerThread_ = std::thread([this] { reader(); });
+    eventPumpThread_ = std::thread([this] { eventPump(); });
     return true;
 }
 
@@ -246,6 +257,7 @@ bool HarpRuntime::sessionUp() {
 void HarpRuntime::sessionDown() {
     bool wasConnected = connected_.exchange(false, std::memory_order_acq_rel);
     if (readerThread_.joinable()) readerThread_.join();
+    if (eventPumpThread_.joinable()) eventPumpThread_.join();
     if (!io_) return;
     std::lock_guard<std::mutex> lk(ctlMutex_);
     if (wasConnected) {
@@ -325,15 +337,21 @@ void HarpRuntime::stop() {
 /* ---------------- audio thread side ---------------- */
 
 void HarpRuntime::queueParamSet(uint32_t id, float v, uint64_t ts) {
-    if (!timedRing_.push({0, id, v, ts, 0}))
+    if (timedRing_.push({0, id, v, ts, 0}))
+        evtQueuedSeq_.fetch_add(1, std::memory_order_release);
+    else
         evDrops_.fetch_add(1, std::memory_order_relaxed);
 }
 void HarpRuntime::queueRamp(uint32_t id, float target, uint64_t start, uint64_t end) {
-    if (!timedRing_.push({1, id, target, start, end}))
+    if (timedRing_.push({1, id, target, start, end}))
+        evtQueuedSeq_.fetch_add(1, std::memory_order_release);
+    else
         evDrops_.fetch_add(1, std::memory_order_relaxed);
 }
 void HarpRuntime::queueNote(uint32_t word, uint64_t ts) {
-    if (!timedRing_.push({2, word, 0.0f, ts, 0})) {
+    if (timedRing_.push({2, word, 0.0f, ts, 0})) {
+        evtQueuedSeq_.fetch_add(1, std::memory_order_release);
+    } else {
         evDrops_.fetch_add(1, std::memory_order_relaxed);
         /* A dropped note-ON is a missing note; a dropped note-OFF is a
          * note that never stops. If anything but a note-on is lost,
@@ -445,69 +463,39 @@ void HarpRuntime::feeder() {
          * automation flood) */
         pollEcho();
 
-        /* 1b. escalated panic: a note-off was lost to overflow — send
-         * all-notes-off (CC 123) ahead of everything else */
-        if (panicPending_.exchange(false, std::memory_order_acq_rel)) {
-            harp_cbuf m;
-            harp_cbuf_init(&m);
-            encodeUmpEvent(&m, 0x20B07B00u, 0); /* CC 123, now */
-            std::lock_guard<std::mutex> lk(ctlMutex_);
-            harp_link_send(io_, HARP_STREAM_EVT, m.buf, m.len);
-            harp_cbuf_free(&m);
-            log_msg("WARNING: note-off lost to overflow; sent all-notes-off");
-        }
+        /* (events + panic live on the eventPump thread: an event's wire
+         * deadline is ~one DAW block, and the pacing writes below can
+         * stall 8 ms in drain-on-stall — head-of-line blocking here is
+         * exactly how block-256 sessions leaked evt_late) */
 
-        /* 2. timestamped events (params, ramps, notes — §9.2/§9.4/§9.10),
-         * sent BEFORE pacing: a pacing frame triggers the render of its
-         * SSIs, so events timestamped within them must already be on the
-         * wire — events after pacing intermittently lost the race and
-         * applied a block late (audible 5-15 ms slop on some notes).
-         * Batched into ONE framed bulk write (per-event writes starved
-         * pacing); bounded per iteration: audio outranks events. */
-        {
-            harp_cbuf msgbuf, batch;
-            harp_cbuf_init(&msgbuf);
-            harp_cbuf_init(&batch);
-            TimedEv te;
-            int sent = 0;
-            for (; sent < 32 && timedRing_.pop(te); sent++) {
-                harp_cbuf_reset(&msgbuf);
-                if (te.kind == 0)
-                    encodeParamEvent(&msgbuf, te.a, te.v, te.ts);
-                else if (te.kind == 1)
-                    encodeRampEvent(&msgbuf, te.a, te.v, te.ts, te.end);
-                else
-                    encodeUmpEvent(&msgbuf, te.a, te.ts);
-                harp_frame_hdr h = {HARP_FRAME_FVER, HARP_STREAM_EVT, HARP_FLAG_FIN,
-                                    (uint32_t)msgbuf.len};
-                uint8_t hdr[HARP_FRAME_HDR_LEN];
-                harp_frame_hdr_encode(&h, hdr);
-                harp_cbuf_put(&batch, hdr, sizeof hdr);
-                harp_cbuf_put(&batch, msgbuf.buf, msgbuf.len);
-            }
-            if (sent) {
-                std::lock_guard<std::mutex> lk(ctlMutex_);
-                if (!io_->write_all(io_, batch.buf, batch.len)) {
-                    log_msg("event write failed; device gone?");
-                    connected_.store(false, std::memory_order_release);
-                }
-                didWork = true;
-            }
-            harp_cbuf_free(&msgbuf);
-            harp_cbuf_free(&batch);
-        }
-
-        /* 3. pace: ring to target depth, small fixed pipeline on top. The
+        /* 2. pace: ring to target depth, small fixed pipeline on top. The
          * reader thread keeps an audio-IN read permanently pending, so the
          * device's response writes land instantly and its pacing turnaround
          * is just render time. */
         size_t ringFrames = audioRing_.readAvailable() / 2;
         uint64_t inFlight = framesSent_ - framesRecv_;
         while (ringFrames < (size_t)targetFrames_ && inFlight < ahead_) {
-            harp_audio_hdr pace = {HARP_AUDIO_FVER, HARP_AUDIO_DIR_H2D, 0,    0,
-                                   ssi_,            (uint16_t)kBlock,   HARP_AUDIO_FMT_F32};
-            uint8_t ph[HARP_AUDIO_HDR_LEN];
+            /* every pacing frame carries the event fence (§8.3.1): the
+             * count of events queued so far this session. Any event queued
+             * before this instant is guaranteed consumed device-side
+             * before this range renders — events and pacing travel on
+             * different pipes, and without the fence they race (measured:
+             * decoupling the event writes from this loop tripled evt_late
+             * until the fence closed the order by construction). */
+            harp_audio_hdr pace = {HARP_AUDIO_FVER,
+                                   HARP_AUDIO_DIR_H2D | HARP_AUDIO_FENCE,
+                                   0,
+                                   0,
+                                   ssi_,
+                                   (uint16_t)kBlock,
+                                   HARP_AUDIO_FMT_F32};
+            uint8_t ph[HARP_AUDIO_HDR_LEN + HARP_AUDIO_FENCE_LEN];
             harp_audio_hdr_encode(&pace, ph);
+            uint32_t seq = evtQueuedSeq_.load(std::memory_order_acquire);
+            ph[HARP_AUDIO_HDR_LEN + 0] = (uint8_t)seq;
+            ph[HARP_AUDIO_HDR_LEN + 1] = (uint8_t)(seq >> 8);
+            ph[HARP_AUDIO_HDR_LEN + 2] = (uint8_t)(seq >> 16);
+            ph[HARP_AUDIO_HDR_LEN + 3] = (uint8_t)(seq >> 24);
             if (!harp_usb_audio_write(io_, ph, sizeof ph, 8)) break;
             ssi_ += kBlock;
             framesSent_++;
@@ -535,6 +523,79 @@ void HarpRuntime::feeder() {
 /* Audio-IN reader: one blocking read always pending. This is what makes the
  * device's response writes complete immediately — the §4.2.1 always-pending
  * inbound rule applied to the stream pair. */
+/* Dedicated event->wire thread (§9.2). The deadline for an event is its
+ * own timestamp's pacing frame — roughly one DAW block of wall time
+ * (5.3 ms at 256) — while the feeder's audio writes can stall 8 ms in
+ * drain-on-stall. Sharing a loop with pacing spent the event budget on
+ * someone else's stall: measured one late event per ~8 min of flood at
+ * block 256, zero at >=512 (whose budget exceeds the stall). Events get
+ * their own thread; the link endpoint is distinct from the audio
+ * endpoint, so the two never contend on the wire — only on ctlMutex_,
+ * whose link writes are short. */
+void HarpRuntime::eventPump() {
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    harp_cbuf msgbuf, batch;
+    harp_cbuf_init(&msgbuf);
+    harp_cbuf_init(&batch);
+    while (running_.load(std::memory_order_relaxed) &&
+           connected_.load(std::memory_order_relaxed)) {
+        bool didWork = false;
+
+        /* escalated panic: a note-off was lost to overflow — all-notes-off
+         * (CC 123) ahead of everything else */
+        if (panicPending_.exchange(false, std::memory_order_acq_rel)) {
+            harp_cbuf m;
+            harp_cbuf_init(&m);
+            encodeUmpEvent(&m, 0x20B07B00u, 0); /* CC 123, now */
+            std::lock_guard<std::mutex> lk(ctlMutex_);
+            harp_link_send(io_, HARP_STREAM_EVT, m.buf, m.len);
+            harp_cbuf_free(&m);
+            log_msg("WARNING: note-off lost to overflow; sent all-notes-off");
+        }
+
+        /* timestamped events (params, ramps, notes — §9.2/§9.4/§9.10),
+         * batched into ONE framed bulk write (per-event writes starve the
+         * pipe); the cap only bounds the write size — the loop comes
+         * straight back for the rest */
+        harp_cbuf_reset(&batch);
+        TimedEv te;
+        int sent = 0;
+        for (; sent < 64 && timedRing_.pop(te); sent++) {
+            harp_cbuf_reset(&msgbuf);
+            if (te.kind == 0)
+                encodeParamEvent(&msgbuf, te.a, te.v, te.ts);
+            else if (te.kind == 1)
+                encodeRampEvent(&msgbuf, te.a, te.v, te.ts, te.end);
+            else
+                encodeUmpEvent(&msgbuf, te.a, te.ts);
+            harp_frame_hdr h = {HARP_FRAME_FVER, HARP_STREAM_EVT, HARP_FLAG_FIN,
+                                (uint32_t)msgbuf.len};
+            uint8_t hdr[HARP_FRAME_HDR_LEN];
+            harp_frame_hdr_encode(&h, hdr);
+            harp_cbuf_put(&batch, hdr, sizeof hdr);
+            harp_cbuf_put(&batch, msgbuf.buf, msgbuf.len);
+        }
+        if (sent) {
+            std::lock_guard<std::mutex> lk(ctlMutex_);
+            if (!io_->write_all(io_, batch.buf, batch.len)) {
+                log_msg("event write failed; device gone?");
+                connected_.store(false, std::memory_order_release);
+            }
+            didWork = true;
+        }
+
+        if (!didWork) {
+            struct timespec ts = {0, 500000}; /* 0.5 ms — well inside the
+                                                 one-block budget */
+            nanosleep(&ts, nullptr);
+        }
+    }
+    harp_cbuf_free(&msgbuf);
+    harp_cbuf_free(&batch);
+}
+
 void HarpRuntime::reader() {
 #ifdef __APPLE__
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);

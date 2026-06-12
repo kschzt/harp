@@ -548,7 +548,11 @@ static void handle_diag_counters(device *d, const harp_env *e) {
     harp_cbuf m;
     harp_cbuf_init(&m);
     rsp_head(&m, e->rid, e->method, true);
-    harp_cbor_map(&m, 14);
+    harp_cbor_map(&m, 16);
+    harp_cbor_text(&m, "x.harp-refdev.fence_waits");
+    harp_cbor_uint(&m, g_fence_waits);
+    harp_cbor_text(&m, "x.harp-refdev.fence_timeouts");
+    harp_cbor_uint(&m, g_fence_timeouts);
     harp_cbor_text(&m, "usb_errors");
     harp_cbor_uint(&m, 0);
     harp_cbor_text(&m, "frame_errors");
@@ -982,8 +986,14 @@ void harp_deviced_run_session(device *d, harp_io *io) {
             handle_ctl(d, msg.buf, msg.len);
         else if (stream == HARP_STREAM_OBJ)
             handle_obj(d, msg.buf, msg.len);
-        else if (stream == HARP_STREAM_EVT)
+        else if (stream == HARP_STREAM_EVT) {
             handle_evt_msg(d, msg.buf, msg.len);
+            /* fence bookkeeping (§8.3.1): every evt message counts once it
+             * is FULLY processed (events visible in evq) — including ones
+             * handle_evt_msg rejected, or a malformed message would leave
+             * the host's sequence unreachable and wedge every later fence */
+            __atomic_add_fetch(&g_evt_consumed, 1, __ATOMIC_RELEASE);
+        }
         if (d->closing) break;
     }
     harp_cbuf_free(&msg);
