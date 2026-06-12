@@ -33,6 +33,10 @@ dev_param g_params[NPARAMS] = {
     {10, "Arp Division", 6, ARP_DIVS, 0.6f}, /* index 3 = 1/16 */
     {11, "Arp Gate", 0, NULL, 0.5f},
     {12, "Arp Octaves", 4, ARP_OCTS, 0.0f},
+    /* 0 = no portamento (legato snaps too — what an arp wants); else
+     * glide tau 1..512 ms, exp-mapped. The old behavior was a fixed
+     * 12 ms tau that audibly never arrived at fast arp rates. */
+    {13, "Glide", 0, NULL, 0.0f},
 };
 
 /* stepped params quantize: normalized [0,1] -> step index */
@@ -217,10 +221,17 @@ static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float 
         bool gate = note >= 0;
         if (gate) {
             float target = 440.0f * exp2f(((float)note - 69.0f) / 12.0f);
-            if (retrig && v->env < 0.2f)
-                v->n_freq = target; /* fresh attack: arrive on time */
-            else
-                v->n_freq += alpha * (target - v->n_freq); /* legato glide */
+            float glide = param_value(13);
+            if (glide <= 0.001f || (retrig && v->env < 0.2f)) {
+                v->n_freq = target; /* no portamento / fresh attack: arrive
+                                       on time (off notes are worse than
+                                       missing glides) */
+            } else {
+                /* legato glide, player-set tau: 1..512 ms exp-mapped */
+                float tau = 0.001f * exp2f(glide * 9.0f);
+                float ga = 1.0f - expf(-(float)SMOOTH_SUBBLOCK / (tau * rate));
+                v->n_freq += ga * (target - v->n_freq);
+            }
         }
         /* attack 1 ms..1 s, release 5 ms..3 s (exp-mapped knobs) */
         float atk_tau = 0.001f * exp2f(param_value(5) * 10.0f);

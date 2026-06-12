@@ -68,7 +68,7 @@ static inline void param_put(dev_param *p, float v) {
 
 /* fixed count so sizeof tricks aren't needed across modules; the arp
  * session grows this to 12 (params 9-12) — one place to change */
-#define NPARAMS 12
+#define NPARAMS 13
 extern dev_param g_params[NPARAMS];
 
 /* Live performance note state is PRIVATE to engine.c (mono, last-note

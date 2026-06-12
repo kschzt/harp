@@ -43,6 +43,7 @@ static const DevParam kParams[] = {
     /* the arp (device params 9-12; param-map-hash changed with these) */
     {9, "Arp Mode", 4, 0.0},     {10, "Arp Division", 5, 0.6},
     {11, "Arp Gate", 0, 0.5},    {12, "Arp Octaves", 3, 0.0},
+    {13, "Glide", 0, 0.0}, /* 0 = off; portamento is opt-in now */
 };
 static constexpr int kNumParams = sizeof(kParams) / sizeof(kParams[0]);
 /* hidden parameter the DAW's panic (CC 120/123) maps onto via IMidiMapping */
