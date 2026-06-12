@@ -48,3 +48,32 @@ systemctl disable harp-deviced
 systemctl enable harp-gadget harp-deviced-usb
 echo "stage 2 installed; rebooting"
 reboot
+
+# --- resilience: persistent journal + Wi-Fi watchdog -------------------
+# (Wi-Fi sometimes fails to come up after a gadget-mode power-cycle —
+#  observed twice; root cause still unknown because the first journals
+#  were volatile. Persistence makes the next occurrence diagnosable;
+#  the watchdog makes it self-healing meanwhile.)
+mkdir -p /var/log/journal
+systemd-tmpfiles --create --prefix /var/log/journal
+
+cat > /etc/systemd/system/wifi-watchdog.service <<'UNIT'
+[Unit]
+Description=Recover wlan0 if it failed to come up (gadget-boot race)
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c "ip -4 addr show wlan0 | grep -q inet || (echo wifi-watchdog: wlan0 has no IPv4, bouncing NetworkManager; systemctl restart NetworkManager)"
+UNIT
+
+cat > /etc/systemd/system/wifi-watchdog.timer <<'UNIT'
+[Unit]
+Description=Check wlan0 45 s after boot, then every 2 min
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=120
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now wifi-watchdog.timer
