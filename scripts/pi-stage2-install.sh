@@ -46,9 +46,6 @@ EOF
 systemctl daemon-reload
 systemctl disable harp-deviced
 systemctl enable harp-gadget harp-deviced-usb
-echo "stage 2 installed; rebooting"
-reboot
-
 # --- resilience: persistent journal + Wi-Fi watchdog -------------------
 # (Wi-Fi sometimes fails to come up after a gadget-mode power-cycle —
 #  observed twice; root cause still unknown because the first journals
@@ -77,3 +74,6 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now wifi-watchdog.timer
+
+echo "stage 2 installed; rebooting"
+reboot
