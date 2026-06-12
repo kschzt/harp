@@ -14,6 +14,11 @@ OUT=/tmp/harp-soak.wav
 LOG=/tmp/harp-soak.log
 fail() { echo "SOAK FAIL: $1"; exit 1; }
 
+if pgrep -x "Live" >/dev/null 2>&1; then
+    echo "SOAK SKIP: Ableton Live is running (device claim)"
+    exit 2
+fi
+
 NOTES=$(python3 -c "import sys; n=int($S/0.6); print(','.join(['60','64','67','72'][i%4] for i in range(n)))")
 C0=$(curl -s --max-time 3 "http://$HOST:8080/api/counters") || fail "panel unreachable"
 
