@@ -2,8 +2,11 @@
 
 The last unimplemented §9 slice, and the launch-demo centerpiece: the
 hardware follows Ableton's timeline the way plugins do (T17 in
-miniature). Status: planned; floor verified (hw-tests 3/3, timing
-proven to ±1 sample, evt_late zero-tolerance enforced).
+miniature). Status: SHIPPED 2026-06-12 — everything below is implemented and in
+hw-tests (tempo-lock-test.sh = T17). The groove is deterministic: two
+renders of the same chord + transport hash byte-identical. What
+remains from this doc is the demo choreography section (filming in a
+couple of weeks).
 
 ## Shell: transport events (§9.7)
 
