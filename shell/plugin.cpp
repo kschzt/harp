@@ -1,10 +1,12 @@
 /* HARP RefDev — VST3 shell (§15): presents a HARP device to a DAW.
  *
- * v0: one stereo output, host-paced audio via the embedded runtime, the 8
- * device params as automatable parameters, getState/setState = Recall
- * Bundle. Known deviations from spec, by design for now: no four-actions
- * UI (auto-Push with archive on mismatch), params pushed via the vendor
- * knob method instead of §9 events (event plane is the next milestone).
+ * One stereo output, host-paced audio via the embedded runtime, the 13
+ * device params as automatable parameters (automation becomes §9.4
+ * ramps, notes travel as §9.10 UMP, ProcessContext becomes §9.7
+ * transport), getState/setState = Recall Bundle. The AU shell
+ * (shell/au) wraps the same runtime; both render byte-identically.
+ * Remaining spec deviation, by design: no four-actions UI yet —
+ * mismatches auto-resolve by Push-with-archive, which is loss-free.
  */
 #include "pluginterfaces/base/fplatform.h"
 #include "pluginterfaces/base/funknown.h"

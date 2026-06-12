@@ -12,7 +12,11 @@ VST=${VST:-$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3}
 HOSTBIN=${HOSTBIN:-./build-vst/harp-vst3-host}
 OUT=/tmp/harp-soak.wav
 LOG=/tmp/harp-soak.log
-fail() { echo "SOAK FAIL: $1"; exit 1; }
+fail() {
+    echo "SOAK FAIL: $1"
+    echo "   (realtime test — machine load matters: $(uptime | sed 's/.*load/load/'))"
+    exit 1
+}
 
 if pgrep -x "Live" >/dev/null 2>&1; then
     echo "SOAK SKIP: Ableton Live is running (device claim)"

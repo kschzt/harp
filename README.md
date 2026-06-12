@@ -139,7 +139,13 @@ https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk`).
 cmake -B build-vst -S tools/vst3-host
 cmake --build build-vst --target install-live   # macOS: build, sign, install
 cmake --build build-vst --target install-linux  # Linux: install to ~/.vst3
+cmake --build build-vst --target install-au     # macOS: the Audio Unit shell
 ```
+
+(The AU appears as **HARP Project: HARP RefDev**; `auval -v aumu rfdv
+HARP` is Apple's own validation and runs in this repo's CI. Both shells
+render byte-identically from the same drive — the conformance kit
+asserts it.)
 
 Rescan plug-ins in your DAW and drop **HARP RefDev** on a track. The
 plugin claims the device over USB, streams host-paced audio into the

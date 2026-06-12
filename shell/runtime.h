@@ -1,12 +1,21 @@
-/* HarpRuntime — the embedded host runtime (§15.1, embedded-in-process for
- * milestone 2; the per-machine daemon split comes later).
+/* HarpRuntime — the embedded host runtime (§15.1, embedded-in-process;
+ * the per-machine daemon split comes later). Shared by every shell
+ * format (VST3, AU) — the shells are thin adapters over this.
  *
- * Owns the USB transport, the control link, and the host-paced audio pump.
- * Threading contract:
- *   - audio thread:   pullAudio(), setParam()        (lock-free, never block)
- *   - feeder thread:  USB I/O — pacing, draining, param pushes
+ * Owns the USB transport, the control link, the host-paced audio pump,
+ * and the event plane. Threading contract:
+ *   - DAW audio thread: pullAudio(), queueParamSet/Ramp/Note(),
+ *     feedTransport(), streamPos() — lock-free, never blocks
+ *   - supervisor thread: session lifecycle (connect/reconnect); runs
+ *     feeder() while connected (pacing writes + inbound echo polling)
+ *   - reader thread (per session): audio-IN always pending -> ring
+ *   - event pump thread (per session): timed events -> wire, never
+ *     behind a pacing stall (its deadline is ~one DAW block)
+ *   - transport event thread (usb_io): async libusb completion reaping
  *   - main/UI thread: start(), stop(), getStateBundle(), setStateBundle()
- *     (control-plane requests serialized with the feeder via ctlMutex_)
+ *     (control-plane requests serialize against the feeder via ctlMutex_)
+ * On AU hosts all RT-adjacent threads join the host's CoreAudio
+ * workgroup (setWorkgroup via RenderContextObserver).
  */
 #pragma once
 

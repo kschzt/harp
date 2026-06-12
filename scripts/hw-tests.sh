@@ -12,6 +12,7 @@ run() {
     else FAIL=$((FAIL+1)); fi
     echo
 }
+run scripts/golden-test.sh
 run scripts/recall-test.sh
 run scripts/timing-test.sh
 run scripts/soak.sh "${SOAK_SECONDS:-30}"
