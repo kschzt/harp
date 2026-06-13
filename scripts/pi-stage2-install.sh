@@ -1,7 +1,14 @@
 #!/bin/sh
 # Stage 2 install: switch the Pi to USB peripheral mode and install the
 # gadget + USB daemon services. Run as root on the Pi. Reboots at the end.
+#
+#   sudo sh pi-stage2-install.sh [SERIAL]   (default PI4B-0001)
+#
+# Each board needs a DISTINCT serial: the host binds a project's recall
+# bundle to a device by (product, serial), so PI4B-0001 (desk) and
+# PI4B-0002 (CI/closet) can coexist on one host without confusion.
 set -ex
+SERIAL="${1:-PI4B-0001}"
 
 # 1. dwc2 peripheral mode (otg_mode=1 forces xhci host mode on the Pi 4)
 sed -i "s/^otg_mode=1/#otg_mode=1  # disabled for HARP gadget mode/" /boot/firmware/config.txt
@@ -18,7 +25,7 @@ After=sys-kernel-config.mount
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/sbin/pi-gadget.sh PI4B-0001
+ExecStart=/usr/local/sbin/pi-gadget.sh $SERIAL
 
 [Install]
 WantedBy=multi-user.target
@@ -34,7 +41,7 @@ After=harp-gadget.service
 Conflicts=harp-deviced.service
 
 [Service]
-ExecStart=/home/jak/harp/build/harp-deviced --state-dir /home/jak/harp-state --serial PI4B-0001 --ffs /dev/ffs-harp
+ExecStart=/home/jak/harp/build/harp-deviced --state-dir /home/jak/harp-state --serial $SERIAL --ffs /dev/ffs-harp
 Restart=always
 RestartSec=1
 User=root
