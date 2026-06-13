@@ -10,8 +10,11 @@
 set -ex
 SERIAL="${1:-PI4B-0001}"
 
-# 1. dwc2 peripheral mode (otg_mode=1 forces xhci host mode on the Pi 4)
+# 1. dwc2 peripheral mode (otg_mode=1 forces xhci host mode on the Pi 4;
+#    some images also ship an explicit dr_mode=host overlay — neutralize
+#    both, then add peripheral, or the two dwc2 overlays fight)
 sed -i "s/^otg_mode=1/#otg_mode=1  # disabled for HARP gadget mode/" /boot/firmware/config.txt
+sed -i "s/^dtoverlay=dwc2,dr_mode=host/#&  # disabled for HARP gadget mode/" /boot/firmware/config.txt
 grep -q "dtoverlay=dwc2,dr_mode=peripheral" /boot/firmware/config.txt || \
     printf "\n[all]\ndtoverlay=dwc2,dr_mode=peripheral\n" >> /boot/firmware/config.txt
 
@@ -51,7 +54,7 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl disable harp-deviced
+systemctl disable harp-deviced 2>/dev/null || true # absent on fresh boxes
 systemctl enable harp-gadget harp-deviced-usb
 # --- resilience: persistent journal + Wi-Fi watchdog -------------------
 # (Wi-Fi sometimes fails to come up after a gadget-mode power-cycle —
