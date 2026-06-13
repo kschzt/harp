@@ -34,6 +34,7 @@
  * 512 leaves room for real devices (wavetables, per-pad kits) */
 #define HARP_CLIENT_MAX_CLOSURE 512
 
+#define HARP_CLIENT_MAX_CAPS 32
 typedef struct {
     char vendor[64], product[64];
     uint32_t vendor_id, product_id;
@@ -42,7 +43,12 @@ typedef struct {
     char engine_id[64], engine_ver[32];
     harp_hash param_map_hash;
     uint64_t boot_count;
+    char caps[HARP_CLIENT_MAX_CAPS][32]; /* capability strings (identity key 6) */
+    size_t ncaps;
 } harp_client_identity;
+
+/* true if the device advertised `cap` */
+bool harp_client_has_cap(const harp_client_identity *id, const char *cap);
 
 typedef struct {
     harp_io *io;

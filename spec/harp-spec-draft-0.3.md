@@ -2,7 +2,7 @@
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 
-Specification, Draft 0.3.4 — 12 June 2026
+Specification, Draft 0.3.5 — 13 June 2026
 
 | | |
 |---|---|
@@ -13,6 +13,8 @@ Specification, Draft 0.3.4 — 12 June 2026
 | **Schema & reference code license** | Apache-2.0 |
 | **Patent policy** | Royalty-free; contributors sign a non-assertion covenant (§19) |
 | **Feedback** | via HARP Enhancement Proposals (HEPs), see §18 |
+
+> **Changes in 0.3.5** — Identity completeness from the reference device advertising what it already does. The `evt.ump` capability gains a defined home for its group map: a new optional identity key (`11 => ump-group-map`, `[* {group, role}]`), since the capability array is strings only and §9.10's "declare evt.ump with a group map" had nowhere to put it. No behavior change — it documents which UMP groups a device consumes/emits (the refdev: group 0 → notes). Hosts ignore unknown identity keys, so this is backward-compatible.
 
 > **Changes in 0.3.4** — The **event fence** (§8.3.1): events and pacing travel on different pipes (framed link vs. audio endpoint pair), so the 0.3.3 transmit-order rule constrains each pipe but cannot order them against each other — the gap was measured, not hypothesized (decoupling a host's event writes from its pacing writes tripled `evt_late` under flood until the fence closed it). A host-paced pacing frame MAY carry a 4-byte event-sequence fence (dirflags bit 2); the device MUST NOT render that frame's range until it has consumed that many event-stream messages this stream. Ordering becomes structural rather than a timing budget; `evt_late` stays the conformance probe, and the new `fence_timeouts` counter reports a peer that fences faster than it feeds.
 
@@ -623,7 +625,7 @@ Parameters flagged readonly are outputs: meters, gain reduction, voice counts, s
 
 ### 9.10 UMP carriage
 
-`etype 0` bodies are byte strings containing one Universal MIDI Packet (32/64/96/128 bits) verbatim. Devices declare `evt.ump` with a group map in capabilities. HARP does not redefine any UMP semantics; MIDI 2.0 per-note controllers, MPE via UMP, and SysEx all pass through. A device MAY expose the same controls both as UMP controllers and HARP params; if so it MUST declare the mapping in the param descriptor (`x-ump` extension key) so hosts avoid double application.
+`etype 0` bodies are byte strings containing one Universal MIDI Packet (32/64/96/128 bits) verbatim. Devices declare `evt.ump` and publish a **group map** in identity key 11 (`ump-group-map = [* {0 => group-index, 1 => role}]`), naming which UMP groups carry what. HARP does not redefine any UMP semantics; MIDI 2.0 per-note controllers, MPE via UMP, and SysEx all pass through. A device MAY expose the same controls both as UMP controllers and HARP params; if so it MUST declare the mapping in the param descriptor (`x-ump` extension key) so hosts avoid double application.
 
 ---
 

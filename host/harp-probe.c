@@ -492,6 +492,63 @@ static void cmd_identify(probe *p) {
     printf("serial:    %s\n", id.serial);
     printf("firmware:  %s   engine: %s %s\n", id.fw, id.engine_id, id.engine_ver);
     printf("param-map: %s…   boots: %llu\n", hex, (unsigned long long)id.boot_count);
+    printf("caps:     ");
+    for (size_t i = 0; i < id.ncaps; i++) printf(" %s", id.caps[i]);
+    printf("\n");
+}
+
+/* §7.2 time correlation: bracket a time.ping with host monotonic stamps,
+ * solve NTP-style for host<->device offset and its uncertainty. One-shot
+ * here (the runtime MUST refine continuously — that loop is still TODO). */
+static void cmd_ping(probe *p, int rounds) {
+    do_hello(p);
+    if (rounds < 1) rounds = 5;
+    double best_unc = 1e18;
+    long long best_off = 0, best_rtt = 0;
+    for (int k = 0; k < rounds; k++) {
+        harp_cbuf req, rsp;
+        harp_cbuf_init(&req);
+        harp_cbuf_init(&rsp);
+        req_head(p, &req, "time.ping", false);
+        struct timespec s, r;
+        clock_gettime(CLOCK_MONOTONIC, &s);
+        harp_env e = request(p, &req, &rsp);
+        clock_gettime(CLOCK_MONOTONIC, &r);
+        long long t_send = (long long)s.tv_sec * 1000000 + s.tv_nsec / 1000;
+        long long t_recv = (long long)r.tv_sec * 1000000 + r.tv_nsec / 1000;
+        /* parse {0:[ep,recv_us], 1:[ep,xmit_us]} */
+        long long d_recv = 0, d_xmit = 0;
+        harp_cdec b;
+        harp_cdec_init(&b, e.body, e.body_len);
+        uint64_t n, key, al, ep, us;
+        if (e.has_body && harp_cdec_map(&b, &n)) {
+            for (uint64_t i = 0; i < n; i++) {
+                if (!harp_cdec_uint(&b, &key) || !harp_cdec_array(&b, &al) ||
+                    !harp_cdec_uint(&b, &ep) || !harp_cdec_uint(&b, &us))
+                    break;
+                if (key == 0) d_recv = (long long)us;
+                else if (key == 1) d_xmit = (long long)us;
+            }
+        }
+        long long rtt = t_recv - t_send;
+        long long turnaround = d_xmit - d_recv;
+        /* offset = device_mid - host_mid; uncertainty = (rtt - turnaround)/2 */
+        long long host_mid = t_send + rtt / 2;
+        long long dev_mid = d_recv + turnaround / 2;
+        double unc = (double)(rtt - turnaround) / 2.0;
+        if (unc < best_unc) {
+            best_unc = unc;
+            best_off = dev_mid - host_mid;
+            best_rtt = rtt;
+        }
+        harp_cbuf_free(&req);
+        harp_cbuf_free(&rsp);
+    }
+    printf("time.ping x%d: best RTT %lld µs, device offset %lld µs, "
+           "uncertainty ±%.1f µs (%s)\n",
+           rounds, best_rtt, best_off, best_unc,
+           best_unc < 250 ? "SHOULD-grade <250µs" : best_unc < 1000 ? "MUST-grade <1ms"
+                                                                    : "OUT OF SPEC");
 }
 
 static void cmd_refs(probe *p) {
@@ -749,6 +806,8 @@ int main(int argc, char **argv) {
 
     if (strcmp(cmd, "identify") == 0)
         cmd_identify(&p);
+    else if (strcmp(cmd, "ping") == 0)
+        cmd_ping(&p, i + 1 < argc ? atoi(argv[i + 1]) : 5);
     else if (strcmp(cmd, "refs") == 0)
         cmd_refs(&p);
     else if (strcmp(cmd, "counters") == 0)

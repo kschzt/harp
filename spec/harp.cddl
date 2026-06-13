@@ -16,7 +16,8 @@ tstamp = [uint, uint64]            ; (epoch, msc)
 ; --- identity ---
 identity = { 0 => vendor, 1 => product, 2 => tstr, 3 => semver, 4 => engine,
              5 => [uint, uint], 6 => [* tstr], 7 => channel-map, 8 => latency-profile,
-             ? 9 => tstr, ? 10 => uint }
+             ? 9 => tstr, ? 10 => uint, ? 11 => ump-group-map }
+ump-group-map = [* { 0 => uint, 1 => tstr }]   ; group index -> role (evt.ump)
 vendor   = { 0 => uint, 1 => tstr }
 product  = { 0 => uint, 1 => tstr }
 engine   = { 0 => tstr, 1 => semver, 2 => hash }

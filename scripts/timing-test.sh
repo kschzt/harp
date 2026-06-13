@@ -20,6 +20,15 @@ fail() { echo "TIMING FAIL: $1"; exit 1; }
 "$HOSTBIN" "$VST" --seconds 0.05 2>&1 | grep -q "connected:" \
     || { echo "TIMING SKIP: device unclaimed check failed (DAW running?)"; exit 2; }
 
+# bind claim to proof: this test IS the harp-perf (§9.2 ±1-sample)
+# conformance probe, so a device advertising harp-perf must pass it, and
+# one that doesn't claim it has no business being measured here.
+PROBE=${PROBE:-./build/harp-probe}
+if [ -x "$PROBE" ]; then
+    "$PROBE" -d usb identify 2>/dev/null | grep -q harp-perf \
+        || fail "device does not advertise harp-perf (claim/proof mismatch)"
+fi
+
 # ---- 1+2: offline render, mixed intervals up to 15 semitones ----
 # settle device into a known state first (drone off, sine, fast envelope)
 "$HOSTBIN" "$VST" --set 7=0 --set 2=0 --set 3=0.8 --set 5=0.05 --set 6=0.15 \

@@ -187,6 +187,19 @@ static bool parse_identity(harp_cdec *b, harp_client_identity *id) {
                 }
                 break;
             }
+            case 6: { /* capabilities: [* tstr] */
+                uint64_t cn;
+                if (!harp_cdec_array(b, &cn)) return false;
+                for (uint64_t j = 0; j < cn; j++) {
+                    if (!harp_cdec_text(b, &s, &sl)) return false;
+                    if (id->ncaps < HARP_CLIENT_MAX_CAPS && sl < 32) {
+                        memcpy(id->caps[id->ncaps], s, sl);
+                        id->caps[id->ncaps][sl] = 0;
+                        id->ncaps++;
+                    }
+                }
+                break;
+            }
             case 10:
                 if (!harp_cdec_uint(b, &id->boot_count)) return false;
                 break;
@@ -195,6 +208,12 @@ static bool parse_identity(harp_cdec *b, harp_client_identity *id) {
         }
     }
     return true;
+}
+
+bool harp_client_has_cap(const harp_client_identity *id, const char *cap) {
+    for (size_t i = 0; i < id->ncaps; i++)
+        if (strcmp(id->caps[i], cap) == 0) return true;
+    return false;
 }
 
 int harp_client_hello(harp_client *c, const char *agent, harp_client_identity *out) {

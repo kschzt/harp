@@ -125,16 +125,20 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, PROTO_MAJOR);
     harp_cbor_uint(m, PROTO_MINOR);
     harp_cbor_uint(m, 6); /* capabilities */
-    harp_cbor_array(m, 10);
+    harp_cbor_array(m, 12);
     harp_cbor_text(m, "harp-core");
     harp_cbor_text(m, "harp-recall");
     harp_cbor_text(m, "harp-stream");
+    harp_cbor_text(m, "harp-perf"); /* ±1-sample event timing (§9.2): proven
+                                       by scripts/timing-test.sh + tempo-lock,
+                                       which gate this claim in the hw suite */
     harp_cbor_text(m, "audio.host-paced");
     harp_cbor_text(m, "audio.deterministic");
     harp_cbor_text(m, "audio.offline-rate");
     harp_cbor_text(m, "evt.param");
     harp_cbor_text(m, "evt.param.echo");
     harp_cbor_text(m, "evt.transport");
+    harp_cbor_text(m, "evt.ump"); /* note input as UMP (§9.10); group map = key 11 */
     harp_cbor_text(m, "x.harp-refdev.sim");
     harp_cbor_uint(m, 7); /* channel map (§6.3): stereo main mix, D→H */
     harp_cbor_array(m, 2);
@@ -168,6 +172,15 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_text(m, "refdev sim " __DATE__);
     harp_cbor_uint(m, 10); /* boot count */
     harp_cbor_uint(m, d->boot_count);
+    harp_cbor_uint(m, 11); /* UMP group map (§9.10): which groups carry what.
+                              refdev consumes notes on group 0 -> the mono
+                              voice; that's the whole map. */
+    harp_cbor_array(m, 1);
+    harp_cbor_map(m, 2);
+    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, 0); /* group index */
+    harp_cbor_uint(m, 1);
+    harp_cbor_text(m, "notes"); /* role */
 }
 
 /* ---------------- method handlers ---------------- */
@@ -933,6 +946,33 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
         send_ctl(d, &m);
         harp_cbuf_free(&m);
         d->closing = true;
+    } else if (strcmp(e.method, "time.ping") == 0) {
+        /* §7.2 host-device time correlation: {0 => (epoch,msc) at receipt,
+         * 1 => (epoch,msc) at transmit}. msc is the device's monotonic
+         * microsecond clock (the refdev has no analog sample clock in
+         * host-paced mode; free-running MSC rides the stream header, §8.2).
+         * The host brackets this with its own send/recv stamps and solves
+         * the offset NTP-style; transmit-receipt = device turnaround. */
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        uint64_t recv_us = (uint64_t)t0.tv_sec * 1000000 + (uint64_t)t0.tv_nsec / 1000;
+        uint32_t epoch = d->audio.epoch;
+        harp_cbuf m;
+        harp_cbuf_init(&m);
+        rsp_head(&m, e.rid, e.method, true);
+        harp_cbor_map(&m, 2);
+        harp_cbor_uint(&m, 0);
+        harp_cbor_array(&m, 2);
+        harp_cbor_uint(&m, epoch);
+        harp_cbor_uint(&m, recv_us);
+        harp_cbor_uint(&m, 1);
+        harp_cbor_array(&m, 2);
+        harp_cbor_uint(&m, epoch);
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        harp_cbor_uint(&m, (uint64_t)t1.tv_sec * 1000000 + (uint64_t)t1.tv_nsec / 1000);
+        send_ctl(d, &m);
+        harp_cbuf_free(&m);
     } else if (strcmp(e.method, "state.refs") == 0)
         handle_state_refs(d, &e);
     else if (strcmp(e.method, "state.snapshot") == 0)
