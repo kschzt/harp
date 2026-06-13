@@ -17,52 +17,14 @@
 #include <string>
 #include <vector>
 
+#include "render_check.h"
+
 static void die(const std::string &m) {
     fprintf(stderr, "au-host: %s\n", m.c_str());
     exit(1);
 }
 
-static void write_wav16(const std::string &path, const std::vector<float> &interleaved,
-                        uint32_t channels, uint32_t rate) {
-    FILE *f = fopen(path.c_str(), "wb");
-    if (!f) die("cannot write " + path);
-    uint32_t nsamp = (uint32_t)interleaved.size();
-    uint32_t data_len = nsamp * 2;
-    uint8_t hdr[44];
-    memcpy(hdr, "RIFF", 4);
-    uint32_t riff = 36 + data_len;
-    memcpy(hdr + 4, &riff, 4);
-    memcpy(hdr + 8, "WAVEfmt ", 8);
-    uint32_t fmtlen = 16;
-    uint16_t pcm = 1, bits = 16;
-    uint16_t ch = (uint16_t)channels;
-    uint32_t brate = rate * channels * 2;
-    uint16_t balign = (uint16_t)(channels * 2);
-    memcpy(hdr + 16, &fmtlen, 4);
-    memcpy(hdr + 20, &pcm, 2);
-    memcpy(hdr + 22, &ch, 2);
-    memcpy(hdr + 24, &rate, 4);
-    memcpy(hdr + 28, &brate, 4);
-    memcpy(hdr + 32, &balign, 2);
-    memcpy(hdr + 34, &bits, 2);
-    memcpy(hdr + 36, "data", 4);
-    memcpy(hdr + 40, &data_len, 4);
-    fwrite(hdr, 1, 44, f);
-    for (float v : interleaved) {
-        if (v > 1) v = 1;
-        if (v < -1) v = -1;
-        int16_t s = (int16_t)lrintf(v * 32767.f);
-        fwrite(&s, 2, 1, f);
-    }
-    fclose(f);
-}
 
-static uint64_t fnv1a(const void *data, size_t len) {
-    const uint8_t *p = (const uint8_t *)data;
-    uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0; i < len; i++) h = (h ^ p[i]) * 1099511628211ull;
-    return h;
-}
 
 /* ---- transport simulation handed to the AU via HostCallbacks ---- */
 struct SimTransport {
@@ -263,9 +225,9 @@ int main(int argc, char **argv) {
            sqrt(acc / (double)capture.size()));
     if (do_hash)
         printf("output-hash: %016llx\n",
-               (unsigned long long)fnv1a(capture.data(), capture.size() * sizeof(float)));
+               (unsigned long long)harp_fnv1a(capture.data(), capture.size() * sizeof(float)));
     if (!out_path.empty()) {
-        write_wav16(out_path, capture, 2, rate);
+        if (!harp_write_wav16(out_path, capture, 2, rate)) die("cannot write " + out_path);
         printf("-> %s\n", out_path.c_str());
     }
     AudioUnitUninitialize(au);

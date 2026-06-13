@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "runtime.h"
+#include "ump.h"
 
 /* identity (also in Info.plist's AudioComponents entry — keep in sync) */
 #define HARP_AU_TYPE 'aumu'
@@ -523,11 +524,11 @@ static OSStatus au_MIDIEvent(void *self, UInt32 status, UInt32 data1, UInt32 dat
     uint64_t ts = rt.streamPos() + rt.latencySamples() + offset;
     UInt32 kind = status & 0xF0;
     if (kind == 0x90 && data2 > 0) {
-        rt.queueNote(0x20900000u | ((data1 & 0x7f) << 8) | (data2 & 0x7f), ts);
+        rt.queueNote(ump_note_on(data1, data2), ts);
     } else if (kind == 0x80 || (kind == 0x90 && data2 == 0)) {
-        rt.queueNote(0x20800000u | ((data1 & 0x7f) << 8) | 0x40, ts);
+        rt.queueNote(ump_note_off(data1), ts);
     } else if (kind == 0xB0 && (data1 == 120 || data1 == 123)) {
-        rt.queueNote(0x20B07B00u, 0); /* panic, now */
+        rt.queueNote(ump_all_notes_off(), 0); /* panic, now */
     }
     return noErr;
 }

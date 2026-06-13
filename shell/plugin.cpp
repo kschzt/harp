@@ -21,6 +21,7 @@
 #include "public.sdk/source/vst/vsteditcontroller.h"
 
 #include "runtime.h"
+#include "ump.h"
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
@@ -132,12 +133,10 @@ public:
                     uint32_t vel = (uint32_t)(ev.noteOn.velocity * 127.f + 0.5f);
                     if (vel == 0) vel = 1;
                     if (vel > 127) vel = 127;
-                    rt.queueNote(0x20900000u | (note << 8) | vel,
-                                 base + (uint64_t)ev.sampleOffset);
+                    rt.queueNote(ump_note_on(note, vel), base + (uint64_t)ev.sampleOffset);
                 } else if (ev.type == Event::kNoteOffEvent) {
                     uint32_t note = (uint32_t)(ev.noteOff.pitch & 0x7f);
-                    rt.queueNote(0x20800000u | (note << 8) | 0x40,
-                                 base + (uint64_t)ev.sampleOffset);
+                    rt.queueNote(ump_note_off(note), base + (uint64_t)ev.sampleOffset);
                 }
             }
         }
@@ -178,7 +177,7 @@ public:
                     if (q->getPoint(k, off, v) != kResultOk) continue;
                     uint64_t ts = base + (uint64_t)off;
                     if (id == kPanicParamId) { /* DAW panic -> all-notes-off */
-                        rt.queueNote(0x20B07B00u, 0);
+                        rt.queueNote(ump_all_notes_off(), 0);
                         continue;
                     }
                     if (idx == SIZE_MAX) {

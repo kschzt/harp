@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include "render_check.h"
+
 #include "base/source/fobject.h"
 #include "pluginterfaces/base/funknown.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -44,47 +46,7 @@ static int die(const std::string &msg) {
     exit(1);
 }
 
-/* ---- WAV (PCM16 stereo) ---- */
-static void write_wav16(const std::string &path, const std::vector<float> &interleaved,
-                        uint32_t channels, uint32_t rate) {
-    FILE *f = fopen(path.c_str(), "wb");
-    if (!f) die("cannot write " + path);
-    uint32_t nsamp = (uint32_t)(interleaved.size());
-    uint32_t data_len = nsamp * 2;
-    uint8_t hdr[44];
-    memcpy(hdr, "RIFF", 4);
-    uint32_t riff = 36 + data_len;
-    memcpy(hdr + 4, &riff, 4);
-    memcpy(hdr + 8, "WAVEfmt ", 8);
-    uint32_t fmtlen = 16;
-    uint16_t pcm = 1, bits = 16;
-    uint16_t align = (uint16_t)(channels * 2);
-    uint32_t byterate = rate * align;
-    memcpy(hdr + 16, &fmtlen, 4);
-    memcpy(hdr + 20, &pcm, 2);
-    memcpy(hdr + 22, &channels, 2);
-    memcpy(hdr + 24, &rate, 4);
-    memcpy(hdr + 28, &byterate, 4);
-    memcpy(hdr + 32, &align, 2);
-    memcpy(hdr + 34, &bits, 2);
-    memcpy(hdr + 36, "data", 4);
-    memcpy(hdr + 40, &data_len, 4);
-    fwrite(hdr, 1, 44, f);
-    for (float v : interleaved) {
-        if (v > 1.f) v = 1.f;
-        if (v < -1.f) v = -1.f;
-        int16_t s = (int16_t)(v * 32767.f);
-        fwrite(&s, 2, 1, f);
-    }
-    fclose(f);
-}
 
-static uint64_t fnv1a(const void *data, size_t len) {
-    const uint8_t *p = (const uint8_t *)data;
-    uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0; i < len; i++) h = (h ^ p[i]) * 1099511628211ull;
-    return h;
-}
 
 /* ---- state container: [u32 len][component][u32 len][controller] ---- */
 static void save_state_file(const std::string &path, MemoryStream &comp, MemoryStream &ctrl) {
@@ -474,9 +436,9 @@ int main(int argc, char **argv) {
     printf("processed %zu samples x %d ch, rms=%.5f\n", done, out_ch, rms);
     if (do_hash)
         printf("output-hash: %016llx\n",
-               (unsigned long long)fnv1a(capture.data(), capture.size() * sizeof(float)));
+               (unsigned long long)harp_fnv1a(capture.data(), capture.size() * sizeof(float)));
     if (!out_path.empty()) {
-        write_wav16(out_path, capture, (uint32_t)out_ch, rate);
+        if (!harp_write_wav16(out_path, capture, (uint32_t)out_ch, rate)) die("cannot write " + out_path);
         printf("-> %s\n", out_path.c_str());
     }
     return 0;

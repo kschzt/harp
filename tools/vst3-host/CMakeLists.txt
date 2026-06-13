@@ -34,7 +34,7 @@ target_link_libraries(harp-vst3-host PRIVATE sdk_hosting sdk_common base plugint
 if(APPLE)
   target_link_libraries(harp-vst3-host PRIVATE "-framework CoreFoundation" "-framework Foundation")
 endif()
-target_include_directories(harp-vst3-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vst3sdk)
+target_include_directories(harp-vst3-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vst3sdk ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 # ---- ring unit + stress tests (no SDK, no hardware) ----
 add_executable(ring-tests ring_tests.cpp)
@@ -132,6 +132,7 @@ if(LIBUSB_FOUND)
       MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/../au-host/au-info.plist.in)
 
     add_executable(au-host ${CMAKE_CURRENT_SOURCE_DIR}/../au-host/main.mm)
+    target_include_directories(au-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
     target_link_libraries(au-host PRIVATE
       "-framework AudioToolbox" "-framework CoreFoundation")
 

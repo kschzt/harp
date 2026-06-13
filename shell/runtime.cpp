@@ -1,4 +1,5 @@
 #include "runtime.h"
+#include "ump.h"
 
 #ifdef __APPLE__
 #include <pthread/qos.h>
@@ -663,7 +664,7 @@ void HarpRuntime::eventPump() {
         if (panicPending_.exchange(false, std::memory_order_acq_rel)) {
             harp_cbuf m;
             harp_cbuf_init(&m);
-            encodeUmpEvent(&m, 0x20B07B00u, 0); /* CC 123, now */
+            encodeUmpEvent(&m, ump_all_notes_off(), 0); /* CC 123, now */
             std::lock_guard<std::mutex> lk(ctlMutex_);
             harp_link_send(io_, HARP_STREAM_EVT, m.buf, m.len);
             harp_cbuf_free(&m);
