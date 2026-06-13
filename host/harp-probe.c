@@ -544,9 +544,12 @@ static void cmd_ping(probe *p, int rounds) {
         harp_cbuf_free(&req);
         harp_cbuf_free(&rsp);
     }
-    printf("time.ping x%d: best RTT %lld µs, device offset %lld µs, "
-           "uncertainty ±%.1f µs (%s)\n",
-           rounds, best_rtt, best_off, best_unc,
+    /* the absolute offset is between two unrelated monotonic origins
+     * (host-boot vs device-boot) and is meaningless until a shared epoch
+     * exists — RTT and uncertainty are the spec-relevant figures (§7.2) */
+    (void)best_off;
+    printf("time.ping x%d: best RTT %lld µs, correlation uncertainty ±%.1f µs (%s)\n",
+           rounds, best_rtt, best_unc,
            best_unc < 250 ? "SHOULD-grade <250µs" : best_unc < 1000 ? "MUST-grade <1ms"
                                                                     : "OUT OF SPEC");
 }
