@@ -666,8 +666,9 @@ size_t harp_usb_enumerate(harp_usb_devinfo *out, size_t cap) {
     size_t found = 0;
     for (ssize_t i = 0; i < n; i++) {
         int iface;
-        uint8_t a, b, c2 = 0, d = 0;
-        if (!find_harp_interface(list[i], &iface, &a, &b, &c2, &d)) continue;
+        uint8_t ep[4] = {0}; /* endpoints unused here — we only want identity */
+        if (!find_harp_interface(list[i], &iface, &ep[0], &ep[1], &ep[2], &ep[3]))
+            continue;
         struct libusb_device_descriptor dd;
         libusb_get_device_descriptor(list[i], &dd);
         harp_usb_devinfo info = {dd.idVendor, dd.idProduct, "?"};

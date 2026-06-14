@@ -259,17 +259,19 @@ bool HarpRuntime::sessionUp() {
         io_ = nullptr;
         return false;
     }
-    /* capture the bound device's USB identity (vid:pid:serial) — recorded
-     * in the recall bundle and used for selection. Stable for the session. */
-    harp_usb_devinfo di;
-    if (harp_usb_devident(io_, &di)) {
-        usbVid_ = di.vendor_id;
-        usbPid_ = di.product_id;
-        usbSerial_ = di.serial;
-        if (boundSerial_.empty()) boundSerial_ = di.serial; /* pin for reconnect */
-    }
     {
         std::lock_guard<std::mutex> lk(ctlMutex_);
+        /* capture the bound device's USB identity (vid:pid:serial) UNDER
+         * ctlMutex_ — getStateBundle reads it there on the main thread, so
+         * an unlocked write here would be a cross-thread race on the
+         * std::string (the project holds itself to zero benign races). */
+        harp_usb_devinfo di;
+        if (harp_usb_devident(io_, &di)) {
+            usbVid_ = di.vendor_id;
+            usbPid_ = di.product_id;
+            usbSerial_ = di.serial;
+            if (boundSerial_.empty()) boundSerial_ = di.serial; /* pin for reconnect */
+        }
         /* fresh per session: rid space, credit, AND the link reassembly
          * state — a half-assembled frame from a dead session must not
          * poison the next one */
