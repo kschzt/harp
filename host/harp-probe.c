@@ -814,8 +814,11 @@ int main(int argc, char **argv) {
     int tcp_fd = -1;
     if (strcmp(addr, "usb") == 0 || strncmp(addr, "usb:", 4) == 0) {
 #ifdef HAVE_LIBUSB
-        /* "usb" = first match; "usb:SERIAL" = that specific board */
-        const char *want = addr[3] == ':' ? addr + 4 : NULL;
+        /* "usb:SERIAL" picks a board; bare "usb" honors HARP_DEVICE_SERIAL
+         * if set (lets the hw-test suite pin one board on a multi-dev bus),
+         * else first match. */
+        const char *want = addr[3] == ':' ? addr + 4 : getenv("HARP_DEVICE_SERIAL");
+        if (want && !want[0]) want = NULL;
         p.io = harp_usb_open_serial(want);
         if (!p.io) return 1;
 #else

@@ -4,6 +4,9 @@
 # Device must be unclaimed (close the DAW). ~2 minutes + soak time.
 set -u
 cd "$(dirname "$0")/.."
+# Deterministic device on a multi-board bus: single-device tests pin one
+# board (the desk unit with the web panel); multidevice-test clears this.
+export HARP_DEVICE_SERIAL="${HARP_DEVICE_SERIAL:-PI4B-0001}"
 PASS=0; FAIL=0; SKIP=0
 run() {
     echo "──── $1"

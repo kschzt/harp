@@ -14,6 +14,7 @@
 # Needs both boards, the VST3 + AU shells installed, Live closed.
 set -e
 cd "$(dirname "$0")/.."
+unset HARP_DEVICE_SERIAL  # this test drives selection itself, per-case
 
 V=build-vst/harp-vst3-host
 A=build-vst/au-host
