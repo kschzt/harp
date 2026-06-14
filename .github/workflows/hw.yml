@@ -1,0 +1,50 @@
+name: hw
+
+# Self-hosted runner driving real hardware (PI4B-0002 over USB) on a
+# private, isolated rig. SECURITY: this workflow is deliberately NOT
+# triggered by pull_request. Forks cannot push to this repo, so only code a
+# trusted collaborator has pushed ever reaches the runner — fork PR code can
+# never execute on the hardware by construction. The sandboxed build/test/
+# fuzz jobs in ci.yml keep running on pull_request (GitHub-hosted).
+on:
+  push:
+  workflow_dispatch:
+
+# One hardware run at a time: the device is exclusive, and a half-finished
+# run can leave the USB bus mid-stream. Queue, never cancel in flight.
+concurrency:
+  group: harp-hw
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  hardware:
+    # never run on a fork of this repo that happens to have the workflow
+    if: github.repository == 'kschzt/harp'
+    runs-on: [self-hosted, harp-hw]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: VST3 SDK (cached on the runner at ~/vst3sdk)
+        run: |
+          if [ -d "$HOME/vst3sdk/.git" ]; then
+            ln -sfn "$HOME/vst3sdk" external/vst3sdk      # instant; checkout wiped the symlink
+          else
+            git clone --depth 1 --recursive \
+              https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
+          fi
+
+      - name: build core + device tools (harp-probe, harp-tests)
+        run: cmake -B build && cmake --build build -j
+
+      - name: build + install the Linux VST3 shell (~/.vst3)
+        run: |
+          cmake -B build-vst -S tools/vst3-host
+          cmake --build build-vst --target harp-vst3-host harp-shell -j
+          cmake --build build-vst --target install-linux
+
+      - name: hardware conformance suite (PI4B-0002 over USB)
+        run: scripts/hw-tests-linux.sh

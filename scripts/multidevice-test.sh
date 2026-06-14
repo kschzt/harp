@@ -18,7 +18,7 @@ unset HARP_DEVICE_SERIAL  # this test drives selection itself, per-case
 
 V=build-vst/harp-vst3-host
 A=build-vst/au-host
-PLUG="$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3"
+PLUG="${PLUG:-$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3}"  # Linux CI overrides -> ~/.vst3
 AUCOMP="$HOME/Library/Audio/Plug-Ins/Components/harp-au.component"
 
 if pgrep -x "Live" >/dev/null 2>&1; then

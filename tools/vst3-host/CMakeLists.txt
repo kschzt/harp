@@ -49,8 +49,16 @@ if(PKG_CONFIG_FOUND)
 endif()
 if(LIBUSB_FOUND)
   set(HARP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+  # VST3 plugin entry point is per-platform (macmain/linuxmain/dllmain).
+  if(APPLE)
+    set(SHELL_MAIN ${SDK_ROOT}/public.sdk/source/main/macmain.cpp)
+  elseif(WIN32)
+    set(SHELL_MAIN ${SDK_ROOT}/public.sdk/source/main/dllmain.cpp)
+  else()
+    set(SHELL_MAIN ${SDK_ROOT}/public.sdk/source/main/linuxmain.cpp)
+  endif()
   smtg_add_vst3plugin(harp-shell
-    ${SDK_ROOT}/public.sdk/source/main/macmain.cpp
+    ${SHELL_MAIN}
     ${HARP_ROOT}/shell/plugin.cpp
     ${HARP_ROOT}/shell/runtime.cpp
     ${HARP_ROOT}/host/usb_io.c

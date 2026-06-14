@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 PI=${PI:-jak@harp.local}
 SERIAL=${SERIAL:-PI4B-0001}   # the board PI hosts; pin the shell to it
 HOST=build-vst/harp-vst3-host
-PLUG="$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3"
+PLUG="${PLUG:-$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3}"  # Linux CI overrides -> ~/.vst3
 OUT=/tmp/replug-test.wav
 LOG=/tmp/replug-test.log
 

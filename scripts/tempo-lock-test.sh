@@ -12,7 +12,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 HOST=build-vst/harp-vst3-host
-PLUG="$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3"
+PLUG="${PLUG:-$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3}"  # Linux CI overrides -> ~/.vst3
 
 if pgrep -x "Live" >/dev/null 2>&1; then
     echo "TEMPO-LOCK SKIP: Ableton Live is running (device claim)"
