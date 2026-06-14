@@ -208,10 +208,53 @@ void HarpRuntime::wgMaintain(WgState &st) {
 
 /* ---------------- lifecycle ---------------- */
 
+/* The device-selection policy (see header). The mutual exclusion is the
+ * USB claim inside harp_usb_open_match: a device owned by another plugin
+ * instance fails the claim and the scan advances, so two fresh instances
+ * land on different units without any coordination here. */
+harp_io *HarpRuntime::selectDevice() {
+    /* reconnect: pinned to the exact unit this instance already owns — the
+     * same-model fallback must NOT fire here, or a replug could let this
+     * instance steal a sibling track's device. */
+    if (!boundSerial_.empty())
+        return harp_usb_open_match(boundSerial_.c_str(), false, 0, 0);
+
+    /* first bind: what does the loaded project want? */
+    std::string wantSerial;
+    bool wantModel = false;
+    uint16_t wvid = 0, wpid = 0;
+    {
+        std::lock_guard<std::mutex> blk(bundleMutex_);
+        if (wantUsb_) {
+            wantSerial = wantUsbSerial_;
+            wantModel = true;
+            wvid = wantUsbVid_;
+            wpid = wantUsbPid_;
+        }
+    }
+    /* test/field override: force a specific unit regardless of the bundle */
+    if (const char *env = getenv("HARP_DEVICE_SERIAL"))
+        if (env[0]) {
+            wantSerial = env;
+            wantModel = false; /* exact-or-nothing when explicitly forced */
+        }
+
+    if (!wantSerial.empty()) {
+        harp_io *io = harp_usb_open_match(wantSerial.c_str(), false, 0, 0); /* exact */
+        if (!io && wantModel) /* serial gone: first unclaimed of the SAME model */
+            io = harp_usb_open_match(nullptr, true, wvid, wpid);
+        return io; /* a known model is never satisfied by a different model */
+    }
+    /* fresh instance (or a bundle predating usb-identity): first unclaimed
+     * HARP device of any model — it adopts whatever is there and records
+     * it on first save. */
+    return harp_usb_open_match(nullptr, false, 0, 0);
+}
+
 /* One connection attempt: claim, hello, re-assert the project bundle,
  * start the stream, spawn the reader. Caller: start() or supervisor(). */
 bool HarpRuntime::sessionUp() {
-    io_ = harp_usb_open();
+    io_ = selectDevice();
     if (!io_) return false;
     if (!harp_usb_has_audio(io_)) {
         harp_usb_close(io_);
@@ -225,6 +268,7 @@ bool HarpRuntime::sessionUp() {
         usbVid_ = di.vendor_id;
         usbPid_ = di.product_id;
         usbSerial_ = di.serial;
+        if (boundSerial_.empty()) boundSerial_ = di.serial; /* pin for reconnect */
     }
     {
         std::lock_guard<std::mutex> lk(ctlMutex_);

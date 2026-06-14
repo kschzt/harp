@@ -182,6 +182,10 @@ private:
 
     void supervisor(); /* owns session lifecycle: connect, run, reconnect */
     bool sessionUp();  /* one attempt: open, hello, re-push bundle, stream */
+    /* multi-device selection: first bind picks by the project's wanted
+     * identity (exact serial -> same model -> fresh-any); once bound,
+     * reconnect targets that exact unit only. Claimed transport or null. */
+    harp_io *selectDevice();
     void sessionDown(); /* reap reader+pump, orderly stop if alive, close usb */
     void feeder();      /* runs on the supervisor thread while connected */
     void reader();
