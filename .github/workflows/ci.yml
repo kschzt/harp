@@ -5,7 +5,7 @@ jobs:
   shell-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: clone VST3 SDK
         run: git clone --depth 1 --recursive
              https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
@@ -31,7 +31,7 @@ jobs:
   core:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: build
         run: cmake -B build && cmake --build build -j
       - name: unit tests
@@ -53,7 +53,7 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: build fuzz tree (clang, ASan everywhere, libFuzzer engines)
         run: |
           CC=clang cmake -B build-fuzz -DHARP_FUZZ=ON
