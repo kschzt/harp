@@ -50,6 +50,7 @@ static constexpr UInt32 kNumAuParams = sizeof(kAuParams) / sizeof(kAuParams[0]);
 struct HarpAU {
     AudioComponentPlugInInterface iface; /* MUST be first */
     AudioComponentInstance compInstance = nullptr;
+    HarpRuntime rt; /* one device per AU instance — no singleton */
 
     bool initialized = false;
     bool offline = false;
@@ -124,7 +125,7 @@ static OSStatus au_Initialize(void *self) {
     if (au->initialized) return noErr;
     OSStatus rc = au_alloc_scratch(au);
     if (rc != noErr) return rc;
-    auto &rt = HarpRuntime::instance();
+    auto &rt = au->rt;
     rt.configure((uint32_t)au->outFormat.mSampleRate, au->maxFrames);
     rt.start((uint32_t)au->outFormat.mSampleRate); /* deviceless = silence */
     au->initialized = true;
@@ -134,7 +135,7 @@ static OSStatus au_Initialize(void *self) {
 static OSStatus au_Uninitialize(void *self) {
     HarpAU *au = (HarpAU *)self;
     if (!au->initialized) return noErr;
-    HarpRuntime::instance().stop();
+    au->rt.stop();
     au->initialized = false;
     return noErr;
 }
@@ -170,7 +171,7 @@ static CFMutableDictionaryRef au_make_classinfo(HarpAU *au) {
 
     /* the Recall Bundle — identical bytes to the VST3 shell's getState */
     std::vector<uint8_t> bundle;
-    if (HarpRuntime::instance().getStateBundle(bundle) && !bundle.empty()) {
+    if (au->rt.getStateBundle(bundle) && !bundle.empty()) {
         CFDataRef data = CFDataCreate(nullptr, bundle.data(), (CFIndex)bundle.size());
         CFDictionarySetValue(d, CFSTR("harp-bundle"), data);
         CFRelease(data);
@@ -192,7 +193,7 @@ static OSStatus au_apply_classinfo(HarpAU *au, CFPropertyListRef plist) {
     CFDataRef data = (CFDataRef)CFDictionaryGetValue((CFDictionaryRef)plist,
                                                      CFSTR("harp-bundle"));
     if (data && CFGetTypeID(data) == CFDataGetTypeID())
-        HarpRuntime::instance().setStateBundle(CFDataGetBytePtr(data),
+        au->rt.setStateBundle(CFDataGetBytePtr(data),
                                                (size_t)CFDataGetLength(data));
     return noErr; /* a preset without our key is fine: defaults stand */
 }
@@ -272,7 +273,7 @@ static OSStatus au_GetProperty(void *self, AudioUnitPropertyID prop,
                                AudioUnitScope scope, AudioUnitElement elem,
                                void *outData, UInt32 *ioSize) {
     HarpAU *au = (HarpAU *)self;
-    auto &rt = HarpRuntime::instance();
+    auto &rt = au->rt;
     switch (prop) {
         case kAudioUnitProperty_ClassInfo: {
             if (*ioSize < sizeof(CFPropertyListRef)) return kAudioUnitErr_InvalidParameter;
@@ -363,7 +364,7 @@ static OSStatus au_GetProperty(void *self, AudioUnitPropertyID prop,
              * its reader/pump/feeder threads so the USB path is scheduled
              * with the audio graph, not against it. */
             AURenderContextObserver obs = ^(const AudioUnitRenderContext *ctx) {
-              HarpRuntime::instance().setWorkgroup(ctx ? ctx->workgroup : nullptr);
+              au->rt.setWorkgroup(ctx ? ctx->workgroup : nullptr);
             };
             *(AURenderContextObserver *)outData = [obs copy];
             *ioSize = sizeof(AURenderContextObserver);
@@ -471,7 +472,7 @@ static OSStatus au_GetParameter(void *self, AudioUnitParameterID param,
     /* drain device echoes into the shadow so hosts see panel moves */
     uint32_t id;
     float v;
-    while (HarpRuntime::instance().popEcho(id, v))
+    while (au->rt.popEcho(id, v))
         if (id >= 1 && id <= kNumAuParams) au->paramShadow[id - 1] = v;
     *out = au->paramShadow[param - 1];
     return noErr;
@@ -486,7 +487,7 @@ static OSStatus au_SetParameter(void *self, AudioUnitParameterID param,
     if (value < 0) value = 0;
     if (value > 1) value = 1;
     au->paramShadow[param - 1] = value;
-    auto &rt = HarpRuntime::instance();
+    auto &rt = au->rt;
     rt.queueParamSet(param, value,
                      offset ? rt.streamPos() + rt.latencySamples() + offset : 0);
     return noErr;
@@ -500,14 +501,14 @@ static OSStatus au_ScheduleParameters(void *self, const AudioUnitParameterEvent 
                             ev[i].eventValues.immediate.value,
                             ev[i].eventValues.immediate.bufferOffset);
         else { /* ramp: start/end values over a frame span -> §9.4 ramp */
-            auto &rt = HarpRuntime::instance();
+            HarpAU *au = (HarpAU *)self;
+            auto &rt = au->rt;
             uint64_t base = rt.streamPos() + rt.latencySamples();
             const auto &r = ev[i].eventValues.ramp;
             rt.queueRamp(ev[i].parameter, r.endValue,
                          base + (uint64_t)r.startBufferOffset,
                          base + (uint64_t)r.startBufferOffset +
                              (uint64_t)r.durationInFrames);
-            HarpAU *au = (HarpAU *)self;
             if (ev[i].parameter >= 1 && ev[i].parameter <= kNumAuParams)
                 au->paramShadow[ev[i].parameter - 1] = r.endValue;
         }
@@ -519,8 +520,8 @@ static OSStatus au_ScheduleParameters(void *self, const AudioUnitParameterEvent 
 
 static OSStatus au_MIDIEvent(void *self, UInt32 status, UInt32 data1, UInt32 data2,
                              UInt32 offset) {
-    (void)self;
-    auto &rt = HarpRuntime::instance();
+    HarpAU *au = (HarpAU *)self;
+    auto &rt = au->rt;
     uint64_t ts = rt.streamPos() + rt.latencySamples() + offset;
     UInt32 kind = status & 0xF0;
     if (kind == 0x90 && data2 > 0) {
@@ -563,7 +564,7 @@ static OSStatus au_Render(void *self, AudioUnitRenderActionFlags *ioFlags,
     if (nFrames > au->maxFrames) return kAudioUnitErr_TooManyFramesToProcess;
     if (!ioData || ioData->mNumberBuffers < 1) return kAudio_ParamError;
 
-    auto &rt = HarpRuntime::instance();
+    auto &rt = au->rt;
 
     /* §9.7: the host's musical clock, via HostCallbacks */
     if (au->hostCallbacks.beatAndTempoProc) {

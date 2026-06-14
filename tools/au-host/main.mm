@@ -68,6 +68,7 @@ int main(int argc, char **argv) {
     uint32_t block = 256, rate = 48000;
     std::string out_path;
     bool do_hash = false;
+    int instances = 1; /* >1: prove N AU instances coexist in one process */
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -106,12 +107,37 @@ int main(int argc, char **argv) {
             out_path = need("--out");
         else if (a == "--hash")
             do_hash = true;
+        else if (a == "--instances")
+            instances = atoi(need("--instances").c_str());
         else
             die("unknown arg: " + a);
     }
 
     AudioComponent comp = AudioComponentFindNext(nullptr, &desc);
     if (!comp) die("AU not found (is harp.component installed?)");
+
+    if (instances > 1) {
+        /* N plugin instances in ONE process — what a DAW with N tracks
+         * does. Pre-singleton-kill they shared a runtime and a device;
+         * now each must claim its own. Init each, render a touch so the
+         * supervisor settles, report the bound serial per instance. */
+        std::vector<AudioComponentInstance> aus(instances, nullptr);
+        for (int k = 0; k < instances; k++) {
+            if (AudioComponentInstanceNew(comp, &aus[k]) != noErr) die("instantiate failed");
+            AudioUnitSetProperty(aus[k], kAudioUnitProperty_MaximumFramesPerSlice,
+                                 kAudioUnitScope_Global, 0, &block, sizeof block);
+            if (AudioUnitInitialize(aus[k]) != noErr)
+                fprintf(stderr, "au-host: instance %d initialize failed\n", k);
+        }
+        struct timespec ts = {1, 0};
+        nanosleep(&ts, nullptr); /* let each supervisor claim + hello */
+        for (int k = 0; k < instances; k++) {
+            AudioUnitUninitialize(aus[k]);
+            AudioComponentInstanceDispose(aus[k]);
+        }
+        return 0; /* the "claimed ... serial" lines on stderr are the result */
+    }
+
     AudioComponentInstance au;
     if (AudioComponentInstanceNew(comp, &au) != noErr) die("instantiate failed");
 

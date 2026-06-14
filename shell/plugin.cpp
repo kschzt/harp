@@ -79,20 +79,20 @@ public:
         /* the ring cushion (and thus reported latency) scales with the
          * DAW's block size — a 1024-sample pull needs a deeper ring than
          * a 64-sample one */
-        HarpRuntime::instance().configure(rate_, (uint32_t)setup.maxSamplesPerBlock);
+        rt_.configure(rate_, (uint32_t)setup.maxSamplesPerBlock);
         return AudioEffect::setupProcessing(setup);
     }
 
     tresult PLUGIN_API setActive(TBool state) override {
         if (state)
-            HarpRuntime::instance().start(rate_);
+            rt_.start(rate_);
         else
-            HarpRuntime::instance().stop();
+            rt_.stop();
         return AudioEffect::setActive(state);
     }
 
     uint32 PLUGIN_API getLatencySamples() override {
-        return HarpRuntime::instance().latencySamples();
+        return rt_.latencySamples();
     }
 
     tresult PLUGIN_API canProcessSampleSize(int32 symbolicSampleSize) override {
@@ -100,7 +100,7 @@ public:
     }
 
     tresult PLUGIN_API process(ProcessData &data) override {
-        auto &rt = HarpRuntime::instance();
+        auto &rt = rt_;
 
         /* Stream-domain "now" for this block: events at DAW offset s map to
          * SSI base + s; the latency term is repaid by the host's PDC, so
@@ -257,7 +257,7 @@ public:
     /* component state = Recall Bundle (§15.3) */
     tresult PLUGIN_API getState(IBStream *state) override {
         std::vector<uint8_t> bundle;
-        if (!HarpRuntime::instance().getStateBundle(bundle)) return kResultFalse;
+        if (!rt_.getStateBundle(bundle)) return kResultFalse;
         int32 written = 0;
         return state->write(bundle.data(), (int32)bundle.size(), &written);
     }
@@ -271,12 +271,13 @@ public:
             if (got < (int32)sizeof buf) break;
         }
         if (bundle.empty()) return kResultFalse;
-        return HarpRuntime::instance().setStateBundle(bundle.data(), bundle.size())
+        return rt_.setStateBundle(bundle.data(), bundle.size())
                    ? kResultOk
                    : kResultFalse;
     }
 
 private:
+    HarpRuntime rt_; /* one device per plugin instance — no singleton */
     uint32_t rate_ = 48000;
     bool offline_ = false;
     /* per-param ramp-synthesis state: last emitted point + pending folded
@@ -340,14 +341,19 @@ public:
             if (got < (int32)sizeof buf) break;
         }
         if (bundle.empty()) return kResultFalse;
-        auto &rt = HarpRuntime::instance();
-        /* the processor's setState stages the bundle; we read knob values
-         * from the staged params (setStateBundle parsed them) */
-        rt.setStateBundle(bundle.data(), bundle.size());
-        for (auto &p : kParams) {
-            float v;
-            if (rt.bundleParam(p.id, v)) setParamNormalized(p.id, v);
-        }
+        /* The Controller is a separate object from the Processor (possibly
+         * a separate process): it must NOT open a device or own a runtime.
+         * The bundle is self-describing (it embeds its object closure), so
+         * we extract knob values straight from it, via a transient store
+         * in the shared cache dir (content-addressed, safe to share). */
+        char dir[512];
+        HarpRuntime::defaultStoreDir(dir, sizeof dir);
+        harp_store store;
+        if (harp_store_open(&store, dir) != 0) return kResultFalse;
+        std::vector<std::pair<uint32_t, float>> params;
+        if (HarpRuntime::bundleParams(bundle.data(), bundle.size(), &store, params))
+            for (auto &kv : params)
+                setParamNormalized(kv.first, kv.second);
         return kResultOk;
     }
 };

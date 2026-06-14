@@ -23,18 +23,16 @@ static void log_msg(const char *fmt, ...) {
     va_end(ap);
 }
 
-HarpRuntime &HarpRuntime::instance() {
-    static HarpRuntime rt;
-    return rt;
+void HarpRuntime::defaultStoreDir(char *out, size_t n) {
+    const char *home = getenv("HOME");
+    snprintf(out, n, "%s/Library/Application Support/HARP/store", home ? home : "/tmp");
 }
 
 HarpRuntime::HarpRuntime() {
     harp_link_init(&link_);
     harp_cbuf_init(&msg_);
-    const char *home = getenv("HOME");
     char dir[512];
-    snprintf(dir, sizeof dir, "%s/Library/Application Support/HARP/store",
-             home ? home : "/tmp");
+    defaultStoreDir(dir, sizeof dir);
     storeOk_ = harp_store_open(&store_, dir) == 0;
     if (!storeOk_) log_msg("cannot open host store at %s", dir);
 }
@@ -1003,6 +1001,112 @@ bool HarpRuntime::getStateBundle(std::vector<uint8_t> &out) {
     return true;
 }
 
+/* Walk a store: target snapshot -> tree -> "params" blob -> (id,value)
+ * pairs. Shared by setStateBundle and the runtime-free controller path. */
+void HarpRuntime::paramsFromStore(harp_store *store, const harp_hash &target,
+                                  std::vector<std::pair<uint32_t, float>> &out) {
+    harp_cbuf enc;
+    harp_cbuf_init(&enc);
+    harp_hash root;
+    if (harp_store_get(store, &target, &enc) == 0 &&
+        harp_obj_parse_snapshot_root(enc.buf, enc.len, &root)) {
+        harp_cbuf tree;
+        harp_cbuf_init(&tree);
+        if (harp_store_get(store, &root, &tree) == 0) {
+            struct Ctx {
+                harp_store *store;
+                std::vector<std::pair<uint32_t, float>> *out;
+            } ctx{store, &out};
+            harp_obj_tree_foreach(
+                tree.buf, tree.len,
+                [](const char *name, size_t nl, const harp_hash *h, uint32_t kind,
+                   void *ud) -> bool {
+                    if (nl != 6 || memcmp(name, "params", 6) != 0 || kind != 0)
+                        return true;
+                    auto *c = (Ctx *)ud;
+                    harp_cbuf blob;
+                    harp_cbuf_init(&blob);
+                    if (harp_store_get(c->store, h, &blob) == 0) {
+                        const uint8_t *pl;
+                        size_t pll;
+                        if (harp_obj_parse_blob(blob.buf, blob.len, nullptr, nullptr, &pl,
+                                                &pll)) {
+                            harp_cdec pd;
+                            harp_cdec_init(&pd, pl, pll);
+                            uint64_t pn;
+                            if (harp_cdec_map(&pd, &pn))
+                                for (uint64_t k = 0; k < pn; k++) {
+                                    uint64_t id;
+                                    double v;
+                                    if (!harp_cdec_uint(&pd, &id) || !harp_cdec_float(&pd, &v))
+                                        break;
+                                    c->out->push_back({(uint32_t)id, (float)v});
+                                }
+                        }
+                    }
+                    harp_cbuf_free(&blob);
+                    return true;
+                },
+                &ctx);
+            harp_cbuf_free(&tree);
+        }
+    }
+    harp_cbuf_free(&enc);
+}
+
+/* Runtime-free bundle param extraction for the VST3 controller (a separate
+ * object that must NOT open USB or own a runtime). Ingests the bundle's
+ * embedded object closure into `store` (idempotent, content-addressed) and
+ * returns the live/project knob values. */
+bool HarpRuntime::bundleParams(const uint8_t *data, size_t len, harp_store *store,
+                               std::vector<std::pair<uint32_t, float>> &out) {
+    out.clear();
+    harp_cdec d;
+    harp_cdec_init(&d, data, len);
+    uint64_t n;
+    if (!harp_cdec_map(&d, &n)) return false;
+    harp_hash target{};
+    bool haveTarget = false, magicOk = false;
+    for (uint64_t i = 0; i < n && !d.err; i++) {
+        uint64_t key;
+        if (!harp_cdec_uint(&d, &key)) return false;
+        if (key == 0) {
+            const char *s;
+            size_t sl;
+            if (!harp_cdec_text(&d, &s, &sl)) return false;
+            magicOk = sl == 5 && memcmp(s, BUNDLE_MAGIC, 5) == 0;
+        } else if (key == 3) {
+            uint64_t alen;
+            if (!harp_cdec_array(&d, &alen)) return false;
+            for (uint64_t j = 0; j < alen; j++) {
+                harp_ref r;
+                if (!harp_ref_decode(&d, &r)) return false;
+                if (strcmp(r.name, LIVE_REF) == 0 && !r.unborn) {
+                    target = r.hash;
+                    haveTarget = true;
+                }
+            }
+        } else if (key == 4) {
+            if (harp_cdec_peek_null(&d)) {
+                harp_cdec_null(&d);
+                continue;
+            }
+            uint64_t alen;
+            if (!harp_cdec_array(&d, &alen)) return false;
+            for (uint64_t j = 0; j < alen; j++) {
+                const uint8_t *span;
+                size_t spanLen;
+                if (!harp_cdec_span(&d, &span, &spanLen)) return false;
+                harp_store_put(store, span, spanLen, nullptr);
+            }
+        } else if (!harp_cdec_skip(&d))
+            return false;
+    }
+    if (!magicOk || !haveTarget) return false;
+    paramsFromStore(store, target, out);
+    return true;
+}
+
 bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
     if (!storeOk_ || !len) return false;
     harp_cdec d;
@@ -1116,55 +1220,7 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
         hasBundle_ = true;
         bundleTarget_ = target;
         bundleParams_.clear();
-        harp_cbuf enc;
-        harp_cbuf_init(&enc);
-        harp_hash root;
-        if (harp_store_get(&store_, &target, &enc) == 0 &&
-            harp_obj_parse_snapshot_root(enc.buf, enc.len, &root)) {
-            harp_cbuf tree;
-            harp_cbuf_init(&tree);
-            if (harp_store_get(&store_, &root, &tree) == 0) {
-                struct Ctx {
-                    HarpRuntime *rt;
-                } ctx{this};
-                harp_obj_tree_foreach(
-                    tree.buf, tree.len,
-                    [](const char *name, size_t nl, const harp_hash *h, uint32_t kind,
-                       void *ud) -> bool {
-                        if (nl != 6 || memcmp(name, "params", 6) != 0 || kind != 0)
-                            return true;
-                        auto *rt = ((Ctx *)ud)->rt;
-                        harp_cbuf blob;
-                        harp_cbuf_init(&blob);
-                        if (harp_store_get(&rt->store_, h, &blob) == 0) {
-                            const uint8_t *pl;
-                            size_t pll;
-                            if (harp_obj_parse_blob(blob.buf, blob.len, nullptr, nullptr,
-                                                    &pl, &pll)) {
-                                harp_cdec pd;
-                                harp_cdec_init(&pd, pl, pll);
-                                uint64_t pn;
-                                if (harp_cdec_map(&pd, &pn)) {
-                                    for (uint64_t k = 0; k < pn; k++) {
-                                        uint64_t id;
-                                        double v;
-                                        if (!harp_cdec_uint(&pd, &id) ||
-                                            !harp_cdec_float(&pd, &v))
-                                            break;
-                                        rt->bundleParams_.push_back(
-                                            {(uint32_t)id, (float)v});
-                                    }
-                                }
-                            }
-                        }
-                        harp_cbuf_free(&blob);
-                        return true;
-                    },
-                    &ctx);
-                harp_cbuf_free(&tree);
-            }
-        }
-        harp_cbuf_free(&enc);
+        paramsFromStore(&store_, target, bundleParams_);
     }
 
     if (connected()) {

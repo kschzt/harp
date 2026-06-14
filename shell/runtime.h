@@ -45,8 +45,6 @@ extern "C" {
 
 class HarpRuntime {
 public:
-    static HarpRuntime &instance();
-
     /* Called from setupProcessing: the ring cushion must scale with the
      * DAW's block size (a 1024-sample pull through a 1280-sample cushion
      * leaves 5 ms of headroom — stutter at large buffers). */
@@ -126,6 +124,8 @@ public:
     bool setStateBundle(const uint8_t *data, size_t len);
     /* Knob values from the project's bundle, for controller display. */
     bool bundleParam(uint32_t id, float &value);
+    static void paramsFromStore(harp_store *store, const harp_hash &target,
+                                std::vector<std::pair<uint32_t, float>> &out);
 
     std::string serial() const { return serial_; }
 
@@ -137,10 +137,22 @@ public:
     void setWorkgroup(os_workgroup_t wg);
 #endif
 
-private:
+    /* One runtime per plugin instance (the singleton is gone — two
+     * instances must own two devices). */
     HarpRuntime();
     ~HarpRuntime();
     HarpRuntime(const HarpRuntime &) = delete;
+    HarpRuntime &operator=(const HarpRuntime &) = delete;
+
+    /* Runtime-free recall-bundle param extraction, for hosts/controllers
+     * that must display knob values without opening a device (the VST3
+     * Controller). Ingests the bundle's embedded objects into `store`. */
+    static bool bundleParams(const uint8_t *data, size_t len, harp_store *store,
+                             std::vector<std::pair<uint32_t, float>> &out);
+    /* the shared host object-cache dir (the controller opens it too). */
+    static void defaultStoreDir(char *out, size_t n);
+
+private:
 
     static constexpr uint32_t kBlock = 256; /* pacing block, samples */
 
