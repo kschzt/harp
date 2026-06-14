@@ -30,6 +30,7 @@ jobs:
 
       - name: VST3 SDK (cached on the runner at ~/vst3sdk)
         run: |
+          mkdir -p external                              # gitignored; absent in a fresh checkout
           if [ -d "$HOME/vst3sdk/.git" ]; then
             ln -sfn "$HOME/vst3sdk" external/vst3sdk      # instant; checkout wiped the symlink
           else
