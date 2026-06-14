@@ -112,6 +112,8 @@ struct usb_io {
     int iface;
     uint8_t ep_in, ep_out;             /* framed link */
     uint8_t ep_audio_in, ep_audio_out; /* HARP stream (0 = absent) */
+    uint16_t vendor_id, product_id;    /* bound device's USB descriptor ids */
+    char dev_serial[64];               /* bound device's USB serial */
 
     pthread_t evthread;
     int ev_running;
@@ -494,13 +496,20 @@ static void teardown(usb_io *u) {
         if (u->aout[i].xfer) libusb_free_transfer(u->aout[i].xfer);
 }
 
-harp_io *harp_usb_open(void) { return harp_usb_open_serial(NULL); }
-
-/* Open the HARP device whose USB serial matches `want` (NULL = first
- * found). Serial selection is the floor of multi-device: the host binds a
- * project's recall bundle to a device by (product, serial), and two boards
- * on one bus enumerate in arbitrary order. */
+harp_io *harp_usb_open(void) { return harp_usb_open_match(NULL, false, 0, 0); }
 harp_io *harp_usb_open_serial(const char *want) {
+    return harp_usb_open_match(want, false, 0, 0);
+}
+
+/* Open+claim the first HARP device matching the multi-device selection
+ * policy (see usb_io.h). Claiming is the mutual-exclusion primitive: a
+ * device already owned by another instance fails libusb_claim_interface
+ * and the loop advances, so racing fresh instances get distinct devices.
+ *   want_serial != NULL : bind exactly that serial.
+ *   want_vp == true     : require USB vid:pid == (want_vid, want_pid).
+ *   both unset          : first unclaimed HARP device of any model. */
+harp_io *harp_usb_open_match(const char *want, bool want_vp, uint16_t want_vid,
+                             uint16_t want_pid) {
     usb_io *u = calloc(1, sizeof *u);
     if (!u) return NULL;
     if (libusb_init(&u->ctx) != 0) {
@@ -536,8 +545,13 @@ harp_io *harp_usb_open_serial(const char *want) {
         if (dd.iSerialNumber)
             libusb_get_string_descriptor_ascii(u->h, dd.iSerialNumber,
                                                (unsigned char *)serial, sizeof serial);
-        if (want && strcmp(want, serial) != 0) { /* not the one we were asked for */
+        if (want && strcmp(want, serial) != 0) { /* wrong serial */
             libusb_close(u->h);
+            u->h = NULL;
+            continue;
+        }
+        if (want_vp && (dd.idVendor != want_vid || dd.idProduct != want_pid)) {
+            libusb_close(u->h); /* wrong model — NEVER bind a different synth */
             u->h = NULL;
             continue;
         }
@@ -553,6 +567,9 @@ harp_io *harp_usb_open_serial(const char *want) {
         u->ep_out = ep_out;
         u->ep_audio_in = ep_ain;
         u->ep_audio_out = ep_aout;
+        u->vendor_id = dd.idVendor;
+        u->product_id = dd.idProduct;
+        snprintf(u->dev_serial, sizeof u->dev_serial, "%s", serial);
         u->io.read_exact = usb_read_exact;
         u->io.write_all = usb_write_all;
 
@@ -594,6 +611,9 @@ harp_io *harp_usb_open_serial(const char *want) {
     libusb_free_device_list(list, 1);
     if (want)
         fprintf(stderr, "harp-usb: no HARP device with serial %s on the bus\n", want);
+    else if (want_vp)
+        fprintf(stderr, "harp-usb: no unclaimed HARP device of model %04x:%04x\n",
+                want_vid, want_pid);
     else
         fprintf(stderr, "harp-usb: no HARP device on the bus (class FF/48/01 scan)\n");
 fail:
@@ -622,6 +642,48 @@ void harp_usb_close(harp_io *io) {
     pthread_cond_destroy(&u->cv);
     libusb_exit(u->ctx);
     free(u);
+}
+
+bool harp_usb_devident(harp_io *io, harp_usb_devinfo *out) {
+    if (!io || !out) return false;
+    usb_io *u = (usb_io *)io;
+    out->vendor_id = u->vendor_id;
+    out->product_id = u->product_id;
+    snprintf(out->serial, sizeof out->serial, "%s", u->dev_serial);
+    return true;
+}
+
+/* Read-only scan of every HARP device on the bus. Opens each briefly to
+ * read its serial string, then closes WITHOUT claiming — so it sees
+ * devices already owned by other instances too (a claimed interface does
+ * not prevent libusb_open). Its own short-lived context; enumeration is a
+ * session-start rarity. */
+size_t harp_usb_enumerate(harp_usb_devinfo *out, size_t cap) {
+    libusb_context *ctx;
+    if (libusb_init(&ctx) != 0) return 0;
+    libusb_device **list;
+    ssize_t n = libusb_get_device_list(ctx, &list);
+    size_t found = 0;
+    for (ssize_t i = 0; i < n; i++) {
+        int iface;
+        uint8_t a, b, c2 = 0, d = 0;
+        if (!find_harp_interface(list[i], &iface, &a, &b, &c2, &d)) continue;
+        struct libusb_device_descriptor dd;
+        libusb_get_device_descriptor(list[i], &dd);
+        harp_usb_devinfo info = {dd.idVendor, dd.idProduct, "?"};
+        libusb_device_handle *h;
+        if (libusb_open(list[i], &h) == 0) {
+            if (dd.iSerialNumber)
+                libusb_get_string_descriptor_ascii(
+                    h, dd.iSerialNumber, (unsigned char *)info.serial, sizeof info.serial);
+            libusb_close(h);
+        }
+        if (found < cap) out[found] = info;
+        found++;
+    }
+    libusb_free_device_list(list, 1);
+    libusb_exit(ctx);
+    return found;
 }
 
 #endif /* HAVE_LIBUSB */

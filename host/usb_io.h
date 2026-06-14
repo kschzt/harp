@@ -2,15 +2,36 @@
 #ifndef HARP_USB_IO_H
 #define HARP_USB_IO_H
 
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
 #include "harp/link.h"
 
 /* Scan the bus for a HARP device (vendor-specific interface class
  * 0xFF/0x48/0x01, per §4.3/§6.1 class-triple probe), claim the interface,
  * and return a transport. NULL on failure (message on stderr). */
+/* A HARP device's USB identity, as seen pre-hello at the descriptor layer.
+ * (vendor_id, product_id) is the "same hardware model" key; serial picks a
+ * specific unit. Distinct synth models carry distinct product_ids. */
+typedef struct {
+    uint16_t vendor_id, product_id;
+    char serial[64];
+} harp_usb_devinfo;
+
 harp_io *harp_usb_open(void);
-/* Open a specific device by USB serial (NULL = first match). The floor of
- * multi-device device selection. */
+/* Open a specific device by USB serial (NULL = first match). */
 harp_io *harp_usb_open_serial(const char *serial);
+/* Open+claim by the multi-device policy: exact serial if want_serial set;
+ * else first unclaimed of model (want_vid,want_pid) if want_vp; else first
+ * unclaimed HARP device of any model. Claim is the mutual exclusion. */
+harp_io *harp_usb_open_match(const char *want_serial, bool want_vp,
+                             uint16_t want_vid, uint16_t want_pid);
+/* Read the bound device's USB identity back out (after open). */
+bool harp_usb_devident(harp_io *io, harp_usb_devinfo *out);
+/* Read-only enumeration of all HARP devices on the bus (no claim). Fills
+ * up to cap entries; returns total count (may exceed cap). */
+size_t harp_usb_enumerate(harp_usb_devinfo *out, size_t cap);
 void harp_usb_close(harp_io *io);
 
 /* The dedicated audio endpoint pair (§8.2), if the device exposes one.

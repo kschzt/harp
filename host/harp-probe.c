@@ -554,6 +554,19 @@ static void cmd_ping(probe *p, int rounds) {
                                                                     : "OUT OF SPEC");
 }
 
+#ifdef HAVE_LIBUSB
+/* enumerate every HARP device on the bus (no claim) — the multi-device
+ * "what's plugged in" view */
+static void cmd_list(void) {
+    harp_usb_devinfo devs[16];
+    size_t n = harp_usb_enumerate(devs, 16);
+    printf("%zu HARP device(s) on the bus:\n", n);
+    for (size_t i = 0; i < n && i < 16; i++)
+        printf("  %04x:%04x  serial %s\n", devs[i].vendor_id, devs[i].product_id,
+               devs[i].serial);
+}
+#endif
+
 static void cmd_refs(probe *p) {
     do_hello(p);
     harp_ref refs[MAX_REFS];
@@ -788,6 +801,14 @@ int main(int argc, char **argv) {
         return 2;
     }
     const char *cmd = argv[i];
+
+#ifdef HAVE_LIBUSB
+    /* `list` is a bus scan: no transport, no claim, no hello */
+    if (strcmp(cmd, "list") == 0) {
+        cmd_list();
+        return 0;
+    }
+#endif
 
     probe p = {0};
     int tcp_fd = -1;
