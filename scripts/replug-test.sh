@@ -10,6 +10,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 PI=${PI:-jak@harp.local}
+SERIAL=${SERIAL:-PI4B-0001}   # the board PI hosts; pin the shell to it
 HOST=build-vst/harp-vst3-host
 PLUG="$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3"
 OUT=/tmp/replug-test.wav
@@ -21,9 +22,10 @@ if pgrep -x "Live" >/dev/null 2>&1; then
     exit 2
 fi
 
-echo "── replug: 20 s realtime render, daemon restart at t=6 s"
+echo "── replug: 20 s realtime render, daemon restart at t=6 s (device $SERIAL)"
+# pin to the board PI restarts (deterministic with multiple devices) and
 # continuous drone (param 7 up) so post-reconnect audio is provable
-"$HOST" "$PLUG" --realtime --set 7=0.9 --set 8=0.7 --set 3=0.6 \
+HARP_DEVICE_SERIAL="$SERIAL" "$HOST" "$PLUG" --realtime --set 7=0.9 --set 8=0.7 --set 3=0.6 \
     --seconds 20 --out "$OUT" >"$LOG" 2>&1 &
 HOSTPID=$!
 
@@ -37,6 +39,14 @@ grep -q "device gone\|link receive failed\|audio stream read failed" "$LOG" || {
     echo "REPLUG FAIL: shell never noticed the detach"; tail -20 "$LOG"; exit 1; }
 grep -q "reconnected; stream re-established" "$LOG" || {
     echo "REPLUG FAIL: no reconnect logged"; tail -20 "$LOG"; exit 1; }
+# rule 6: reconnect pins the bound serial — every claim must be $SERIAL,
+# never a same-model sibling that happened to be free during the restart.
+if grep -oE "claimed 1209:[0-9a-f]+ serial PI4B-[0-9]+" "$LOG" \
+     | grep -qv "serial $SERIAL"; then
+    echo "REPLUG FAIL: reconnect bound a different unit than $SERIAL"
+    grep -oE "claimed .* serial PI4B-[0-9]+" "$LOG"; exit 1
+fi
+echo "   reconnect re-bound $SERIAL (never a sibling) — rule 6 holds"
 
 # audio must be back: RMS of the final 2 s well above silence
 python3 - "$OUT" <<'EOF'
