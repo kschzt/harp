@@ -212,6 +212,12 @@ with a warning, §9.3). The conformance kit gained T17: grid-exactness,
 loop-wrap survival, and a byte-identical "groove hash" — two renders of
 the same chord and transport are the same file.
 
+Multi-device works: two boards on one bus, each plugin instance binds its
+own by USB identity (the project's saved serial, else the first unclaimed
+unit of the same model — never a different synth), reconnect pins that
+exact unit, and two instances in one host claim two devices by claim
+contention.
+
 Not yet: four-safe-actions UI (v0 auto-resolves by Push-with-archive),
 runtime/shell process split (§15.1), firmware management (§13),
 class-audio coexistence (§8.5), free-running ASRC for analog devices,

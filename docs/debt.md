@@ -11,6 +11,7 @@ Living document; items leave by being fixed, not forgotten.
 | 4 | shell: no reconnect on device replug; log-and-continue error paths; `staged*` naming is stale | medium | DONE — supervisor thread owns session lifecycle: hot-plug attach, unplug -> silence + 1 s retry, replug -> hello + bundle re-assert + stream (scripts/replug-test.sh proves it on hardware); staged* renamed bundle* |
 | 5 | debt tracked informally | low | this file |
 | 6 | §15.1 runtime/shell process split (full client unification) | medium | deferred — item 2 is the stepping stone |
+| 16 | multi-device: one shared runtime singleton -> all instances grab device #1 | high | DONE — per-instance runtime; selection by USB vid:pid:serial (exact serial -> same-model fallback -> fresh-any -> never cross-model); reconnect pins the bound serial; bundle records usb-identity (key 5, additive). Verified on a two-board bus: scripts/multidevice-test.sh (all rules) + replug-test (rule 6). harp-probe `list`, `-d usb:SERIAL`; au-host `--instances N`; HARP_DEVICE_SERIAL override |
 | 7 | free-running mode unexercised by any DAW path (no analog device yet) | low | deferred until a converter HAT / real analog device |
 | 8 | recall-test transient failure after cold boot (one occurrence, error codes now logged) | watch | monitoring |
 | 9 | sub-ms PDC accuracy: reported latency vs ring-occupancy mean differs by ≲1 block | low | acceptable; revisit with async transport work |

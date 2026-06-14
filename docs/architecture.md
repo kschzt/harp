@@ -95,6 +95,14 @@ converters).
   ordering can save them (measured at 64: mid-frame events applied a
   frame late while fence_timeouts stayed zero — delivery was perfect,
   the math wasn't).
+- One runtime per plugin instance (no singleton): each binds its own
+  device by USB identity. Selection is exact-serial -> first-unclaimed
+  same-model -> fresh-any, NEVER a different model; the USB claim is the
+  mutual exclusion so racing instances get distinct devices; once bound,
+  reconnect targets that exact serial only (a replug can't steal a
+  sibling track's device). The VST3 Controller, a separate object, never
+  opens a device — it reads knob values straight from the self-describing
+  recall bundle. The bundle records the device's USB vid:pid:serial.
 - Device cross-thread state is C11 atomics with explicit, commented
   orderings — no "benign race" volatiles (UB, and TSan-opaque). Engine
   note/queue/ramp state is private to engine.c; other threads get
