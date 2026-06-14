@@ -783,7 +783,7 @@ int main(int argc, char **argv) {
     }
     if (i >= argc) {
         fprintf(stderr,
-                "usage: harp-probe [-d HOST:PORT|usb] [-s STOREDIR] "
+                "usage: harp-probe [-d HOST:PORT|usb|usb:SERIAL] [-s STOREDIR] "
                 "identify|refs|counters|params|knob ID V|save|restore|record SECS WAV|demo\n");
         return 2;
     }
@@ -791,9 +791,11 @@ int main(int argc, char **argv) {
 
     probe p = {0};
     int tcp_fd = -1;
-    if (strcmp(addr, "usb") == 0) {
+    if (strcmp(addr, "usb") == 0 || strncmp(addr, "usb:", 4) == 0) {
 #ifdef HAVE_LIBUSB
-        p.io = harp_usb_open();
+        /* "usb" = first match; "usb:SERIAL" = that specific board */
+        const char *want = addr[3] == ':' ? addr + 4 : NULL;
+        p.io = harp_usb_open_serial(want);
         if (!p.io) return 1;
 #else
         die("built without libusb; -d usb unavailable");

@@ -494,7 +494,13 @@ static void teardown(usb_io *u) {
         if (u->aout[i].xfer) libusb_free_transfer(u->aout[i].xfer);
 }
 
-harp_io *harp_usb_open(void) {
+harp_io *harp_usb_open(void) { return harp_usb_open_serial(NULL); }
+
+/* Open the HARP device whose USB serial matches `want` (NULL = first
+ * found). Serial selection is the floor of multi-device: the host binds a
+ * project's recall bundle to a device by (product, serial), and two boards
+ * on one bus enumerate in arbitrary order. */
+harp_io *harp_usb_open_serial(const char *want) {
     usb_io *u = calloc(1, sizeof *u);
     if (!u) return NULL;
     if (libusb_init(&u->ctx) != 0) {
@@ -526,6 +532,15 @@ harp_io *harp_usb_open(void) {
                     dd.idVendor, dd.idProduct);
             continue;
         }
+        char serial[64] = "?";
+        if (dd.iSerialNumber)
+            libusb_get_string_descriptor_ascii(u->h, dd.iSerialNumber,
+                                               (unsigned char *)serial, sizeof serial);
+        if (want && strcmp(want, serial) != 0) { /* not the one we were asked for */
+            libusb_close(u->h);
+            u->h = NULL;
+            continue;
+        }
         libusb_set_auto_detach_kernel_driver(u->h, 1);
         if (libusb_claim_interface(u->h, iface) != 0) {
             fprintf(stderr, "harp-usb: cannot claim interface %d\n", iface);
@@ -555,10 +570,6 @@ harp_io *harp_usb_open(void) {
             !start_in_xfers(u, u->audio_in, USB_AUDIO_IN_XFERS, ep_ain, 1))
             goto fail_started;
 
-        char serial[64] = "?";
-        if (dd.iSerialNumber)
-            libusb_get_string_descriptor_ascii(u->h, dd.iSerialNumber,
-                                               (unsigned char *)serial, sizeof serial);
         fprintf(stderr,
                 "harp-usb: claimed %04x:%04x serial %s (iface %d, link %02x/%02x, "
                 "audio %02x/%02x, async)\n",
@@ -581,7 +592,10 @@ harp_io *harp_usb_open(void) {
         goto fail_no_list;
     }
     libusb_free_device_list(list, 1);
-    fprintf(stderr, "harp-usb: no HARP device on the bus (class FF/48/01 scan)\n");
+    if (want)
+        fprintf(stderr, "harp-usb: no HARP device with serial %s on the bus\n", want);
+    else
+        fprintf(stderr, "harp-usb: no HARP device on the bus (class FF/48/01 scan)\n");
 fail:
 fail_no_list:
     free(u->link_fifo.buf);

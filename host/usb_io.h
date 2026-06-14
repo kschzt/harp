@@ -8,6 +8,9 @@
  * 0xFF/0x48/0x01, per §4.3/§6.1 class-triple probe), claim the interface,
  * and return a transport. NULL on failure (message on stderr). */
 harp_io *harp_usb_open(void);
+/* Open a specific device by USB serial (NULL = first match). The floor of
+ * multi-device device selection. */
+harp_io *harp_usb_open_serial(const char *serial);
 void harp_usb_close(harp_io *io);
 
 /* The dedicated audio endpoint pair (§8.2), if the device exposes one.
