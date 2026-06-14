@@ -274,6 +274,14 @@ private:
     /* identity (for the bundle's identity-expectation) */
     std::string serial_, vendorName_, productName_, engineId_, engineVer_;
     uint32_t vendorId_ = 0, productId_ = 0;
+
+    /* USB-descriptor identity of the BOUND device (vid:pid = "same model",
+     * serial = this unit). Captured at claim, recorded in the bundle,
+     * used for selection — distinct from the hello/CBOR identity above,
+     * which lives in a different id namespace. */
+    uint16_t usbVid_ = 0, usbPid_ = 0;
+    std::string usbSerial_;
+    std::string boundSerial_; /* once bound, reconnect targets this exactly (Step 5) */
     harp_hash paramMapHash_{};
 
     /* the project's recall bundle: PERSISTENT, not consumed — the DAW
@@ -283,6 +291,11 @@ private:
     bool hasBundle_ = false;
     harp_hash bundleTarget_{};
     std::vector<std::pair<uint32_t, float>> bundleParams_;
+    /* the device the loaded bundle wants (USB identity, key 5). Empty
+     * serial = no usb-identity in the bundle (fresh or pre-schema). */
+    bool wantUsb_ = false;
+    uint16_t wantUsbVid_ = 0, wantUsbPid_ = 0;
+    std::string wantUsbSerial_;
 
     uint32_t rate_ = 48000;
 };

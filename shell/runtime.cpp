@@ -218,6 +218,14 @@ bool HarpRuntime::sessionUp() {
         io_ = nullptr;
         return false;
     }
+    /* capture the bound device's USB identity (vid:pid:serial) — recorded
+     * in the recall bundle and used for selection. Stable for the session. */
+    harp_usb_devinfo di;
+    if (harp_usb_devident(io_, &di)) {
+        usbVid_ = di.vendor_id;
+        usbPid_ = di.product_id;
+        usbSerial_ = di.serial;
+    }
     {
         std::lock_guard<std::mutex> lk(ctlMutex_);
         /* fresh per session: rid space, credit, AND the link reassembly
@@ -843,8 +851,10 @@ static void encode_bundle(harp_cbuf *out, uint32_t vendorId, const std::string &
                           uint32_t productId, const std::string &productName,
                           const std::string &serial, const std::string &engineId,
                           const std::string &engineVer, const harp_hash &pmh,
-                          const harp_ref &ref, harp_store *store, HashList &closure) {
-    harp_cbor_map(out, 5);
+                          const harp_ref &ref, harp_store *store, HashList &closure,
+                          uint16_t usbVid, uint16_t usbPid,
+                          const std::string &usbSerial) {
+    harp_cbor_map(out, 6); /* +1: key 5 usb-identity */
     harp_cbor_uint(out, 0);
     harp_cbor_text(out, BUNDLE_MAGIC);
     harp_cbor_uint(out, 1);
@@ -885,6 +895,17 @@ static void encode_bundle(harp_cbuf *out, uint32_t vendorId, const std::string &
             harp_cbuf_put(out, enc.buf, enc.len); /* objects are CBOR items */
         harp_cbuf_free(&enc);
     }
+    /* key 5: USB-descriptor identity of the device this bundle was saved
+     * from — the multi-device selection key. Additive; decoders that
+     * predate it skip it. */
+    harp_cbor_uint(out, 5);
+    harp_cbor_map(out, 3);
+    harp_cbor_uint(out, 0);
+    harp_cbor_uint(out, usbVid);
+    harp_cbor_uint(out, 1);
+    harp_cbor_uint(out, usbPid);
+    harp_cbor_uint(out, 2);
+    harp_cbor_text(out, usbSerial.c_str());
 }
 
 bool HarpRuntime::getStateBundle(std::vector<uint8_t> &out) {
@@ -922,7 +943,8 @@ bool HarpRuntime::getStateBundle(std::vector<uint8_t> &out) {
     harp_cbuf b;
     harp_cbuf_init(&b);
     encode_bundle(&b, vendorId_, vendorName_, productId_, productName_, serial_, engineId_,
-                  engineVer_, paramMapHash_, expected, &store_, clo);
+                  engineVer_, paramMapHash_, expected, &store_, clo, usbVid_, usbPid_,
+                  usbSerial_);
     out.assign(b.buf, b.buf + b.len);
     harp_cbuf_free(&b);
     { /* a save moves the project's reference point to what it captured */
@@ -999,6 +1021,27 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
                         target = r.hash;
                         haveTarget = true;
                     }
+                }
+                break;
+            }
+            case 5: { /* usb-identity (selection key): {0 vid, 1 pid, 2 serial} */
+                uint64_t mn, mk, vid = 0, pid = 0;
+                const char *s = nullptr;
+                size_t sl = 0;
+                if (!harp_cdec_map(&d, &mn)) return false;
+                for (uint64_t j = 0; j < mn; j++) {
+                    if (!harp_cdec_uint(&d, &mk)) return false;
+                    if (mk == 0) harp_cdec_uint(&d, &vid);
+                    else if (mk == 1) harp_cdec_uint(&d, &pid);
+                    else if (mk == 2) harp_cdec_text(&d, &s, &sl);
+                    else harp_cdec_skip(&d);
+                }
+                {
+                    std::lock_guard<std::mutex> slk(bundleMutex_);
+                    wantUsbVid_ = (uint16_t)vid;
+                    wantUsbPid_ = (uint16_t)pid;
+                    wantUsbSerial_.assign(s ? s : "", s ? sl : 0);
+                    wantUsb_ = !wantUsbSerial_.empty();
                 }
                 break;
             }
