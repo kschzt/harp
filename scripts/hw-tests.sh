@@ -30,6 +30,7 @@ run scripts/tempo-lock-test.sh
 run scripts/multidevice-test.sh
 run scripts/session-share-test.sh
 run scripts/alias-play-test.sh
+run scripts/alias-group-e2e.sh
 run scripts/replug-test.sh
 echo "════ hw-tests: $PASS passed, $FAIL failed, $SKIP skipped"
 [ $FAIL -eq 0 ]

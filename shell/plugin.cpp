@@ -54,8 +54,27 @@ static const DevParam kParams[] = {
     {13, "Glide", 0, 0.0}, /* 0 = off; portamento is opt-in now */
 };
 static constexpr int kNumParams = sizeof(kParams) / sizeof(kParams[0]);
+/* HOST-SIDE routing parameter (NOT a device param): which multitimbral PART
+ * (§9.4 channel 0..15) this plugin instance owns. Stepped+automatable so a DAW
+ * can show/persist it per-instance and several aliases each pick a distinct
+ * part (the P5c gap — see setActive). It must NOT enter the device param-set
+ * path (process() special-cases it, exactly like kPanicParamId) and must NOT
+ * affect param-map-hash (it isn't a device param). */
+static constexpr uint32_t kPartParamId = 98;
+static constexpr int32 kPartStepCount = 15; /* 16 parts (0..15); VST3 steps = N-1 */
 /* hidden parameter the DAW's panic (CC 120/123) maps onto via IMidiMapping */
 static constexpr uint32_t kPanicParamId = 99;
+
+/* Component-state header (P6 recall-safe Part persistence). getState writes
+ * this small versioned header carrying the Part, THEN the existing recall
+ * bundle bytes verbatim; setState parses it and hands the REMAINING bundle to
+ * setStateBundle exactly as before. The magic's first byte (ASCII 'H' = 0x48,
+ * CBOR major type 2 / byte-string) can NEVER be a recall bundle's first byte
+ * (every bundle starts with a CBOR MAP — encode_bundle's harp_cbor_map(out, 6)
+ * => 0xA6, major type 5), so an OLD header-less component state (a raw bundle)
+ * is detected unambiguously and migrates with Part=0, byte-compatible. */
+static const uint8_t kStateHeaderMagic[3] = {'H', 'P', '1'};
+static constexpr size_t kStateHeaderLen = sizeof kStateHeaderMagic + 1; /* magic + part byte */
 
 /* ---------------- processor ---------------- */
 
@@ -143,6 +162,13 @@ public:
                     runtime()->setStateBundle(pendingState_.data(), pendingState_.size());
                 runtime()->start(rate_);
                 source_ = runtime()->ownerSource();
+                /* P6: pin the owner source to THIS instance's part. start() seeds
+                 * the channel from HARP_CHANNEL (the headless --channel path);
+                 * part_ was seeded from the SAME env (or recalled by setState),
+                 * so for the env/golden path this is a no-op (part 0 / the env
+                 * value), and for a recalled/automated Part it asserts the saved
+                 * part — the per-instance routing the env alone could not give. */
+                applyPart();
             } else {
                 /* ATTACHED (P5): the shared session is already configured/
                  * started and streaming under the sibling owner. This instance
@@ -154,24 +180,15 @@ public:
                  * sibling emits silence — per-part audio demux is P5b. The
                  * part comes from HARP_CHANNEL (the out-of-process host's
                  * --channel), exactly as the owner reads it in start(). */
-                /* FOLLOW-UP P5c — recall-safe per-instance channel. HARP_CHANNEL
-                 * is a PROCESS-GLOBAL env: fine for the headless tsan-host test
-                 * (it sets each instance's channel programmatically), but in a
-                 * real DAW every plugin instance reads the SAME env, so all
-                 * aliases would land on ONE part. Real in-DAW multitimbral needs
-                 * a per-instance channel that PERSISTS with the project — a
-                 * plugin parameter or a per-instance bundle field, recall-safe so
-                 * it survives save/reload — NOT a global env. Not implemented
-                 * here: a plugin-param channel needs recall-safe persistence
-                 * design (parameter id, automation/display semantics, bundle
-                 * round-trip). Until then, in-DAW aliasing collapses onto the
-                 * env's single part. */
-                uint8_t ch = 0;
-                if (const char *e = getenv("HARP_CHANNEL"); e && e[0]) {
-                    int v = atoi(e);
-                    if (v >= 0 && v <= 15) ch = (uint8_t)v;
-                }
-                source_ = runtime()->registerSource(ch);
+                /* P6 (closes the P5c gap): this instance registers its OWN source
+                 * on ITS part — part_, the per-instance "Part" param (id 98).
+                 * part_ defaults to the HARP_CHANNEL env (so the headless tsan/
+                 * host --channel path is unchanged) but is per-instance state that
+                 * setState RECALLS and a live Part edit re-parts: in a real DAW
+                 * each alias now owns a DISTINCT part that persists with the
+                 * project, instead of every instance collapsing onto the one
+                 * process-global env value. */
+                source_ = runtime()->registerSource(part_);
             }
         } else {
             /* Release: an ATTACHED instance first removes its event source so
@@ -328,6 +345,16 @@ public:
                         rt.queueNote(source_, ump_all_notes_off(), 0);
                         continue;
                     }
+                    if (id == kPartParamId) {
+                        /* HOST-SIDE routing only: re-part THIS instance live and
+                         * do NOT queue a device param-set (id 98 is not a device
+                         * param). Stepped 0..15 => part = round(norm * 15). The
+                         * eventPump re-reads the source channel per event, so the
+                         * change applies from the next event with no restart. */
+                        part_ = (uint8_t)(v * (double)kPartStepCount + 0.5);
+                        applyPart();
+                        continue;
+                    }
                     if (idx == SIZE_MAX) {
                         rt.queueParamSet(source_, id, (float)v, ts);
                         continue;
@@ -421,17 +448,44 @@ public:
         if (!runtime()) return kResultFalse;
         std::vector<uint8_t> bundle;
         if (!runtime()->getStateBundle(bundle)) return kResultFalse;
+        /* P6 recall-safe Part: write the versioned header (magic + part byte)
+         * AHEAD of the unchanged bundle bytes. The device still receives the
+         * SAME bundle on reload (setState strips the header before
+         * setStateBundle), so the recall round-trip is byte-transparent; the
+         * header just carries this instance's per-project Part. */
+        uint8_t header[kStateHeaderLen];
+        memcpy(header, kStateHeaderMagic, sizeof kStateHeaderMagic);
+        header[sizeof kStateHeaderMagic] = (uint8_t)(part_ & 0xf);
         int32 written = 0;
+        if (state->write(header, (int32)sizeof header, &written) != kResultOk)
+            return kResultFalse;
         return state->write(bundle.data(), (int32)bundle.size(), &written);
     }
 
     tresult PLUGIN_API setState(IBStream *state) override {
-        std::vector<uint8_t> bundle;
+        std::vector<uint8_t> raw;
         uint8_t buf[8192];
         int32 got = 0;
         while (state->read(buf, sizeof buf, &got) == kResultOk && got > 0) {
-            bundle.insert(bundle.end(), buf, buf + got);
+            raw.insert(raw.end(), buf, buf + got);
             if (got < (int32)sizeof buf) break;
+        }
+        if (raw.empty()) return kResultFalse;
+        /* P6 recall-safe Part: a NEW component state begins with the versioned
+         * header (magic + part byte); strip it and adopt the Part. An OLD state
+         * is a raw recall bundle (first byte a CBOR map, never the header magic):
+         * detected by the magic mismatch, it loads byte-compatibly with Part=0
+         * (left at its env/default seed). Everything past the header is the SAME
+         * bundle bytes the device round-trips, so getState/setState stays
+         * byte-transparent to the recall tests. */
+        std::vector<uint8_t> bundle;
+        if (raw.size() >= kStateHeaderLen &&
+            memcmp(raw.data(), kStateHeaderMagic, sizeof kStateHeaderMagic) == 0) {
+            part_ = (uint8_t)(raw[sizeof kStateHeaderMagic] & 0xf);
+            applyPart(); /* live restore (usually a no-op pre-activate; setActive re-applies) */
+            bundle.assign(raw.begin() + kStateHeaderLen, raw.end());
+        } else {
+            bundle = std::move(raw); /* MIGRATION: header-less old state -> Part=0 */
         }
         if (bundle.empty()) return kResultFalse;
         /* ALWAYS stash the raw bundle: it is this instance's project state and
@@ -500,6 +554,34 @@ private:
      * stage-before-start ordering. Also the source of the wanted serial used
      * as the registry key when no HARP_DEVICE_SERIAL env pins one. */
     std::vector<uint8_t> pendingState_;
+    /* This instance's multitimbral PART (§9.4 channel, 0..15) — the per-instance
+     * routing the "Part" param (id 98) drives. DEFAULT = HARP_CHANNEL env if set,
+     * else 0: the headless out-of-process host (harp-vst3-host --channel) still
+     * pins the part through the env exactly as before, and a fresh in-DAW instance
+     * starts on part 0. setState may override it (recall), and a live param edit
+     * re-parts the source mid-session. Drives the instance's event-source channel
+     * at activate and on change (see setActive / process). */
+    uint8_t part_ = envChannelDefault();
+    /* The Part default the env pins: HARP_CHANNEL (the headless --channel path)
+     * clamped 0..15, else 0. Read once to seed part_ so the env path is unchanged
+     * (start() ALSO reads HARP_CHANNEL into the owner source, so for the owner
+     * applyPart() below is a no-op vs the env; for an attached instance we pass
+     * part_ to registerSource). */
+    static uint8_t envChannelDefault() {
+        if (const char *e = getenv("HARP_CHANNEL"); e && e[0]) {
+            int v = atoi(e);
+            if (v >= 0 && v <= 15) return (uint8_t)v;
+        }
+        return 0;
+    }
+    /* Drive THIS instance's event-source channel to part_ (its part). For the
+     * owner this is the runtime's built-in owner source; for an attached instance
+     * it is the source it registered. Both store into EventSource::chan (the
+     * eventPump re-reads it per event), so re-parting takes effect without a
+     * restart. nullptr source (unacquired / event-dormant 17th alias) = no-op. */
+    void applyPart() {
+        if (source_) source_->chan.store(part_ & 0xf, std::memory_order_relaxed);
+    }
     bool offline_ = false;
     /* per-param ramp-synthesis state: last emitted point + pending folded
      * point awaiting the 256-sample thinning interval */
@@ -528,6 +610,13 @@ public:
             parameters.addParameter(title, nullptr, p.stepCount, p.defaultVal,
                                     ParameterInfo::kCanAutomate, p.id);
         }
+        /* "Part" (id 98): the host-side multitimbral-part router. Stepped over
+         * 16 parts (stepCount 15), default 0 => normalized 0 => part 0, the
+         * single-instance / golden default. Automatable + per-instance so each
+         * shell alias in a DAW can own a distinct part and the choice persists
+         * with the project (see HarpProcessor::getState/setState). */
+        parameters.addParameter(STR16("Part"), nullptr, kPartStepCount, 0,
+                                ParameterInfo::kCanAutomate, kPartParamId);
         parameters.addParameter(STR16("Panic"), nullptr, 0, 0,
                                 ParameterInfo::kIsHidden, kPanicParamId);
         return kResultOk;
@@ -554,14 +643,28 @@ public:
     /* component state arrives here too on project load: surface the saved
      * knob positions so the DAW shows what the device will hold */
     tresult PLUGIN_API setComponentState(IBStream *state) override {
-        std::vector<uint8_t> bundle;
+        std::vector<uint8_t> raw;
         uint8_t buf[8192];
         int32 got = 0;
         while (state->read(buf, sizeof buf, &got) == kResultOk && got > 0) {
-            bundle.insert(bundle.end(), buf, buf + got);
+            raw.insert(raw.end(), buf, buf + got);
             if (got < (int32)sizeof buf) break;
         }
-        if (bundle.empty()) return kResultFalse;
+        if (raw.empty()) return kResultFalse;
+        /* The controller gets the SAME component blob as the processor's
+         * setState — so it must strip the P6 header too (NEW state) before
+         * parsing the bundle, and surface the recalled Part on its param so the
+         * DAW shows it. An OLD header-less state parses whole, Part stays 0. */
+        const uint8_t *bundle = raw.data();
+        size_t blen = raw.size();
+        if (raw.size() >= kStateHeaderLen &&
+            memcmp(raw.data(), kStateHeaderMagic, sizeof kStateHeaderMagic) == 0) {
+            uint8_t part = (uint8_t)(raw[sizeof kStateHeaderMagic] & 0xf);
+            setParamNormalized(kPartParamId, (double)part / (double)kPartStepCount);
+            bundle += kStateHeaderLen;
+            blen -= kStateHeaderLen;
+        }
+        if (blen == 0) return kResultFalse;
         /* The Controller is a separate object from the Processor (possibly
          * a separate process): it must NOT open a device or own a runtime.
          * The bundle is self-describing (it embeds its object closure), so
@@ -572,7 +675,7 @@ public:
         harp_store store;
         if (harp_store_open(&store, dir) != 0) return kResultFalse;
         std::vector<std::pair<uint32_t, float>> params;
-        if (HarpRuntime::bundleParams(bundle.data(), bundle.size(), &store, params))
+        if (HarpRuntime::bundleParams(bundle, blen, &store, params))
             for (auto &kv : params)
                 setParamNormalized(kv.first, kv.second);
         return kResultOk;
