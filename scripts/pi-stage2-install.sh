@@ -19,7 +19,7 @@ grep -q "dtoverlay=dwc2,dr_mode=peripheral" /boot/firmware/config.txt || \
     printf "\n[all]\ndtoverlay=dwc2,dr_mode=peripheral\n" >> /boot/firmware/config.txt
 
 # 2. gadget skeleton service
-install -m755 /home/jak/harp/scripts/pi-gadget.sh /usr/local/sbin/pi-gadget.sh
+install -m755 "$(dirname "$0")/pi-gadget.sh" /usr/local/sbin/pi-gadget.sh
 cat > /etc/systemd/system/harp-gadget.service <<EOF
 [Unit]
 Description=HARP USB gadget skeleton (configfs)
@@ -44,7 +44,7 @@ After=harp-gadget.service
 Conflicts=harp-deviced.service
 
 [Service]
-ExecStart=/home/jak/harp/build/harp-deviced --state-dir /home/jak/harp-state --serial $SERIAL --ffs /dev/ffs-harp
+ExecStart=/home/ci/harp/build/harp-deviced --state-dir /home/ci/harp-state --serial $SERIAL --ffs /dev/ffs-harp
 Restart=always
 RestartSec=1
 User=root

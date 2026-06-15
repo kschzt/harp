@@ -47,6 +47,19 @@ jobs:
           cmake --build build-vst --target harp-vst3-host harp-shell -j
           cmake --build build-vst --target install-linux
 
+      - name: deploy harp-deviced under test to PI4B-0002 (the daemon runs THIS commit)
+        # The hw suite must exercise the device daemon built from the commit
+        # under test — not whatever was last hand-deployed. Push the tree to the
+        # board (ci@) and build the daemon there (native arm64); the conformance
+        # preflight then restarts harp-deviced-usb, whose ExecStart is
+        # ~ci/harp/build/harp-deviced (see scripts/pi-stage2-install.sh).
+        run: |
+          rsync -a --delete --exclude build --exclude .git --exclude external \
+            ./ ci@harptest.local:harp/
+          ssh ci@harptest.local \
+            'cmake -B ~/harp/build ~/harp && cmake --build ~/harp/build -j4 --target harp-deviced \
+             && sudo -n systemctl restart harp-deviced-usb'
+
       - name: hardware conformance suite (PI4B-0002 over USB)
         run: scripts/hw-tests-linux.sh
 

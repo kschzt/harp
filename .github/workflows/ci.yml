@@ -89,7 +89,6 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true   # native nonzero exit => step fails
           Invoke-WebRequest -UseBasicParsing `
             https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Windows.zip `
             -OutFile pv.zip
@@ -98,14 +97,16 @@ jobs:
           # Locate the bundle by search — its config subdir can move with the generator.
           $plug = (Get-ChildItem build-vst -Recurse -Directory -Filter harp-shell.vst3 | Select-Object -First 1).FullName
           if (-not $plug) { throw "harp-shell.vst3 not found under build-vst" }
-          # Turn native-error-throwing off only here so we can capture and print
-          # the exact exit code — a teardown crash shows as 0xC000xxxx, a real
-          # validation failure as a small int (pluginval prints FAILED first).
-          $PSNativeCommandUseErrorActionPreference = $false
-          & $pv --strictness-level 10 --skip-gui-tests --validate $plug
-          $code = $LASTEXITCODE
-          Write-Host ("pluginval exit code: {0} (0x{1:X8})" -f $code, ($code -band 0xFFFFFFFF))
-          if ($code -ne 0) { throw "pluginval failed (exit $code)" }
+          # pluginval.exe is a GUI-subsystem (JUCE) app: `& $pv` does not wait for
+          # it, so $LASTEXITCODE returns $null and a clean SUCCESS run looks like a
+          # failure. Start-Process -Wait -PassThru waits and yields the real exit
+          # code; redirect its streams so the test output still appears in the log.
+          $p = Start-Process -FilePath $pv -NoNewWindow -Wait -PassThru `
+                 -ArgumentList @('--strictness-level','10','--skip-gui-tests','--validate',$plug) `
+                 -RedirectStandardOutput pv-out.txt -RedirectStandardError pv-err.txt
+          Get-Content pv-out.txt, pv-err.txt
+          Write-Host "pluginval exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "pluginval failed (exit $($p.ExitCode))" }
 
   core:
     runs-on: ubuntu-latest
