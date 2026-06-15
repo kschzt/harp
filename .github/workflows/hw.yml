@@ -49,3 +49,8 @@ jobs:
 
       - name: hardware conformance suite (PI4B-0002 over USB)
         run: scripts/hw-tests-linux.sh
+
+      - name: IDM-flood event-plane stress (PI4B-0002 over USB)
+        # hammer the shell's event plane with dense automation + notes + loop
+        # wraps; assert the device dropped/delayed nothing (§14.2 counters).
+        run: scripts/flood-stress.sh

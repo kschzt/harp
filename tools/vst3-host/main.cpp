@@ -87,13 +87,16 @@ int main(int argc, char **argv) {
                 "usage: harp-vst3-host PLUGIN.vst3 [--list] [--rate N] [--block N]\n"
                 "       [--seconds S] [--input sine[:HZ]|impulse|silence]\n"
                 "       [--set ID=NORMVALUE]... [--ramp ID=V0:V1]... [--notes N,N,..]\n"
+                "       [--lfo ID=HZ[:PTS_PER_BLOCK[:SHAPE]]]... [--flood]\n"
                 "       [--bpm B] [--chord N,N,..] [--loop STARTPPQ:ENDPPQ]\n"
-                "       [--realtime] [--out FILE.wav] [--hash]\n"
+                "       [--realtime] [--out FILE.wav] [--hash] [--json] [--expect-hash HEX]\n"
                 "       [--save-state FILE] [--load-state FILE]\n");
         return 2;
     }
     std::string plugin_path = argv[1];
     bool do_list = false, do_hash = false, realtime = false;
+    bool do_flood = false, do_json = false, do_reset = false;
+    std::string expect_hash; /* if set, assert the output hash (exit 3 on mismatch) */
     uint32_t rate = 48000, block = 256;
     double seconds = 2.0;
     std::string input_kind = "silence", out_path, save_state_path, load_state_path;
@@ -109,6 +112,13 @@ int main(int argc, char **argv) {
         double v0, v1;
     };
     std::vector<RampSpec> ramps; /* one automation point per block, linear v0->v1 */
+    struct LfoSpec {
+        uint32_t id;
+        double hz;
+        int ppb;    /* automation points emitted per process block (density) */
+        char shape; /* 't' triangle, 's' saw, 'n' sine */
+    };
+    std::vector<LfoSpec> lfos; /* dense sub-block automation — the IDM hammer */
 
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
@@ -169,8 +179,49 @@ int main(int argc, char **argv) {
             if (eq == std::string::npos) die("--set wants ID=VALUE");
             sets.push_back({(uint32_t)strtoul(kv.substr(0, eq).c_str(), nullptr, 0),
                             atof(kv.substr(eq + 1).c_str())});
+        } else if (a == "--lfo") { /* ID=HZ[:POINTS_PER_BLOCK[:SHAPE]] */
+            std::string kv = next();
+            LfoSpec l{};
+            l.ppb = 8;
+            char shape = 't';
+            int got = sscanf(kv.c_str(), "%u=%lf:%d:%c", &l.id, &l.hz, &l.ppb, &shape);
+            if (got < 2) die("--lfo wants ID=HZ[:POINTS_PER_BLOCK[:SHAPE]]");
+            if (l.ppb < 1) l.ppb = 1;
+            l.shape = shape;
+            lfos.push_back(l);
+        } else if (a == "--reset") {
+            do_reset = true;
+        } else if (a == "--flood") {
+            do_flood = true;
+        } else if (a == "--json") {
+            do_json = true;
+        } else if (a == "--expect-hash") {
+            expect_hash = next();
         } else
             die("unknown option " + a);
+    }
+
+    /* The flood preset: an IDM-grade hammer on the event plane — tiny DAW
+     * blocks, every knob under dense LFO automation, rapid notes, a fast tempo,
+     * and a per-beat loop wrap. Each piece stays overridable by an explicit flag.
+     * Two runs of this must still hash identically: the determinism gate. */
+    if (do_flood) {
+        if (block == 256) block = 64;   /* smallest DAW block = peak event rate */
+        if (seconds == 2.0) seconds = 4.0;
+        if (bpm == 0) bpm = 174.0;      /* + a per-beat loop wrap below */
+        if (loop_a < 0) { loop_a = 0.0; loop_b = 1.0; }
+        if (lfos.empty())
+            for (uint32_t id = 1; id <= 8; id++)
+                lfos.push_back({id, 2.0 + 1.7 * id, 8, (id & 1) ? 't' : 'n'});
+        /* dense sample-exact notes (not host-thinnable, unlike automation) hammer
+         * the note voice + retrigger path. The device arpeggiator is an even
+         * denser event source, but its transport anchoring isn't reproducible
+         * across separate processes — exercise it via the in-session T17 test
+         * instead, and keep this flood deterministic for a clean CI gate. */
+        if (notes.empty() && chord.empty()) {
+            note_period = 0.05; /* 20 notes/s */
+            for (int k = 0; k < 80; k++) notes.push_back(48 + (k * 5) % 25);
+        }
     }
 
     /* ---- host context + module ---- */
@@ -320,12 +371,46 @@ int main(int argc, char **argv) {
         }
 
         ParameterChanges pc;
+        if (do_reset && done == 0 && controller) {
+            /* pin start state: set EVERY param to its default at t=0 (offset 0,
+             * before the ramp/lfo/set points below), so two runs start
+             * identically. Params persist on the device across sessions (recall
+             * state) and automation becomes ramps that interpolate FROM the
+             * current value — so the start value must be pinned, not just the
+             * undriven params. A later --set / lfo point at offset 0 overrides. */
+            int32 np = controller->getParameterCount();
+            for (int32 pi = 0; pi < np; pi++) {
+                ParameterInfo info{};
+                if (controller->getParameterInfo(pi, info) != kResultOk) continue;
+                if (info.flags & ParameterInfo::kIsReadOnly) continue;
+                int32 qi = 0;
+                auto *q = pc.addParameterData(info.id, qi);
+                int32 pp = 0;
+                if (q) q->addPoint(0, info.defaultNormalizedValue, pp);
+                controller->setParamNormalized(info.id, info.defaultNormalizedValue);
+            }
+        }
         for (auto &r : ramps) { /* block-rate automation, like a DAW writes */
             double t = total > 1 ? (double)done / (double)total : 0.0;
             int32 qidx = 0;
             auto *q = pc.addParameterData(r.id, qidx);
             int32 pidx = 0;
             if (q) q->addPoint(0, r.v0 + (r.v1 - r.v0) * t, pidx);
+        }
+        for (auto &l : lfos) { /* dense sub-block automation — many points/block */
+            int32 qidx = 0;
+            auto *q = pc.addParameterData(l.id, qidx);
+            if (!q) continue;
+            for (int k = 0; k < l.ppb; k++) {
+                int32 off = (int32)((int64_t)k * (int64_t)n / l.ppb);
+                double ph = l.hz * (double)(done + (size_t)off) / rate;
+                ph -= (double)(int64_t)ph; /* fractional phase 0..1, deterministic */
+                double v = (l.shape == 's')   ? ph                                /* saw */
+                           : (l.shape == 'n') ? 0.5 + 0.5 * sin(2.0 * M_PI * ph)  /* sine */
+                                              : (ph < 0.5 ? 2.0 * ph : 2.0 - 2.0 * ph); /* tri */
+                int32 pidx = 0;
+                q->addPoint(off, v, pidx);
+            }
         }
         if (first_block) {
             for (auto &kv : sets) {
@@ -429,12 +514,23 @@ int main(int argc, char **argv) {
     for (float v : capture) rms += (double)v * v;
     rms = capture.empty() ? 0 : sqrt(rms / capture.size());
     printf("processed %zu samples x %d ch, rms=%.5f\n", done, out_ch, rms);
-    if (do_hash)
-        printf("output-hash: %016llx\n",
-               (unsigned long long)harp_fnv1a(capture.data(), capture.size() * sizeof(float)));
+
+    uint64_t hash = harp_fnv1a(capture.data(), capture.size() * sizeof(float));
+    char hashhex[17];
+    snprintf(hashhex, sizeof hashhex, "%016llx", (unsigned long long)hash);
+    if (do_hash) printf("output-hash: %s\n", hashhex);
+    if (do_json)
+        printf("{\"frames\":%zu,\"channels\":%d,\"rate\":%u,\"rms\":%.6f,\"hash\":\"%s\"}\n",
+               capture.size() / (size_t)(out_ch ? out_ch : 1), out_ch, rate, rms, hashhex);
+
     if (!out_path.empty()) {
         if (!harp_write_wav16(out_path, capture, (uint32_t)out_ch, rate)) die("cannot write " + out_path);
         printf("-> %s\n", out_path.c_str());
+    }
+    if (!expect_hash.empty() && expect_hash != hashhex) {
+        fprintf(stderr, "harp-vst3-host: FAIL expected hash %s, got %s\n", expect_hash.c_str(),
+                hashhex);
+        return 3;
     }
     return 0;
 }
