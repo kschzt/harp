@@ -73,6 +73,17 @@ public:
     void stop();
     bool connected() const { return connected_.load(std::memory_order_acquire); }
 
+    /* Which device output slots audio.start subscribes to (§9.x active-slots-out,
+     * key 4). DEFAULT {0,1} = the stereo MAIN MIX — the exact render the device
+     * has always produced, so the default wire is byte-identical to before this
+     * setter existed (golden gate). A test/host harness can request a single
+     * PART's stereo pair instead — part N occupies slots {2+2N, 3+2N} — to pull
+     * that part in isolation (P2.2). Must be called before start()/audioStart();
+     * a no-op once a session is up (the subscription is fixed at audio.start). */
+    void setOutSlots(const std::vector<uint32_t> &slots) {
+        if (!slots.empty()) outSlots_ = slots;
+    }
+
     /* ---- audio thread (all lock-free) ---- */
     void queueParamSet(uint32_t id, float v, uint64_t ts);
     void queueRamp(uint32_t id, float target, uint64_t start, uint64_t end);
@@ -323,4 +334,10 @@ private:
     std::string wantUsbSerial_;
 
     uint32_t rate_ = 48000;
+
+    /* audio.start key 4 = active-slots-out. {0,1} = the stereo main mix —
+     * the historical default (the wire used to send an empty [] here; sending
+     * the explicit {0,1} drives the same main-mix render byte-identically).
+     * setOutSlots() overrides it before start() to pull a single part. */
+    std::vector<uint32_t> outSlots_{0, 1};
 };

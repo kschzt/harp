@@ -231,9 +231,18 @@ static void ramps_advance(uint64_t pos) {
 /* with_drone: part 0 renders the full voice (drone + note); parts 1..15 are
  * NOTE-ONLY (no drone). The drone-only smoothed params/coeffs are still
  * computed when !with_drone (harmless, unused) so coefficient ORDER and the
- * note filter's f/q/shape/master are byte-identical across parts (§P2.1). */
+ * note filter's f/q/shape/master are byte-identical across parts (§P2.1).
+ *
+ * accumulate: false WRITES the stereo scratch with a direct '=' (the first
+ * voice into a buffer, signed zero preserved); true sums onto it with '+='.
+ * §P2.2 DECOUPLES this from with_drone — the per-part output branch needs a
+ * fresh '=' write for each isolated part (which has no drone), while the
+ * main mix still wants part0(with_drone, accumulate=false) + active note-only
+ * parts(accumulate=true). The main-mix call pattern is byte-identical to P2.1
+ * (which keyed write/+= off with_drone): part0 is the only with_drone caller
+ * and is also the only accumulate=false caller there. */
 static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
-                          uint64_t pos, bool with_drone) {
+                          uint64_t pos, bool with_drone, bool accumulate) {
     synth_voice *v = &p->voice; /* per-part voice; note state from p too */
     if (!v->s_init) { /* first block: land on targets, no glide-in from zero */
         v->s_pitch = param_value(1);
@@ -356,18 +365,23 @@ static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
             float nhigh_r = nosc_r - v->n_low_r - q * v->n_band_r;
             v->n_band_r += f * nhigh_r;
 
-            /* Part 0 (with_drone) is the PRIMARY: it renders first and WRITES
-             * every sample with a direct '=', bit-identical to P2.0's store —
+            /* The PRIMARY voice into a scratch buffer WRITES every sample with
+             * a direct '=' (accumulate=false), bit-identical to P2.0's store —
              * signed zero included (the groove render legitimately produces
              * -0.0f samples; a memset+accumulate would flip them to +0.0f and
-             * break the byte hash). Note-only parts 1..15 ACCUMULATE on top
-             * with '+='. The expression inside the ternary is char-for-char
-             * P2.0's, and `float out` is float-typed so the rounding matches. */
+             * break the byte hash). Voices that mix ON TOP ACCUMULATE with '+='
+             * (accumulate=true). The sample EXPRESSION is char-for-char P2.0's,
+             * keyed off with_drone (drone+note vs note-only), and `float out`
+             * is float-typed so the rounding matches. §P2.2 split the write/+=
+             * decision out into `accumulate` (was keyed off with_drone): the
+             * main mix still calls part0(with_drone, accumulate=false) then
+             * note-only parts(accumulate=true) — same bytes as P2.1 — while the
+             * per-part branch WRITES each isolated part with accumulate=false. */
             float out_l =
                 with_drone ? (v->low_l * drone_lvl + v->n_low_l * env) : (v->n_low_l * env);
             float out_r =
                 with_drone ? (v->low_r * drone_lvl + v->n_low_r * env) : (v->n_low_r * env);
-            if (with_drone) {
+            if (!accumulate) {
                 interleaved[2 * i] = out_l * master * 0.5f;
                 interleaved[2 * i + 1] = out_r * master * 0.5f;
             } else {
@@ -383,6 +397,14 @@ static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
 
 static void render_with_events(float *interleaved, uint32_t n,
                                float rate, uint64_t pos);
+/* §P2.2 output assembly: render the host-requested output slots (a->out_slots
+ * / n_out_slots) into `out`, interleaved nsamples × n_out_slots in request
+ * order. Returns the channel count written (== a->n_out_slots), to stamp the
+ * frame header `slots`. The default stereo main mix ({0,1}) routes straight
+ * through the unchanged render_with_events; see the definition for the
+ * additive per-part branch. */
+static uint16_t render_output(audio_state *a, float *out, uint32_t n, float rate,
+                              uint64_t pos);
 
 /* Host-paced loop (§8.3 mode 1): block on pacing frames, render the exact
  * SSI range each one names, echo its (epoch, ts) on the output frame. The
@@ -394,8 +416,10 @@ static void host_paced_loop(device *d) {
     /* voice starts from zero at audio.start (T15); notes/arp are reset by
      * evq_reset_for_new_stream, so zero ONLY the per-part voices here */
     for (size_t i = 0; i < NPARTS; i++) g_parts[i].voice = (synth_voice){0};
-    uint8_t frame[HARP_AUDIO_HDR_LEN + AUDIO_MAX_NSAMPLES * 2 * 4];
-    float samples[AUDIO_MAX_NSAMPLES * 2];
+    /* frame + sample buffers sized for the full 34-channel map (§P2.2); the
+     * default stereo main mix uses only the first 2 channels */
+    uint8_t frame[HARP_AUDIO_HDR_LEN + AUDIO_MAX_NSAMPLES * 34 * 4];
+    float samples[AUDIO_MAX_NSAMPLES * 34];
     /* buffered endpoint reads (packet-multiple, see ffs.c) */
     uint8_t rbuf[16384];
     size_t rlen = 0, rpos = 0;
@@ -492,12 +516,15 @@ static void host_paced_loop(device *d) {
             CTR_INC(d->frame_errors);
             return;
         }
-        render_with_events(samples, n, (float)a->rate, h.ts);
-        harp_audio_hdr out = {HARP_AUDIO_FVER, 0, 2, h.epoch, h.ts, (uint16_t)n,
+        /* §P2.2: render the requested output slots; `slots` carries the count.
+         * Default {0,1} is the unchanged 2-channel main mix (golden holds). */
+        uint16_t slots = render_output(a, samples, n, (float)a->rate, h.ts);
+        harp_audio_hdr out = {HARP_AUDIO_FVER, 0, slots, h.epoch, h.ts, (uint16_t)n,
                               HARP_AUDIO_FMT_F32};
         harp_audio_hdr_encode(&out, frame);
-        memcpy(frame + HARP_AUDIO_HDR_LEN, samples, (size_t)n * 2 * 4);
-        if (!harp_write_all(a->fd, frame, HARP_AUDIO_HDR_LEN + (size_t)n * 2 * 4)) return;
+        size_t payload = (size_t)n * slots * 4;
+        memcpy(frame + HARP_AUDIO_HDR_LEN, samples, payload);
+        if (!harp_write_all(a->fd, frame, HARP_AUDIO_HDR_LEN + payload)) return;
     }
 }
 
@@ -514,8 +541,10 @@ void *audio_thread(void *arg) {
     /* voice starts from zero at audio.start (T15); notes/arp are reset by
      * evq_reset_for_new_stream, so zero ONLY the per-part voices here */
     for (size_t i = 0; i < NPARTS; i++) g_parts[i].voice = (synth_voice){0};
-    uint8_t frame[HARP_AUDIO_HDR_LEN + AUDIO_MAX_NSAMPLES * 2 * 4];
-    float samples[AUDIO_MAX_NSAMPLES * 2];
+    /* frame + sample buffers sized for the full 34-channel map (§P2.2); the
+     * default stereo main mix uses only the first 2 channels */
+    uint8_t frame[HARP_AUDIO_HDR_LEN + AUDIO_MAX_NSAMPLES * 34 * 4];
+    float samples[AUDIO_MAX_NSAMPLES * 34];
     uint64_t msc = 0;
     uint64_t period_ns = (uint64_t)a->nsamples * 1000000000ull / a->rate;
     bool discont = false;
@@ -523,12 +552,14 @@ void *audio_thread(void *arg) {
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
     while (atomic_load_explicit(&a->running, memory_order_relaxed)) {
-        render_with_events(samples, a->nsamples, (float)a->rate, msc);
-        harp_audio_hdr h = {HARP_AUDIO_FVER, discont ? HARP_AUDIO_DISCONT : 0, 2,
+        /* §P2.2: render the requested output slots; `slots` carries the count.
+         * Default {0,1} is the unchanged 2-channel main mix (golden holds). */
+        uint16_t slots = render_output(a, samples, a->nsamples, (float)a->rate, msc);
+        harp_audio_hdr h = {HARP_AUDIO_FVER, discont ? HARP_AUDIO_DISCONT : 0, slots,
                             a->epoch, msc, (uint16_t)a->nsamples, HARP_AUDIO_FMT_F32};
         discont = false;
         harp_audio_hdr_encode(&h, frame);
-        size_t payload = (size_t)a->nsamples * 2 * 4;
+        size_t payload = (size_t)a->nsamples * slots * 4;
         memcpy(frame + HARP_AUDIO_HDR_LEN, samples, payload);
         if (!harp_write_all(a->fd, frame, HARP_AUDIO_HDR_LEN + payload))
             break; /* endpoint died (stop/unplug) */
@@ -853,15 +884,126 @@ static void render_with_events(float *interleaved, uint32_t n,
         if (seg == 0) seg = 1; /* paranoia: guarantee forward progress */
         if (seg > n - done) seg = n - done;
         /* part 0 ALWAYS renders first with a direct write (no pre-zero needed —
-         * it initialises every sample of the segment, bit-identical to P2.0) */
+         * it initialises every sample of the segment, bit-identical to P2.0).
+         * accumulate=!is_part0: part0 WRITES (=), parts 1..15 sum (+=) — the
+         * P2.1 write/+= behaviour, now spelled via the decoupled `accumulate`
+         * param (§P2.2) so these bytes are unchanged. */
         engine_render(&g_parts[0], interleaved + 2 * done, seg, rate, pos + done,
-                      true); /* part 0 ALWAYS: full voice (drone+note) */
+                      true, false); /* part 0 ALWAYS: full voice (drone+note), WRITE */
         for (size_t pi = 1; pi < NPARTS; pi++)
             if (part_active(&g_parts[pi]))
                 engine_render(&g_parts[pi], interleaved + 2 * done, seg, rate,
-                              pos + done, false); /* parts 1..15: note-only, when active */
+                              pos + done, false,
+                              true); /* parts 1..15: note-only, accumulate, when active */
         done += seg;
     }
+}
+
+/* §P2.2 per-part output. Active-slots-out may ask for the main mix (slots
+ * 0/1), any part's isolated stereo output (slots 2+2k / 3+2k), or a mix of
+ * both. We must NOT advance any voice more than once per segment, so the
+ * segment loop here mirrors render_with_events EXACTLY for the shared
+ * event/arp application + min-deadline, then renders each NEEDED part ONCE
+ * into a stereo scratch and distributes it: into the main-mix accumulator
+ * (part0 WRITE then active parts ACCUMULATE, in part order — reproducing
+ * render_with_events's part0-write+others-+=) and/or into that part's own
+ * output slot pair. Per-part columns are written once with '='; the main-mix
+ * columns are copied from the accumulator. Only ONE part scratch + ONE stereo
+ * mix accumulator are live at a time (bounded stack), not 16 scratches. */
+static void render_part_slots(audio_state *a, float *out, uint32_t n, float rate,
+                              uint64_t pos) {
+    uint8_t ns = a->n_out_slots;
+    /* which output columns want slot 0 / slot 1 (main mix), and which want a
+     * given part's L/R — precomputed so the inner packing is a copy */
+    bool need_main = false;
+    bool need_part[NPARTS] = {false};
+    for (uint8_t s = 0; s < ns; s++) {
+        uint8_t slot = a->out_slots[s];
+        if (slot < 2)
+            need_main = true;
+        else
+            need_part[(slot - 2) / 2] = true; /* slot 2+2k/3+2k -> part k */
+    }
+
+    float pscr[2 * AUDIO_MAX_NSAMPLES]; /* one part's stereo render */
+    float mix[2 * AUDIO_MAX_NSAMPLES];  /* the reconstructed main mix */
+
+    uint32_t done = 0;
+    while (done < n) {
+        /* SHARED event/arp application — IDENTICAL to render_with_events, run
+         * EXACTLY ONCE per segment so each voice advances at most once */
+        uint64_t next = evq_apply_due(pos + done, pos + n);
+        for (size_t pi = 0; pi < NPARTS; pi++)
+            arp_fire_due(&g_parts[pi], pos + done, rate); /* steps fire AT seg starts */
+        for (size_t pi = 0; pi < NPARTS; pi++) {
+            uint64_t anext = arp_next_deadline(&g_parts[pi], pos + done, rate);
+            if (anext && (next == 0 || anext < next)) next = anext;
+        }
+        uint32_t seg = next ? (uint32_t)(next - (pos + done)) : n - done;
+        if (seg == 0) seg = 1; /* paranoia: guarantee forward progress */
+        if (seg > n - done) seg = n - done;
+
+        bool mix_written = false; /* part0 is the first writer of `mix` */
+        /* render each needed part ONCE, in part order, distributing its
+         * scratch to the main-mix accumulator and/or its own slot pair */
+        for (size_t pi = 0; pi < NPARTS; pi++) {
+            bool in_mix = need_main && (pi == 0 || part_active(&g_parts[pi]));
+            if (!in_mix && !need_part[pi]) continue; /* this part isn't wanted */
+            /* part 0 carries the drone; 1..15 are note-only. WRITE the scratch
+             * (accumulate=false) — signed-zero-preserving, like P2.1's part0 */
+            engine_render(&g_parts[pi], pscr, seg, rate, pos + done, pi == 0, false);
+            if (in_mix) {
+                /* part0 WRITES mix, later active parts ACCUMULATE — same order
+                 * and same float ops as render_with_events's main mix */
+                for (uint32_t i = 0; i < 2 * seg; i++) {
+                    if (!mix_written)
+                        mix[i] = pscr[i];
+                    else
+                        mix[i] += pscr[i];
+                }
+                mix_written = true;
+            }
+            if (need_part[pi]) {
+                /* pack this part's isolated stereo into every output column
+                 * that requested its L/R slot */
+                for (uint8_t s = 0; s < ns; s++) {
+                    uint8_t slot = a->out_slots[s];
+                    if (slot >= 2 && (size_t)((slot - 2) / 2) == pi) {
+                        bool right = (slot & 1);
+                        for (uint32_t i = 0; i < seg; i++)
+                            out[(size_t)(done + i) * ns + s] = pscr[2 * i + right];
+                    }
+                }
+            }
+        }
+        /* if main was requested but nothing fed `mix` (can't happen: part0 is
+         * always in_mix when need_main), guard against reading uninitialised */
+        if (need_main && !mix_written) memset(mix, 0, (size_t)2 * seg * sizeof(float));
+        /* pack the main-mix columns (slots 0/1) from the accumulator */
+        if (need_main)
+            for (uint8_t s = 0; s < ns; s++) {
+                uint8_t slot = a->out_slots[s];
+                if (slot < 2)
+                    for (uint32_t i = 0; i < seg; i++)
+                        out[(size_t)(done + i) * ns + s] = mix[2 * i + slot];
+            }
+        done += seg;
+    }
+}
+
+static uint16_t render_output(audio_state *a, float *out, uint32_t n, float rate,
+                              uint64_t pos) {
+    /* DEFAULT / main-mix fast path: the host wants exactly the stereo main mix
+     * in slot order {0,1}. Route straight through the UNCHANGED P2.1
+     * render_with_events into the 2-channel `out` buffer — byte-identical
+     * output, golden hashes hold. The per-part branch is purely additive. */
+    if (a->n_out_slots == 2 && a->out_slots[0] == 0 && a->out_slots[1] == 1) {
+        render_with_events(out, n, rate, pos);
+        return 2;
+    }
+    /* PER-PART case: any requested slot >= 2, or a non-{0,1} arrangement */
+    render_part_slots(a, out, n, rate, pos);
+    return a->n_out_slots;
 }
 
 void audio_stop(device *d) {

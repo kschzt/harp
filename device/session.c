@@ -140,20 +140,39 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_text(m, "evt.transport");
     harp_cbor_text(m, "evt.ump"); /* note input as UMP (§9.10); group map = key 11 */
     harp_cbor_text(m, "x.harp-refdev.sim");
-    harp_cbor_uint(m, 7); /* channel map (§6.3): stereo main mix, D→H */
-    harp_cbor_array(m, 2);
-    for (int ch = 0; ch < 2; ch++) {
+    harp_cbor_uint(m, 7); /* channel map (§6.3): 34 slots, all D→H. §P2.2
+                             exposes per-part outputs: slots 0/1 are the stereo
+                             main mix; slots 2+2k/3+2k are part k+1's stereo
+                             output (k=0..15). The host requests a subset via
+                             audio.start active-slots-out (key 4). */
+    harp_cbor_array(m, 34);
+    /* one stereo pair per group: pair 0 = "Mix"/"main", pairs 1..16 =
+     * "Part N"/"partN". Each entry keeps the P2.1 shape (keys 0..5); built in
+     * a loop so the 17 groups stay in lockstep. */
+    for (int slot = 0; slot < 34; slot++) {
+        int pair = slot / 2;      /* 0 = main mix, 1..16 = part 1..16 */
+        bool right = (slot & 1);  /* even = L, odd = R */
+        char name[16], path[16], group[16];
+        if (pair == 0) {
+            snprintf(name, sizeof name, "Main %c", right ? 'R' : 'L');
+            snprintf(group, sizeof group, "Mix");
+            snprintf(path, sizeof path, "main");
+        } else {
+            snprintf(name, sizeof name, "Part %d %c", pair, right ? 'R' : 'L');
+            snprintf(group, sizeof group, "Part %d", pair);
+            snprintf(path, sizeof path, "part%d", pair);
+        }
         harp_cbor_map(m, 6);
         harp_cbor_uint(m, 0);
-        harp_cbor_uint(m, ch); /* slot */
+        harp_cbor_uint(m, slot); /* slot */
         harp_cbor_uint(m, 1);
         harp_cbor_uint(m, 0); /* direction: device -> host */
         harp_cbor_uint(m, 2);
-        harp_cbor_text(m, ch ? "Main R" : "Main L");
+        harp_cbor_text(m, name);
         harp_cbor_uint(m, 3);
-        harp_cbor_text(m, "Mix");
+        harp_cbor_text(m, group);
         harp_cbor_uint(m, 4);
-        harp_cbor_text(m, "main");
+        harp_cbor_text(m, path);
         harp_cbor_uint(m, 5);
         harp_cbor_bool(m, true); /* host-paced capable: pure-digital path */
     }
@@ -609,6 +628,11 @@ int harp_ffs_audio_out_fd(void); /* device/ffs.c */
 /* audio.start (§8.2): free-running mode only, stereo D→H, USB transport only */
 static void handle_audio_start(device *d, const harp_env *e) {
     uint64_t rate = 48000, nsamples = 256, mode = 0;
+    /* active-slots-out (§6.3, key 4): the output slots the host wants, in
+     * request order. Parsed into a local array first; an absent or empty key
+     * defaults to the stereo main mix {0,1} (the P2.1 byte-identical path). */
+    uint8_t out_slots[34];
+    uint8_t n_out_slots = 0;
     if (e->has_body) {
         harp_cdec b;
         harp_cdec_init(&b, e->body, e->body_len);
@@ -621,12 +645,30 @@ static void handle_audio_start(device *d, const harp_env *e) {
                     if (!harp_cdec_uint(&b, &rate)) break;
                 } else if (key == 1) {
                     if (!harp_cdec_uint(&b, &nsamples)) break;
+                } else if (key == 4) {
+                    /* CBOR array of uint slot indices: clamp each to 0..33,
+                     * cap the count at 34. (key 3 active-slots-IN is left to
+                     * the skip branch — this engine has no input channels.) */
+                    uint64_t alen;
+                    if (!harp_cdec_array(&b, &alen)) break;
+                    for (uint64_t j = 0; j < alen; j++) {
+                        uint64_t slot;
+                        if (!harp_cdec_uint(&b, &slot)) break;
+                        if (slot > 33) slot = 33;
+                        if (n_out_slots < 34) out_slots[n_out_slots++] = (uint8_t)slot;
+                    }
                 } else if (key == 5) {
                     if (!harp_cdec_uint(&b, &mode)) break;
                 } else if (!harp_cdec_skip(&b))
                     break;
             }
         }
+    }
+    /* absent or empty active-slots-out -> default stereo main mix {0,1} */
+    if (n_out_slots == 0) {
+        out_slots[0] = 0;
+        out_slots[1] = 1;
+        n_out_slots = 2;
     }
     if (mode > 1) {
         send_error(d, e->rid, e->method, "unsupported", "unknown clock mode");
@@ -661,6 +703,9 @@ static void handle_audio_start(device *d, const harp_env *e) {
     d->audio.rate = (uint32_t)rate;
     d->audio.nsamples = (uint32_t)nsamples;
     d->audio.reanchors = 0;
+    /* publish the requested output slots for the render thread (§P2.2) */
+    memcpy(d->audio.out_slots, out_slots, n_out_slots);
+    d->audio.n_out_slots = n_out_slots;
     atomic_store_explicit(&d->audio.running, true, memory_order_relaxed);
     if (pthread_create(&d->audio.thread, NULL, audio_thread, d) != 0) {
         atomic_store_explicit(&d->audio.running, false, memory_order_relaxed);

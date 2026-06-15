@@ -98,8 +98,14 @@ bool HarpRuntime::audioStart(uint32_t rate) {
     harp_cbor_array(&req, 2);
     harp_cbor_uint(&req, 0);
     harp_cbor_uint(&req, 1);
-    harp_cbor_uint(&req, 4);
-    harp_cbor_array(&req, 0);
+    harp_cbor_uint(&req, 4); /* active-slots-out: the slots the host subscribes
+                              * to. DEFAULT outSlots_ = {0,1} (the stereo main
+                              * mix) renders exactly as the historical empty []
+                              * did — the golden byte-identical default. A
+                              * single part's pair {2+2N,3+2N} pulls that part
+                              * in isolation (set via setOutSlots before start). */
+    harp_cbor_array(&req, outSlots_.size());
+    for (uint32_t slot : outSlots_) harp_cbor_uint(&req, slot);
     harp_cbor_uint(&req, 5);
     harp_cbor_uint(&req, 1); /* host-paced */
     harp_env e;
@@ -416,6 +422,24 @@ bool HarpRuntime::start(uint32_t sampleRate) {
     if (running_.load()) return connected();
     harp_plat_init(); /* hi-res timers for the sub-ms pacing/idle waits (Windows) */
     rate_ = sampleRate;
+    /* test/field override: HARP_OUT_SLOTS="a,b,..." forces the active-slots-out
+     * subscription regardless of any setOutSlots() call. This is how an
+     * out-of-process host (harp-vst3-host --part N) reaches the runtime across
+     * the plugin boundary — it sets the env, exactly as HARP_DEVICE_SERIAL pins
+     * the device. UNSET (the default) leaves outSlots_ = {0,1}, the golden
+     * main-mix request. */
+    if (const char *e = getenv("HARP_OUT_SLOTS"))
+        if (e[0]) {
+            std::vector<uint32_t> slots;
+            for (const char *p = e; *p;) {
+                char *end = nullptr;
+                unsigned long v = strtoul(p, &end, 10);
+                if (end == p) break; /* no digits: stop at the garbage */
+                slots.push_back((uint32_t)v);
+                p = (*end == ',') ? end + 1 : end;
+            }
+            setOutSlots(slots); /* no-op if it parsed to nothing */
+        }
     running_.store(true);
     /* One libusb context for the whole active life — every connect attempt
      * (incl. the device-less retry loop) borrows it, so we never churn

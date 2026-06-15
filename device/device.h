@@ -149,6 +149,15 @@ typedef struct {
     int out_fd; /* audio OUT endpoint: host -> device (pacing, mode 1) */
     uint32_t mode, rate, nsamples, epoch;
     uint64_t reanchors;
+    /* requested OUTPUT slots (§6.3 active-slots-out, audio.start key 4): the
+     * channel map exposes 34 slots (2 main-mix + 16 stereo per-part pairs,
+     * §P2.2). out_slots[0..n_out_slots-1] holds the host-requested slot
+     * indices in request order; the render thread emits exactly those channels
+     * interleaved in that order. Default (key absent / empty) = {0,1}, the
+     * stereo main mix — the P2.1 byte-identical render path. Sized for the full
+     * map (34) so any subset/order fits; values are clamped 0..33 on parse. */
+    uint8_t out_slots[34];
+    uint8_t n_out_slots;
 } audio_state;
 
 typedef struct {

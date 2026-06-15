@@ -89,8 +89,10 @@ int main(int argc, char **argv) {
                 "       [--set ID=NORMVALUE]... [--ramp ID=V0:V1]... [--notes N,N,..]\n"
                 "       [--lfo ID=HZ[:PTS_PER_BLOCK[:SHAPE]]]... [--flood]\n"
                 "       [--bpm B] [--chord N,N,..] [--channel N] [--loop STARTPPQ:ENDPPQ]\n"
-                "       [--realtime] [--out FILE.wav] [--hash] [--json] [--expect-hash HEX]\n"
-                "       [--save-state FILE] [--load-state FILE]\n");
+                "       [--part N] [--realtime] [--out FILE.wav] [--hash] [--json]\n"
+                "       [--expect-hash HEX] [--save-state FILE] [--load-state FILE]\n"
+                "  --part N   pull device part N's (0..15) stereo output instead of the\n"
+                "             main mix (slots {2+2N,3+2N}); default = main mix\n");
         return 2;
     }
     std::string plugin_path = argv[1];
@@ -105,6 +107,7 @@ int main(int argc, char **argv) {
     std::vector<int> notes;    /* played sequentially at note_period spacing */
     std::vector<int> chord;    /* held from 0.1 s to the end (arp fodder) */
     int channel = 0;           /* MIDI channel 0..15 for emitted notes -> device part (P2.1) */
+    int part = -1;             /* -1 = main mix (default); 0..15 = pull that part's stereo pair (P2.2) */
     double bpm = 0;            /* >0: emit a playing transport (tempo, PPQ) */
     double loop_a = -1, loop_b = -1; /* PPQ loop region: jump b -> a */
     double note_period = 0.6;  /* s between note-ons; gate = 75% of period */
@@ -172,6 +175,9 @@ int main(int argc, char **argv) {
             channel = atoi(next().c_str());
             if (channel < 0) channel = 0;
             if (channel > 15) channel = 15;
+        } else if (a == "--part") { /* pull device PART N's stereo pair, not the main mix (P2.2) */
+            part = atoi(next().c_str());
+            if (part < 0 || part > 15) die("--part wants 0..15");
         } else if (a == "--ramp") { /* ID=V0:V1 over the whole duration */
             std::string kv = next();
             RampSpec r{};
@@ -227,6 +233,26 @@ int main(int argc, char **argv) {
             note_period = 0.05; /* 20 notes/s */
             for (int k = 0; k < 80; k++) notes.push_back(48 + (k * 5) % 25);
         }
+    }
+
+    /* --part N: ask the shell runtime to subscribe to device part N's stereo
+     * output (slots {2+2N, 3+2N}) instead of the main mix. The runtime lives
+     * inside the plugin (a separate module we dlopen), so we reach it the way
+     * the rest of the harness does — an env var the runtime reads at start():
+     * HARP_OUT_SLOTS, equivalent to calling rt.setOutSlots({2+2N, 3+2N}). It
+     * MUST be set before the plugin's setActive(true) below (where start()
+     * runs). Without --part we leave it unset -> the runtime's {0,1} main-mix
+     * default -> golden byte-identical. Either way the output bus is stereo and
+     * we still pull/capture 2 channels. */
+    if (part >= 0) {
+        char slots[32];
+        snprintf(slots, sizeof slots, "%d,%d", 2 + 2 * part, 3 + 2 * part);
+#ifdef _WIN32
+        _putenv_s("HARP_OUT_SLOTS", slots);
+#else
+        setenv("HARP_OUT_SLOTS", slots, 1);
+#endif
+        printf("part: %d -> output slots {%s}\n", part, slots);
     }
 
     /* ---- host context + module ---- */
