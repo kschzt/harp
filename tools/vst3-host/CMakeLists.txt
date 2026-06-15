@@ -92,6 +92,7 @@ if(LIBUSB_FOUND)
     ${SHELL_MAIN}
     ${HARP_ROOT}/shell/plugin.cpp
     ${HARP_ROOT}/shell/runtime.cpp
+    ${HARP_ROOT}/shell/runtime_registry.cpp
     ${HARP_ROOT}/host/usb_io.c
     ${HARP_ROOT}/host/client.c
     ${HARP_ROOT}/core/src/cbor.c
@@ -125,6 +126,7 @@ if(LIBUSB_FOUND)
     add_executable(tsan-host
       ${CMAKE_CURRENT_SOURCE_DIR}/../tsan-host/main.cpp
       ${HARP_ROOT}/shell/runtime.cpp
+      ${HARP_ROOT}/shell/runtime_registry.cpp
       ${HARP_ROOT}/host/usb_io.c
       ${HARP_ROOT}/host/client.c
       ${HARP_ROOT}/core/src/cbor.c
@@ -148,6 +150,44 @@ if(LIBUSB_FOUND)
     target_link_libraries(tsan-host ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS})
     message(STATUS "tsan-host: ThreadSanitizer harness for the shell runtime")
   endif()
+
+  # registry-tests (P4): the process-global runtime registry's keying +
+  # refcount logic (shell/runtime_registry.*), unit-tested WITHOUT a device.
+  # The registry never start()s a runtime, and an un-started HarpRuntime opens
+  # no USB and spawns no threads (ctor = on-disk store only; stop()/dtor early-
+  # return), so acquire()/release() exercise the table bookkeeping against real
+  # HarpRuntime objects with zero hardware — no test hook in shell/* needed.
+  # It still links runtime.cpp (the registry news/deletes it) and thus the C
+  # core/host sources + libusb runtime.cpp references, so it lives here in the
+  # LIBUSB_FOUND block beside tsan-host rather than in the harpcore-only
+  # harp-tests. Runs in plain CI (ctest) — it is the cloud-side complement to
+  # the session-share HARDWARE test, which proves the same sharing on the bus.
+  add_executable(registry-tests
+    ${HARP_ROOT}/tests/registry_tests.cpp
+    ${HARP_ROOT}/shell/runtime.cpp
+    ${HARP_ROOT}/shell/runtime_registry.cpp
+    ${HARP_ROOT}/host/usb_io.c
+    ${HARP_ROOT}/host/client.c
+    ${HARP_ROOT}/core/src/cbor.c
+    ${HARP_ROOT}/core/src/sha256.c
+    ${HARP_ROOT}/core/src/frame.c
+    ${HARP_ROOT}/core/src/object.c
+    ${HARP_ROOT}/core/src/store.c
+    ${HARP_ROOT}/core/src/envelope.c
+    ${HARP_ROOT}/core/src/link.c
+    ${HARP_ROOT}/core/src/audio.c
+    ${HARP_PLAT_SRC})
+  target_include_directories(registry-tests PRIVATE
+    ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
+    ${LIBUSB_INCLUDE_DIRS})
+  target_compile_definitions(registry-tests PRIVATE HAVE_LIBUSB)
+  target_link_directories(registry-tests PRIVATE ${LIBUSB_LIBRARY_DIRS})
+  target_link_libraries(registry-tests ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS})
+  if(WIN32)
+    target_link_libraries(registry-tests setupapi ole32) # static libusb deps
+  endif()
+  add_test(NAME registry COMMAND registry-tests)
+  message(STATUS "registry-tests: runtime registry keying/refcount unit test")
 
   # SMTG emits the bundle under VST3/<config>/ ($<CONFIG> = multi-config safe).
   set(HARP_SHELL_BUNDLE ${CMAKE_BINARY_DIR}/VST3/$<CONFIG>/harp-shell.vst3)

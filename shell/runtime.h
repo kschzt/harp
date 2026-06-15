@@ -51,17 +51,19 @@ public:
     void configure(uint32_t sampleRate, uint32_t maxDawBlock) {
         rate_ = sampleRate;
         maxDawBlock_ = maxDawBlock;
-        uint32_t needed = 2 * maxDawBlock;
-        uint32_t depth = kTargetDepthFrames;
-        /* measurement/field override: HARP_CUSHION_BLOCKS=N (min 2). The
-         * default is data-driven per transport generation — see the
-         * kTargetDepthFrames comment. */
-        if (const char *e = getenv("HARP_CUSHION_BLOCKS")) {
-            int v = atoi(e);
-            if (v >= 2 && v <= 64) depth = (uint32_t)v;
-        }
-        uint32_t floor_ = depth * kBlock;
-        targetFrames_ = needed > floor_ ? needed : floor_;
+        targetFrames_ = targetFramesFor(maxDawBlock);
+    }
+
+    /* The reported latency (= ring target + event headroom) is a PURE function
+     * of the DAW block size — independent of any session. A shell can report it
+     * before a runtime is configured (P4: the runtime now comes from the
+     * registry at activate-time, so a host querying latency in the inactive
+     * window has no live runtime to ask). Same constants/env as configure() +
+     * latencySamples(), so the value is byte-identical to a configured
+     * runtime's. */
+    static uint32_t latencyFor(uint32_t maxDawBlock) {
+        uint32_t headroom = maxDawBlock > kBlock ? maxDawBlock : kBlock;
+        return targetFramesFor(maxDawBlock) + headroom;
     }
 
     /* Begin supervising: claim the device, hello, start the host-paced
@@ -177,6 +179,16 @@ public:
     /* the shared host object-cache dir (the controller opens it too). */
     static void defaultStoreDir(char *out, size_t n);
 
+    /* Runtime-free extraction of the bundle's WANTED usb serial (§15.3 key 5
+     * -> usb-identity -> serial). Empty if the bundle has no usb-identity
+     * (fresh / pre-schema) or doesn't parse. The runtime registry (P4) uses
+     * this to learn a project's target unit BEFORE any runtime exists, so a
+     * shell that loaded a bundle pinning a serial can share that unit's runtime
+     * with a sibling that pins the same serial. Selection is unchanged — this
+     * only surfaces the serial the bundle already carries (the same one
+     * setStateBundle would later record in wantUsbSerial_). */
+    static std::string bundleWantedSerial(const uint8_t *data, size_t len);
+
 private:
 
     static constexpr uint32_t kBlock = 256; /* pacing block, samples */
@@ -201,6 +213,23 @@ private:
      * derives from this: 16 ms total at DAW blocks <= 256 (48 k).
      * HARP_CUSHION_BLOCKS overrides for measurement. */
     static constexpr uint32_t kTargetDepthFrames = 2;
+
+    /* Ring target depth in frames for a given DAW block — the single source
+     * of the cushion math (incl. the HARP_CUSHION_BLOCKS override) shared by
+     * configure() and the static latencyFor(). */
+    static uint32_t targetFramesFor(uint32_t maxDawBlock) {
+        uint32_t needed = 2 * maxDawBlock;
+        uint32_t depth = kTargetDepthFrames;
+        /* measurement/field override: HARP_CUSHION_BLOCKS=N (min 2). The
+         * default is data-driven per transport generation — see the
+         * kTargetDepthFrames comment. */
+        if (const char *e = getenv("HARP_CUSHION_BLOCKS")) {
+            int v = atoi(e);
+            if (v >= 2 && v <= 64) depth = (uint32_t)v;
+        }
+        uint32_t floor_ = depth * kBlock;
+        return needed > floor_ ? needed : floor_;
+    }
 
 #ifdef __APPLE__
     /* per-thread workgroup membership; loops call wgMaintain() each pass

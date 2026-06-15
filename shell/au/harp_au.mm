@@ -50,7 +50,14 @@ static constexpr UInt32 kNumAuParams = sizeof(kAuParams) / sizeof(kAuParams[0]);
 struct HarpAU {
     AudioComponentPlugInInterface iface; /* MUST be first */
     AudioComponentInstance compInstance = nullptr;
-    HarpRuntime rt; /* one device per AU instance — no singleton */
+    HarpRuntime rt; /* one device per AU instance — no singleton.
+                     * NOTE (P4): the VST3 shell shares a device session across
+                     * instances via the runtime registry (shell/runtime_registry.h);
+                     * the AU shell does NOT yet — it keeps its own by-value runtime,
+                     * so AU instances can't form a multitimbral group on one unit.
+                     * Single-instance AU is unaffected. Migrating AU to the registry
+                     * (mirroring plugin.cpp's RuntimeHandle/owner pattern) is a
+                     * tracked follow-up; until then, multitimbral aliasing is VST3-only. */
 
     bool initialized = false;
     bool offline = false;

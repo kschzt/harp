@@ -8,6 +8,10 @@
  * Remaining spec deviation, by design: no four-actions UI yet —
  * mismatches auto-resolve by Push-with-archive, which is loss-free.
  */
+#include <cstring>
+#include <string>
+#include <vector>
+
 #include "pluginterfaces/base/fplatform.h"
 #include "pluginterfaces/base/funknown.h"
 #include "pluginterfaces/base/ibstream.h"
@@ -21,6 +25,7 @@
 #include "public.sdk/source/vst/vsteditcontroller.h"
 
 #include "runtime.h"
+#include "runtime_registry.h"
 #include "ump.h"
 
 using namespace Steinberg;
@@ -58,6 +63,15 @@ class HarpProcessor : public AudioEffect {
 public:
     HarpProcessor() { setControllerClass(kHarpControllerUID); }
 
+    /* Defensive teardown: the host calls setActive(false) before destroying
+     * us (which releases the handle), but if it doesn't, release here so the
+     * shared refcount is correct and a private runtime is not leaked — the
+     * same net cleanup the old by-value member's ~HarpRuntime gave. */
+    ~HarpProcessor() override {
+        runtime_release(handle_);
+        handle_ = RuntimeHandle{};
+    }
+
     static FUnknown *createInstance(void *) {
         return (IAudioProcessor *)new HarpProcessor();
     }
@@ -75,32 +89,111 @@ public:
 
     tresult PLUGIN_API setupProcessing(ProcessSetup &setup) override {
         rate_ = (uint32_t)setup.sampleRate;
+        maxBlock_ = (uint32_t)setup.maxSamplesPerBlock;
         offline_ = setup.processMode == kOffline;
-        /* the ring cushion (and thus reported latency) scales with the
-         * DAW's block size — a 1024-sample pull needs a deeper ring than
-         * a 64-sample one */
-        rt_.configure(rate_, (uint32_t)setup.maxSamplesPerBlock);
+        /* The ring cushion (and thus reported latency) scales with the DAW's
+         * block size — a 1024-sample pull needs a deeper ring than a 64-sample
+         * one. We CAPTURE the params here and let the OWNER apply them via
+         * rt->configure() at acquire time (setActive), so the single-instance
+         * sequence configure()->start() stays byte-identical even though the
+         * runtime now comes from the registry. setupProcessing runs while
+         * inactive (no runtime yet) for a fresh instance; if a runtime is
+         * already acquired (a re-setup) and we own it, configure it now too. */
+        if (runtime() && owner()) runtime()->configure(rate_, maxBlock_);
         return AudioEffect::setupProcessing(setup);
     }
 
     tresult PLUGIN_API setActive(TBool state) override {
-        if (state)
-            rt_.start(rate_);
-        else
-            rt_.stop();
+        if (state) {
+            /* Idempotent against a redundant setActive(true) (some hosts double-
+             * activate): drop any handle we already hold before re-acquiring, so
+             * we never leak a reference or strand a shared session's refcount. */
+            if (handle_.rt) {
+                runtime_release(handle_);
+                handle_ = RuntimeHandle{};
+            }
+            /* Acquire the (possibly shared) runtime for THIS instance's target
+             * unit. The wanted serial is the explicit target, in priority:
+             *   1. HARP_DEVICE_SERIAL env — the field/test pin (also how the
+             *      out-of-process host forces a unit, like HARP_OUT_SLOTS).
+             *   2. the loaded bundle's usb serial, if the project pinned one.
+             *   3. else "" — NO explicit target -> a fresh, UNSHARED runtime
+             *      that auto-selects, byte-identical to the old by-value member
+             *      (the golden / single-instance / #16 multi-device gate). */
+            std::string wantSerial;
+            if (const char *e = getenv("HARP_DEVICE_SERIAL"); e && e[0])
+                wantSerial = e;
+            else if (!pendingState_.empty())
+                wantSerial = HarpRuntime::bundleWantedSerial(pendingState_.data(),
+                                                             pendingState_.size());
+
+            handle_ = runtime_acquire(wantSerial);
+            if (owner()) {
+                /* First/sole instance for this unit: drive it exactly as the
+                 * old by-value runtime did — configure, stage the project's
+                 * bundle (stage-before-start, as setState did pre-acquire),
+                 * then start. */
+                runtime()->configure(rate_, maxBlock_);
+                if (!pendingState_.empty())
+                    runtime()->setStateBundle(pendingState_.data(), pendingState_.size());
+                runtime()->start(rate_);
+            }
+            /* owner == false: the shared session is already configured/started
+             * and streaming under the sibling owner; this attached instance
+             * stays dormant (P4) — nothing to configure/start here. */
+        } else {
+            /* Release: the LAST owner/holder of a shared runtime stops+destroys
+             * it (joining its threads); an attached instance just drops its
+             * reference; a private (unshared) runtime is torn down outright. */
+            runtime_release(handle_);
+            handle_ = RuntimeHandle{};
+        }
         return AudioEffect::setActive(state);
     }
 
     uint32 PLUGIN_API getLatencySamples() override {
-        return rt_.latencySamples();
+        /* OWNER (or inactive, pre-acquire): the historical value — a pure
+         * function of the DAW block size, so it's byte-identical whether we ask
+         * the live runtime or compute it statically (the runtime now arrives
+         * from the registry at activate-time, so a host querying latency in the
+         * inactive window has nothing to ask). ATTACHED instances emit silence
+         * with no PDC alignment, so they report 0. */
+        if (owner() && runtime()) return runtime()->latencySamples();
+        if (handle_.rt && !owner()) return 0; /* attached: dormant silence */
+        return HarpRuntime::latencyFor(maxBlock_);
     }
 
     tresult PLUGIN_API canProcessSampleSize(int32 symbolicSampleSize) override {
         return symbolicSampleSize == kSample32 ? kResultTrue : kResultFalse;
     }
 
+    /* Zero the output bus and flag it silent. The dormant-attached path (P4)
+     * and any pre-acquire call route here: no runtime touch, no event queueing,
+     * just clean silence so the host bus is well-defined. */
+    tresult processSilence(ProcessData &data) {
+        if (data.numOutputs < 1 || data.numSamples <= 0 ||
+            data.outputs[0].numChannels < 1 || !data.outputs[0].channelBuffers32)
+            return kResultOk;
+        int32 nch = data.outputs[0].numChannels;
+        for (int32 c = 0; c < nch; c++) {
+            float *ch = data.outputs[0].channelBuffers32[c];
+            if (ch) memset(ch, 0, (size_t)data.numSamples * sizeof(float));
+        }
+        data.outputs[0].silenceFlags = (nch >= 64) ? ~0ull : ((1ull << nch) - 1);
+        return kResultOk;
+    }
+
     tresult PLUGIN_API process(ProcessData &data) override {
-        auto &rt = rt_;
+        /* ATTACHED (owner == false) or unacquired: a sibling owns the shared
+         * session — this instance MUST NOT touch the runtime's SPSC audio ring
+         * or event queue (it would corrupt the single-producer/single-consumer
+         * invariants the owner relies on). It also must not pull audio (one
+         * consumer) or queue events. P4 behaviour: emit SILENCE and queue
+         * nothing. (P5 gives attached instances their own part's audio + a
+         * per-shell event source, lifting this dormancy.) */
+        if (!owner() || !runtime()) return processSilence(data);
+
+        HarpRuntime &rt = *runtime();
 
         /* Stream-domain "now" for this block: events at DAW offset s map to
          * SSI base + s; the latency term is repaid by the host's PDC, so
@@ -258,10 +351,15 @@ public:
         return kResultOk;
     }
 
-    /* component state = Recall Bundle (§15.3) */
+    /* component state = Recall Bundle (§15.3). getStateBundle is a ctlMutex_-
+     * guarded READ of the shared device state, so it is safe for an ATTACHED
+     * instance too — it reports the same project state the shared session
+     * holds. With no runtime yet (queried before activate) there is nothing
+     * to pull. */
     tresult PLUGIN_API getState(IBStream *state) override {
+        if (!runtime()) return kResultFalse;
         std::vector<uint8_t> bundle;
-        if (!rt_.getStateBundle(bundle)) return kResultFalse;
+        if (!runtime()->getStateBundle(bundle)) return kResultFalse;
         int32 written = 0;
         return state->write(bundle.data(), (int32)bundle.size(), &written);
     }
@@ -275,14 +373,55 @@ public:
             if (got < (int32)sizeof buf) break;
         }
         if (bundle.empty()) return kResultFalse;
-        return rt_.setStateBundle(bundle.data(), bundle.size())
-                   ? kResultOk
-                   : kResultFalse;
+        /* ALWAYS stash the raw bundle: it is this instance's project state and
+         * the source of the registry's wanted serial at acquire time. (On
+         * project-open setState lands before setupProcessing/setActive, so the
+         * runtime usually does not exist yet — staging here reproduces today's
+         * stage-before-start; the owner applies it just before start().) */
+        pendingState_ = bundle;
+
+        if (owner() && runtime())
+            /* Live, sole/owning instance: push now, exactly as before. */
+            return runtime()->setStateBundle(bundle.data(), bundle.size()) ? kResultOk
+                                                                      : kResultFalse;
+        /* ATTACHED: the shared session is the OWNER's to (re)assert — an
+         * attached push would fight the owner's "Live wins" bundle on one
+         * device. So we only stage locally (P5 will route per-part state). */
+        /* No runtime yet: staged above; the owner will apply it at activate. */
+        return kResultOk;
     }
 
 private:
-    HarpRuntime rt_; /* one device per plugin instance — no singleton */
+    /* The runtime this instance drives — obtained from the PROCESS-GLOBAL
+     * registry (P4), not owned by value. Instances that target the SAME unit
+     * (same explicit serial) share ONE runtime / ONE USB claim; that's the
+     * prerequisite for multitimbral aliasing (P5). A single instance, or one
+     * that auto-selects (no explicit serial), gets its OWN fresh runtime with
+     * handle_.owner == true and behaves BYTE-IDENTICALLY to the old by-value
+     * member. See runtime_registry.h for the "not the old singleton" rule.
+     *   owner == true:  drive normally (configure / pull audio / queue events /
+     *                   get+set state) — exactly as today.
+     *   owner == false: ATTACHED — a sibling already owns and streams the
+     *                   shared session. This instance stays DORMANT in P4: it
+     *                   MUST NOT touch the runtime's SPSC audio ring or event
+     *                   queue (would break the single-producer/consumer
+     *                   invariants). process() outputs silence and queues
+     *                   nothing; getState reads the shared state (safe). P5
+     *                   gives attached instances their own part's audio + a
+     *                   per-shell event source. */
+    RuntimeHandle handle_;
+    HarpRuntime *runtime() const { return handle_.rt; }
+    bool owner() const { return handle_.owner; }
     uint32_t rate_ = 48000;
+    uint32_t maxBlock_ = 1024; /* captured in setupProcessing; the owner feeds
+                                  it to rt->configure() at acquire/start time
+                                  (the ring cushion scales with it) */
+    /* Raw recall bundle staged by setState BEFORE a runtime exists (state is
+     * restored on project-open, before setActive/acquire). The OWNER applies
+     * it via setStateBundle() right before start(), reproducing today's
+     * stage-before-start ordering. Also the source of the wanted serial used
+     * as the registry key when no HARP_DEVICE_SERIAL env pins one. */
+    std::vector<uint8_t> pendingState_;
     bool offline_ = false;
     /* per-param ramp-synthesis state: last emitted point + pending folded
      * point awaiting the 256-sample thinning interval */

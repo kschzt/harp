@@ -17,6 +17,16 @@
  *   - optionally two runtimes at once (--instances 2): the multi-device
  *     path, two devices, two of every thread.
  *
+ * Runtimes now come from the PROCESS-GLOBAL registry (P4), exactly as the
+ * plugin obtains them — so --instances N exercises the registry's concurrent
+ * acquire/release under TSan. With HARP_DEVICE_SERIAL set, all N instances
+ * name the SAME serial: ONE owner runtime / ONE claim, N-1 attached handles
+ * (the shared-session path). With no serial, each instance gets its OWN fresh
+ * unregistered runtime (the multi-device path) — every instance is an owner.
+ * Only OWNER instances configure/start and run the drive threads, matching
+ * plugin.cpp: an attached instance is dormant in P4 and must not touch the
+ * shared runtime's SPSC rings/queues.
+ *
  * Clean exit code 0 + no "WARNING: ThreadSanitizer" in stderr = pass.
  */
 #include <atomic>
@@ -29,6 +39,7 @@
 #include <vector>
 
 #include "runtime.h"
+#include "runtime_registry.h"
 
 static std::atomic<bool> g_run{true};
 
@@ -81,30 +92,44 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--block") && i + 1 < argc) block = (uint32_t)atoi(argv[++i]);
     }
-    fprintf(stderr, "tsan-host: %d instance(s), %d s, block %u\n", instances, seconds, block);
+    /* The registry key, exactly as the plugin computes it: HARP_DEVICE_SERIAL
+     * pins a unit. Set it (with --instances >1) to exercise SHARING — N
+     * instances on one serial, one owner runtime, one claim. Unset -> each
+     * instance auto-selects its own fresh runtime (the multi-device path). */
+    const char *envSerial = getenv("HARP_DEVICE_SERIAL");
+    std::string wantSerial = (envSerial && envSerial[0]) ? envSerial : std::string();
+    fprintf(stderr, "tsan-host: %d instance(s), %d s, block %u, serial=\"%s\"\n", instances,
+            seconds, block, wantSerial.c_str());
 
-    std::vector<HarpRuntime *> rts;
+    std::vector<RuntimeHandle> handles;
     std::vector<std::thread> audio, control;
-    for (int k = 0; k < instances; k++) rts.push_back(new HarpRuntime());
-    for (auto *rt : rts) {
-        rt->configure(48000, block);
-        rt->start(48000); /* device-less is fine — supervisor retries, threads still run */
+    /* Acquire all handles first so the concurrent-acquire bookkeeping (and, for
+     * a shared serial, the owner/attached split) is established before driving.
+     * The owner of a shared serial is the first acquire; the rest attach. */
+    for (int k = 0; k < instances; k++) handles.push_back(runtime_acquire(wantSerial));
+    for (auto &h : handles) {
+        if (!h.owner) continue; /* attached: dormant in P4 — do not drive it */
+        h.rt->configure(48000, block);
+        h.rt->start(48000); /* device-less is fine — supervisor retries, threads still run */
     }
     /* let the supervisors connect/claim before flooding */
     struct timespec s = {1, 0};
     nanosleep(&s, nullptr);
-    for (auto *rt : rts) {
-        audio.emplace_back(audio_thread, rt, block);
-        control.emplace_back(control_thread, rt, seconds);
+    /* Drive ONLY owner runtimes: an attached instance must not touch the shared
+     * runtime's SPSC audio ring or event queue (single-producer/consumer), so
+     * it spawns no audio/control thread — matching plugin.cpp's process(). */
+    for (auto &h : handles) {
+        if (!h.owner) continue;
+        audio.emplace_back(audio_thread, h.rt, block);
+        control.emplace_back(control_thread, h.rt, seconds);
     }
     for (int t = 0; t < seconds; t++) nanosleep(&s, nullptr);
     g_run.store(false);
     for (auto &th : control) th.join();
     for (auto &th : audio) th.join();
-    for (auto *rt : rts) {
-        rt->stop();
-        delete rt; /* dtor path too */
-    }
+    /* Release every handle: the last release of the shared runtime stops+
+     * destroys it (joining its threads); a private runtime is torn down here. */
+    for (auto &h : handles) runtime_release(h);
     fprintf(stderr, "tsan-host: done\n");
     return 0;
 }

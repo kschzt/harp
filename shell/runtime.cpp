@@ -1219,6 +1219,40 @@ bool HarpRuntime::bundleParams(const uint8_t *data, size_t len, harp_store *stor
     return true;
 }
 
+/* Runtime-free read of the bundle's wanted usb serial (§15.3 key 5 ->
+ * {0 vid, 1 pid, 2 serial}). Mirrors setStateBundle's key-5 decode but takes
+ * nothing and touches no state — the registry calls it before a runtime
+ * exists. Returns "" on any miss (no key 5, no serial, or a parse failure):
+ * "" means "no explicit target", which the registry maps to a fresh unshared
+ * runtime, exactly as an env-less / bundle-less instance gets today. */
+std::string HarpRuntime::bundleWantedSerial(const uint8_t *data, size_t len) {
+    if (!data || !len) return std::string();
+    harp_cdec d;
+    harp_cdec_init(&d, data, len);
+    uint64_t n;
+    if (!harp_cdec_map(&d, &n)) return std::string();
+    for (uint64_t i = 0; i < n && !d.err; i++) {
+        uint64_t key;
+        if (!harp_cdec_uint(&d, &key)) return std::string();
+        if (key == 5) { /* usb-identity: {0 vid, 1 pid, 2 serial} */
+            uint64_t mn, mk;
+            const char *s = nullptr;
+            size_t sl = 0;
+            if (!harp_cdec_map(&d, &mn)) return std::string();
+            for (uint64_t j = 0; j < mn && !d.err; j++) {
+                if (!harp_cdec_uint(&d, &mk)) return std::string();
+                if (mk == 2) {
+                    if (!harp_cdec_text(&d, &s, &sl)) return std::string();
+                } else if (!harp_cdec_skip(&d))
+                    return std::string();
+            }
+            return std::string(s ? s : "", s ? sl : 0);
+        }
+        if (!harp_cdec_skip(&d)) return std::string();
+    }
+    return std::string();
+}
+
 bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
     if (!storeOk_ || !len) return false;
     harp_cdec d;
