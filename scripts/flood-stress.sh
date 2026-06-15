@@ -16,11 +16,13 @@ set -e
 HOST=${HARP_VST3_HOST:-./build-vst/harp-vst3-host}
 PLUGIN=${HARP_SHELL:-$HOME/.vst3/harp-shell.vst3}
 PROBE=${HARP_PROBE:-./build/harp-probe}
-# --seconds is AUDIO seconds, and the flood renders OFFLINE (faster than
-# realtime through the null device — ~3x), so wall time ≈ audio/3: 60 s of audio
-# only ran ~20 s. 90 s/run (×2 = ~3 min of dense-automation audio) lands near a
-# minute of wall-clock hammering — long enough for drift/leak/counter creep to
-# surface. Block size stays 64 (the per-second automation density, not length).
+# --seconds is AUDIO seconds. The flood runs THROUGH the real Pi over USB, but
+# host-paced/offline (the host feeds blocks as fast as the USB round-trip
+# allows, not gated to a realtime audio clock), so it renders ~3x faster than
+# realtime: 60 s of audio only took ~20 s wall. 90 s/run (×2 = ~3 min of
+# dense-automation audio) lands near a minute of wall-clock hammering — long
+# enough for drift/leak/counter creep to surface. Block size stays 64 (the
+# per-second automation density, not the length).
 SECS=${HARP_FLOOD_SECONDS:-90}
 
 # Pin a known start state on the device (front-panel sets persist past the
