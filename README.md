@@ -67,7 +67,7 @@ byte-compares the result on every push. The plugin shell builds and is
 CI-validated on **macOS, Windows, and Linux** — a VST3 on all three
 (pluginval strictness 10 on macOS + Windows) plus an Audio Unit on macOS
 (`auval`). The four-actions recall UI, a CLAP port, and the Ethernet binding
-are next (see [Status](#status) for the full honest list).
+are next (see [Status](#status) for the full list).
 
 ## Repository map
 
