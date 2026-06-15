@@ -116,6 +116,39 @@ if(LIBUSB_FOUND)
   endif()
   message(STATUS "harp-shell: building VST3 shell with libusb")
 
+  # tsan-host (debt #17): the shell runtime, statically linked into a TSan
+  # main image and driven directly (no plugin boundary — TSan must be in
+  # the main image, not a dlopen'd bundle). Built only with -DHARP_TSAN=ON;
+  # run against a real device via scripts/tsan-shell.sh.
+  option(HARP_TSAN "Build tsan-host: ThreadSanitize the shell runtime" OFF)
+  if(HARP_TSAN)
+    add_executable(tsan-host
+      ${CMAKE_CURRENT_SOURCE_DIR}/../tsan-host/main.cpp
+      ${HARP_ROOT}/shell/runtime.cpp
+      ${HARP_ROOT}/host/usb_io.c
+      ${HARP_ROOT}/host/client.c
+      ${HARP_ROOT}/core/src/cbor.c
+      ${HARP_ROOT}/core/src/sha256.c
+      ${HARP_ROOT}/core/src/frame.c
+      ${HARP_ROOT}/core/src/object.c
+      ${HARP_ROOT}/core/src/store.c
+      ${HARP_ROOT}/core/src/envelope.c
+      ${HARP_ROOT}/core/src/link.c
+      ${HARP_ROOT}/core/src/audio.c
+      ${HARP_PLAT_SRC})
+    target_include_directories(tsan-host PRIVATE
+      ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
+      ${LIBUSB_INCLUDE_DIRS})
+    target_compile_definitions(tsan-host PRIVATE HAVE_LIBUSB)
+    target_compile_options(tsan-host PRIVATE -fsanitize=thread -g -O1)
+    target_link_options(tsan-host PRIVATE -fsanitize=thread)
+    if(LIBUSB_LIBRARY_DIRS)
+      target_link_directories(tsan-host PRIVATE ${LIBUSB_LIBRARY_DIRS})
+    endif()
+    target_link_libraries(tsan-host ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS})
+    message(STATUS "tsan-host: ThreadSanitizer harness for the shell runtime")
+  endif()
+
   # SMTG emits the bundle under VST3/<config>/ ($<CONFIG> = multi-config safe).
   set(HARP_SHELL_BUNDLE ${CMAKE_BINARY_DIR}/VST3/$<CONFIG>/harp-shell.vst3)
   if(APPLE)
