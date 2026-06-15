@@ -131,12 +131,16 @@ public:
                 if (ev.type == Event::kNoteOnEvent) {
                     uint32_t note = (uint32_t)(ev.noteOn.pitch & 0x7f);
                     uint32_t vel = (uint32_t)(ev.noteOn.velocity * 127.f + 0.5f);
+                    uint32_t chan = (uint32_t)ev.noteOn.channel & 0xf; /* -> device part (P2.1) */
                     if (vel == 0) vel = 1;
                     if (vel > 127) vel = 127;
-                    rt.queueNote(ump_note_on(note, vel), base + (uint64_t)ev.sampleOffset);
+                    rt.queueNote(ump_note_on(note, vel, chan),
+                                 base + (uint64_t)ev.sampleOffset);
                 } else if (ev.type == Event::kNoteOffEvent) {
                     uint32_t note = (uint32_t)(ev.noteOff.pitch & 0x7f);
-                    rt.queueNote(ump_note_off(note), base + (uint64_t)ev.sampleOffset);
+                    uint32_t chan = (uint32_t)ev.noteOff.channel & 0xf;
+                    rt.queueNote(ump_note_off(note, chan),
+                                 base + (uint64_t)ev.sampleOffset);
                 }
             }
         }

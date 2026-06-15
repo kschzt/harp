@@ -116,8 +116,11 @@ typedef struct {
     uint32_t note_seq;
     arp_state arp;
 } part;
-#define NPARTS 1
-static part g_parts[NPARTS] = {{.note = -1}};
+#define NPARTS 16
+/* every part starts idle: note -1 AND arp.sounding -1 (else part_active would
+ * read the zero-init sounding==0 as "holding note 0" before the first stream
+ * reset). GNU range designator (engine.c is gnu11). */
+static part g_parts[NPARTS] = {[0 ... NPARTS - 1] = {.note = -1, .arp = {.sounding = -1}}};
 
 /* note state: p->note crosses threads (panic paths from session/panel) */
 static inline int note_get(part *p) {
@@ -225,8 +228,12 @@ static void ramps_advance(uint64_t pos) {
     }
 }
 
+/* with_drone: part 0 renders the full voice (drone + note); parts 1..15 are
+ * NOTE-ONLY (no drone). The drone-only smoothed params/coeffs are still
+ * computed when !with_drone (harmless, unused) so coefficient ORDER and the
+ * note filter's f/q/shape/master are byte-identical across parts (§P2.1). */
 static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
-                          uint64_t pos) {
+                          uint64_t pos, bool with_drone) {
     synth_voice *v = &p->voice; /* per-part voice; note state from p too */
     if (!v->s_init) { /* first block: land on targets, no glide-in from zero */
         v->s_pitch = param_value(1);
@@ -308,17 +315,31 @@ static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
         float nfreq = v->n_freq;
 
         for (; i < end; i++) {
-            /* drone oscillator pair */
-            v->phase_l += freq / rate;
-            if (v->phase_l >= 1.0f) v->phase_l -= 1.0f;
-            v->phase_r += freq * detune / rate;
-            if (v->phase_r >= 1.0f) v->phase_r -= 1.0f;
-            float osc_l = sinf(2.0f * (float)M_PI * v->phase_l);
-            osc_l += ((2.0f * v->phase_l - 1.0f) - osc_l) * shape;
-            float osc_r = sinf(2.0f * (float)M_PI * v->phase_r);
-            osc_r += ((2.0f * v->phase_r - 1.0f) - osc_r) * shape;
+            /* drone oscillator pair + its state-variable lowpass: PART 0 ONLY
+             * (parts 1..15 are note-only). Gating the phase-advance and the
+             * drone filter together leaves the drone state (phase_*, low_*,
+             * band_*) frozen for note-only parts and keeps osc_l/osc_r local
+             * to this branch (no unused-variable warning when !with_drone). */
+            if (with_drone) {
+                v->phase_l += freq / rate;
+                if (v->phase_l >= 1.0f) v->phase_l -= 1.0f;
+                v->phase_r += freq * detune / rate;
+                if (v->phase_r >= 1.0f) v->phase_r -= 1.0f;
+                float osc_l = sinf(2.0f * (float)M_PI * v->phase_l);
+                osc_l += ((2.0f * v->phase_l - 1.0f) - osc_l) * shape;
+                float osc_r = sinf(2.0f * (float)M_PI * v->phase_r);
+                osc_r += ((2.0f * v->phase_r - 1.0f) - osc_r) * shape;
 
-            /* note oscillator pair (own filter state, same patch character) */
+                v->low_l += f * v->band_l;
+                float high_l = osc_l - v->low_l - q * v->band_l;
+                v->band_l += f * high_l;
+                v->low_r += f * v->band_r;
+                float high_r = osc_r - v->low_r - q * v->band_r;
+                v->band_r += f * high_r;
+            }
+
+            /* note oscillator pair (own filter state, same patch character) —
+             * runs for ALL parts */
             v->n_phase_l += nfreq / rate;
             if (v->n_phase_l >= 1.0f) v->n_phase_l -= 1.0f;
             v->n_phase_r += nfreq * detune / rate;
@@ -328,13 +349,6 @@ static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
             float nosc_r = sinf(2.0f * (float)M_PI * v->n_phase_r);
             nosc_r += ((2.0f * v->n_phase_r - 1.0f) - nosc_r) * shape;
 
-            v->low_l += f * v->band_l;
-            float high_l = osc_l - v->low_l - q * v->band_l;
-            v->band_l += f * high_l;
-            v->low_r += f * v->band_r;
-            float high_r = osc_r - v->low_r - q * v->band_r;
-            v->band_r += f * high_r;
-
             v->n_low_l += f * v->n_band_l;
             float nhigh_l = nosc_l - v->n_low_l - q * v->n_band_l;
             v->n_band_l += f * nhigh_l;
@@ -342,9 +356,24 @@ static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
             float nhigh_r = nosc_r - v->n_low_r - q * v->n_band_r;
             v->n_band_r += f * nhigh_r;
 
-            interleaved[2 * i] = (v->low_l * drone_lvl + v->n_low_l * env) * master * 0.5f;
-            interleaved[2 * i + 1] =
-                (v->low_r * drone_lvl + v->n_low_r * env) * master * 0.5f;
+            /* Part 0 (with_drone) is the PRIMARY: it renders first and WRITES
+             * every sample with a direct '=', bit-identical to P2.0's store —
+             * signed zero included (the groove render legitimately produces
+             * -0.0f samples; a memset+accumulate would flip them to +0.0f and
+             * break the byte hash). Note-only parts 1..15 ACCUMULATE on top
+             * with '+='. The expression inside the ternary is char-for-char
+             * P2.0's, and `float out` is float-typed so the rounding matches. */
+            float out_l =
+                with_drone ? (v->low_l * drone_lvl + v->n_low_l * env) : (v->n_low_l * env);
+            float out_r =
+                with_drone ? (v->low_r * drone_lvl + v->n_low_r * env) : (v->n_low_r * env);
+            if (with_drone) {
+                interleaved[2 * i] = out_l * master * 0.5f;
+                interleaved[2 * i + 1] = out_r * master * 0.5f;
+            } else {
+                interleaved[2 * i] += out_l * master * 0.5f;
+                interleaved[2 * i + 1] += out_r * master * 0.5f;
+            }
         }
     }
 }
@@ -710,8 +739,9 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                 if (ev->end && ev->end < pos) CTR_INC(g_ramp_late);
             } else if (ev->ts && ev->ts < pos)
                 CTR_INC(g_evt_late);
-            /* route to the event's part (== part 0 for NPARTS=1); the note +
-             * arp cases mutate p, PARAM_SET/RAMP apply to GLOBAL params/ramps */
+            /* route to the event's part (real routing now, §P2.1); the note +
+             * arp cases mutate p, PARAM_SET/RAMP apply to GLOBAL params/ramps,
+             * and ALL_OFF/TRANSPORT act across ALL parts (see below) */
             part *p = &g_parts[ev->channel % NPARTS];
             switch (ev->kind) {
                 case DEV_EV_NOTE_ON:
@@ -734,20 +764,29 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                     }
                     break;
                 case DEV_EV_ALL_OFF:
-                    arp_reset(p);
-                    note_put(p, -1);
+                    /* global panic: reset arp + clear note on EVERY part */
+                    for (size_t pi = 0; pi < NPARTS; pi++) {
+                        arp_reset(&g_parts[pi]);
+                        note_put(&g_parts[pi], -1);
+                    }
                     break;
                 case DEV_EV_TRANSPORT: {
-                    bool was = p->arp.playing;
-                    p->arp.playing = (ev->a & 1) != 0;
-                    if (ev->a & (1u << 3)) p->arp.tempo = ev->v;
-                    if (ev->a & (1u << 5)) {
-                        p->arp.anchor_ppq = ev->ppq;
-                        p->arp.anchor_ssi = ev->ts ? ev->ts : pos;
-                        p->arp.anchor_valid = true;
+                    /* transport has no channel: BROADCAST the one timeline to
+                     * every part's arp (identical anchor/playing/tempo math
+                     * per part, including the was/stop/start handling) */
+                    for (size_t pi = 0; pi < NPARTS; pi++) {
+                        part *tp = &g_parts[pi];
+                        bool was = tp->arp.playing;
+                        tp->arp.playing = (ev->a & 1) != 0;
+                        if (ev->a & (1u << 3)) tp->arp.tempo = ev->v;
+                        if (ev->a & (1u << 5)) {
+                            tp->arp.anchor_ppq = ev->ppq;
+                            tp->arp.anchor_ssi = ev->ts ? ev->ts : pos;
+                            tp->arp.anchor_valid = true;
+                        }
+                        if (!tp->arp.playing && was) arp_voice_off(tp); /* stop: silence */
+                        if (tp->arp.playing && !was) tp->arp.step = 0;  /* start on step 1 */
                     }
-                    if (!p->arp.playing && was) arp_voice_off(p); /* stop: silence */
-                    if (p->arp.playing && !was) p->arp.step = 0;  /* start on step 1 */
                     break;
                 }
                 case DEV_EV_PARAM_SET:
@@ -782,26 +821,45 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
     return next;
 }
 
+/* A part is "active" (worth rendering) if it sounds now or still rings:
+ * a held/arp note, a non-empty latch, an arp voice, or a decaying envelope.
+ * The env>1e-4f term keeps release tails alive — env only decays WHILE the
+ * part renders, so an active part keeps rendering until env<1e-4f, then goes
+ * silent and terminates. For ch0-only input, parts 1..15 have note=-1, empty
+ * latch, sounding=-1, env=0 -> inactive -> never rendered. */
+static bool part_active(const part *p) {
+    return atomic_load_explicit(&p->note, memory_order_relaxed) >= 0 ||
+           p->arp.nlatch > 0 || p->arp.sounding >= 0 || p->voice.env > 1e-4f;
+}
+
 /* Render n samples starting at stream position `pos`, splitting at event
- * timestamps so application is sample-accurate (§9.2). Per part now: arp
- * steps fire for every part and the segment deadline is the min over all
- * parts; for NPARTS=1 this is part 0 alone and the render is a DIRECT WRITE
- * (multi-part summing is a later step — byte identity to HEAD is preserved). */
+ * timestamps so application is sample-accurate (§9.2). Multi-part now (§P2.1):
+ * arp steps fire for every part and the segment deadline is the min over all
+ * parts. Each segment is ZEROED, then part 0 ALWAYS renders the full voice
+ * (drone+note) and parts 1..15 accumulate NOTE-ONLY when active. For ch0-only
+ * input this is zero + part0(full) == P2.0's direct write, byte for byte. */
 static void render_with_events(float *interleaved, uint32_t n,
                                float rate, uint64_t pos) {
     uint32_t done = 0;
     while (done < n) {
         uint64_t next = evq_apply_due(pos + done, pos + n);
+        for (size_t pi = 0; pi < NPARTS; pi++)
+            arp_fire_due(&g_parts[pi], pos + done, rate); /* steps fire AT seg starts */
         for (size_t pi = 0; pi < NPARTS; pi++) {
-            part *p = &g_parts[pi];
-            arp_fire_due(p, pos + done, rate); /* steps fire AT segment starts */
-            uint64_t anext = arp_next_deadline(p, pos + done, rate);
+            uint64_t anext = arp_next_deadline(&g_parts[pi], pos + done, rate);
             if (anext && (next == 0 || anext < next)) next = anext;
         }
         uint32_t seg = next ? (uint32_t)(next - (pos + done)) : n - done;
         if (seg == 0) seg = 1; /* paranoia: guarantee forward progress */
         if (seg > n - done) seg = n - done;
-        engine_render(&g_parts[0], interleaved + 2 * done, seg, rate, pos + done);
+        /* part 0 ALWAYS renders first with a direct write (no pre-zero needed —
+         * it initialises every sample of the segment, bit-identical to P2.0) */
+        engine_render(&g_parts[0], interleaved + 2 * done, seg, rate, pos + done,
+                      true); /* part 0 ALWAYS: full voice (drone+note) */
+        for (size_t pi = 1; pi < NPARTS; pi++)
+            if (part_active(&g_parts[pi]))
+                engine_render(&g_parts[pi], interleaved + 2 * done, seg, rate,
+                              pos + done, false); /* parts 1..15: note-only, when active */
         done += seg;
     }
 }

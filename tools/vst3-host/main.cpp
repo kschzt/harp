@@ -88,7 +88,7 @@ int main(int argc, char **argv) {
                 "       [--seconds S] [--input sine[:HZ]|impulse|silence]\n"
                 "       [--set ID=NORMVALUE]... [--ramp ID=V0:V1]... [--notes N,N,..]\n"
                 "       [--lfo ID=HZ[:PTS_PER_BLOCK[:SHAPE]]]... [--flood]\n"
-                "       [--bpm B] [--chord N,N,..] [--loop STARTPPQ:ENDPPQ]\n"
+                "       [--bpm B] [--chord N,N,..] [--channel N] [--loop STARTPPQ:ENDPPQ]\n"
                 "       [--realtime] [--out FILE.wav] [--hash] [--json] [--expect-hash HEX]\n"
                 "       [--save-state FILE] [--load-state FILE]\n");
         return 2;
@@ -104,6 +104,7 @@ int main(int argc, char **argv) {
     std::vector<std::pair<uint32_t, double>> sets;
     std::vector<int> notes;    /* played sequentially at note_period spacing */
     std::vector<int> chord;    /* held from 0.1 s to the end (arp fodder) */
+    int channel = 0;           /* MIDI channel 0..15 for emitted notes -> device part (P2.1) */
     double bpm = 0;            /* >0: emit a playing transport (tempo, PPQ) */
     double loop_a = -1, loop_b = -1; /* PPQ loop region: jump b -> a */
     double note_period = 0.6;  /* s between note-ons; gate = 75% of period */
@@ -167,6 +168,10 @@ int main(int argc, char **argv) {
             }
         } else if (a == "--note-period") {
             note_period = atof(next().c_str());
+        } else if (a == "--channel") { /* MIDI channel for emitted notes, clamped 0..15 */
+            channel = atoi(next().c_str());
+            if (channel < 0) channel = 0;
+            if (channel > 15) channel = 15;
         } else if (a == "--ramp") { /* ID=V0:V1 over the whole duration */
             std::string kv = next();
             RampSpec r{};
@@ -435,7 +440,7 @@ int main(int argc, char **argv) {
                     Event ev{};
                     ev.type = Event::kNoteOnEvent;
                     ev.sampleOffset = (int32)(onAt - done);
-                    ev.noteOn.channel = 0;
+                    ev.noteOn.channel = (int16)channel;
                     ev.noteOn.pitch = (int16)cn;
                     ev.noteOn.velocity = 0.8f;
                     evList.addEvent(ev);
@@ -444,7 +449,7 @@ int main(int argc, char **argv) {
                     Event ev{};
                     ev.type = Event::kNoteOffEvent;
                     ev.sampleOffset = (int32)(n > 0 ? n - 1 : 0);
-                    ev.noteOff.channel = 0;
+                    ev.noteOff.channel = (int16)channel;
                     ev.noteOff.pitch = (int16)cn;
                     ev.noteOff.velocity = 0;
                     evList.addEvent(ev);
@@ -458,6 +463,7 @@ int main(int argc, char **argv) {
                 Event ev{};
                 ev.type = Event::kNoteOnEvent;
                 ev.sampleOffset = (int32)(on_at - (int64_t)done);
+                ev.noteOn.channel = (int16)channel;
                 ev.noteOn.pitch = (int16)notes[ni];
                 ev.noteOn.velocity = 0.9f;
                 ev.noteOn.noteId = -1;
@@ -467,6 +473,7 @@ int main(int argc, char **argv) {
                 Event ev{};
                 ev.type = Event::kNoteOffEvent;
                 ev.sampleOffset = (int32)(off_at - (int64_t)done);
+                ev.noteOff.channel = (int16)channel;
                 ev.noteOff.pitch = (int16)notes[ni];
                 ev.noteOff.velocity = 0.f;
                 ev.noteOff.noteId = -1;

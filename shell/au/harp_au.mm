@@ -524,10 +524,11 @@ static OSStatus au_MIDIEvent(void *self, UInt32 status, UInt32 data1, UInt32 dat
     auto &rt = au->rt;
     uint64_t ts = rt.streamPos() + rt.latencySamples() + offset;
     UInt32 kind = status & 0xF0;
+    uint32_t chan = (uint32_t)(status & 0x0F); /* MIDI channel -> device part (P2.1) */
     if (kind == 0x90 && data2 > 0) {
-        rt.queueNote(ump_note_on(data1, data2), ts);
+        rt.queueNote(ump_note_on(data1, data2, chan), ts);
     } else if (kind == 0x80 || (kind == 0x90 && data2 == 0)) {
-        rt.queueNote(ump_note_off(data1), ts);
+        rt.queueNote(ump_note_off(data1, chan), ts);
     } else if (kind == 0xB0 && (data1 == 120 || data1 == 123)) {
         rt.queueNote(ump_all_notes_off(), 0); /* panic, now */
     }
