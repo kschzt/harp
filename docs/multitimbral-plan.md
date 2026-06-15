@@ -9,8 +9,7 @@ audio owner). This doc is the build plan and the test matrix.
 
 1. **Part model — 16 parts, full per-part params.** Each MIDI channel (one UMP
    group, channels 0–15) is an independent monophonic synth: its own voice,
-   note state, per-param values, per-param ramps, and arp. The render sums all
-   active parts.
+   note state, per-param values, per-param ramps, and arp.
 
 2. **Addressing — channel-scoped, NOT ID-namespaced.** Notes are already
    channel-addressed (UMP word). Param-set (§9.2) and ramp (§9.4) events gain an
@@ -38,10 +37,16 @@ audio owner). This doc is the build plan and the test matrix.
    holds). The feeder drains every shell's ring and merges in timestamp order,
    stamping each shell's assigned channel. No hot ring is rewritten MPSC.
 
-6. **Audio owner — one stream, one puller.** The device renders one mixed
-   stream. The first shell to bind is the audio owner and pulls it; sibling
-   shells output silence (the user routes device audio from the owner's track).
-   Handoff follows the §15.2 controllership rule.
+6. **Per-part audio outputs + main mix.** Each part renders its own stereo pair
+   (16 × 2 = 32 channels), plus a summed stereo **main mix** (2 channels) =
+   **34 output channels**, declared in the channel map (§6.3) as "Main L/R",
+   "Part 1 L/R" … "Part 16 L/R". The shared session's audio plane carries all
+   slots; the runtime demuxes slot→shell so each track gets its own part's
+   audio (no audio-owner election). The host streams only active parts'
+   slots (`active-slots-out`, §8). **Determinism anchor:** the main mix with
+   only part 0 active == the current single-part output, so the existing
+   golden reproduces on the main-mix slots and the engine split stays
+   verifiable; per-part play gets new per-slot goldens.
 
 7. **Per-shell channel** is a plugin parameter (default: round-robin on attach,
    user-overridable), so a DAW project pins each track to its part.
@@ -64,7 +69,7 @@ audio owner). This doc is the build plan and the test matrix.
 | P | scope | risk | hw-validate? |
 |---|-------|------|--------------|
 | ~~P1~~ ✅ | Wire: `channel` key (key 5) on param/ramp encode+decode (runtime + device parse + `dev_event`), default 0, byte-identical for part 0. Unit test `test_event_channel` (byte-identity + round-trip + skip-unknown). Host+device compile-verified | low | done |
-| P2 | Device engine: 16 per-part voices/params/ramps/arp, channel routing, summed render | **high** (determinism) | **yes — golden regen** |
+| P2 | Device engine: 16 per-part voices/params/ramps/arp, channel routing; render to 34 channels (16 stereo parts + main mix); channel map (§6.3) | **high** (determinism) | **yes — golden regen** |
 | P3 | Device state/recall/panel: per-part param state in snapshot/ref/bundle; panel API part dim; capability + identity part-count | med | yes (recall round-trip) |
 | P4 | Host registry: session sharing by serial, refcount, acquire/release, audio owner | low | partial (2 instances → 1 claim) |
 | P5 | Host contributor merge: per-shell channel + event source, feeder merge, siblings silent; shells expose channel param | **high** (RT core) | **yes** |
