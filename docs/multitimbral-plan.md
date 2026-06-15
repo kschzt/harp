@@ -69,7 +69,9 @@ audio owner). This doc is the build plan and the test matrix.
 | P | scope | risk | hw-validate? |
 |---|-------|------|--------------|
 | ~~P1~~ ✅ | Wire: `channel` key (key 5) on param/ramp encode+decode (runtime + device parse + `dev_event`), default 0, byte-identical for part 0. Unit test `test_event_channel` (byte-identity + round-trip + skip-unknown). Host+device compile-verified | low | done |
-| P2 | Device engine: 16 per-part voices/params/ramps/arp, channel routing; render to 34 channels (16 stereo parts + main mix); channel map (§6.3) | **high** (determinism) | **yes — golden regen** |
+| ~~P2.0~~ ✅ | Engine per-part **data model**: `part` struct (voice+note+arp), `NPARTS=1`, all→part 0; params/ramps/evq/counters stay global. **Byte-identical** — golden+groove unchanged (A/B on PI4B-0003, both shells). Verified by a workflow (impl + 5-lens adversarial equivalence + completeness critic) then the hardware oracle | high | **done (golden held)** |
+| P2.1 | `NPARTS=16`; events route by `dev_event.channel` to their part; parts sum into the 2ch main mix. ⚠ **drone hazard**: the always-on drone would sum 16× — inactive parts must not contribute (drone gating / activation), else golden breaks. ch0 play ⇒ part 0 only ⇒ golden holds | **high** (determinism) | yes |
+| P2.2 | Render to 34 channels (16 stereo parts + main mix); channel map (§6.3); `active-slots-out`. ch0+main-mix ⇒ golden holds; add per-part goldens | **high** | **yes — new goldens** |
 | P3 | Device state/recall/panel: per-part param state in snapshot/ref/bundle; panel API part dim; capability + identity part-count | med | yes (recall round-trip) |
 | P4 | Host registry: session sharing by serial, refcount, acquire/release, audio owner | low | partial (2 instances → 1 claim) |
 | P5 | Host contributor merge: per-shell channel + event source, feeder merge, siblings silent; shells expose channel param | **high** (RT core) | **yes** |

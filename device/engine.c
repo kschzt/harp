@@ -51,26 +51,92 @@ static int param_step_index(uint32_t id) {
     return 0;
 }
 
-/* note state: g_note crosses threads (panic paths from session/panel);
- * vel and seq are render-thread-only (event application happens on the
- * render thread) and stay plain */
-static _Atomic int g_note = -1;
-static float g_note_vel = 0;
-static uint32_t g_note_seq = 0;
+/* ---------------- per-part types (P2.0) ----------------
+ *
+ * The synth voice, the note state, and the arpeggiator are all PER PART;
+ * their type defs are relocated here (verbatim, comments intact) so the
+ * 'part' struct can contain them by value. Params/ramps/event-queue stay
+ * global — events route to a part only on APPLICATION (evq_apply_due). */
 
-static inline int note_get(void) {
-    return atomic_load_explicit(&g_note, memory_order_relaxed);
+/* A small stereo drone synth: blended sine/saw oscillator (R detuned for
+ * width) through a Chamberlin state-variable lowpass. Every voice parameter
+ * is one of the 8 recallable params — the point is recall you can hear. */
+typedef struct {
+    float phase_l, phase_r;
+    float low_l, band_l, low_r, band_r;
+    /* control-rate-smoothed parameter values (§9.3: the device interpolates
+     * at its declared control rate — instant steps are zipper clicks) */
+    float s_pitch, s_shape, s_cutoff, s_reso, s_master, s_drone;
+    bool s_init;
+    /* note voice: envelope-gated, portamento via smoothed frequency */
+    float n_phase_l, n_phase_r;
+    float n_low_l, n_band_l, n_low_r, n_band_r;
+    float n_freq;   /* smoothed toward the sounding note */
+    float env;      /* envelope level 0..1 */
+    uint8_t env_reset; /* sub-blocks of fast decay before a fresh attack */
+    uint32_t seen_seq;
+} synth_voice;
+
+/* ---------------- the arpeggiator (§9.7 consumer) ----------------
+ *
+ * All state is render-thread-owned: note events mutate the latch from
+ * evq_apply_due (render thread), transport anchors arrive the same way,
+ * and the step clock fires between render segments. Musical position at
+ * SSI x derives from the anchor: ppq(x) = ppq0 + (x - ssi0) * tempo /
+ * (60 * rate) — linear until the next anchor (§9.7), so steps land on
+ * division boundaries sample-exactly BY CONSTRUCTION, and a loop wrap
+ * or locate is just a new anchor to realign against (T17). */
+#define ARP_LATCH_MAX 8
+
+typedef struct {
+    /* transport anchor */
+    bool playing;
+    bool anchor_valid;
+    double tempo;       /* BPM */
+    double anchor_ppq;  /* song position at anchor_ssi */
+    uint64_t anchor_ssi;
+    /* latch, in press order */
+    uint8_t latch[ARP_LATCH_MAX];
+    float vel[ARP_LATCH_MAX];
+    int nlatch;
+    /* stepping */
+    int step;            /* monotone step counter (mode maps it to a note) */
+    int sounding;        /* note the arp voice is holding, -1 = none */
+    uint64_t gate_off;   /* SSI to release `sounding` (0 = none pending) */
+} arp_state;
+
+/* One multitimbral part: a voice, its mono note state, and its arp. The
+ * note crosses threads (panic paths from session/panel); vel and seq are
+ * render-thread-only (event application happens on the render thread) and
+ * stay plain. */
+typedef struct {
+    synth_voice voice;
+    _Atomic int note;
+    float note_vel;
+    uint32_t note_seq;
+    arp_state arp;
+} part;
+#define NPARTS 1
+static part g_parts[NPARTS] = {{.note = -1}};
+
+/* note state: p->note crosses threads (panic paths from session/panel) */
+static inline int note_get(part *p) {
+    return atomic_load_explicit(&p->note, memory_order_relaxed);
 }
-static inline void note_put(int n) {
-    atomic_store_explicit(&g_note, n, memory_order_relaxed);
+static inline void note_put(part *p, int n) {
+    atomic_store_explicit(&p->note, n, memory_order_relaxed);
 }
 
-void engine_all_notes_off(void) { note_put(-1); }
+void engine_all_notes_off(void) {
+    for (size_t i = 0; i < NPARTS; i++) note_put(&g_parts[i], -1);
+}
 void engine_note_off_if(uint32_t note) {
-    int cur = note_get();
-    if (cur == (int)note) note_put(-1); /* benign CAS-free: worst case a
-                                           racing note-on wins, which is the
-                                           musically correct outcome */
+    for (size_t i = 0; i < NPARTS; i++) {
+        part *p = &g_parts[i];
+        if (note_get(p) == (int)note) note_put(p, -1); /* benign CAS-free: worst
+                                           case a racing note-on wins, which is
+                                           the musically correct outcome */
+    }
 }
 
 static dev_event g_evq[DEV_EVQ_CAP];
@@ -113,7 +179,7 @@ static dev_ramp g_ramps[NPARAMS];
  * timeline are stale BY DEFINITION and must not leak into this one.
  * (Learned from a jammed queue of never-due zombie events silently
  * dropping every new event.) */
-static void arp_stream_reset(void);
+static void arp_stream_reset(part *p);
 
 void evq_reset_for_new_stream(void) {
     pthread_mutex_lock(&g_evq_mu);
@@ -121,33 +187,19 @@ void evq_reset_for_new_stream(void) {
     pthread_mutex_unlock(&g_evq_mu);
     memset(g_ramps, 0, sizeof g_ramps);
     /* notes are performance state OF A STREAM: a note held across a stream
-     * stop/restart is a stuck note (its note-off died with the old stream) */
-    note_put(-1);
-    arp_stream_reset(); /* defined with the arp block below */
+     * stop/restart is a stuck note (its note-off died with the old stream).
+     * Per part now: each part's note + arp are stale BY DEFINITION. */
+    for (size_t i = 0; i < NPARTS; i++) {
+        part *p = &g_parts[i];
+        note_put(p, -1);
+        arp_stream_reset(p); /* defined with the arp block below */
+    }
     /* fence sequence space restarts with the stream (host resets its
      * queued-event counter at session start; both sides count from 0) */
     atomic_store_explicit(&g_evt_consumed, 0, memory_order_release);
 }
 /* ---------------- the sound engine ---------------- */
-
-/* A small stereo drone synth: blended sine/saw oscillator (R detuned for
- * width) through a Chamberlin state-variable lowpass. Every voice parameter
- * is one of the 8 recallable params — the point is recall you can hear. */
-typedef struct {
-    float phase_l, phase_r;
-    float low_l, band_l, low_r, band_r;
-    /* control-rate-smoothed parameter values (§9.3: the device interpolates
-     * at its declared control rate — instant steps are zipper clicks) */
-    float s_pitch, s_shape, s_cutoff, s_reso, s_master, s_drone;
-    bool s_init;
-    /* note voice: envelope-gated, portamento via smoothed frequency */
-    float n_phase_l, n_phase_r;
-    float n_low_l, n_band_l, n_low_r, n_band_r;
-    float n_freq;   /* smoothed toward the sounding note */
-    float env;      /* envelope level 0..1 */
-    uint8_t env_reset; /* sub-blocks of fast decay before a fresh attack */
-    uint32_t seen_seq;
-} synth_voice;
+/* (synth_voice is defined up top so 'part' can contain it — see P2.0.) */
 
 static float param_value(uint32_t id) {
     for (size_t i = 0; i < NPARAMS; i++)
@@ -173,8 +225,9 @@ static void ramps_advance(uint64_t pos) {
     }
 }
 
-static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float rate,
+static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
                           uint64_t pos) {
+    synth_voice *v = &p->voice; /* per-part voice; note state from p too */
     if (!v->s_init) { /* first block: land on targets, no glide-in from zero */
         v->s_pitch = param_value(1);
         v->s_shape = param_value(2);
@@ -207,10 +260,10 @@ static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float 
          * glide on every note makes perceived onsets interval-dependent —
          * measured r=0.86 between grid deviation and leap size, ±23 ms of
          * musical slop on sequenced 16ths. Real monosynths snap too. */
-        int note = note_get();
-        bool retrig = v->seen_seq != g_note_seq;
+        int note = note_get(p);
+        bool retrig = v->seen_seq != p->note_seq;
         if (retrig) {
-            v->seen_seq = g_note_seq;
+            v->seen_seq = p->note_seq;
             /* Envelope RESETS per note: without this, articulation depends
              * on how far the previous release decayed (measured transient
              * depth 0.06..0.99 across one take — heard as timing slop).
@@ -240,7 +293,7 @@ static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float 
             v->env *= 0.25f; /* fast decay sub-block */
             v->env_reset--;
         } else {
-            float env_target = gate ? g_note_vel : 0.0f;
+            float env_target = gate ? p->note_vel : 0.0f;
             float env_alpha =
                 1.0f - expf(-(float)SMOOTH_SUBBLOCK / ((gate ? atk_tau : rel_tau) * rate));
             v->env += env_alpha * (env_target - v->env);
@@ -299,7 +352,7 @@ static void engine_render(synth_voice *v, float *interleaved, uint32_t n, float 
 /* Free-running stream thread (§8.3 mode 0): the device clock owns the
  * stream; the MSC counts rendered samples; frames carry (epoch, msc). */
 
-static void render_with_events(synth_voice *v, float *interleaved, uint32_t n,
+static void render_with_events(float *interleaved, uint32_t n,
                                float rate, uint64_t pos);
 
 /* Host-paced loop (§8.3 mode 1): block on pacing frames, render the exact
@@ -309,7 +362,9 @@ static void render_with_events(synth_voice *v, float *interleaved, uint32_t n,
  * than real time is automatic — there is no clock here (audio.offline-rate). */
 static void host_paced_loop(device *d) {
     audio_state *a = &d->audio;
-    synth_voice voice = {0};
+    /* voice starts from zero at audio.start (T15); notes/arp are reset by
+     * evq_reset_for_new_stream, so zero ONLY the per-part voices here */
+    for (size_t i = 0; i < NPARTS; i++) g_parts[i].voice = (synth_voice){0};
     uint8_t frame[HARP_AUDIO_HDR_LEN + AUDIO_MAX_NSAMPLES * 2 * 4];
     float samples[AUDIO_MAX_NSAMPLES * 2];
     /* buffered endpoint reads (packet-multiple, see ffs.c) */
@@ -408,7 +463,7 @@ static void host_paced_loop(device *d) {
             CTR_INC(d->frame_errors);
             return;
         }
-        render_with_events(&voice, samples, n, (float)a->rate, h.ts);
+        render_with_events(samples, n, (float)a->rate, h.ts);
         harp_audio_hdr out = {HARP_AUDIO_FVER, 0, 2, h.epoch, h.ts, (uint16_t)n,
                               HARP_AUDIO_FMT_F32};
         harp_audio_hdr_encode(&out, frame);
@@ -427,7 +482,9 @@ void *audio_thread(void *arg) {
         fprintf(stderr, "harp-deviced: host-paced loop exited\n");
         return NULL;
     }
-    synth_voice voice = {0};
+    /* voice starts from zero at audio.start (T15); notes/arp are reset by
+     * evq_reset_for_new_stream, so zero ONLY the per-part voices here */
+    for (size_t i = 0; i < NPARTS; i++) g_parts[i].voice = (synth_voice){0};
     uint8_t frame[HARP_AUDIO_HDR_LEN + AUDIO_MAX_NSAMPLES * 2 * 4];
     float samples[AUDIO_MAX_NSAMPLES * 2];
     uint64_t msc = 0;
@@ -437,7 +494,7 @@ void *audio_thread(void *arg) {
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
     while (atomic_load_explicit(&a->running, memory_order_relaxed)) {
-        render_with_events(&voice, samples, a->nsamples, (float)a->rate, msc);
+        render_with_events(samples, a->nsamples, (float)a->rate, msc);
         harp_audio_hdr h = {HARP_AUDIO_FVER, discont ? HARP_AUDIO_DISCONT : 0, 2,
                             a->epoch, msc, (uint16_t)a->nsamples, HARP_AUDIO_FMT_F32};
         discont = false;
@@ -482,90 +539,70 @@ void *audio_thread(void *arg) {
  * (pos, limit) for render segmentation, or 0 if none. Render thread only. */
 /* ---------------- the arpeggiator (§9.7 consumer) ----------------
  *
- * All state is render-thread-owned: note events mutate the latch from
- * evq_apply_due (render thread), transport anchors arrive the same way,
- * and the step clock fires between render segments. Musical position at
- * SSI x derives from the anchor: ppq(x) = ppq0 + (x - ssi0) * tempo /
- * (60 * rate) — linear until the next anchor (§9.7), so steps land on
- * division boundaries sample-exactly BY CONSTRUCTION, and a loop wrap
- * or locate is just a new anchor to realign against (T17). */
-#define ARP_LATCH_MAX 8
-
-static struct {
-    /* transport anchor */
-    bool playing;
-    bool anchor_valid;
-    double tempo;       /* BPM */
-    double anchor_ppq;  /* song position at anchor_ssi */
-    uint64_t anchor_ssi;
-    /* latch, in press order */
-    uint8_t latch[ARP_LATCH_MAX];
-    float vel[ARP_LATCH_MAX];
-    int nlatch;
-    /* stepping */
-    int step;            /* monotone step counter (mode maps it to a note) */
-    int sounding;        /* note the arp voice is holding, -1 = none */
-    uint64_t gate_off;   /* SSI to release `sounding` (0 = none pending) */
-} g_arp;
+ * Per part now: every function takes 'part *p' and operates on p->arp and
+ * p->note/note_seq/note_vel. The arp type + ARP_LATCH_MAX are defined up
+ * top so 'part' can contain the state by value; the step/latch/anchor/gate
+ * MATH is unchanged. arp_active() reads the GLOBAL Arp Mode param and so
+ * needs no part. */
 
 static bool arp_active(void) { return param_step_index(9) != 0; }
 
-static void arp_reset(void);
-static void arp_voice_off(void);
+static void arp_reset(part *p);
+static void arp_voice_off(part *p);
 
 /* a new stream is a new time domain: anchor and groove are stale */
-static void arp_stream_reset(void) {
-    arp_reset();
-    g_arp.anchor_valid = false;
-    g_arp.playing = false;
-    g_arp.tempo = 0;
+static void arp_stream_reset(part *p) {
+    arp_reset(p);
+    p->arp.anchor_valid = false;
+    p->arp.playing = false;
+    p->arp.tempo = 0;
 }
 
-static void arp_voice_off(void) {
-    if (g_arp.sounding >= 0 && note_get() == g_arp.sounding) note_put(-1);
-    g_arp.sounding = -1;
-    g_arp.gate_off = 0;
+static void arp_voice_off(part *p) {
+    if (p->arp.sounding >= 0 && note_get(p) == p->arp.sounding) note_put(p, -1);
+    p->arp.sounding = -1;
+    p->arp.gate_off = 0;
 }
 
-static void arp_latch_add(uint8_t note, float vel) {
-    for (int i = 0; i < g_arp.nlatch; i++)
-        if (g_arp.latch[i] == note) {
-            g_arp.vel[i] = vel;
+static void arp_latch_add(part *p, uint8_t note, float vel) {
+    for (int i = 0; i < p->arp.nlatch; i++)
+        if (p->arp.latch[i] == note) {
+            p->arp.vel[i] = vel;
             return;
         }
-    if (g_arp.nlatch < ARP_LATCH_MAX) {
-        g_arp.latch[g_arp.nlatch] = note;
-        g_arp.vel[g_arp.nlatch] = vel;
-        g_arp.nlatch++;
+    if (p->arp.nlatch < ARP_LATCH_MAX) {
+        p->arp.latch[p->arp.nlatch] = note;
+        p->arp.vel[p->arp.nlatch] = vel;
+        p->arp.nlatch++;
     }
 }
 
-static void arp_latch_remove(uint8_t note) {
-    for (int i = 0; i < g_arp.nlatch; i++)
-        if (g_arp.latch[i] == note) {
-            memmove(&g_arp.latch[i], &g_arp.latch[i + 1],
-                    (size_t)(g_arp.nlatch - i - 1));
-            memmove(&g_arp.vel[i], &g_arp.vel[i + 1],
-                    (size_t)(g_arp.nlatch - i - 1) * sizeof(float));
-            g_arp.nlatch--;
+static void arp_latch_remove(part *p, uint8_t note) {
+    for (int i = 0; i < p->arp.nlatch; i++)
+        if (p->arp.latch[i] == note) {
+            memmove(&p->arp.latch[i], &p->arp.latch[i + 1],
+                    (size_t)(p->arp.nlatch - i - 1));
+            memmove(&p->arp.vel[i], &p->arp.vel[i + 1],
+                    (size_t)(p->arp.nlatch - i - 1) * sizeof(float));
+            p->arp.nlatch--;
             return;
         }
 }
 
-static void arp_reset(void) {
-    g_arp.nlatch = 0;
-    g_arp.step = 0;
-    arp_voice_off();
+static void arp_reset(part *p) {
+    p->arp.nlatch = 0;
+    p->arp.step = 0;
+    arp_voice_off(p);
 }
 
 /* musical position <-> stream position under the current anchor */
-static double arp_ppq_at(uint64_t ssi, double rate) {
-    return g_arp.anchor_ppq +
-           ((double)ssi - (double)g_arp.anchor_ssi) * g_arp.tempo / (60.0 * rate);
+static double arp_ppq_at(part *p, uint64_t ssi, double rate) {
+    return p->arp.anchor_ppq +
+           ((double)ssi - (double)p->arp.anchor_ssi) * p->arp.tempo / (60.0 * rate);
 }
-static uint64_t arp_ssi_at(double ppq, double rate) {
-    double ds = (ppq - g_arp.anchor_ppq) * 60.0 * rate / g_arp.tempo;
-    double ssi = (double)g_arp.anchor_ssi + ds;
+static uint64_t arp_ssi_at(part *p, double ppq, double rate) {
+    double ds = (ppq - p->arp.anchor_ppq) * 60.0 * rate / p->arp.tempo;
+    double ssi = (double)p->arp.anchor_ssi + ds;
     return ssi <= 0 ? 0 : (uint64_t)(ssi + 0.5);
 }
 
@@ -573,90 +610,90 @@ static uint64_t arp_ssi_at(double ppq, double rate) {
  * source of truth: the firing check asks "is pos the boundary seen from
  * pos-1?", so fire and deadline agree by construction — no epsilon games
  * across the ppq<->ssi rounding. */
-static uint64_t arp_next_step_ssi(uint64_t after, double rate) {
+static uint64_t arp_next_step_ssi(part *p, uint64_t after, double rate) {
     double div = ARP_DIV_PPQ[param_step_index(10)];
-    double k = floor(arp_ppq_at(after, rate) / div + 1e-9) + 1.0;
-    uint64_t bssi = arp_ssi_at(k * div, rate);
-    while (bssi <= after) bssi = arp_ssi_at((k += 1.0) * div, rate);
+    double k = floor(arp_ppq_at(p, after, rate) / div + 1e-9) + 1.0;
+    uint64_t bssi = arp_ssi_at(p, k * div, rate);
+    while (bssi <= after) bssi = arp_ssi_at(p, (k += 1.0) * div, rate);
     return bssi;
 }
 
 /* next arp deadline strictly after `pos`: a step boundary or a pending
  * gate-off, whichever first. 0 = nothing scheduled. */
-static uint64_t arp_next_deadline(uint64_t pos, double rate) {
-    if (!arp_active() || !g_arp.playing || !g_arp.anchor_valid ||
-        g_arp.tempo <= 0)
+static uint64_t arp_next_deadline(part *p, uint64_t pos, double rate) {
+    if (!arp_active() || !p->arp.playing || !p->arp.anchor_valid ||
+        p->arp.tempo <= 0)
         return 0;
     uint64_t next = 0;
-    if (g_arp.nlatch > 0) next = arp_next_step_ssi(pos, rate);
-    if (g_arp.gate_off && g_arp.gate_off > pos &&
-        (next == 0 || g_arp.gate_off < next))
-        next = g_arp.gate_off;
+    if (p->arp.nlatch > 0) next = arp_next_step_ssi(p, pos, rate);
+    if (p->arp.gate_off && p->arp.gate_off > pos &&
+        (next == 0 || p->arp.gate_off < next))
+        next = p->arp.gate_off;
     return next;
 }
 
 /* fire whatever is due exactly AT `pos` (called between render segments) */
-static void arp_fire_due(uint64_t pos, double rate) {
+static void arp_fire_due(part *p, uint64_t pos, double rate) {
     if (!arp_active()) return;
-    if (g_arp.gate_off && pos >= g_arp.gate_off) arp_voice_off();
-    if (!g_arp.playing || !g_arp.anchor_valid || g_arp.tempo <= 0 ||
-        g_arp.nlatch == 0 || pos == 0)
+    if (p->arp.gate_off && pos >= p->arp.gate_off) arp_voice_off(p);
+    if (!p->arp.playing || !p->arp.anchor_valid || p->arp.tempo <= 0 ||
+        p->arp.nlatch == 0 || pos == 0)
         return;
-    if (arp_next_step_ssi(pos - 1, rate) != pos) return; /* not a boundary */
+    if (arp_next_step_ssi(p, pos - 1, rate) != pos) return; /* not a boundary */
 
     /* which latched note does this step sound? */
-    int span = g_arp.nlatch * (param_step_index(12) + 1); /* notes x octaves */
-    int s = g_arp.step % span;
+    int span = p->arp.nlatch * (param_step_index(12) + 1); /* notes x octaves */
+    int s = p->arp.step % span;
     int idx, oct;
     switch (param_step_index(9)) {
         default:
         case 1: /* up */
-            idx = s % g_arp.nlatch;
-            oct = s / g_arp.nlatch;
+            idx = s % p->arp.nlatch;
+            oct = s / p->arp.nlatch;
             break;
         case 2: /* down */
-            idx = (span - 1 - s) % g_arp.nlatch;
-            oct = (span - 1 - s) / g_arp.nlatch;
+            idx = (span - 1 - s) % p->arp.nlatch;
+            oct = (span - 1 - s) / p->arp.nlatch;
             break;
         case 3: { /* up-down (no repeated endpoints) */
             int cycle = span > 1 ? 2 * span - 2 : 1;
-            int t = g_arp.step % cycle;
+            int t = p->arp.step % cycle;
             if (t >= span) t = cycle - t;
-            idx = t % g_arp.nlatch;
-            oct = t / g_arp.nlatch;
+            idx = t % p->arp.nlatch;
+            oct = t / p->arp.nlatch;
             break;
         }
         case 4: /* as played */
-            idx = s % g_arp.nlatch;
-            oct = s / g_arp.nlatch;
+            idx = s % p->arp.nlatch;
+            oct = s / p->arp.nlatch;
             break;
     }
     /* up/down sort by pitch; as-played keeps press order */
     int order[ARP_LATCH_MAX];
-    for (int i = 0; i < g_arp.nlatch; i++) order[i] = i;
+    for (int i = 0; i < p->arp.nlatch; i++) order[i] = i;
     if (param_step_index(9) != 4)
-        for (int i = 0; i < g_arp.nlatch; i++)
-            for (int j = i + 1; j < g_arp.nlatch; j++)
-                if (g_arp.latch[order[j]] < g_arp.latch[order[i]]) {
+        for (int i = 0; i < p->arp.nlatch; i++)
+            for (int j = i + 1; j < p->arp.nlatch; j++)
+                if (p->arp.latch[order[j]] < p->arp.latch[order[i]]) {
                     int t = order[i];
                     order[i] = order[j];
                     order[j] = t;
                 }
-    int note = g_arp.latch[order[idx]] + 12 * oct;
-    if (note > 127) note = g_arp.latch[order[idx]];
+    int note = p->arp.latch[order[idx]] + 12 * oct;
+    if (note > 127) note = p->arp.latch[order[idx]];
 
-    g_note_vel = g_arp.vel[order[idx]];
-    note_put(note);
-    g_note_seq++;
-    g_arp.sounding = note;
+    p->note_vel = p->arp.vel[order[idx]];
+    note_put(p, note);
+    p->note_seq++;
+    p->arp.sounding = note;
     /* gate: release after gate-fraction of the step length */
     double div = ARP_DIV_PPQ[param_step_index(10)];
-    double step_samples = div * 60.0 * rate / g_arp.tempo;
+    double step_samples = div * 60.0 * rate / p->arp.tempo;
     double gate = param_value(11);
     gate = gate < 0.05 ? 0.05 : gate > 0.98 ? 0.98 : gate;
-    g_arp.gate_off = pos + (uint64_t)(step_samples * gate + 0.5);
-    if (g_arp.gate_off <= pos) g_arp.gate_off = pos + 1;
-    g_arp.step++;
+    p->arp.gate_off = pos + (uint64_t)(step_samples * gate + 0.5);
+    if (p->arp.gate_off <= pos) p->arp.gate_off = pos + 1;
+    p->arp.step++;
 }
 
 static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
@@ -673,41 +710,44 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                 if (ev->end && ev->end < pos) CTR_INC(g_ramp_late);
             } else if (ev->ts && ev->ts < pos)
                 CTR_INC(g_evt_late);
+            /* route to the event's part (== part 0 for NPARTS=1); the note +
+             * arp cases mutate p, PARAM_SET/RAMP apply to GLOBAL params/ramps */
+            part *p = &g_parts[ev->channel % NPARTS];
             switch (ev->kind) {
                 case DEV_EV_NOTE_ON:
                     /* arp engaged: notes feed the latch; the step clock
                      * owns the voice. Arp off (or transport stopped):
                      * direct mono voice as ever — audition while stopped */
-                    arp_latch_add((uint8_t)ev->a, ev->v);
-                    if (!arp_active() || !g_arp.playing || !g_arp.anchor_valid) {
-                        g_note_vel = ev->v;
-                        note_put((int)ev->a);
-                        g_note_seq++;
+                    arp_latch_add(p, (uint8_t)ev->a, ev->v);
+                    if (!arp_active() || !p->arp.playing || !p->arp.anchor_valid) {
+                        p->note_vel = ev->v;
+                        note_put(p, (int)ev->a);
+                        p->note_seq++;
                     }
                     break;
                 case DEV_EV_NOTE_OFF:
-                    arp_latch_remove((uint8_t)ev->a);
-                    if (!arp_active() || !g_arp.playing || !g_arp.anchor_valid) {
-                        if (note_get() == (int)ev->a) note_put(-1);
-                    } else if (g_arp.nlatch == 0) {
-                        arp_voice_off(); /* all keys released = latch clears */
+                    arp_latch_remove(p, (uint8_t)ev->a);
+                    if (!arp_active() || !p->arp.playing || !p->arp.anchor_valid) {
+                        if (note_get(p) == (int)ev->a) note_put(p, -1);
+                    } else if (p->arp.nlatch == 0) {
+                        arp_voice_off(p); /* all keys released = latch clears */
                     }
                     break;
                 case DEV_EV_ALL_OFF:
-                    arp_reset();
-                    note_put(-1);
+                    arp_reset(p);
+                    note_put(p, -1);
                     break;
                 case DEV_EV_TRANSPORT: {
-                    bool was = g_arp.playing;
-                    g_arp.playing = (ev->a & 1) != 0;
-                    if (ev->a & (1u << 3)) g_arp.tempo = ev->v;
+                    bool was = p->arp.playing;
+                    p->arp.playing = (ev->a & 1) != 0;
+                    if (ev->a & (1u << 3)) p->arp.tempo = ev->v;
                     if (ev->a & (1u << 5)) {
-                        g_arp.anchor_ppq = ev->ppq;
-                        g_arp.anchor_ssi = ev->ts ? ev->ts : pos;
-                        g_arp.anchor_valid = true;
+                        p->arp.anchor_ppq = ev->ppq;
+                        p->arp.anchor_ssi = ev->ts ? ev->ts : pos;
+                        p->arp.anchor_valid = true;
                     }
-                    if (!g_arp.playing && was) arp_voice_off(); /* stop: silence */
-                    if (g_arp.playing && !was) g_arp.step = 0;  /* start on step 1 */
+                    if (!p->arp.playing && was) arp_voice_off(p); /* stop: silence */
+                    if (p->arp.playing && !was) p->arp.step = 0;  /* start on step 1 */
                     break;
                 }
                 case DEV_EV_PARAM_SET:
@@ -743,19 +783,25 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
 }
 
 /* Render n samples starting at stream position `pos`, splitting at event
- * timestamps so application is sample-accurate (§9.2). */
-static void render_with_events(synth_voice *v, float *interleaved, uint32_t n,
+ * timestamps so application is sample-accurate (§9.2). Per part now: arp
+ * steps fire for every part and the segment deadline is the min over all
+ * parts; for NPARTS=1 this is part 0 alone and the render is a DIRECT WRITE
+ * (multi-part summing is a later step — byte identity to HEAD is preserved). */
+static void render_with_events(float *interleaved, uint32_t n,
                                float rate, uint64_t pos) {
     uint32_t done = 0;
     while (done < n) {
         uint64_t next = evq_apply_due(pos + done, pos + n);
-        arp_fire_due(pos + done, rate); /* steps fire AT segment starts */
-        uint64_t anext = arp_next_deadline(pos + done, rate);
-        if (anext && (next == 0 || anext < next)) next = anext;
+        for (size_t pi = 0; pi < NPARTS; pi++) {
+            part *p = &g_parts[pi];
+            arp_fire_due(p, pos + done, rate); /* steps fire AT segment starts */
+            uint64_t anext = arp_next_deadline(p, pos + done, rate);
+            if (anext && (next == 0 || anext < next)) next = anext;
+        }
         uint32_t seg = next ? (uint32_t)(next - (pos + done)) : n - done;
         if (seg == 0) seg = 1; /* paranoia: guarantee forward progress */
         if (seg > n - done) seg = n - done;
-        engine_render(v, interleaved + 2 * done, seg, rate, pos + done);
+        engine_render(&g_parts[0], interleaved + 2 * done, seg, rate, pos + done);
         done += seg;
     }
 }
@@ -770,7 +816,8 @@ void audio_stop(device *d) {
     pthread_cancel(d->audio.thread);
     pthread_join(d->audio.thread, NULL);
     atomic_store_explicit(&d->audio.thread_live, false, memory_order_relaxed);
-    note_put(-1); /* never let a note outlive its stream */
+    for (size_t i = 0; i < NPARTS; i++)
+        note_put(&g_parts[i], -1); /* never let a note outlive its stream */
     fprintf(stderr, "harp-deviced: audio stream stopped (%llu reanchors)\n",
             (unsigned long long)d->audio.reanchors);
 }
