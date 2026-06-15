@@ -8,7 +8,9 @@
  */
 #include <errno.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -57,12 +59,52 @@ static void panel_json_params(device *d, char *body, size_t sz) {
     snprintf(body + off, sz - off, "]}");
 }
 
+/* The refs array grows without bound — a desk board accumulates an
+ * archive/ snapshot per session. The old fixed 4096-byte stack buffer
+ * overflowed once ~48 refs no longer fit: snprintf returns what it WOULD
+ * have written, so `off` ran past `sz`, `sz - off` underflowed to a huge
+ * size_t, and the next entry wrote past the buffer and smashed the stack
+ * (the SIGSEGV on the desk board). So refs build into a growable heap
+ * buffer instead, returning the whole list rather than truncating it. */
 struct refs_json {
     device *d;
-    char *body;
-    size_t sz, off;
+    char *buf;
+    size_t cap, off;
     int n;
+    bool oom;
 };
+
+/* Append printf-style, growing the buffer as needed. Underflow-proof:
+ * `off` never advances past a write that didn't fit; on OOM it latches
+ * `oom` and stops touching memory. */
+static void refs_appendf(struct refs_json *j, const char *fmt, ...) {
+    if (j->oom) return;
+    for (;;) {
+        va_list ap;
+        va_start(ap, fmt);
+        int r = vsnprintf(j->buf + j->off, j->cap - j->off, fmt, ap);
+        va_end(ap);
+        if (r < 0) {
+            j->oom = true;
+            return;
+        }
+        if ((size_t)r < j->cap - j->off) { /* fit, with room for the NUL */
+            j->off += (size_t)r;
+            return;
+        }
+        size_t need = j->off + (size_t)r + 1;
+        size_t ncap = j->cap ? j->cap : 1024;
+        while (ncap < need) ncap *= 2;
+        char *nb = realloc(j->buf, ncap);
+        if (!nb) {
+            j->oom = true;
+            return;
+        }
+        j->buf = nb;
+        j->cap = ncap;
+        /* loop: re-format into the grown buffer */
+    }
+}
 
 static void panel_refs_cb(const harp_ref *r, void *ud) {
     struct refs_json *j = ud;
@@ -77,19 +119,23 @@ static void panel_refs_cb(const harp_ref *r, void *ud) {
         harp_hash_hex(&shown.hash, hex);
         hex[12] = 0;
     }
-    j->off += (size_t)snprintf(j->body + j->off, j->sz - j->off,
-                               "%s{\"name\":\"%s\",\"hash\":\"%s\",\"gen\":%llu,"
-                               "\"dirty\":%s}",
-                               j->n++ ? "," : "", shown.name, hex,
-                               (unsigned long long)shown.generation,
-                               shown.dirty ? "true" : "false");
+    refs_appendf(j,
+                 "%s{\"name\":\"%s\",\"hash\":\"%s\",\"gen\":%llu,\"dirty\":%s}",
+                 j->n++ ? "," : "", shown.name, hex,
+                 (unsigned long long)shown.generation, shown.dirty ? "true" : "false");
 }
 
-static void panel_json_refs(device *d, char *body, size_t sz) {
-    struct refs_json j = {d, body, sz, 0, 0};
-    j.off = (size_t)snprintf(body, sz, "{\"refs\":[");
+/* Returns a heap JSON string (caller frees), or NULL on allocation failure. */
+static char *panel_json_refs(device *d) {
+    struct refs_json j = {d, NULL, 0, 0, 0, false};
+    refs_appendf(&j, "{\"refs\":[");
     harp_store_ref_list(&d->store, panel_refs_cb, &j);
-    snprintf(body + j.off, sz - j.off, "]}");
+    refs_appendf(&j, "]}");
+    if (j.oom) {
+        free(j.buf);
+        return NULL;
+    }
+    return j.buf;
 }
 
 static void panel_json_counters(device *d, char *body, size_t sz) {
@@ -156,11 +202,15 @@ static void panel_serve_conn(device *d, int fd) {
         char *nl;
         while ((nl = memchr(buf, '\n', len))) {
             *nl = 0;
+            char *dyn = NULL;       /* heap response (refs); freed after send */
+            const char *out = body; /* what we send: fixed body, or dyn if set */
             if (strcmp(buf, "params") == 0)
                 panel_json_params(d, body, sizeof body);
-            else if (strcmp(buf, "refs") == 0)
-                panel_json_refs(d, body, sizeof body);
-            else if (strcmp(buf, "counters") == 0)
+            else if (strcmp(buf, "refs") == 0) {
+                dyn = panel_json_refs(d);
+                if (dyn) out = dyn;
+                else snprintf(body, sizeof body, "{\"error\":\"out of memory\"}");
+            } else if (strcmp(buf, "counters") == 0)
                 panel_json_counters(d, body, sizeof body);
             else if (strcmp(buf, "snapshot") == 0) {
                 /* the front-panel save button (§10.4 snapshot-on-demand) */
@@ -194,9 +244,9 @@ static void panel_serve_conn(device *d, int fd) {
                              "{\"ok\":false,\"error\":\"knob <id 1..8> <value 0..1>\"}");
             } else
                 snprintf(body, sizeof body, "{\"error\":\"unknown command\"}");
-            size_t blen = strlen(body);
-            body[blen] = '\n';
-            if (!harp_write_all(fd, body, blen + 1)) return;
+            bool ok = harp_write_all(fd, out, strlen(out)) && harp_write_all(fd, "\n", 1);
+            free(dyn);
+            if (!ok) return;
             size_t consumed = (size_t)(nl + 1 - buf);
             memmove(buf, nl + 1, len - consumed);
             len -= consumed;
