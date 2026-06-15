@@ -60,12 +60,14 @@ floods across buffer sizes 64–1024, hot-replug, tempo lock, determinism
 hashes — plus fuzzed parsers and a ThreadSanitizer-clean device. The
 specification is an **editor's draft** (0.3.4): breaking changes are
 expected and versions are negotiated at hello; its changelog records what
-implementation taught us. One reference device and one DAW (Live) for the
-hand-driven path so far, but the plugin shell builds and is CI-validated on
-**macOS, Windows, and Linux** — a VST3 on all three (pluginval strictness 10
-on macOS + Windows, a real-DAW REAPER render on Linux) plus an Audio Unit on
-macOS (`auval`). The four-actions recall UI, a CLAP port, and the Ethernet
-binding are next (see [Status](#status) for the full honest list).
+implementation taught us. Verified across three DAWs — **Ableton Live**
+(macOS) and **Renoise** (Windows) by hand, plus **REAPER** headless on Linux
+as an automated e2e that renders a project through the real device and
+byte-compares the result on every push. The plugin shell builds and is
+CI-validated on **macOS, Windows, and Linux** — a VST3 on all three
+(pluginval strictness 10 on macOS + Windows) plus an Audio Unit on macOS
+(`auval`). The four-actions recall UI, a CLAP port, and the Ethernet binding
+are next (see [Status](#status) for the full honest list).
 
 ## Repository map
 
