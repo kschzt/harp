@@ -61,7 +61,9 @@ jobs:
             "https://github.com/libusb/libusb/releases/download/v$ver/libusb-$ver.7z" `
             -OutFile libusb.7z
           New-Item -ItemType Directory -Force external/libusb-win | Out-Null
-          tar -xf libusb.7z -C external/libusb-win   # bsdtar reads 7z
+          # Use 7-Zip, not bsdtar: the runner's tar.exe lacks the LZMA codec
+          # libusb's .7z uses ("LZMA codec is unsupported"). 7z is on PATH.
+          7z x libusb.7z -oexternal/libusb-win -y
       - name: core build + unit tests (MSVC)
         shell: pwsh
         run: |
