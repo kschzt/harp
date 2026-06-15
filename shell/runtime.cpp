@@ -970,11 +970,12 @@ static void encode_bundle(harp_cbuf *out, uint32_t vendorId, const std::string &
 
 bool HarpRuntime::getStateBundle(std::vector<uint8_t> &out) {
     if (!storeOk_) return false;
-    if (!connected()) {
-        /* offline: re-emit staged bundle if we have one */
-        std::lock_guard<std::mutex> slk(bundleMutex_);
-        return false; /* v0: nothing meaningful to save offline */
-    }
+    /* The host-paced session can briefly drop between render passes — the
+     * supervisor reconnects within ~1s. A save (getState) right after a render,
+     * as REAPER and other offline hosts do, can land in that window; wait
+     * (bounded) for the device to come back rather than failing the save. */
+    for (int i = 0; i < 60 && !connected(); i++) harp_sleep_ns(50000000ull); /* ≤ ~3 s */
+    if (!connected()) return false; /* genuinely offline: nothing to save */
     std::lock_guard<std::mutex> lk(ctlMutex_);
     harp_ref live;
     if (!refsLocked(&live)) return false;

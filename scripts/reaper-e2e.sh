@@ -95,22 +95,13 @@ sys.exit(0 if pcm(sys.argv[1]) == pcm(sys.argv[2]) else 1)
 PY
 }
 
-# DIAG (temporary): show the shell's connect/stop/recall messages from a render's
-# REAPER log + the saved bundle size, to see whether the plugin was connected at
-# save time and whether the recall push fired on reopen.
-diag() {
-    echo "  [diag $1] recall.rpp=$(wc -c <"$OUTDIR/recall.rpp" 2>/dev/null || echo 0)B"
-    grep -iE "connected:|stopped|re-asserted|state apply|recall|no HARP|staged|offline" \
-        "$OUTDIR/$1.reaper.log" 2>/dev/null | sed 's/^/    | /' | head -12
-}
-
 fail=0
 b_drop=$(ctr evq_drops); b_late=$(ctr evt_late); b_fto=$(ctr fence_timeouts)
 
 # --- scenario 1: determinism — state A rendered twice (save the project on the
 #     first render so scenario 2 can reopen it) ---
 echo "[reaper-e2e] determinism: render state A twice ..."
-pin 0.5; render a1 build "$OUTDIR/recall.rpp"; diag a1
+pin 0.5; render a1 build "$OUTDIR/recall.rpp"
 pin 0.5; render a2 build
 if pcm_eq "$OUTDIR/a1.wav" "$OUTDIR/a2.wav"; then
     echo "PASS determinism: two REAPER renders are byte-identical through the device"
@@ -127,7 +118,7 @@ else
     echo "  scramble confirmed: state B differs from saved state A"
 fi
 # device is still in state B; opening the saved project must recall A onto it
-render recalled open "$OUTDIR/recall.rpp"; diag recalled
+render recalled open "$OUTDIR/recall.rpp"
 if pcm_eq "$OUTDIR/recalled.wav" "$OUTDIR/a1.wav"; then
     echo "PASS recall: reopening the project re-pushed the saved state through REAPER (recalled == saved, despite a scrambled device)"
 else
