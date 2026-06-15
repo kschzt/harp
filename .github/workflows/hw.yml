@@ -68,6 +68,12 @@ jobs:
         # wraps; assert the device dropped/delayed nothing (§14.2 counters).
         run: scripts/flood-stress.sh
 
+      - name: recall round-trip (save / scramble / restore through PI4B-0002)
+        # pin state A + save the Recall Bundle, scramble the device to B, then
+        # load A back: the recalled render must equal A and differ from B —
+        # total recall onto a deliberately-changed device, via the real shell.
+        run: scripts/recall-roundtrip.sh
+
       - name: REAPER real-DAW e2e (render through PI4B-0002, byte-deterministic)
         # REAPER (headless under xvfb, provisioned at /opt/REAPER) loads
         # harp-shell.vst3 and renders a MIDI project through the device twice;

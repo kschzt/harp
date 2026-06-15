@@ -226,9 +226,6 @@ private:
     bool snapshotLocked(harp_hash *out);
     bool fetchClosureLocked(const harp_hash &root);
     bool pushStateLocked(const harp_hash &target);
-    /* Build the current live/project bundle (caller holds ctlMutex_, device
-     * connected) and cache it in lastBundle_ for offline getState. */
-    bool buildAndCacheLocked(std::vector<uint8_t> &out);
 
     harp_io *io_ = nullptr;
     harp_link link_;   /* rx reassembly: shared by client_ and pollEcho */
@@ -315,10 +312,6 @@ private:
     bool hasBundle_ = false;
     harp_hash bundleTarget_{};
     std::vector<std::pair<uint32_t, float>> bundleParams_;
-    /* last bundle built while connected — returned by getStateBundle when the
-     * host saves after deactivating the plugin (offline render path; the device
-     * is no longer claimed), so a save never silently loses state */
-    std::vector<uint8_t> lastBundle_;
     /* the device the loaded bundle wants (USB identity, key 5). Empty
      * serial = no usb-identity in the bundle (fresh or pre-schema). */
     bool wantUsb_ = false;
