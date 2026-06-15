@@ -48,7 +48,8 @@ local ok, err = pcall(function()
     end
     reaper.MIDI_Sort(take)
     set_render_cfg()
-    if SAVE then reaper.Main_SaveProjectEx(0, SAVE, 0) end -- Recall Bundle -> .rpp
+    -- NB: the project is saved AFTER the first render (see tick), not here —
+    -- the plugin has not connected yet, so getStateBundle would capture nothing.
     w("built")
   end
 end)
@@ -61,6 +62,10 @@ local function tick()
   if cyc < 8 then reaper.defer(tick); return end
   local ok2, err2 = pcall(function()
     reaper.Main_OnCommand(42230, 0) -- render, most recent settings, no dialog
+    -- Save AFTER the render: rendering forces the plugin to connect, so now
+    -- getStateBundle captures the live device state into the .rpp. (Saving in
+    -- __startup ran before connect -> empty bundle -> nothing to recall.)
+    if MODE ~= "open" and SAVE then reaper.Main_SaveProjectEx(0, SAVE, 0) end
     local p = OUTDIR .. "/" .. NAME .. ".wav"
     local f = io.open(p, "rb")
     local n = f and f:seek("end") or -1
