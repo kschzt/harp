@@ -402,8 +402,85 @@ static void test_audio_codec(void) {
     CHECK(harp_audio_payload_len(&fo) == 0); /* fence word is not payload */
 }
 
+/* Multitimbral channel key (§9.4 key 5) on param/ramp event bodies. The real
+ * encoders (shell/runtime.cpp) and decoder (device/session.c) are C++/device
+ * code, so this pins the WIRE CONTRACT they share via harpcore's codec: the
+ * channel round-trips, the device's skip-unknown loop tolerates it, and —
+ * the back-compat guarantee — channel 0 is byte-identical to the legacy form
+ * (encoders omit the key for part 0). End-to-end host→device→part routing is
+ * validated on hardware once the engine routes channels (P2). */
+static void enc_param_body(harp_cbuf *b, uint64_t id, double val, unsigned channel) {
+    harp_cbor_map(b, channel ? 3 : 2);
+    harp_cbor_uint(b, 0);
+    harp_cbor_uint(b, id);
+    harp_cbor_uint(b, 1);
+    harp_cbor_float(b, val);
+    if (channel) {
+        harp_cbor_uint(b, 5);
+        harp_cbor_uint(b, channel);
+    }
+}
+/* the device's param-body decode loop (keys 0,1,5; unknown skipped; chan⇒0) */
+static unsigned dec_param_channel(const harp_cbuf *b, uint64_t *id_out) {
+    harp_cdec d;
+    harp_cdec_init(&d, b->buf, b->len);
+    uint64_t n, key, id = 0, channel = 0;
+    double v = 0;
+    if (!harp_cdec_map(&d, &n)) return 0xffff;
+    for (uint64_t i = 0; i < n; i++) {
+        if (!harp_cdec_uint(&d, &key)) return 0xffff;
+        if (key == 0) harp_cdec_uint(&d, &id);
+        else if (key == 1) harp_cdec_float(&d, &v);
+        else if (key == 5) harp_cdec_uint(&d, &channel);
+        else harp_cdec_skip(&d);
+    }
+    if (id_out) *id_out = id;
+    return d.err ? 0xffff : (unsigned)channel;
+}
+
+static void test_event_channel(void) {
+    harp_cbuf legacy, ch0, ch15;
+    harp_cbuf_init(&legacy);
+    harp_cbuf_init(&ch0);
+    harp_cbuf_init(&ch15);
+
+    /* byte-identity: channel 0 must equal the legacy 2-key body exactly */
+    harp_cbor_map(&legacy, 2);
+    harp_cbor_uint(&legacy, 0);
+    harp_cbor_uint(&legacy, 7);
+    harp_cbor_uint(&legacy, 1);
+    harp_cbor_float(&legacy, 0.25);
+    enc_param_body(&ch0, 7, 0.25, 0);
+    CHECK(ch0.len == legacy.len && memcmp(ch0.buf, legacy.buf, ch0.len) == 0);
+
+    /* channel round-trips, and an absent key decodes as part 0 */
+    uint64_t id = 0;
+    CHECK(dec_param_channel(&ch0, &id) == 0 && id == 7);
+    enc_param_body(&ch15, 3, 0.5, 15);
+    CHECK(dec_param_channel(&ch15, &id) == 15 && id == 3);
+    CHECK(ch15.len == ch0.len + 2); /* exactly the "5 => 15" pair added */
+
+    /* an unknown trailing key (e.g. a future field) must be skipped, not fail */
+    harp_cbuf evt;
+    harp_cbuf_init(&evt);
+    harp_cbor_map(&evt, 3);
+    harp_cbor_uint(&evt, 0);
+    harp_cbor_uint(&evt, 9);
+    harp_cbor_uint(&evt, 1);
+    harp_cbor_float(&evt, 0.1);
+    harp_cbor_uint(&evt, 4); /* txn-id (§9.4 key 4) — we don't consume it */
+    harp_cbor_uint(&evt, 42);
+    CHECK(dec_param_channel(&evt, &id) == 0 && id == 9);
+
+    harp_cbuf_free(&legacy);
+    harp_cbuf_free(&ch0);
+    harp_cbuf_free(&ch15);
+    harp_cbuf_free(&evt);
+}
+
 int main(void) {
     test_sha256();
+    test_event_channel();
     test_cbor_encode();
     test_cbor_roundtrip();
     test_frame();

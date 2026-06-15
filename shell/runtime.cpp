@@ -122,17 +122,22 @@ void HarpRuntime::audioStopLocked() {
 
 /* Param set as a §9.4 event message: fire-and-forget, no response.
  * ts is an SSI (0 = "now"). Encode-only; the feeder frames and batches. */
-void HarpRuntime::encodeParamEvent(harp_cbuf *m, uint32_t id, float v, uint64_t ts) {
+void HarpRuntime::encodeParamEvent(harp_cbuf *m, uint32_t id, float v, uint64_t ts,
+                                   uint8_t channel) {
     harp_cbor_array(m, 3);
     harp_cbor_array(m, 2);
     harp_cbor_uint(m, 0);
     harp_cbor_uint(m, ts);
     harp_cbor_uint(m, 1); /* etype: param */
-    harp_cbor_map(m, 2);
+    harp_cbor_map(m, channel ? 3 : 2);
     harp_cbor_uint(m, 0);
     harp_cbor_uint(m, id);
     harp_cbor_uint(m, 1);
     harp_cbor_float(m, v);
+    if (channel) { /* key 5 = multitimbral part (§9.4); omitted for part 0 */
+        harp_cbor_uint(m, 5);
+        harp_cbor_uint(m, channel);
+    }
 }
 
 /* Drain any asynchronous inbound link traffic: evt echoes (-> echoRing_)
@@ -538,13 +543,13 @@ void HarpRuntime::encodeUmpEvent(harp_cbuf *m, uint32_t word, uint64_t ts) {
 
 /* Ramp event (§9.4): etype 5, msg tstamp = start, body {param, target, end}. */
 void HarpRuntime::encodeRampEvent(harp_cbuf *m, uint32_t id, float target,
-                                  uint64_t start, uint64_t end) {
+                                  uint64_t start, uint64_t end, uint8_t channel) {
     harp_cbor_array(m, 3);
     harp_cbor_array(m, 2);
     harp_cbor_uint(m, 0);
     harp_cbor_uint(m, start);
     harp_cbor_uint(m, 5); /* etype: ramp */
-    harp_cbor_map(m, 3);
+    harp_cbor_map(m, channel ? 4 : 3);
     harp_cbor_uint(m, 0);
     harp_cbor_uint(m, id);
     harp_cbor_uint(m, 1);
@@ -553,6 +558,10 @@ void HarpRuntime::encodeRampEvent(harp_cbuf *m, uint32_t id, float target,
     harp_cbor_array(m, 2);
     harp_cbor_uint(m, 0);
     harp_cbor_uint(m, end);
+    if (channel) { /* key 5 = multitimbral part (§9.4); omitted for part 0 */
+        harp_cbor_uint(m, 5);
+        harp_cbor_uint(m, channel);
+    }
 }
 
 /* Padded stream positions are SPENT: ssiRead_ always advances by the full

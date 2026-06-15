@@ -211,9 +211,13 @@ private:
     void audioStopLocked();
     /* encode one event message into `out` (no I/O) — the feeder batches
      * many messages into a single framed bulk write per cycle */
-    static void encodeParamEvent(harp_cbuf *out, uint32_t id, float v, uint64_t ts);
+    /* channel = multitimbral part (§9.4, key 5); 0 omits the key so the
+     * single-part wire is byte-identical. The host sends 0 until per-shell
+     * channel routing lands (multitimbral group). */
+    static void encodeParamEvent(harp_cbuf *out, uint32_t id, float v, uint64_t ts,
+                                 uint8_t channel = 0);
     static void encodeRampEvent(harp_cbuf *out, uint32_t id, float target,
-                                uint64_t start, uint64_t end);
+                                uint64_t start, uint64_t end, uint8_t channel = 0);
     static void encodeUmpEvent(harp_cbuf *out, uint32_t word, uint64_t ts);
     static void encodeTransportEvent(harp_cbuf *out, uint32_t flags, double tempo,
                                      double ppq, uint64_t ts);

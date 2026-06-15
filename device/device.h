@@ -97,6 +97,10 @@ typedef struct {
     float v;       /* velocity / value / ramp target / tempo BPM */
     uint64_t end;  /* ramp end position */
     double ppq;    /* transport: song position at ts (§9.7 key 4) */
+    uint8_t channel; /* multitimbral part = UMP channel (notes) / event body
+                        key 5 (param/ramp); 0..15, default 0 (§9.4, §15.2).
+                        Appended last so positional initializers default it
+                        to part 0 — single-part is channel 0. */
 } dev_event;
 
 #define DEV_EVQ_CAP 256

@@ -52,16 +52,18 @@ audio owner). This doc is the build plan and the test matrix.
 - [x] §15.2 — state-controller (single writer) vs multitimbral event group
       (disjoint channels), audio owner.
 - [x] 0.3.6 changelog + header bump.
-- [ ] §9.2 / §9.4 — OPTIONAL `channel` key on param-set and ramp event bodies
-      (default 0). `harp.cddl` updated.
+- [x] §9.4 — OPTIONAL `channel` key (key **5**, NOT 3 — key 3 is `voice`,
+      §9.5, a different axis) on param-set and ramp event bodies (default 0).
+      `harp.cddl` updated. Distinguished from `voice` in prose (part base value
+      vs transient sounding voice).
 - [ ] §C / identity — `evt.multitimbral` capability + identity key for part
-      count (mirrors 0.3.5's `ump-group-map`).
+      count (mirrors 0.3.5's `ump-group-map`). [P3]
 
 ## Phased implementation (each phase: committable + testable)
 
 | P | scope | risk | hw-validate? |
 |---|-------|------|--------------|
-| P1 | Wire: `channel` key on param/ramp encode+decode (core + runtime + device parse), default 0 | low | no (round-trip + fuzz) |
+| ~~P1~~ ✅ | Wire: `channel` key (key 5) on param/ramp encode+decode (runtime + device parse + `dev_event`), default 0, byte-identical for part 0. Unit test `test_event_channel` (byte-identity + round-trip + skip-unknown). Host+device compile-verified | low | done |
 | P2 | Device engine: 16 per-part voices/params/ramps/arp, channel routing, summed render | **high** (determinism) | **yes — golden regen** |
 | P3 | Device state/recall/panel: per-part param state in snapshot/ref/bundle; panel API part dim; capability + identity part-count | med | yes (recall round-trip) |
 | P4 | Host registry: session sharing by serial, refcount, acquire/release, audio owner | low | partial (2 instances → 1 claim) |

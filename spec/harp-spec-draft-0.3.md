@@ -577,10 +577,12 @@ param  = { 0 => uint,                     ; stable param id (u32)
 
 ```cddl
 param-event = { 0 => uint param-id, 1 => float32 normalized,    ; [0,1] — point set
-                ? 2 => int raw, ? 3 => uint voice, ? 4 => uint txn-id }
+                ? 2 => int raw, ? 3 => uint voice, ? 4 => uint txn-id,
+                ? 5 => uint channel }                            ; multitimbral part, 0..15
 ramp-event  = { 0 => uint param-id, 1 => float32 target,
                 2 => tstamp end,                                 ; reach target at end
-                ? 3 => uint voice, ? 4 => uint txn-id }
+                ? 3 => uint voice, ? 4 => uint txn-id,
+                ? 5 => uint channel }
 mod-event   = { 0 => uint param-id, 1 => float32 offset,        ; signed, normalized
                 ? 2 => uint voice, ? 3 => uint txn-id }
 ```
@@ -588,6 +590,8 @@ mod-event   = { 0 => uint param-id, 1 => float32 offset,        ; signed, normal
 **Set** applies a value at its timestamp. **Ramp** interpolates linearly in normalized space from the value in effect at the event's timestamp to `target` at `end`; the device interpolates at no less than its declared control rate, which is what makes automation zipper-free *and* cheap — a DAW curve becomes a handful of ramps per block instead of a point per tick. A new set or ramp on the same (param, voice) supersedes any ramp in flight. Devices claiming `evt.param` MUST implement ramps.
 
 **Mod** (capability `evt.param.mod`) sets the current additive modulation offset on top of the base value, clamped after summation; it MUST NOT alter the stored base value and MUST NOT appear in base-value echo. This is CLAP's automation/modulation split, and it maps naturally onto hardware mod-matrix thinking: the knob position is sacred; modulation breathes around it. Devices SHOULD smooth offset changes at control rate.
+
+**Channel** (the optional `channel` field, 0..15, absent ⇒ 0) selects the **multitimbral part** the set/ramp addresses, on a device that declares more than one part (capability `evt.multitimbral`; §15.2). It addresses a part's *base parameter* — persistent, stored in the part's state, and echoed — and is therefore distinct from `voice` (§9.5), which addresses a *transient sounding voice* and MAY be ignored once that voice is gone. A single-part device ignores `channel`; absence is part 0, so the single-part wire is unchanged. Notes carry their part in the UMP channel nibble (§9.10) by the same numbering, so a shell's notes and its parameter edits land on the same part.
 
 **Echo**: devices MUST emit `param` events for front-panel and internally-driven base-value changes (`evt.param.echo`, REQUIRED for `harp-recall`) so shells reflect knob movements and record automation, timestamped by the device.
 
