@@ -26,6 +26,22 @@ export PROBE="${PROBE:-./build/harp-probe}"
 export PI="${PI:-ci@harptest.local}"               # replug ssh target (NOT jak)
 export SERIAL="$HARP_DEVICE_SERIAL"                # replug pins this board
 
+# Preflight: reset the device to a known-clean state. A CI job killed mid-
+# USB-stream (job cancellation, timeout) can leave the bus poisoned until a
+# device-side reattach (see host/usb_io.c lore); restart the daemon so every
+# run starts clean regardless of how the previous one died. Graceful if the
+# Pi is unreachable.
+echo "──── preflight: device reset (daemon restart on $PI)"
+if ssh -o BatchMode=yes -o ConnectTimeout=8 "$PI" 'sudo -n systemctl restart harp-deviced-usb' 2>&1; then
+    for i in $(seq 1 20); do
+        "$PROBE" -d "usb:$SERIAL" identify >/dev/null 2>&1 && { echo "   device claimable after ~${i}s"; break; }
+        sleep 1
+    done
+else
+    echo "   (skipped: $PI unreachable)"
+fi
+echo
+
 PASS=0; FAIL=0; SKIP=0
 run() {
     echo "──── $1"
