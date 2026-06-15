@@ -120,4 +120,4 @@ for pair in "evq_drops $b_drop $a_drop" "evt_late $b_late $a_late" "fence_timeou
     [ "$d" -ne 0 ] && { echo "FAIL: $1 rose by $d"; fail=1; }
 done
 
-[ "$fail" -eq 0 ] && echo "PASS: REAPER e2e — real-DAW determinism + recall round-trip, lossless" || exit 1
+[ "$fail" -eq 0 ] && echo "PASS: REAPER e2e — real-DAW render, byte-deterministic, lossless" || exit 1
