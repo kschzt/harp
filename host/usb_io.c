@@ -34,11 +34,11 @@
 #include "usb_io.h"
 
 #include <libusb.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+
+#include "sync_compat.h"
 #ifdef __APPLE__
 #include <pthread/qos.h>
 #endif
@@ -115,11 +115,11 @@ struct usb_io {
     uint16_t vendor_id, product_id;    /* bound device's USB descriptor ids */
     char dev_serial[64];               /* bound device's USB serial */
 
-    pthread_t evthread;
-    int ev_running;
+    harp_thread evthread;
+    harp_flag ev_running;
 
-    pthread_mutex_t mu;
-    pthread_cond_t cv; /* broadcast on: fifo growth, slot free, write done, death */
+    harp_mutex mu;
+    harp_cond cv; /* broadcast on: fifo growth, slot free, write done, death */
     int dead;          /* transport failed (unplug); all ops fail fast */
     int closing;       /* orderly teardown; cancelled completions are normal */
     int inflight;      /* transfers not yet reaped (close waits for zero) */
@@ -140,7 +140,7 @@ static void mark_dead_locked(usb_io *u, const char *what, int rc) {
     if (!u->dead && !u->closing)
         fprintf(stderr, "harp-usb: %s failed: %s\n", what, libusb_error_name(rc));
     u->dead = 1;
-    pthread_cond_broadcast(&u->cv);
+    harp_cond_broadcast(&u->cv);
 }
 
 /* ---------------- completions (run on the event thread) ---------------- */
@@ -151,7 +151,7 @@ static void LIBUSB_CALL in_cb(struct libusb_transfer *x) {
     if (u->debug)
         fprintf(stderr, "harp-usb-dbg: in_cb %s status=%d len=%d\n",
                 t->is_audio ? "audio" : "link", x->status, x->actual_length);
-    pthread_mutex_lock(&u->mu);
+    harp_mutex_lock(&u->mu);
     u->inflight--;
     if (x->status == LIBUSB_TRANSFER_COMPLETED ||
         x->status == LIBUSB_TRANSFER_TIMED_OUT) {
@@ -161,7 +161,7 @@ static void LIBUSB_CALL in_cb(struct libusb_transfer *x) {
             fifo_push(f, t->buf, (size_t)x->actual_length);
             if (fifo_used(f) - before < (size_t)x->actual_length)
                 u->fifo_drops += x->actual_length - (fifo_used(f) - before);
-            pthread_cond_broadcast(&u->cv);
+            harp_cond_broadcast(&u->cv);
         }
         if (!u->closing && !u->dead) { /* keep the read pending, always */
             t->xfer = libusb_alloc_transfer(0); /* fresh per submission */
@@ -176,8 +176,8 @@ static void LIBUSB_CALL in_cb(struct libusb_transfer *x) {
             } else
                 mark_dead_locked(u, "in alloc", LIBUSB_ERROR_NO_MEM);
             libusb_free_transfer(x); /* the completed one */
-            pthread_cond_broadcast(&u->cv);
-            pthread_mutex_unlock(&u->mu);
+            harp_cond_broadcast(&u->cv);
+            harp_mutex_unlock(&u->mu);
             return;
         }
     } else if (x->status != LIBUSB_TRANSFER_CANCELLED) {
@@ -185,14 +185,14 @@ static void LIBUSB_CALL in_cb(struct libusb_transfer *x) {
                          x->status == LIBUSB_TRANSFER_NO_DEVICE ? LIBUSB_ERROR_NO_DEVICE
                                                                 : LIBUSB_ERROR_IO);
     }
-    pthread_cond_broadcast(&u->cv); /* close() may be waiting on inflight */
-    pthread_mutex_unlock(&u->mu);
+    harp_cond_broadcast(&u->cv); /* close() may be waiting on inflight */
+    harp_mutex_unlock(&u->mu);
 }
 
 static void LIBUSB_CALL aout_cb(struct libusb_transfer *x) {
     aout_slot *s = x->user_data;
     usb_io *u = s->u;
-    pthread_mutex_lock(&u->mu);
+    harp_mutex_lock(&u->mu);
     u->inflight--;
     s->busy = 0;
     if (x->status != LIBUSB_TRANSFER_COMPLETED &&
@@ -200,14 +200,14 @@ static void LIBUSB_CALL aout_cb(struct libusb_transfer *x) {
         mark_dead_locked(u, "audio bulk out",
                          x->status == LIBUSB_TRANSFER_NO_DEVICE ? LIBUSB_ERROR_NO_DEVICE
                                                                 : LIBUSB_ERROR_IO);
-    pthread_cond_broadcast(&u->cv);
-    pthread_mutex_unlock(&u->mu);
+    harp_cond_broadcast(&u->cv);
+    harp_mutex_unlock(&u->mu);
 }
 
 static void LIBUSB_CALL lout_cb(struct libusb_transfer *x) {
     lout_ctx *c = x->user_data;
     usb_io *u = c->u;
-    pthread_mutex_lock(&u->mu);
+    harp_mutex_lock(&u->mu);
     u->inflight--;
     c->done = 1;
     c->ok = x->status == LIBUSB_TRANSFER_COMPLETED;
@@ -215,36 +215,25 @@ static void LIBUSB_CALL lout_cb(struct libusb_transfer *x) {
         mark_dead_locked(u, "bulk out",
                          x->status == LIBUSB_TRANSFER_NO_DEVICE ? LIBUSB_ERROR_NO_DEVICE
                                                                 : LIBUSB_ERROR_IO);
-    pthread_cond_broadcast(&u->cv);
-    pthread_mutex_unlock(&u->mu);
+    harp_cond_broadcast(&u->cv);
+    harp_mutex_unlock(&u->mu);
     libusb_free_transfer(x);
 }
 
 /* ---------------- the event thread ---------------- */
 
-static void *ev_main(void *arg) {
+static HARP_THREAD_RET ev_main(void *arg) {
     usb_io *u = arg;
 #ifdef __APPLE__
     /* completion reaping is on the realtime path: every audio byte and
      * every event acknowledgment passes through this thread */
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
-    while (__atomic_load_n(&u->ev_running, __ATOMIC_ACQUIRE)) {
+    while (harp_flag_load_acq(&u->ev_running)) {
         struct timeval tv = {0, 20000}; /* 20 ms tick to observe shutdown */
         libusb_handle_events_timeout_completed(u->ctx, &tv, NULL);
     }
-    return NULL;
-}
-
-/* helpers: absolute deadline for condvar waits */
-static void deadline_in(struct timespec *ts, unsigned ms) {
-    clock_gettime(CLOCK_REALTIME, ts);
-    ts->tv_sec += ms / 1000;
-    ts->tv_nsec += (long)(ms % 1000) * 1000000L;
-    if (ts->tv_nsec >= 1000000000L) {
-        ts->tv_sec++;
-        ts->tv_nsec -= 1000000000L;
-    }
+    return 0;
 }
 
 /* ---------------- harp_io: framed link ---------------- */
@@ -252,19 +241,19 @@ static void deadline_in(struct timespec *ts, unsigned ms) {
 static bool usb_read_exact(harp_io *io, void *buf, size_t n) {
     usb_io *u = (usb_io *)io;
     uint8_t *p = buf;
-    pthread_mutex_lock(&u->mu);
+    harp_mutex_lock(&u->mu);
     while (n) {
         size_t got = fifo_pop(&u->link_fifo, p, n);
         p += got;
         n -= got;
         if (!n) break;
         if (u->dead || u->closing) {
-            pthread_mutex_unlock(&u->mu);
+            harp_mutex_unlock(&u->mu);
             return false;
         }
-        pthread_cond_wait(&u->cv, &u->mu);
+        harp_cond_wait(&u->cv, &u->mu);
     }
-    pthread_mutex_unlock(&u->mu);
+    harp_mutex_unlock(&u->mu);
     return true;
 }
 
@@ -284,33 +273,32 @@ static bool usb_write_all(harp_io *io, const void *buf, size_t n) {
     memcpy(copy, buf, n);
     libusb_fill_bulk_transfer(x, u->h, u->ep_out, copy, (int)n, lout_cb, &c, 0);
     x->flags = LIBUSB_TRANSFER_FREE_BUFFER; /* libusb frees `copy` with x */
-    pthread_mutex_lock(&u->mu);
+    harp_mutex_lock(&u->mu);
     if (u->dead || u->closing) {
-        pthread_mutex_unlock(&u->mu);
+        harp_mutex_unlock(&u->mu);
         libusb_free_transfer(x); /* frees copy via flag */
         return false;
     }
     if (libusb_submit_transfer(x) != 0) {
         mark_dead_locked(u, "bulk out submit", LIBUSB_ERROR_IO);
-        pthread_mutex_unlock(&u->mu);
+        harp_mutex_unlock(&u->mu);
         libusb_free_transfer(x);
         return false;
     }
     u->inflight++;
-    struct timespec ts;
-    deadline_in(&ts, USB_LINK_WRITE_GIVE_UP_MS);
+    uint64_t dl = harp_deadline_ms(USB_LINK_WRITE_GIVE_UP_MS);
     while (!c.done) {
-        if (pthread_cond_timedwait(&u->cv, &u->mu, &ts) != 0 && !c.done) {
+        if (harp_cond_timedwait(&u->cv, &u->mu, dl) && !c.done) {
             /* still in flight after the give-up window: the device is
              * wedged. Cancel and wait for the (now certain) completion —
              * the ctx must stay valid until the callback runs. */
             libusb_cancel_transfer(x);
-            while (!c.done) pthread_cond_wait(&u->cv, &u->mu);
+            while (!c.done) harp_cond_wait(&u->cv, &u->mu);
             c.ok = 0;
             break;
         }
     }
-    pthread_mutex_unlock(&u->mu);
+    harp_mutex_unlock(&u->mu);
     return c.ok != 0;
 }
 
@@ -330,17 +318,16 @@ int harp_usb_audio_read(harp_io *io, void *buf, int len, unsigned timeout_ms) {
         fprintf(stderr, "harp-usb: sync audio in failed: %s\n", libusb_error_name(rc));
         return -1;
     }
-    pthread_mutex_lock(&u->mu);
+    harp_mutex_lock(&u->mu);
     if (!fifo_used(&u->audio_fifo) && !u->dead && !u->closing && timeout_ms) {
-        struct timespec ts;
-        deadline_in(&ts, timeout_ms);
+        uint64_t dl = harp_deadline_ms(timeout_ms);
         while (!fifo_used(&u->audio_fifo) && !u->dead && !u->closing)
-            if (pthread_cond_timedwait(&u->cv, &u->mu, &ts) != 0) break;
+            if (harp_cond_timedwait(&u->cv, &u->mu, dl)) break;
     }
     size_t got = fifo_pop(&u->audio_fifo, buf, (size_t)len);
     int rc = (int)got;
     if (!got && (u->dead || u->closing)) rc = -1;
-    pthread_mutex_unlock(&u->mu);
+    harp_mutex_unlock(&u->mu);
     return rc;
 }
 
@@ -350,11 +337,11 @@ bool harp_usb_audio_write(harp_io *io, const void *buf, int len, unsigned timeou
         fprintf(stderr, "harp-usb: audio write too large (%d)\n", len);
         return false;
     }
-    pthread_mutex_lock(&u->mu);
+    harp_mutex_lock(&u->mu);
     aout_slot *s = NULL;
     for (;;) {
         if (u->dead || u->closing) {
-            pthread_mutex_unlock(&u->mu);
+            harp_mutex_unlock(&u->mu);
             return false;
         }
         for (int i = 0; i < USB_AOUT_SLOTS; i++)
@@ -365,10 +352,9 @@ bool harp_usb_audio_write(harp_io *io, const void *buf, int len, unsigned timeou
         if (s) break;
         /* all slots in flight = genuine device backpressure; same contract
          * as the old sync write timeout */
-        struct timespec ts;
-        deadline_in(&ts, timeout_ms ? timeout_ms : 1);
-        if (pthread_cond_timedwait(&u->cv, &u->mu, &ts) != 0) {
-            pthread_mutex_unlock(&u->mu);
+        uint64_t dl = harp_deadline_ms(timeout_ms ? timeout_ms : 1);
+        if (harp_cond_timedwait(&u->cv, &u->mu, dl)) {
+            harp_mutex_unlock(&u->mu);
             return false;
         }
     }
@@ -377,12 +363,12 @@ bool harp_usb_audio_write(harp_io *io, const void *buf, int len, unsigned timeou
                               0);
     if (libusb_submit_transfer(s->xfer) != 0) {
         mark_dead_locked(u, "audio bulk out submit", LIBUSB_ERROR_IO);
-        pthread_mutex_unlock(&u->mu);
+        harp_mutex_unlock(&u->mu);
         return false;
     }
     s->busy = 1;
     u->inflight++;
-    pthread_mutex_unlock(&u->mu);
+    harp_mutex_unlock(&u->mu);
     return true;
 }
 
@@ -390,24 +376,23 @@ bool harp_usb_audio_write(harp_io *io, const void *buf, int len, unsigned timeou
 
 bool harp_usb_link_poll(harp_io *io, unsigned timeout_ms) {
     usb_io *u = (usb_io *)io;
-    pthread_mutex_lock(&u->mu);
+    harp_mutex_lock(&u->mu);
     if (!fifo_used(&u->link_fifo) && !u->dead && !u->closing) {
-        struct timespec ts;
-        deadline_in(&ts, timeout_ms ? timeout_ms : 1);
+        uint64_t dl = harp_deadline_ms(timeout_ms ? timeout_ms : 1);
         while (!fifo_used(&u->link_fifo) && !u->dead && !u->closing)
-            if (pthread_cond_timedwait(&u->cv, &u->mu, &ts) != 0) break;
+            if (harp_cond_timedwait(&u->cv, &u->mu, dl)) break;
     }
     bool have = fifo_used(&u->link_fifo) > 0;
-    pthread_mutex_unlock(&u->mu);
+    harp_mutex_unlock(&u->mu);
     return have; /* data already buffered is served even on a dying
                     transport; the recv that follows reports death */
 }
 
 size_t harp_usb_link_pending(harp_io *io) {
     usb_io *u = (usb_io *)io;
-    pthread_mutex_lock(&u->mu);
+    harp_mutex_lock(&u->mu);
     size_t n = fifo_used(&u->link_fifo);
-    pthread_mutex_unlock(&u->mu);
+    harp_mutex_unlock(&u->mu);
     return n;
 }
 
@@ -466,27 +451,26 @@ static bool start_in_xfers(usb_io *u, in_xfer *arr, int n, uint8_t ep, int is_au
 
 static void teardown(usb_io *u) {
     /* cancel everything pending, reap on this thread, then stop the loop */
-    pthread_mutex_lock(&u->mu);
+    harp_mutex_lock(&u->mu);
     u->closing = 1;
-    pthread_cond_broadcast(&u->cv);
+    harp_cond_broadcast(&u->cv);
     for (int i = 0; i < USB_LINK_IN_XFERS; i++)
         if (u->link_in[i].xfer) libusb_cancel_transfer(u->link_in[i].xfer);
     for (int i = 0; i < USB_AUDIO_IN_XFERS; i++)
         if (u->audio_in[i].xfer) libusb_cancel_transfer(u->audio_in[i].xfer);
     for (int i = 0; i < USB_AOUT_SLOTS; i++)
         if (u->aout[i].busy) libusb_cancel_transfer(u->aout[i].xfer);
-    pthread_mutex_unlock(&u->mu);
+    harp_mutex_unlock(&u->mu);
 
     /* the event thread reaps the cancellations; wait for inflight == 0 */
-    pthread_mutex_lock(&u->mu);
-    struct timespec ts;
-    deadline_in(&ts, 2000);
+    harp_mutex_lock(&u->mu);
+    uint64_t dl = harp_deadline_ms(2000);
     while (u->inflight > 0)
-        if (pthread_cond_timedwait(&u->cv, &u->mu, &ts) != 0) break;
-    pthread_mutex_unlock(&u->mu);
+        if (harp_cond_timedwait(&u->cv, &u->mu, dl)) break;
+    harp_mutex_unlock(&u->mu);
 
-    __atomic_store_n(&u->ev_running, 0, __ATOMIC_RELEASE);
-    if (u->evthread) pthread_join(u->evthread, NULL);
+    harp_flag_store_rel(&u->ev_running, 0);
+    if (u->evthread) harp_thread_join(u->evthread);
 
     for (int i = 0; i < USB_LINK_IN_XFERS; i++)
         if (u->link_in[i].xfer) libusb_free_transfer(u->link_in[i].xfer);
@@ -517,8 +501,8 @@ harp_io *harp_usb_open_match(const char *want, bool want_vp, uint16_t want_vid,
         free(u);
         return NULL;
     }
-    pthread_mutex_init(&u->mu, NULL);
-    pthread_cond_init(&u->cv, NULL);
+    harp_mutex_init(&u->mu);
+    harp_cond_init(&u->cv);
     u->debug = getenv("HARP_USB_DEBUG") != NULL;
     u->sync_audio = getenv("HARP_USB_SYNC_AUDIO") != NULL;
     u->link_fifo.buf = malloc(LINK_FIFO_SZ);
@@ -580,8 +564,8 @@ harp_io *harp_usb_open_match(const char *want, bool want_vp, uint16_t want_vid,
             u->aout[s].xfer = libusb_alloc_transfer(0);
             if (!u->aout[s].xfer) goto fail_open;
         }
-        u->ev_running = 1;
-        if (pthread_create(&u->evthread, NULL, ev_main, u) != 0) goto fail_open;
+        harp_flag_store_rel(&u->ev_running, 1);
+        if (harp_thread_create(&u->evthread, ev_main, u) != 0) goto fail_open;
         if (!start_in_xfers(u, u->link_in, USB_LINK_IN_XFERS, ep_in, 0)) goto fail_started;
         if (ep_ain && !u->sync_audio &&
             !start_in_xfers(u, u->audio_in, USB_AUDIO_IN_XFERS, ep_ain, 1))
@@ -638,8 +622,8 @@ void harp_usb_close(harp_io *io) {
     }
     free(u->link_fifo.buf);
     free(u->audio_fifo.buf);
-    pthread_mutex_destroy(&u->mu);
-    pthread_cond_destroy(&u->cv);
+    harp_mutex_destroy(&u->mu);
+    harp_cond_destroy(&u->cv);
     libusb_exit(u->ctx);
     free(u);
 }

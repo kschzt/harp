@@ -12,22 +12,38 @@
  *     restore                push saved state back (archive-before-push, CAS)
  *     demo                   narrated end-to-end recall walkthrough
  */
-#include <arpa/inet.h>
 #include <errno.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <time.h>
-#include <unistd.h>
+
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+typedef SOCKET sockhandle;
+#  define SOCK_INVALID INVALID_SOCKET
+#  define harp_closesock closesocket
+#else
+#  include <arpa/inet.h>
+#  include <netdb.h>
+#  include <netinet/in.h>
+#  include <netinet/tcp.h>
+#  include <sys/socket.h>
+#  include <unistd.h>
+typedef int sockhandle;
+#  define SOCK_INVALID (-1)
+#  define harp_closesock close
+#endif
 
 #include "harp/audio.h"
 #include "harp/envelope.h"
 #include "harp/link.h"
 #include "harp/object.h"
+#include "harp/plat.h"
 #include "harp/store.h"
 #include "client.h"
 #include "usb_io.h"
@@ -35,9 +51,62 @@
 #define EXPECT_REF "expected/live-project"
 #define LIVE_REF "live/project"
 
+/* harp_io over a TCP socket (the dev transport). Unlike core's fd-backed io,
+ * this uses recv/send so it works on Winsock SOCKETs as well as POSIX fds —
+ * read()/write() do not operate on Windows sockets. */
+typedef struct {
+    harp_io io;
+    sockhandle s;
+} sock_io;
+
+static bool sock_read_exact(harp_io *io, void *buf, size_t n) {
+    sock_io *t = (sock_io *)io;
+    uint8_t *p = buf;
+    while (n) {
+        int r = recv(t->s, (char *)p, (int)(n > 0x7fffffff ? 0x7fffffff : n), 0);
+        if (r < 0) {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEINTR) continue;
+#else
+            if (errno == EINTR) continue;
+#endif
+            return false;
+        }
+        if (r == 0) return false; /* peer closed */
+        p += r;
+        n -= (size_t)r;
+    }
+    return true;
+}
+
+static bool sock_write_all(harp_io *io, const void *buf, size_t n) {
+    sock_io *t = (sock_io *)io;
+    const uint8_t *p = buf;
+    while (n) {
+        int r = send(t->s, (const char *)p, (int)(n > 0x7fffffff ? 0x7fffffff : n), 0);
+        if (r < 0) {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEINTR) continue;
+#else
+            if (errno == EINTR) continue;
+#endif
+            return false;
+        }
+        p += r;
+        n -= (size_t)r;
+    }
+    return true;
+}
+
+static void sock_io_init(sock_io *t, sockhandle s) {
+    t->io.read_exact = sock_read_exact;
+    t->io.write_all = sock_write_all;
+    t->s = s;
+}
+
 typedef struct {
     harp_io *io;
-    harp_io_fd tcp; /* backing storage when the transport is a socket */
+    sock_io tcp; /* backing storage when the transport is a socket */
     harp_link link;
     harp_client client; /* shared protocol client (host/client.h) */
     harp_store store;
@@ -51,7 +120,7 @@ static void die(const char *msg) {
 
 /* ---------------- transport ---------------- */
 
-static int dial(const char *hostport) {
+static sockhandle dial(const char *hostport) {
     char host[256];
     const char *colon = strrchr(hostport, ':');
     if (!colon || colon == hostport) die("device address must be HOST:PORT");
@@ -63,18 +132,18 @@ static int dial(const char *hostport) {
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(host, colon + 1, &hints, &res) != 0) die("cannot resolve device host");
-    int fd = -1;
+    sockhandle fd = SOCK_INVALID;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
-        close(fd);
-        fd = -1;
+        if (fd == SOCK_INVALID) continue;
+        if (connect(fd, ai->ai_addr, (int)ai->ai_addrlen) == 0) break;
+        harp_closesock(fd);
+        fd = SOCK_INVALID;
     }
     freeaddrinfo(res);
-    if (fd < 0) die("cannot connect to device");
+    if (fd == SOCK_INVALID) die("cannot connect to device");
     int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
     return fd;
 }
 
@@ -192,6 +261,9 @@ static uint64_t refset(probe *p, const char *name, const harp_hash *expect /* NU
 /* ---------------- audio recording (§8) ---------------- */
 
 #ifdef HAVE_LIBUSB
+/* Writes a 16-bit PCM WAV. Header fields and samples are emitted in host byte
+ * order, which WAV requires to be little-endian — correct on every current
+ * target (x86/ARM64 are LE); would need byte-swapping on a big-endian host. */
 static void write_wav16(const char *path, const float *interleaved, size_t nframes,
                         uint32_t rate) {
     FILE *f = fopen(path, "wb");
@@ -272,8 +344,7 @@ static void cmd_record(probe *p, double seconds, const char *path) {
     uint64_t expect_ts = 0;
     bool have_ts = false;
     uint64_t lost_samples = 0, disconts = 0, frames = 0;
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint64_t t0 = harp_now_ns(), t1;
 
     while (got_frames < want_frames) {
         int r = harp_usb_audio_read(p->io, acc + acc_len, (int)(sizeof acc - acc_len), 2000);
@@ -303,7 +374,7 @@ static void cmd_record(probe *p, double seconds, const char *path) {
         memmove(acc, acc + off, acc_len - off);
         acc_len -= off;
     }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    t1 = harp_now_ns();
 
     /* stop: send the request, then keep draining the stream until the device
      * thread parks — its writes must complete before it can see the stop */
@@ -322,7 +393,7 @@ static void cmd_record(probe *p, double seconds, const char *path) {
         ck(p, harp_client_wait(&p->client, stop_rid, &rsp, &stop_e));
     }
 
-    double wall = (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    double wall = (double)(t1 - t0) / 1e9;
     double stream_secs = (double)got_frames / rate;
     double drift_ppm = (stream_secs / wall - 1.0) * 1e6;
     write_wav16(path, samples, got_frames, rate);
@@ -372,8 +443,7 @@ static double render_host_paced(probe *p, size_t want_frames, uint32_t nsamples,
     size_t total_blocks = (want_frames + nsamples - 1) / nsamples;
     size_t got_frames = 0, acc_len = 0;
     uint64_t expect_ts = 0;
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint64_t t0 = harp_now_ns(), t1;
 
     int dry_spins = 0;
     /* Effective pipeline depth: start optimistic, learn the device's real
@@ -419,7 +489,7 @@ static double render_host_paced(probe *p, size_t want_frames, uint32_t nsamples,
         memmove(acc, acc + off, acc_len - off);
         acc_len -= off;
     }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    t1 = harp_now_ns();
 
     req_head(p, &req, "audio.stop", false);
     uint64_t stop_rid = p->client.next_rid;
@@ -437,7 +507,7 @@ static double render_host_paced(probe *p, size_t want_frames, uint32_t nsamples,
     }
     harp_cbuf_free(&req);
     harp_cbuf_free(&rsp);
-    return (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    return (double)(t1 - t0) / 1e9;
 }
 
 static void cmd_render(probe *p, double seconds, const char *path) {
@@ -510,12 +580,11 @@ static void cmd_ping(probe *p, int rounds) {
         harp_cbuf_init(&req);
         harp_cbuf_init(&rsp);
         req_head(p, &req, "time.ping", false);
-        struct timespec s, r;
-        clock_gettime(CLOCK_MONOTONIC, &s);
+        uint64_t s = harp_now_ns();
         harp_env e = request(p, &req, &rsp);
-        clock_gettime(CLOCK_MONOTONIC, &r);
-        long long t_send = (long long)s.tv_sec * 1000000 + s.tv_nsec / 1000;
-        long long t_recv = (long long)r.tv_sec * 1000000 + r.tv_nsec / 1000;
+        uint64_t r = harp_now_ns();
+        long long t_send = (long long)(s / 1000);
+        long long t_recv = (long long)(r / 1000);
         /* parse {0:[ep,recv_us], 1:[ep,xmit_us]} */
         long long d_recv = 0, d_xmit = 0;
         harp_cdec b;
@@ -700,7 +769,7 @@ static void do_restore(probe *p) {
     char archive_name[HARP_REF_NAME_MAX];
     time_t now = time(NULL);
     struct tm tm;
-    gmtime_r(&now, &tm);
+    harp_gmtime(now, &tm);
     snprintf(archive_name, sizeof archive_name, "archive/%04d-%02d-%02dT%02d:%02d:%02dZ",
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
              tm.tm_sec);
@@ -783,6 +852,11 @@ static void cmd_demo(probe *p, const char *addr) {
 /* ---------------- main ---------------- */
 
 int main(int argc, char **argv) {
+    harp_plat_init();
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) die("WSAStartup failed");
+#endif
     const char *addr = "127.0.0.1:47800";
     const char *store_dir = "./host-store";
     int i = 1;
@@ -811,7 +885,7 @@ int main(int argc, char **argv) {
 #endif
 
     probe p = {0};
-    int tcp_fd = -1;
+    sockhandle tcp_fd = SOCK_INVALID;
     if (strcmp(addr, "usb") == 0 || strncmp(addr, "usb:", 4) == 0) {
 #ifdef HAVE_LIBUSB
         /* "usb:SERIAL" picks a board; bare "usb" honors HARP_DEVICE_SERIAL
@@ -826,7 +900,7 @@ int main(int argc, char **argv) {
 #endif
     } else {
         tcp_fd = dial(addr);
-        harp_io_fd_init(&p.tcp, tcp_fd, tcp_fd);
+        sock_io_init(&p.tcp, tcp_fd);
         p.io = &p.tcp.io;
     }
     harp_link_init(&p.link);
@@ -885,10 +959,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "harp-probe: unknown command '%s'\n", cmd);
         return 2;
     }
-    if (tcp_fd >= 0) close(tcp_fd);
+    if (tcp_fd != SOCK_INVALID) harp_closesock(tcp_fd);
 #ifdef HAVE_LIBUSB
     else
         harp_usb_close(p.io);
+#endif
+#ifdef _WIN32
+    WSACleanup();
 #endif
     return 0;
 }

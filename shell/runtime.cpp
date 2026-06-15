@@ -10,6 +10,8 @@
 #include <cstring>
 #include <ctime>
 
+#include "harp/plat.h" /* monotonic clock, hi-res sleep, UTC breakdown */
+
 #define LIVE_REF "live/project"
 #define CREDIT_GRANT (16u << 20)
 #define BUNDLE_MAGIC "harpb"
@@ -24,8 +26,17 @@ static void log_msg(const char *fmt, ...) {
 }
 
 void HarpRuntime::defaultStoreDir(char *out, size_t n) {
+#ifdef _WIN32
+    /* %LOCALAPPDATA%\HARP\store. Forward slashes for the parts we append so the
+     * store's mkdir -p (which splits on '/') creates each level; Win32 accepts
+     * the mixed separators. */
+    const char *base = getenv("LOCALAPPDATA");
+    if (!base || !base[0]) base = getenv("APPDATA");
+    snprintf(out, n, "%s/HARP/store", base && base[0] ? base : ".");
+#else
     const char *home = getenv("HOME");
     snprintf(out, n, "%s/Library/Application Support/HARP/store", home ? home : "/tmp");
+#endif
 }
 
 HarpRuntime::HarpRuntime() {
@@ -390,8 +401,7 @@ void HarpRuntime::supervisor() {
             continue;
         }
         for (int i = 0; i < 10 && running_.load(std::memory_order_acquire); i++) {
-            struct timespec ts = {0, 100000000}; /* 1 s total, stop-responsive */
-            nanosleep(&ts, nullptr);
+            harp_sleep_ns(100000000ull); /* 100 ms x10 = 1 s total, stop-responsive */
         }
     }
     sessionDown();
@@ -399,6 +409,7 @@ void HarpRuntime::supervisor() {
 
 bool HarpRuntime::start(uint32_t sampleRate) {
     if (running_.load()) return connected();
+    harp_plat_init(); /* hi-res timers for the sub-ms pacing/idle waits (Windows) */
     rate_ = sampleRate;
     running_.store(true);
     bool now = sessionUp(); /* fast path: report a present device immediately */
@@ -413,8 +424,7 @@ void HarpRuntime::stop() {
      * them still queued is how notes get stuck. Bounded wait. */
     if (running_.load(std::memory_order_acquire) && connected()) {
         for (int i = 0; i < 100 && !timedRing_.empty(); i++) {
-            struct timespec ts = {0, 1000000};
-            nanosleep(&ts, nullptr);
+            harp_sleep_ns(1000000ull); /* 1 ms */
         }
     }
     if (!running_.exchange(false)) return;
@@ -583,8 +593,7 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
             padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
             return (want - got) / 2;
         }
-        struct timespec ts = {0, 500000}; /* 0.5 ms */
-        nanosleep(&ts, nullptr);
+        harp_sleep_ns(500000ull); /* 0.5 ms */
         waited++;
     }
     return 0;
@@ -676,8 +685,7 @@ void HarpRuntime::feeder() {
         }
 
         if (!didWork) {
-            struct timespec ts = {0, 1000000}; /* 1 ms */
-            nanosleep(&ts, nullptr);
+            harp_sleep_ns(1000000ull); /* 1 ms */
         }
     }
 }
@@ -759,9 +767,7 @@ void HarpRuntime::eventPump() {
         }
 
         if (!didWork) {
-            struct timespec ts = {0, 500000}; /* 0.5 ms — well inside the
-                                                 one-block budget */
-            nanosleep(&ts, nullptr);
+            harp_sleep_ns(500000ull); /* 0.5 ms — well inside the one-block budget */
         }
     }
     harp_cbuf_free(&msgbuf);
@@ -861,7 +867,7 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
         char archive[96];
         time_t now = time(nullptr);
         struct tm tm;
-        gmtime_r(&now, &tm);
+        harp_gmtime(now, &tm);
         snprintf(archive, sizeof archive, "archive/%04d-%02d-%02dT%02d:%02d:%02dZ",
                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
                  tm.tm_sec);

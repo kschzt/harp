@@ -11,6 +11,8 @@
  *                  --out out.wav [--hash] [--save-state f] [--load-state f]
  */
 
+#define _USE_MATH_DEFINES /* M_PI on MSVC */
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #ifdef __APPLE__
@@ -20,6 +22,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "render_check.h"
@@ -279,22 +282,14 @@ int main(int argc, char **argv) {
     if (realtime) /* compete like a DAW audio thread, not a background job */
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
-    struct timespec rt0;
-    clock_gettime(CLOCK_MONOTONIC, &rt0);
+    auto rt0 = std::chrono::steady_clock::now();
     while (done < total) {
         if (realtime) { /* wall-clock pacing: process() at DAW cadence */
             double target = (double)done / rate;
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
             double elapsed =
-                (double)(now.tv_sec - rt0.tv_sec) + (now.tv_nsec - rt0.tv_nsec) / 1e9;
-            if (target > elapsed) {
-                struct timespec slp;
-                double wait = target - elapsed;
-                slp.tv_sec = (time_t)wait;
-                slp.tv_nsec = (long)((wait - (double)slp.tv_sec) * 1e9);
-                nanosleep(&slp, nullptr);
-            }
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - rt0).count();
+            if (target > elapsed)
+                std::this_thread::sleep_for(std::chrono::duration<double>(target - elapsed));
         }
         size_t n = std::min((size_t)block, total - done);
         pd.numSamples = (int32)n;

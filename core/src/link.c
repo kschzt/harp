@@ -2,7 +2,17 @@
 
 #include <errno.h>
 #include <string.h>
-#include <unistd.h>
+
+/* The fd-backed transport below uses raw byte read/write. On POSIX this serves
+ * sockets, pipes, and FunctionFS endpoint files alike. On Windows _read/_write
+ * work for CRT fds (files/pipes) only — sockets there are a separate handle
+ * namespace served by a Winsock recv/send harp_io, so the fd path is the
+ * file/pipe transport and the socket transport is registered separately. */
+#ifdef _WIN32
+#  include <io.h> /* _read, _write */
+#else
+#  include <unistd.h>
+#endif
 
 void harp_link_init(harp_link *l) {
     for (int i = 0; i < 4; i++) harp_cbuf_init(&l->acc[i]);
@@ -12,12 +22,27 @@ void harp_link_free(harp_link *l) {
     for (int i = 0; i < 4; i++) harp_cbuf_free(&l->acc[i]);
 }
 
+/* Frames are <= 65536+8 bytes, so a size_t length always fits the platform
+ * read/write count; clamp defensively on Windows where _read takes unsigned. */
+#ifdef _WIN32
+static int io_read(int fd, void *p, size_t n) {
+    return _read(fd, p, n > 0x7fffffffu ? 0x7fffffffu : (unsigned)n);
+}
+static int io_write(int fd, const void *p, size_t n) {
+    return _write(fd, p, n > 0x7fffffffu ? 0x7fffffffu : (unsigned)n);
+}
+#else
+#  include <sys/types.h> /* ssize_t */
+static ssize_t io_read(int fd, void *p, size_t n) { return read(fd, p, n); }
+static ssize_t io_write(int fd, const void *p, size_t n) { return write(fd, p, n); }
+#endif
+
 bool harp_read_exact(int fd, void *buf, size_t n) {
     uint8_t *p = buf;
     while (n) {
-        ssize_t r = read(fd, p, n);
+        long r = (long)io_read(fd, p, n);
         if (r < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) continue; /* POSIX only; _read never sets it */
             return false;
         }
         if (r == 0) return false; /* EOF */
@@ -30,9 +55,9 @@ bool harp_read_exact(int fd, void *buf, size_t n) {
 bool harp_write_all(int fd, const void *buf, size_t n) {
     const uint8_t *p = buf;
     while (n) {
-        ssize_t r = write(fd, p, n);
+        long r = (long)io_write(fd, p, n);
         if (r < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) continue; /* POSIX only; _write never sets it */
             return false;
         }
         p += r;

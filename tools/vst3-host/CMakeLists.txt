@@ -11,11 +11,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
+if(MSVC)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS) # harp C sources use getenv/snprintf
+endif()
 
 set(SMTG_ENABLE_VST3_HOSTING_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SMTG_ENABLE_VST3_PLUGIN_EXAMPLES ON CACHE BOOL "" FORCE) # adelay = test subject
 set(SMTG_ENABLE_VSTGUI_SUPPORT OFF CACHE BOOL "" FORCE)
 set(SMTG_CREATE_PLUGIN_LINK OFF CACHE BOOL "" FORCE) # no ~/Library symlink spam
+# Skip the SDK's post-build validator: it loads the plugin before our libusb DLL
+# is copied beside it, and we validate the shell with harp-vst3-host + a real DAW.
+set(SMTG_RUN_VST_VALIDATOR OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../external/vst3sdk vst3sdk EXCLUDE_FROM_ALL)
 
@@ -27,6 +33,8 @@ if(APPLE)
   target_sources(harp-vst3-host PRIVATE ${SDK_ROOT}/public.sdk/source/vst/hosting/module_mac.mm)
   set_source_files_properties(${SDK_ROOT}/public.sdk/source/vst/hosting/module_mac.mm
     PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+elseif(WIN32)
+  target_sources(harp-vst3-host PRIVATE ${SDK_ROOT}/public.sdk/source/vst/hosting/module_win32.cpp)
 elseif(UNIX)
   target_sources(harp-vst3-host PRIVATE ${SDK_ROOT}/public.sdk/source/vst/hosting/module_linux.cpp)
 endif()
@@ -47,8 +55,31 @@ find_package(PkgConfig QUIET)
 if(PKG_CONFIG_FOUND)
   pkg_check_modules(LIBUSB libusb-1.0)
 endif()
+if(NOT LIBUSB_FOUND)
+  # No pkg-config (typical on Windows/MSVC): vendored prebuilt under
+  # external/libusb-win. Use the STATIC lib so the plugin is fully self-contained
+  # — no libusb DLL to place beside the plugin, the host, AND the SDK's
+  # moduleinfo/validator tools (all of which LoadLibrary() the plugin at build).
+  set(_HARP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+  find_path(LIBUSB_INCLUDE_DIRS NAMES libusb.h PATH_SUFFIXES libusb-1.0
+    HINTS ${_HARP_ROOT}/external/libusb-win/include)
+  find_library(LIBUSB_LIBRARIES NAMES libusb-1.0 usb-1.0
+    HINTS ${_HARP_ROOT}/external/libusb-win/VS2022/MS64/static
+          ${_HARP_ROOT}/external/libusb-win/MS64/static)
+  if(LIBUSB_INCLUDE_DIRS AND LIBUSB_LIBRARIES)
+    set(LIBUSB_FOUND TRUE)
+  endif()
+endif()
 if(LIBUSB_FOUND)
   set(HARP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+  # Platform shim (harp/plat.h) compiled into the shell/AU like the core .c files.
+  if(WIN32)
+    set(HARP_PLAT_SRC ${HARP_ROOT}/core/src/plat_win.c)
+    set(HARP_PLAT_LIBS winmm)
+  else()
+    set(HARP_PLAT_SRC ${HARP_ROOT}/core/src/plat_posix.c)
+    set(HARP_PLAT_LIBS "")
+  endif()
   # VST3 plugin entry point is per-platform (macmain/linuxmain/dllmain).
   if(APPLE)
     set(SHELL_MAIN ${SDK_ROOT}/public.sdk/source/main/macmain.cpp)
@@ -71,42 +102,60 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/core/src/envelope.c
     ${HARP_ROOT}/core/src/link.c
     ${HARP_ROOT}/core/src/audio.c
+    ${HARP_PLAT_SRC}
   )
   target_include_directories(harp-shell PRIVATE
     ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
     ${LIBUSB_INCLUDE_DIRS})
   target_compile_definitions(harp-shell PRIVATE HAVE_LIBUSB)
   target_link_directories(harp-shell PRIVATE ${LIBUSB_LIBRARY_DIRS})
-  target_link_libraries(harp-shell PRIVATE sdk ${LIBUSB_LIBRARIES})
-  message(STATUS "harp-shell: building VST3 shell with libusb ${LIBUSB_VERSION}")
+  target_link_libraries(harp-shell PRIVATE sdk ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS})
+  if(WIN32)
+    # static libusb pulls in the Win device-enumeration + COM GUID APIs
+    target_link_libraries(harp-shell PRIVATE setupapi ole32)
+  endif()
+  message(STATUS "harp-shell: building VST3 shell with libusb")
 
-  # SMTG signs at link time, then moduleinfotool writes into Resources and
-  # breaks the seal ("code has no resources but signature indicates they
-  # must be present" — Live refuses such bundles). Re-sign as the last step.
-  set(HARP_SHELL_BUNDLE ${CMAKE_BINARY_DIR}/VST3/Release/harp-shell.vst3)
+  # SMTG emits the bundle under VST3/<config>/ ($<CONFIG> = multi-config safe).
+  set(HARP_SHELL_BUNDLE ${CMAKE_BINARY_DIR}/VST3/$<CONFIG>/harp-shell.vst3)
   if(APPLE)
+    # SMTG signs at link, then moduleinfotool rewrites Resources and breaks the
+    # seal ("code has no resources but signature indicates they must be present"
+    # — Live refuses such bundles). Re-sign as the last step.
     add_custom_command(TARGET harp-shell POST_BUILD
       COMMAND codesign --force --deep -s - "${HARP_SHELL_BUNDLE}"
       COMMENT "Re-sealing harp-shell.vst3 signature")
   endif()
 
-  # `cmake --build build-vst --target install-live` -> user VST3 folder
+  # `cmake --build ... --target install-live` -> the OS VST3 folder. Uses
+  # cmake -E (cross-platform) instead of rm/cp/mkdir. On Windows the system
+  # VST3 dir lives under Program Files, so this may need an elevated shell.
+  if(WIN32)
+    set(HARP_VST3_DEST "$ENV{CommonProgramW6432}/VST3")
+  elseif(APPLE)
+    set(HARP_VST3_DEST "$ENV{HOME}/Library/Audio/Plug-Ins/VST3")
+  else()
+    set(HARP_VST3_DEST "$ENV{HOME}/.vst3")
+  endif()
+  if(NOT HARP_VST3_DEST OR HARP_VST3_DEST MATCHES "^/+VST3$")
+    # the env var was unset — fall back to a build-local dir rather than risk
+    # `rm -rf` against a bogus root path.
+    set(HARP_VST3_DEST "${CMAKE_BINARY_DIR}/dist/VST3")
+  endif()
   add_custom_target(install-live
-    COMMAND rm -rf "$ENV{HOME}/Library/Audio/Plug-Ins/VST3/harp-shell.vst3"
-    COMMAND cp -R "${HARP_SHELL_BUNDLE}" "$ENV{HOME}/Library/Audio/Plug-Ins/VST3/"
-    COMMAND codesign --force --deep -s -
-            "$ENV{HOME}/Library/Audio/Plug-Ins/VST3/harp-shell.vst3"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${HARP_VST3_DEST}/harp-shell.vst3"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${HARP_VST3_DEST}"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${HARP_SHELL_BUNDLE}" "${HARP_VST3_DEST}/harp-shell.vst3"
     DEPENDS harp-shell
-    COMMENT "Installing harp-shell.vst3 for Ableton Live")
-
-  # Linux: VST3 bundles land in ~/.vst3 (Bitwig, Reaper, Ardour pick it up)
+    COMMENT "Installing harp-shell.vst3 to ${HARP_VST3_DEST}")
+  if(APPLE)
+    add_custom_command(TARGET install-live POST_BUILD
+      COMMAND codesign --force --deep -s - "${HARP_VST3_DEST}/harp-shell.vst3")
+  endif()
+  # Back-compat alias referenced by docs/CI.
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    add_custom_target(install-linux
-      COMMAND rm -rf "$ENV{HOME}/.vst3/harp-shell.vst3"
-      COMMAND mkdir -p "$ENV{HOME}/.vst3"
-      COMMAND cp -R "${HARP_SHELL_BUNDLE}" "$ENV{HOME}/.vst3/"
-      DEPENDS harp-shell
-      COMMENT "Installing harp-shell.vst3 to ~/.vst3")
+    add_custom_target(install-linux DEPENDS install-live)
   endif()
 
   # ---- the Audio Unit shell (macOS): same runtime, second format ----
@@ -123,7 +172,8 @@ if(LIBUSB_FOUND)
       ${HARP_ROOT}/core/src/store.c
       ${HARP_ROOT}/core/src/envelope.c
       ${HARP_ROOT}/core/src/link.c
-      ${HARP_ROOT}/core/src/audio.c)
+      ${HARP_ROOT}/core/src/audio.c
+      ${HARP_PLAT_SRC})
     target_include_directories(harp-au PRIVATE
       ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
       ${LIBUSB_INCLUDE_DIRS})

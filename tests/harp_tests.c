@@ -289,6 +289,61 @@ static void test_store(void) {
     harp_cbuf_free(&out);
 }
 
+/* ref_list must enumerate hierarchical refs and return their LOGICAL names —
+ * including the colons in archive timestamps. On Windows those colons are
+ * escaped on disk (illegal in NTFS names); this proves the escape/unescape
+ * round-trips through the directory walk. On POSIX it's a plain walk check. */
+struct namelist {
+    char names[16][HARP_REF_NAME_MAX];
+    int n;
+};
+static void collect_cb(const harp_ref *r, void *ud) {
+    struct namelist *nl = ud;
+    if (nl->n < 16) snprintf(nl->names[nl->n++], HARP_REF_NAME_MAX, "%s", r->name);
+}
+static bool has_name(const struct namelist *nl, const char *want) {
+    for (int i = 0; i < nl->n; i++)
+        if (strcmp(nl->names[i], want) == 0) return true;
+    return false;
+}
+
+static void test_store_reflist(void) {
+    harp_store s;
+    CHECK(harp_store_open(&s, "/tmp/harp-test-reflist") == 0);
+
+    harp_cbuf b;
+    harp_cbuf_init(&b);
+    harp_obj_encode_blob(&b, "application/x.test", "x", 1);
+    harp_hash h;
+    CHECK(harp_store_put(&s, b.buf, b.len, &h) == 0);
+
+    static const char *names[3] = {
+        "live/project",
+        "archive/2026-06-10T12:00:00Z", /* colons: illegal raw on Windows */
+        "archive/2026-06-11T08:30:15Z",
+    };
+    for (int i = 0; i < 3; i++) {
+        harp_ref r = {0};
+        snprintf(r.name, sizeof r.name, "%s", names[i]);
+        r.unborn = false;
+        r.hash = h;
+        r.generation = (uint64_t)(i + 1);
+        r.dirty = (i & 1) != 0;
+        CHECK(harp_store_ref_write(&s, &r) == 0);
+        /* and each reads back with its colons intact */
+        harp_ref rr;
+        CHECK(harp_store_ref_read(&s, names[i], &rr) == 0);
+        CHECK(strcmp(rr.name, names[i]) == 0 && !rr.unborn && harp_hash_eq(&rr.hash, &h));
+    }
+
+    struct namelist nl = {0};
+    CHECK(harp_store_ref_list(&s, collect_cb, &nl) == 0);
+    CHECK(nl.n == 3);
+    for (int i = 0; i < 3; i++) CHECK(has_name(&nl, names[i]));
+
+    harp_cbuf_free(&b);
+}
+
 static void test_envelope(void) {
     harp_cbuf b;
     harp_cbuf_init(&b);
@@ -354,6 +409,7 @@ int main(void) {
     test_frame();
     test_objects();
     test_store();
+    test_store_reflist();
     test_envelope();
     test_audio_codec();
     printf("%d passed, %d failed\n", g_pass, g_fail);

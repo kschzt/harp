@@ -28,6 +28,44 @@ jobs:
           sleep 2
           auval -v aumu rfdv HARP
 
+  shell-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: clone VST3 SDK
+        run: git clone --depth 1 --recursive
+             https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
+      - name: fetch libusb (prebuilt MSVC binaries — no pkg-config on Windows)
+        shell: pwsh
+        run: |
+          $ver = '1.0.27'
+          Invoke-WebRequest -UseBasicParsing `
+            "https://github.com/libusb/libusb/releases/download/v$ver/libusb-$ver.7z" `
+            -OutFile libusb.7z
+          New-Item -ItemType Directory -Force external/libusb-win | Out-Null
+          tar -xf libusb.7z -C external/libusb-win   # bsdtar reads 7z
+      - name: core build + unit tests (MSVC)
+        shell: pwsh
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64
+          cmake --build build --config RelWithDebInfo --target harp-tests harp-probe
+          ctest --test-dir build -C RelWithDebInfo --output-on-failure
+      - name: shell + host build, ring tests
+        shell: pwsh
+        run: |
+          cmake -B build-vst -S tools/vst3-host -G "Visual Studio 17 2022" -A x64
+          cmake --build build-vst --config Release --target harp-vst3-host harp-shell ring-tests
+          ctest --test-dir build-vst -C Release --output-on-failure
+      - name: plugin load + process gate (device-tolerant; no hardware on CI)
+        shell: pwsh
+        run: |
+          # The build already LoadLibrary()'d the plugin (moduleinfotool); this
+          # instantiates the processor and runs a block the way a DAW does. With
+          # no device attached the runtime pads silence and still returns cleanly.
+          & build-vst/Release/harp-vst3-host.exe `
+            build-vst/VST3/Release/harp-shell.vst3 --seconds 1 --out ci-render.wav
+          if ($LASTEXITCODE -ne 0) { throw "harp-vst3-host failed to load/process the shell" }
+
   core:
     runs-on: ubuntu-latest
     steps:
