@@ -54,3 +54,10 @@ jobs:
         # hammer the shell's event plane with dense automation + notes + loop
         # wraps; assert the device dropped/delayed nothing (§14.2 counters).
         run: scripts/flood-stress.sh
+
+      - name: REAPER real-DAW e2e (render through PI4B-0002, byte-deterministic)
+        # REAPER (headless under xvfb, provisioned at /opt/REAPER) loads
+        # harp-shell.vst3 and renders a MIDI project through the device twice;
+        # asserts byte-identical audio + zero event loss — the real third-party
+        # DAW gate, complementing the SDK/pluginval validators.
+        run: scripts/reaper-e2e.sh

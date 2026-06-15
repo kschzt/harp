@@ -96,3 +96,23 @@ shell-driven tests (soak/timing/tempo-lock) need the Linux VST3 build
 variant of `scripts/hw-tests.sh` (the current one assumes macOS plugin
 paths + an Ableton claim guard). That variant is the first task once the
 NUC is reachable.
+
+### REAPER real-DAW e2e (runner provisioning)
+
+`scripts/reaper-e2e.sh` renders the shell through REAPER (a real third-party
+VST3 host), headless, twice, and asserts byte-identical audio + zero event
+loss — the `hw` job's top tier. The runner guest is a libvirt VM (the runner
+executes as user `ci`); provision REAPER once, system-wide so `ci` can use it:
+
+```sh
+sudo apt-get install -y xvfb libasound2t64
+V=$(curl -s https://www.reaper.fm/download.php | grep -oE 'reaper[0-9]+_linux_x86_64\.tar\.xz' | head -1)
+curl -sL -o /tmp/r.tar.xz "https://www.reaper.fm/files/7.x/$V"
+tmp=$(mktemp -d); tar -xf /tmp/r.tar.xz -C "$tmp" --strip-components=1
+sudo cp -r "$tmp/REAPER" /opt/REAPER && sudo chmod -R a+rX /opt/REAPER
+```
+
+REAPER renders offline without an audio device on Linux (no ASIO modal like
+Windows), so no dummy-audio config is needed. The e2e overrides nothing —
+`/opt/REAPER/reaper`, `./build/harp-probe`, `~/.vst3/harp-shell.vst3` are the
+defaults.
