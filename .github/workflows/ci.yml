@@ -31,11 +31,21 @@ jobs:
         run: |
           curl -sL https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_macOS.zip -o pv.zip
           unzip -q pv.zip
+          # Locate the bundle by search — its config subdir (VST3/Release/…)
+          # depends on the runner's default generator, which has changed before.
+          plug=$(find build-vst -maxdepth 4 -name 'harp-shell.vst3' -type d | head -1)
+          test -n "$plug" || { echo "harp-shell.vst3 not found under build-vst"; exit 1; }
           ./pluginval.app/Contents/MacOS/pluginval --strictness-level 10 --skip-gui-tests \
-            --validate build-vst/VST3/harp-shell.vst3
+            --validate "$plug"
 
   shell-windows:
-    runs-on: windows-latest
+    # Pinned to the VS 2022 image deliberately: this port targets the
+    # "Visual Studio 17 2022" generator below. `windows-latest` rolled to
+    # windows-2025/VS2026, where that generator finds no VS instance — and
+    # because pwsh doesn't abort on a native command's nonzero exit, the
+    # failed configure produced nothing yet the step went green. Reproducible
+    # toolchain beats latest; the pwsh steps now also fail loudly (see below).
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: clone VST3 SDK
@@ -44,6 +54,8 @@ jobs:
       - name: fetch libusb (prebuilt MSVC binaries — no pkg-config on Windows)
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true   # native nonzero exit => step fails
           $ver = '1.0.27'
           Invoke-WebRequest -UseBasicParsing `
             "https://github.com/libusb/libusb/releases/download/v$ver/libusb-$ver.7z" `
@@ -53,12 +65,16 @@ jobs:
       - name: core build + unit tests (MSVC)
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true   # native nonzero exit => step fails
           cmake -B build -G "Visual Studio 17 2022" -A x64
           cmake --build build --config RelWithDebInfo --target harp-tests harp-probe
           ctest --test-dir build -C RelWithDebInfo --output-on-failure
       - name: shell + host build, ring tests
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true   # native nonzero exit => step fails
           # Building harp-shell runs the SDK's moduleinfotool POST_BUILD, which
           # LoadLibrary()'s the plugin and introspects its factory — so a green
           # build IS the DAW-scan load gate (it fails the build if the DLL can't
@@ -70,12 +86,17 @@ jobs:
       - name: pluginval (plugin-contract abuse, strictness 10)
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true   # native nonzero exit => step fails
           Invoke-WebRequest -UseBasicParsing `
             https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Windows.zip `
             -OutFile pv.zip
           Expand-Archive pv.zip -DestinationPath pv -Force
           $pv = (Get-ChildItem pv -Recurse -Filter pluginval.exe | Select-Object -First 1).FullName
-          & $pv --strictness-level 10 --skip-gui-tests --validate build-vst/VST3/Release/harp-shell.vst3
+          # Locate the bundle by search — its config subdir can move with the generator.
+          $plug = (Get-ChildItem build-vst -Recurse -Directory -Filter harp-shell.vst3 | Select-Object -First 1).FullName
+          if (-not $plug) { throw "harp-shell.vst3 not found under build-vst" }
+          & $pv --strictness-level 10 --skip-gui-tests --validate $plug
           if ($LASTEXITCODE -ne 0) { throw "pluginval failed" }
 
   core:
