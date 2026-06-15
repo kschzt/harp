@@ -372,12 +372,12 @@ int main(int argc, char **argv) {
 
         ParameterChanges pc;
         if (do_reset && done == 0 && controller) {
-            /* pin start state: set EVERY param to its default at t=0 (offset 0,
-             * before the ramp/lfo/set points below), so two runs start
-             * identically. Params persist on the device across sessions (recall
-             * state) and automation becomes ramps that interpolate FROM the
-             * current value — so the start value must be pinned, not just the
-             * undriven params. A later --set / lfo point at offset 0 overrides. */
+            /* set EVERY param to its default at t=0 — a clean patch to render
+             * from, regardless of the device's persisted state. NOTE: under
+             * dense automation the shell's ramp thinning (§9.4) folds this into
+             * the first ramp, so it does NOT guarantee cross-run determinism for
+             * automated params; the flood determinism gate instead pins device
+             * state directly via the front panel (scripts/flood-stress.sh). */
             int32 np = controller->getParameterCount();
             for (int32 pi = 0; pi < np; pi++) {
                 ParameterInfo info{};
