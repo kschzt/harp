@@ -4,19 +4,27 @@
 [![hw — real device](https://github.com/kschzt/harp/actions/workflows/hw.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/hw.yml)
 [![license: Apache-2.0 | CC-BY-4.0](https://img.shields.io/badge/license-Apache--2.0%20%7C%20CC--BY--4.0-blue)](LICENSE.md)
 
-**An open standard that makes hardware instruments behave like plugins.**
+**Make hardware instruments behave like plugins.** A Raspberry Pi 4B plays as
+an instrument track in Ableton Live today — Git-style total recall through the
+project's own save/reopen, knobs as sample-accurate automation lanes, and
+offline bounce *through the physical box*.
+
+<!-- ▶ DEMO VIDEO GOES HERE — ~60s: Pi as a Live track → automate a knob →
+     save & reopen the set → recall restores the hardware → offline bounce. -->
 
 Hardware synths, drum machines, and effects have connected to computers for
 forty years, and the connection is still fragile in one specific way:
 *recall*. Audio mostly works, MIDI mostly works — but reopen last month's
 project and the hardware is not in the state you saved, and nothing will
 tell you. The deep integrations that fix this (multichannel USB audio,
-plugin-shell control, total recall) exist only inside closed single-vendor
-ecosystems, because every vendor must rebuild drivers, state sync, and DAW
-compatibility from scratch — and most can't afford to.
+plugin-shell control, total recall) have existed only inside closed
+single-vendor ecosystems, because every vendor has to rebuild drivers, state
+sync, and DAW compatibility from scratch.
 
-HARP makes that integration a shared, open substrate. A device implementing
-it gets, from any conforming host:
+HARP is a complete, working implementation of that integration — with an open
+spec underneath, if you want to build a device on it. The reference device is
+a Raspberry Pi running an 8-knob stereo synth; anything that speaks the
+protocol gets the same treatment from any conforming host:
 
 - **Total recall, Git-style** — device state is content-addressed and
   hash-verified; a saved project reopens with the hardware *provably* in
@@ -48,26 +56,28 @@ it gets, from any conforming host:
   Hostile or corrupt wire input ends in a clean session reset, never a
   crash (every parser is fuzzed; a live abuse test is part of CI).
 
-**The whole stack runs today**: a Raspberry Pi 4B plays as an instrument
-track in Ableton Live 12 — knobs as automation lanes, total recall through
-the Live set's own save/reopen, a tempo-locked arpeggiator, offline bounce
-through the hardware.
+**What "works" means here:** the four protocol planes (control, state, events,
+audio) are implemented end-to-end and verified on real hardware — recall
+through Ableton's own save/reopen, a tempo-locked arpeggiator, sample-accurate
+automation, offline bounce through the box. The plugin shell builds and is
+CI-validated on **macOS, Windows, and Linux** — a VST3 on all three (pluginval
+strictness 10) plus an Audio Unit on macOS (`auval`) — and the device has been
+driven from **Ableton Live** (macOS + Windows) and **Renoise** (Windows) by
+hand, plus a headless **REAPER** render-and-recall e2e on Linux that runs on
+every push.
 
-**Degree of completeness:** the four protocol planes (control, state,
-events, audio) are implemented end-to-end and verified on real hardware. The
-plugin shell builds and is CI-validated on **macOS, Windows, and Linux** — a
-VST3 on all three (pluginval strictness 10) plus an Audio Unit on macOS
-(`auval`) — and the device has been driven from **Ableton Live** (macOS +
-Windows) and **Renoise** (Windows) by hand, plus a headless **REAPER**
-render-and-recall e2e on Linux that runs on every push. The specification is
-an **editor's draft** (0.3.4): breaking changes are expected and negotiated at
-hello. The four-actions recall UI, a CLAP port, and the Ethernet binding are
+**What it is, and isn't, yet:** today HARP is a complete recall + audio system
+with one reference device — a Raspberry Pi synth. It is *not* yet an ecosystem
+of instruments; building richer synths and shipping real devices on top of the
+protocol is the roadmap, not a claim about the present. The spec is an
+**editor's draft** (0.3.6): breaking changes are expected and negotiated at
+`hello`. The four-actions recall UI, a CLAP port, and the Ethernet binding are
 next — the [Status](#status) section is the full breakdown.
 
 ## Repository map
 
 ```
-spec/             the specification (draft 0.3.4) + machine-readable CDDL
+spec/             the specification (draft 0.3.6) + machine-readable CDDL
 core/             portable C11 protocol library, no dependencies:
                   framing, deterministic CBOR, SHA-256, content-addressed
                   objects, crash-atomic ref store, audio frame codec
