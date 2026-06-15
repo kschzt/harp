@@ -22,6 +22,7 @@ PROBE=${HARP_PROBE:-./build/harp-probe}
 SHELL_VST3=${HARP_SHELL:-$HOME/.vst3/harp-shell.vst3}
 SCRIPTS="$HOME/.config/REAPER/Scripts"
 CACHE="$HOME/.config/REAPER/reaper-vstplugins64.ini"
+INI="$HOME/.config/REAPER/reaper.ini"
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUTDIR=$(mktemp -d)   # per-run, per-user — avoids cross-user /tmp collisions
 
@@ -32,6 +33,18 @@ mkdir -p "$SCRIPTS"
 cleanup() { rm -f "$SCRIPTS/__startup.lua"; rm -rf "$OUTDIR"; }
 trap cleanup EXIT INT TERM
 
+# REAPER reopens the last project on startup, and pops a "this project may have
+# crashed REAPER — open anyway?" modal when it was open during an unclean exit
+# (we SIGTERM it at the render timeout). Our recall.rpp lives in a per-run mktemp
+# dir that is gone by the next run, so that modal blocks __startup under xvfb
+# forever — empty status, no render. Scrub the reopen/faulty/recent state before
+# every launch so REAPER always starts with a clean, empty project.
+scrub_ini() {
+    [ -f "$INI" ] && sed -i -E '/^projecttab/d; /^(faultyproject|lastproject|numrecent|hasrecentsec)=/d; /^recent[0-9]+=/d' "$INI"
+    return 0
+}
+
+scrub_ini
 echo "[reaper-e2e] warm-up launch to scan ~/.vst3 ..."
 xvfb-run -a timeout 40 "$REAPER" -nonewinst >/dev/null 2>&1 || true
 if ! grep -qi 'harp_shell\|HARP RefDev' "$CACHE" 2>/dev/null; then
@@ -54,6 +67,7 @@ render() {
     R_NAME="$1"; R_MODE="${2:-build}"; R_SAVE=""; R_PROJECT=""
     if [ "$R_MODE" = "open" ]; then R_PROJECT="$3"; else R_SAVE="$3"; fi
     rm -f "$OUTDIR/$R_NAME.wav" "$OUTDIR/status.txt"
+    scrub_ini   # never let REAPER reopen a prior (now-deleted) project on launch
     HARP_E2E_OUTDIR="$OUTDIR" HARP_E2E_NAME="$R_NAME" HARP_E2E_STATUS="$OUTDIR/status.txt" \
     HARP_E2E_MODE="$R_MODE" HARP_E2E_SAVE="$R_SAVE" HARP_E2E_PROJECT="$R_PROJECT" \
         xvfb-run -a timeout 120 "$REAPER" -nonewinst >"$OUTDIR/$R_NAME.reaper.log" 2>&1 || true
