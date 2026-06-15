@@ -56,14 +56,18 @@ render() {
     rm -f "$OUTDIR/$R_NAME.wav" "$OUTDIR/status.txt"
     HARP_E2E_OUTDIR="$OUTDIR" HARP_E2E_NAME="$R_NAME" HARP_E2E_STATUS="$OUTDIR/status.txt" \
     HARP_E2E_MODE="$R_MODE" HARP_E2E_SAVE="$R_SAVE" HARP_E2E_PROJECT="$R_PROJECT" \
-        xvfb-run -a timeout 120 "$REAPER" -nonewinst >/dev/null 2>&1 || true
+        xvfb-run -a timeout 120 "$REAPER" -nonewinst >"$OUTDIR/$R_NAME.reaper.log" 2>&1 || true
     for _ in $(seq 1 40); do
         grep -q rendered "$OUTDIR/status.txt" 2>/dev/null && break
         grep -q ERROR "$OUTDIR/status.txt" 2>/dev/null && break
         sleep 1
     done
     echo "  [$R_NAME/$R_MODE] status: $(cat "$OUTDIR/status.txt" 2>/dev/null)"
-    [ -f "$OUTDIR/$R_NAME.wav" ] || { echo "FAIL: no render output $OUTDIR/$R_NAME.wav"; exit 1; }
+    [ -f "$OUTDIR/$R_NAME.wav" ] || {
+        echo "FAIL: no render output $OUTDIR/$R_NAME.wav"
+        echo "  --- REAPER output tail ---"; tail -25 "$OUTDIR/$R_NAME.reaper.log" 2>/dev/null | sed 's/^/  | /'
+        exit 1
+    }
 }
 
 # byte-compare the PCM data only — REAPER stamps a render timestamp into a WAV

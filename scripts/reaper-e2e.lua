@@ -16,6 +16,7 @@ local SAVE = os.getenv("HARP_E2E_SAVE")        -- build: save the project here
 local PROJECT = os.getenv("HARP_E2E_PROJECT")  -- open: project to load
 local STATUS = os.getenv("HARP_E2E_STATUS") or (OUTDIR .. "/status.txt")
 local function w(s) local f = io.open(STATUS, "w"); if f then f:write(s .. "\n"); f:close() end end
+w("loaded") -- earliest marker: proves __startup ran (vs an empty status = it didn't)
 
 local function set_render_cfg()
   reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 0, true) -- custom time range
