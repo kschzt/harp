@@ -108,6 +108,7 @@ typedef struct {
 struct usb_io {
     harp_io io;
     libusb_context *ctx;
+    bool owns_ctx;     /* true: we libusb_exit it on close; false: borrowed */
     libusb_device_handle *h;
     int iface;
     uint8_t ep_in, ep_out;             /* framed link */
@@ -492,15 +493,29 @@ harp_io *harp_usb_open_serial(const char *want) {
  *   want_serial != NULL : bind exactly that serial.
  *   want_vp == true     : require USB vid:pid == (want_vid, want_pid).
  *   both unset          : first unclaimed HARP device of any model. */
-harp_io *harp_usb_open_match(const char *want, bool want_vp, uint16_t want_vid,
-                             uint16_t want_pid) {
-    usb_io *u = calloc(1, sizeof *u);
-    if (!u) return NULL;
-    if (libusb_init(&u->ctx) != 0) {
+/* Persistent libusb context for a long-lived caller (the plugin supervisor):
+ * create once, reuse across many open/close cycles, destroy once at teardown.
+ * Per-attempt libusb_init/exit churn is fragile on the Windows backend (it
+ * spins the whole backend up and down each time) and was the prime suspect
+ * for unclean process shutdown on a device-less host. Opaque void* so callers
+ * need not include libusb.h. NULL on failure. */
+void *harp_usb_ctx_create(void) {
+    libusb_context *ctx = NULL;
+    if (libusb_init(&ctx) != 0) {
         fprintf(stderr, "harp-usb: libusb init failed\n");
-        free(u);
         return NULL;
     }
+    return ctx;
+}
+void harp_usb_ctx_destroy(void *ctx) {
+    if (ctx) libusb_exit((libusb_context *)ctx);
+}
+
+/* Core open: u->ctx and u->owns_ctx are preset by the caller. Enumerate the
+ * bus, claim a matching device, return a transport. On failure free u, exiting
+ * the context only if we own it. */
+static harp_io *usb_open_core(usb_io *u, const char *want, bool want_vp,
+                             uint16_t want_vid, uint16_t want_pid) {
     harp_mutex_init(&u->mu);
     harp_cond_init(&u->cv);
     u->debug = getenv("HARP_USB_DEBUG") != NULL;
@@ -604,9 +619,32 @@ fail:
 fail_no_list:
     free(u->link_fifo.buf);
     free(u->audio_fifo.buf);
-    libusb_exit(u->ctx);
+    if (u->owns_ctx) libusb_exit(u->ctx);
     free(u);
     return NULL;
+}
+
+harp_io *harp_usb_open_match(const char *want, bool want_vp, uint16_t want_vid,
+                             uint16_t want_pid) {
+    usb_io *u = calloc(1, sizeof *u);
+    if (!u) return NULL;
+    if (libusb_init(&u->ctx) != 0) {
+        fprintf(stderr, "harp-usb: libusb init failed\n");
+        free(u);
+        return NULL;
+    }
+    u->owns_ctx = true; /* one-shot caller (harp-probe): own and free the ctx */
+    return usb_open_core(u, want, want_vp, want_vid, want_pid);
+}
+
+harp_io *harp_usb_open_match_ctx(void *ctx, const char *want, bool want_vp,
+                                 uint16_t want_vid, uint16_t want_pid) {
+    if (!ctx) return NULL;
+    usb_io *u = calloc(1, sizeof *u);
+    if (!u) return NULL;
+    u->ctx = (libusb_context *)ctx;
+    u->owns_ctx = false; /* borrowed from harp_usb_ctx_create; leave it intact */
+    return usb_open_core(u, want, want_vp, want_vid, want_pid);
 }
 
 void harp_usb_close(harp_io *io) {
@@ -624,7 +662,7 @@ void harp_usb_close(harp_io *io) {
     free(u->audio_fifo.buf);
     harp_mutex_destroy(&u->mu);
     harp_cond_destroy(&u->cv);
-    libusb_exit(u->ctx);
+    if (u->owns_ctx) libusb_exit(u->ctx);
     free(u);
 }
 

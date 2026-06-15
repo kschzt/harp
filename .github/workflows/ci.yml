@@ -98,8 +98,14 @@ jobs:
           # Locate the bundle by search — its config subdir can move with the generator.
           $plug = (Get-ChildItem build-vst -Recurse -Directory -Filter harp-shell.vst3 | Select-Object -First 1).FullName
           if (-not $plug) { throw "harp-shell.vst3 not found under build-vst" }
+          # Turn native-error-throwing off only here so we can capture and print
+          # the exact exit code — a teardown crash shows as 0xC000xxxx, a real
+          # validation failure as a small int (pluginval prints FAILED first).
+          $PSNativeCommandUseErrorActionPreference = $false
           & $pv --strictness-level 10 --skip-gui-tests --validate $plug
-          if ($LASTEXITCODE -ne 0) { throw "pluginval failed" }
+          $code = $LASTEXITCODE
+          Write-Host ("pluginval exit code: {0} (0x{1:X8})" -f $code, ($code -band 0xFFFFFFFF))
+          if ($code -ne 0) { throw "pluginval failed (exit $code)" }
 
   core:
     runs-on: ubuntu-latest

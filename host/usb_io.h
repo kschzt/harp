@@ -27,6 +27,18 @@ harp_io *harp_usb_open_serial(const char *serial);
  * unclaimed HARP device of any model. Claim is the mutual exclusion. */
 harp_io *harp_usb_open_match(const char *want_serial, bool want_vp,
                              uint16_t want_vid, uint16_t want_pid);
+/* A persistent libusb context for a long-lived caller (the plugin
+ * supervisor): create once, reuse it across many open/close cycles via
+ * harp_usb_open_match_ctx, destroy once at teardown. Avoids per-attempt
+ * libusb_init/exit churn (fragile on Windows, esp. device-less). Opaque so
+ * callers need not include libusb.h; returns NULL on failure. */
+void *harp_usb_ctx_create(void);
+void harp_usb_ctx_destroy(void *ctx);
+/* Like harp_usb_open_match but borrows a caller-owned context (from
+ * harp_usb_ctx_create). The returned transport does not own the context;
+ * harp_usb_close leaves it intact for the next open. */
+harp_io *harp_usb_open_match_ctx(void *ctx, const char *want_serial, bool want_vp,
+                                 uint16_t want_vid, uint16_t want_pid);
 /* Read the bound device's USB identity back out (after open). */
 bool harp_usb_devident(harp_io *io, harp_usb_devinfo *out);
 /* Read-only enumeration of all HARP devices on the bus (no claim). Fills

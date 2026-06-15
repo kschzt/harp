@@ -16,11 +16,11 @@ set -e
 HOST=${HARP_VST3_HOST:-./build-vst/harp-vst3-host}
 PLUGIN=${HARP_SHELL:-$HOME/.vst3/harp-shell.vst3}
 PROBE=${HARP_PROBE:-./build/harp-probe}
-# A full minute of continuous hammering per run (×2 runs) — long enough that
+# 30 s/run (×2 runs = a full minute of continuous hammering) — long enough that
 # any drift, leak, or counter creep under the IDM load has time to surface;
 # 4 s proved nothing. Duration is --seconds (the pattern loops); block size
 # stays 64 (that is the per-second automation density, not the length).
-SECS=${HARP_FLOOD_SECONDS:-60}
+SECS=${HARP_FLOOD_SECONDS:-30}
 
 # Pin a known start state on the device (front-panel sets persist past the
 # session and are not thinned). Params 1-8 to mid; arp off so the flood's

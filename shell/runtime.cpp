@@ -226,7 +226,7 @@ harp_io *HarpRuntime::selectDevice() {
      * same-model fallback must NOT fire here, or a replug could let this
      * instance steal a sibling track's device. */
     if (!boundSerial_.empty())
-        return harp_usb_open_match(boundSerial_.c_str(), false, 0, 0);
+        return harp_usb_open_match_ctx(usbCtx_, boundSerial_.c_str(), false, 0, 0);
 
     /* first bind: what does the loaded project want? */
     std::string wantSerial;
@@ -249,15 +249,15 @@ harp_io *HarpRuntime::selectDevice() {
         }
 
     if (!wantSerial.empty()) {
-        harp_io *io = harp_usb_open_match(wantSerial.c_str(), false, 0, 0); /* exact */
+        harp_io *io = harp_usb_open_match_ctx(usbCtx_, wantSerial.c_str(), false, 0, 0); /* exact */
         if (!io && wantModel) /* serial gone: first unclaimed of the SAME model */
-            io = harp_usb_open_match(nullptr, true, wvid, wpid);
+            io = harp_usb_open_match_ctx(usbCtx_, nullptr, true, wvid, wpid);
         return io; /* a known model is never satisfied by a different model */
     }
     /* fresh instance (or a bundle predating usb-identity): first unclaimed
      * HARP device of any model — it adopts whatever is there and records
      * it on first save. */
-    return harp_usb_open_match(nullptr, false, 0, 0);
+    return harp_usb_open_match_ctx(usbCtx_, nullptr, false, 0, 0);
 }
 
 /* One connection attempt: claim, hello, re-assert the project bundle,
@@ -412,6 +412,11 @@ bool HarpRuntime::start(uint32_t sampleRate) {
     harp_plat_init(); /* hi-res timers for the sub-ms pacing/idle waits (Windows) */
     rate_ = sampleRate;
     running_.store(true);
+    /* One libusb context for the whole active life — every connect attempt
+     * (incl. the device-less retry loop) borrows it, so we never churn
+     * libusb_init/exit. Created before the first sessionUp() and the
+     * supervisor spawn so both use it. */
+    if (!usbCtx_) usbCtx_ = harp_usb_ctx_create();
     bool now = sessionUp(); /* fast path: report a present device immediately */
     if (!now) log_msg("no HARP device on the bus; supervising for hot-plug");
     supervisorThread_ = std::thread([this] { supervisor(); });
@@ -429,6 +434,11 @@ void HarpRuntime::stop() {
     }
     if (!running_.exchange(false)) return;
     if (supervisorThread_.joinable()) supervisorThread_.join(); /* final sessionDown */
+    /* Supervisor is joined: no thread can touch the context now. Tear it down
+     * here, while ~HarpRuntime still runs — i.e. before the DLL can unload, so
+     * no libusb backend thread outlives our module. */
+    harp_usb_ctx_destroy(usbCtx_);
+    usbCtx_ = nullptr;
     log_msg("stopped (underruns: %llu, padded samples: %llu)",
             (unsigned long long)underruns_.load(),
             (unsigned long long)padSamples_.load());

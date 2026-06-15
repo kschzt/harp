@@ -236,6 +236,11 @@ private:
     harp_store store_;
     bool storeOk_ = false;
 
+    void *usbCtx_ = nullptr; /* one libusb context for the whole plugin life:
+                                created in start(), reused across every connect
+                                attempt (no per-retry init/exit churn), and
+                                destroyed in stop() after the supervisor joins,
+                                before the DLL can unload */
     std::thread supervisorThread_; /* runs supervisor(): feeder + reconnect */
     std::thread readerThread_; /* always-pending audio-IN read: the device's
                                   response writes must never wait for us;
