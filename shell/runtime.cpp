@@ -318,6 +318,14 @@ bool HarpRuntime::sessionUp() {
             else
                 log_msg("project state apply failed (will retry on reconnect)");
         }
+        /* Cache the live state now, while connected, so a getState issued later
+         * — after the host deactivates us (offline-render save) — can still
+         * return it. Cheap and idempotent (content-addressed; unchanged state
+         * snapshots to the same hash). */
+        {
+            std::vector<uint8_t> tmp;
+            buildAndCacheLocked(tmp);
+        }
         if (!audioStart(rate_)) {
             log_msg("audio.start failed");
             harp_client_free(&client_);
@@ -974,9 +982,25 @@ bool HarpRuntime::getStateBundle(std::vector<uint8_t> &out) {
      * supervisor reconnects within ~1s. A save (getState) right after a render,
      * as REAPER and other offline hosts do, can land in that window; wait
      * (bounded) for the device to come back rather than failing the save. */
-    for (int i = 0; i < 60 && !connected(); i++) harp_sleep_ns(50000000ull); /* ≤ ~3 s */
-    if (!connected()) return false; /* genuinely offline: nothing to save */
-    std::lock_guard<std::mutex> lk(ctlMutex_);
+    if (running_.load(std::memory_order_acquire))
+        for (int i = 0; i < 60 && !connected(); i++) harp_sleep_ns(50000000ull); /* ≤ ~3 s */
+    if (connected()) {
+        std::lock_guard<std::mutex> lk(ctlMutex_);
+        if (buildAndCacheLocked(out)) return true;
+    }
+    /* Device offline — e.g. the host deactivated the plugin before saving (an
+     * offline render leaves it setActive(false), so the device is no longer
+     * claimed). Return the bundle captured on the last connect, so a save never
+     * silently loses the project's state. */
+    std::lock_guard<std::mutex> slk(bundleMutex_);
+    if (!lastBundle_.empty()) {
+        out = lastBundle_;
+        return true;
+    }
+    return false;
+}
+
+bool HarpRuntime::buildAndCacheLocked(std::vector<uint8_t> &out) {
     harp_ref live;
     if (!refsLocked(&live)) return false;
     harp_hash head = live.hash;
@@ -1012,6 +1036,7 @@ bool HarpRuntime::getStateBundle(std::vector<uint8_t> &out) {
         std::lock_guard<std::mutex> slk(bundleMutex_);
         hasBundle_ = true;
         bundleTarget_ = head;
+        lastBundle_ = out; /* cache for an offline (post-deactivate) getState */
     }
     char hex[2 * HARP_HASH_LEN + 1];
     harp_hash_hex(&head, hex);

@@ -496,8 +496,13 @@ int main(int argc, char **argv) {
     }
 
     processor->setProcessing(false);
+    component->setActive(false);
 
     /* ---- save state ---- */
+    /* Deactivate BEFORE saving, matching a DAW's offline-render flow (REAPER
+     * deactivates the plugin once the render is done, then writes the project):
+     * the device is no longer claimed, so this exercises the shell's offline
+     * getState path — the harder case that an active-plugin save would miss. */
     if (!save_state_path.empty()) {
         MemoryStream comp, ctrl;
         if (component->getState(&comp) != kResultOk) die("component getState failed");
@@ -506,8 +511,6 @@ int main(int argc, char **argv) {
         printf("state: saved to %s (%lld+%lld bytes)\n", save_state_path.c_str(),
                (long long)comp.getSize(), (long long)ctrl.getSize());
     }
-
-    component->setActive(false);
 
     /* ---- output ---- */
     double rms = 0;
