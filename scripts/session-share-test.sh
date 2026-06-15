@@ -31,7 +31,7 @@ cd "$(dirname "$0")/.."
 SERIAL="${HARP_DEVICE_SERIAL:-PI4B-0001}"
 export HARP_DEVICE_SERIAL="$SERIAL"
 PROBE="${PROBE:-./build/harp-probe}"
-BUILD="${BUILD:-build-tsan-shell}"   # share tsan-shell.sh's harness build dir
+BUILD="${BUILD:-build-mt-host}"      # the multi-instance harness, built WITHOUT TSan
 INSTANCES="${INSTANCES:-2}"
 SECONDS_RUN="${SECONDS_RUN:-6}"
 # X's must be the template TAIL: BSD mktemp does not expand them when a suffix
@@ -58,17 +58,16 @@ else
 fi
 echo "── session-share: $INSTANCES instances pinned to $SERIAL — expect ONE shared claim"
 
-# Build the harness exactly like tsan-shell.sh (TSan in the main image, the
-# shell runtime statically linked, runtimes from the registry).
-echo "── building tsan-host (-DHARP_TSAN=ON)"
-cmake -B "$BUILD" -S tools/vst3-host -DHARP_TSAN=ON >/dev/null
+# Build the multi-instance harness: the same tsan-host main.cpp + the shell
+# runtime + the registry, but WITHOUT ThreadSanitizer (-DHARP_TSAN_SANITIZE=OFF).
+# This test asserts session SHARING (one claim for N instances), NOT race-
+# freedom — that is tsan-shell.sh's job — and a TSan binary aborts at startup on
+# recent Linux kernels (the vm.mmap_rnd_bits ASLR mapping issue), which would
+# fail this hardware test for a reason that has nothing to do with sharing.
+echo "── building multi-instance harness (-DHARP_TSAN=ON -DHARP_TSAN_SANITIZE=OFF)"
+cmake -B "$BUILD" -S tools/vst3-host -DHARP_TSAN=ON -DHARP_TSAN_SANITIZE=OFF >/dev/null
 cmake --build "$BUILD" --target tsan-host -j >/dev/null
-
-# This test asserts the SHARING property (one claim for N instances), NOT race-
-# freedom — that is tsan-shell.sh's job. Run with halt_on_error=0 (as tsan-shell
-# does) so a runtime race, if any, doesn't abort the harness before it logs the
-# claim/connect lines we assert on; we do not parse TSan warnings here.
-export TSAN_OPTIONS="halt_on_error=0${TSAN_OPTIONS:+ $TSAN_OPTIONS}"
+[ -x "$BUILD/tsan-host" ] || { echo "SESSION-SHARE FAIL: harness build produced no binary"; exit 1; }
 
 # Run N instances on the one serial. All but the first attach to the owner's
 # shared runtime; only the owner claims/connects.

@@ -122,6 +122,13 @@ if(LIBUSB_FOUND)
   # the main image, not a dlopen'd bundle). Built only with -DHARP_TSAN=ON;
   # run against a real device via scripts/tsan-shell.sh.
   option(HARP_TSAN "Build tsan-host: ThreadSanitize the shell runtime" OFF)
+  # The ThreadSanitizer instrumentation is separable from the multi-instance
+  # harness itself. session-share-test.sh builds this SAME host with
+  # -DHARP_TSAN_SANITIZE=OFF — it checks session SHARING (one claim for N
+  # instances), not race-freedom, and a TSan binary aborts at startup on recent
+  # Linux kernels (the vm.mmap_rnd_bits ASLR mapping issue), which has no place
+  # in a plain hardware test. tsan-shell.sh keeps it ON for race detection.
+  option(HARP_TSAN_SANITIZE "Instrument tsan-host with ThreadSanitizer" ON)
   if(HARP_TSAN)
     add_executable(tsan-host
       ${CMAKE_CURRENT_SOURCE_DIR}/../tsan-host/main.cpp
@@ -142,13 +149,17 @@ if(LIBUSB_FOUND)
       ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
       ${LIBUSB_INCLUDE_DIRS})
     target_compile_definitions(tsan-host PRIVATE HAVE_LIBUSB)
-    target_compile_options(tsan-host PRIVATE -fsanitize=thread -g -O1)
-    target_link_options(tsan-host PRIVATE -fsanitize=thread)
+    if(HARP_TSAN_SANITIZE)
+      target_compile_options(tsan-host PRIVATE -fsanitize=thread -g -O1)
+      target_link_options(tsan-host PRIVATE -fsanitize=thread)
+    else()
+      target_compile_options(tsan-host PRIVATE -g -O1)
+    endif()
     if(LIBUSB_LIBRARY_DIRS)
       target_link_directories(tsan-host PRIVATE ${LIBUSB_LIBRARY_DIRS})
     endif()
     target_link_libraries(tsan-host ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS})
-    message(STATUS "tsan-host: ThreadSanitizer harness for the shell runtime")
+    message(STATUS "tsan-host: multi-instance shell-runtime harness (TSan: ${HARP_TSAN_SANITIZE})")
   endif()
 
   # registry-tests (P4): the process-global runtime registry's keying +
