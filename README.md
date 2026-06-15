@@ -60,10 +60,12 @@ floods across buffer sizes 64–1024, hot-replug, tempo lock, determinism
 hashes — plus fuzzed parsers and a ThreadSanitizer-clean device. The
 specification is an **editor's draft** (0.3.4): breaking changes are
 expected and versions are negotiated at hello; its changelog records what
-implementation taught us. One reference device, one DAW (Live), one OS
-(macOS) so far — multi-device support, the four-actions recall UI, AU/CLAP
-ports, and the Ethernet binding are next (see [Status](#status) for the
-full honest list).
+implementation taught us. One reference device and one DAW (Live) for the
+hand-driven path so far, but the plugin shell builds and is CI-validated on
+**macOS, Windows, and Linux** — a VST3 on all three (pluginval strictness 10
+on macOS + Windows, a real-DAW REAPER render on Linux) plus an Audio Unit on
+macOS (`auval`). The four-actions recall UI, a CLAP port, and the Ethernet
+binding are next (see [Status](#status) for the full honest list).
 
 ## Repository map
 
@@ -132,16 +134,17 @@ hardware — plus audio:
 
 ### Path 3 — the DAW (VST3 shell)
 
-Requires CMake ≥ 3.25, libusb (macOS: `brew install libusb`; Linux:
-`apt install libusb-1.0-0-dev` plus
+Builds on macOS, Windows, and Linux. Requires CMake ≥ 3.25, libusb (macOS:
+`brew install libusb`; Linux: `apt install libusb-1.0-0-dev` plus
 `sudo cp scripts/99-harp.rules /etc/udev/rules.d/` for rootless device
-access), and the VST3 SDK
+access; Windows: prebuilt MSVC binaries under `external/libusb-win`, built
+with the Visual Studio 2022 generator), and the VST3 SDK
 cloned to `external/vst3sdk` (`git clone --recursive
 https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk`).
 
 ```sh
 cmake -B build-vst -S tools/vst3-host
-cmake --build build-vst --target install-live   # macOS: build, sign, install
+cmake --build build-vst --target install-live   # macOS/Windows: install to the OS VST3 folder (+sign on macOS)
 cmake --build build-vst --target install-linux  # Linux: install to ~/.vst3
 cmake --build build-vst --target install-au     # macOS: the Audio Unit shell
 ```
@@ -225,7 +228,7 @@ contention.
 Not yet: four-safe-actions UI (v0 auto-resolves by Push-with-archive),
 runtime/shell process split (§15.1), firmware management (§13),
 class-audio coexistence (§8.5), free-running ASRC for analog devices,
-AU/CLAP/Windows-ASIO ports, TCP companion spec (§4.4).
+a CLAP port, TCP companion spec (§4.4).
 
 The spec is an **editor's draft**: breaking changes expected, version
 negotiated at `core.hello`. Changes flow through HARP Enhancement
