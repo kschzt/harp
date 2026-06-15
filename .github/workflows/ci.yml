@@ -27,6 +27,12 @@ jobs:
           killall -9 AudioComponentRegistrar 2>/dev/null || true
           sleep 2
           auval -v aumu rfdv HARP
+      - name: pluginval (plugin-contract abuse, strictness 10)
+        run: |
+          curl -sL https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_macOS.zip -o pv.zip
+          unzip -q pv.zip
+          ./pluginval.app/Contents/MacOS/pluginval --strictness-level 10 --skip-gui-tests \
+            --validate build-vst/VST3/harp-shell.vst3
 
   shell-windows:
     runs-on: windows-latest
@@ -61,6 +67,16 @@ jobs:
           cmake -B build-vst -S tools/vst3-host -G "Visual Studio 17 2022" -A x64
           cmake --build build-vst --config Release --target harp-vst3-host harp-shell ring-tests
           ctest --test-dir build-vst -C Release --output-on-failure
+      - name: pluginval (plugin-contract abuse, strictness 10)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -UseBasicParsing `
+            https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Windows.zip `
+            -OutFile pv.zip
+          Expand-Archive pv.zip -DestinationPath pv -Force
+          $pv = (Get-ChildItem pv -Recurse -Filter pluginval.exe | Select-Object -First 1).FullName
+          & $pv --strictness-level 10 --skip-gui-tests --validate build-vst/VST3/Release/harp-shell.vst3
+          if ($LASTEXITCODE -ne 0) { throw "pluginval failed" }
 
   core:
     runs-on: ubuntu-latest
