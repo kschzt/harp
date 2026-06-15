@@ -43,11 +43,17 @@ fi
 echo
 
 PASS=0; FAIL=0; SKIP=0
+# Sub-test exit codes: 0 pass; 2 = not applicable on this rig (legit SKIP, e.g.
+# multidevice needs two boards); 3 = device busy/unavailable (a hard FAIL — the
+# runner owns the device exclusively, so "busy" means a poisoned bus or a stray
+# claimer, never something to skip past); any other code = FAIL.
 run() {
     echo "──── $1"
-    if "$@"; then PASS=$((PASS+1));
-    elif [ $? -eq 2 ]; then SKIP=$((SKIP+1));
-    else FAIL=$((FAIL+1)); fi
+    "$@"; rc=$?
+    if   [ $rc -eq 0 ]; then PASS=$((PASS+1));
+    elif [ $rc -eq 2 ]; then SKIP=$((SKIP+1));
+    else FAIL=$((FAIL+1));
+         [ $rc -eq 3 ] && echo "   ↑ device was not exclusively claimable — counted as a FAILURE, not a skip"; fi
     echo
 }
 run scripts/golden-test.sh

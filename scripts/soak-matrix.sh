@@ -11,7 +11,7 @@ for B in 32 64 128 256 512 1024; do
     echo "════ block $B, ${S}s"
     if ! BLOCK=$B ./scripts/soak.sh "$S"; then
         rc=$?
-        [ $rc -eq 2 ] && exit 2 # claim conflict: nothing below will work
+        [ $rc -eq 3 ] && exit 3 # device unavailable: nothing below will work
         FAIL=$((FAIL+1))
     fi
 done

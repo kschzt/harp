@@ -15,8 +15,8 @@ HOST=build-vst/harp-vst3-host
 PLUG="${PLUG:-$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3}"  # Linux CI overrides -> ~/.vst3
 
 if pgrep -x "Live" >/dev/null 2>&1; then
-    echo "TEMPO-LOCK SKIP: Ableton Live is running (device claim)"
-    exit 2
+    echo "TEMPO-LOCK FAIL: device claimed by Ableton Live — the suite needs it exclusively"
+    exit 3
 fi
 
 ARP="--set 9=0.25 --set 10=0.6 --set 11=0.5 --set 12=0.0 --set 7=0.0 \

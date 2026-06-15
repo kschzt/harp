@@ -22,8 +22,8 @@ PLUG="${PLUG:-$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3}"  # Linux CI ov
 AUCOMP="$HOME/Library/Audio/Plug-Ins/Components/harp-au.component"
 
 if pgrep -x "Live" >/dev/null 2>&1; then
-    echo "MULTIDEV SKIP: Ableton Live is running (device claim)"
-    exit 2
+    echo "MULTIDEV FAIL: device claimed by Ableton Live — the suite needs it exclusively"
+    exit 3
 fi
 
 # need at least two HARP devices on the bus

@@ -24,8 +24,8 @@ PLUG="${PLUG:-$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3}"  # Linux CI ov
 AUCOMP="$HOME/Library/Audio/Plug-Ins/Components/harp-au.component"
 
 if pgrep -x "Live" >/dev/null 2>&1; then
-    echo "GOLDEN SKIP: Ableton Live is running (device claim)"
-    exit 2
+    echo "GOLDEN FAIL: device claimed by Ableton Live — the suite needs it exclusively"
+    exit 3
 fi
 
 SETTLE="--set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 5=0.1 --set 6=0.2 \

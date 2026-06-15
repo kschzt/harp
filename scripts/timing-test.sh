@@ -18,7 +18,7 @@ fail() { echo "TIMING FAIL: $1"; exit 1; }
 # the device is exclusive: a DAW holding the claim makes every test render
 # silence and fail confusingly (cost us a debugging detour) — guard first
 "$HOSTBIN" "$VST" --seconds 0.05 2>&1 | grep -q "connected:" \
-    || { echo "TIMING SKIP: device unclaimed check failed (DAW running?)"; exit 2; }
+    || { echo "TIMING FAIL: cannot claim device — the rig must own it exclusively (busy/absent?)"; exit 3; }
 
 # bind claim to proof: this test IS the harp-perf (§9.2 ±1-sample)
 # conformance probe, so a device advertising harp-perf must pass it, and

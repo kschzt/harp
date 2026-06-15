@@ -13,7 +13,7 @@ HOSTBIN=${HOSTBIN:-./build-vst/harp-vst3-host}
 fail() { echo "RECALL FAIL: $1"; exit 1; }
 
 "$HOSTBIN" "$VST" --seconds 0.05 2>&1 | grep -q "connected:" \
-    || { echo "RECALL SKIP: cannot claim device (DAW running?)"; exit 2; }
+    || { echo "RECALL FAIL: cannot claim device — the rig must own it exclusively (busy/absent?)"; exit 3; }
 
 ARCH0=$(curl -s "http://$HOST:8080/api/refs" | python3 -c \
     "import json,sys; print(sum(1 for r in json.load(sys.stdin)['refs'] if r['name'].startswith('archive/')))")

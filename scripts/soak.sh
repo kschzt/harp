@@ -19,8 +19,8 @@ fail() {
 }
 
 if pgrep -x "Live" >/dev/null 2>&1; then
-    echo "SOAK SKIP: Ableton Live is running (device claim)"
-    exit 2
+    echo "SOAK FAIL: device claimed by Ableton Live — the suite needs it exclusively"
+    exit 3
 fi
 
 NOTES=$(python3 -c "import sys; n=int($S/0.6); print(','.join(['60','64','67','72'][i%4] for i in range(n)))")

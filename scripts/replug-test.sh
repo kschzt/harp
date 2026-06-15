@@ -18,8 +18,8 @@ LOG=/tmp/replug-test.log
 
 # claim guard: a DAW holding the device makes this test lie
 if pgrep -x "Live" >/dev/null 2>&1; then
-    echo "REPLUG SKIP: Ableton Live is running (device claim)"
-    exit 2
+    echo "REPLUG FAIL: device claimed by Ableton Live — the suite needs it exclusively"
+    exit 3
 fi
 
 echo "── replug: 20 s realtime render, daemon restart at t=6 s (device $SERIAL)"
