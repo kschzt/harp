@@ -68,6 +68,7 @@ public:
      * shared refcount is correct and a private runtime is not leaked — the
      * same net cleanup the old by-value member's ~HarpRuntime gave. */
     ~HarpProcessor() override {
+        releaseSource(); /* attached: drop our event source before the runtime */
         runtime_release(handle_);
         handle_ = RuntimeHandle{};
     }
@@ -107,8 +108,10 @@ public:
         if (state) {
             /* Idempotent against a redundant setActive(true) (some hosts double-
              * activate): drop any handle we already hold before re-acquiring, so
-             * we never leak a reference or strand a shared session's refcount. */
+             * we never leak a reference or strand a shared session's refcount.
+             * Drop our event source first too (same ordering rule as release). */
             if (handle_.rt) {
+                releaseSource();
                 runtime_release(handle_);
                 handle_ = RuntimeHandle{};
             }
@@ -132,19 +135,54 @@ public:
                 /* First/sole instance for this unit: drive it exactly as the
                  * old by-value runtime did — configure, stage the project's
                  * bundle (stage-before-start, as setState did pre-acquire),
-                 * then start. */
+                 * then start. The owner's event source is the runtime's built-
+                 * in ownerSource_ (its channel is set inside start() from
+                 * HARP_CHANNEL — byte-identical single-instance path). */
                 runtime()->configure(rate_, maxBlock_);
                 if (!pendingState_.empty())
                     runtime()->setStateBundle(pendingState_.data(), pendingState_.size());
                 runtime()->start(rate_);
+                source_ = runtime()->ownerSource();
+            } else {
+                /* ATTACHED (P5): the shared session is already configured/
+                 * started and streaming under the sibling owner. This instance
+                 * is NO LONGER DORMANT FOR EVENTS — it registers its OWN event
+                 * source (its part) and queues notes/params on it; the owner's
+                 * eventPump merges every source onto the one session, so the
+                 * group PLAYS multitimbrally. AUDIO stays dormant though: the
+                 * owner pulls the MAIN MIX (which sums all parts) and this
+                 * sibling emits silence — per-part audio demux is P5b. The
+                 * part comes from HARP_CHANNEL (the out-of-process host's
+                 * --channel), exactly as the owner reads it in start(). */
+                /* FOLLOW-UP P5c — recall-safe per-instance channel. HARP_CHANNEL
+                 * is a PROCESS-GLOBAL env: fine for the headless tsan-host test
+                 * (it sets each instance's channel programmatically), but in a
+                 * real DAW every plugin instance reads the SAME env, so all
+                 * aliases would land on ONE part. Real in-DAW multitimbral needs
+                 * a per-instance channel that PERSISTS with the project — a
+                 * plugin parameter or a per-instance bundle field, recall-safe so
+                 * it survives save/reload — NOT a global env. Not implemented
+                 * here: a plugin-param channel needs recall-safe persistence
+                 * design (parameter id, automation/display semantics, bundle
+                 * round-trip). Until then, in-DAW aliasing collapses onto the
+                 * env's single part. */
+                uint8_t ch = 0;
+                if (const char *e = getenv("HARP_CHANNEL"); e && e[0]) {
+                    int v = atoi(e);
+                    if (v >= 0 && v <= 15) ch = (uint8_t)v;
+                }
+                source_ = runtime()->registerSource(ch);
             }
-            /* owner == false: the shared session is already configured/started
-             * and streaming under the sibling owner; this attached instance
-             * stays dormant (P4) — nothing to configure/start here. */
         } else {
-            /* Release: the LAST owner/holder of a shared runtime stops+destroys
-             * it (joining its threads); an attached instance just drops its
-             * reference; a private (unshared) runtime is torn down outright. */
+            /* Release: an ATTACHED instance first removes its event source so
+             * the owner's eventPump stops draining it and never touches a freed
+             * source (unregisterSource is a no-op on the owner source / null).
+             * MUST happen BEFORE runtime_release — release may be the last one,
+             * which stops+destroys the runtime; unregistering after that would
+             * touch a freed runtime. Then drop the reference: the LAST holder of
+             * a shared runtime stops+destroys it (joining its threads); a
+             * private (unshared) runtime is torn down outright. */
+            releaseSource();
             runtime_release(handle_);
             handle_ = RuntimeHandle{};
         }
@@ -152,14 +190,19 @@ public:
     }
 
     uint32 PLUGIN_API getLatencySamples() override {
-        /* OWNER (or inactive, pre-acquire): the historical value — a pure
-         * function of the DAW block size, so it's byte-identical whether we ask
-         * the live runtime or compute it statically (the runtime now arrives
-         * from the registry at activate-time, so a host querying latency in the
-         * inactive window has nothing to ask). ATTACHED instances emit silence
-         * with no PDC alignment, so they report 0. */
-        if (owner() && runtime()) return runtime()->latencySamples();
-        if (handle_.rt && !owner()) return 0; /* attached: dormant silence */
+        /* The reported latency is a pure function of the DAW block size, so it
+         * is byte-identical whether we ask the live runtime or compute it
+         * statically (the runtime now arrives from the registry at activate-
+         * time, so a host querying latency in the inactive window has nothing
+         * to ask). An OWNER reports its live runtime's value.
+         *
+         * P5: an ATTACHED instance must report the SAME latency as the owner.
+         * Its audio bus is silent, but it now SENDS events stamped at
+         * streamPos() + latencySamples() (full PDC) — so the host must delay
+         * this instance's EVENT timeline by that same latency, or the part's
+         * notes/automation land misaligned against the owner's. (Reporting 0
+         * was a P4 leftover from when attached instances were fully dormant.) */
+        if (runtime()) return runtime()->latencySamples();
         return HarpRuntime::latencyFor(maxBlock_);
     }
 
@@ -184,30 +227,38 @@ public:
     }
 
     tresult PLUGIN_API process(ProcessData &data) override {
-        /* ATTACHED (owner == false) or unacquired: a sibling owns the shared
-         * session — this instance MUST NOT touch the runtime's SPSC audio ring
-         * or event queue (it would corrupt the single-producer/single-consumer
-         * invariants the owner relies on). It also must not pull audio (one
-         * consumer) or queue events. P4 behaviour: emit SILENCE and queue
-         * nothing. (P5 gives attached instances their own part's audio + a
-         * per-shell event source, lifting this dormancy.) */
-        if (!owner() || !runtime()) return processSilence(data);
+        /* Unacquired (queried before activate): nothing to drive — clean
+         * silence so the host bus is well-defined. */
+        if (!runtime() || !source_) return processSilence(data);
 
         HarpRuntime &rt = *runtime();
+        const bool isOwner = owner();
+        /* P5: ATTACHED instances are NO LONGER DORMANT FOR EVENTS — they queue
+         * notes/params on THEIR OWN source (source_), which the owner's
+         * eventPump merges onto the one session, so the multitimbral group
+         * PLAYS. What they still MUST NOT touch is the OWNER-only state: the
+         * single audio ring (one consumer — they emit silence, not pull) and
+         * the transport-change detector (one driver — the owner anchors the
+         * session's musical time; an attached feedTransport would push a
+         * second, conflicting transport stream). AUDIO demux per part is P5b. */
 
         /* Stream-domain "now" for this block: events at DAW offset s map to
          * SSI base + s; the latency term is repaid by the host's PDC, so
-         * they sound exactly when the DAW intended (§9.2). */
+         * they sound exactly when the DAW intended (§9.2). streamPos advances
+         * only as the OWNER pulls audio, but it is a shared-session read every
+         * instance timestamps against — all parts ride the one stream clock. */
         uint64_t base = rt.streamPos() + rt.latencySamples();
 
-        /* transport (§9.7): an event on every CHANGE — play/stop, tempo,
-         * locate or loop wrap (detected as a discontinuity between this
-         * block's musical position and the last block's prediction) — plus
-         * a >= 1 Hz refresh while playing (spec MUST). PPQ is anchored at
-         * `base`, this block's start in the stream domain: after PDC that
-         * is exactly when Live hears this block, so the device's musical
-         * grid aligns with the project grid by construction. */
-        if (data.processContext) {
+        /* transport (§9.7): OWNER ONLY. An event on every CHANGE — play/stop,
+         * tempo, locate or loop wrap (detected as a discontinuity between this
+         * block's musical position and the last block's prediction) — plus a
+         * >= 1 Hz refresh while playing (spec MUST). PPQ is anchored at `base`,
+         * this block's start in the stream domain: after PDC that is exactly
+         * when Live hears this block, so the device's musical grid aligns with
+         * the project grid by construction. Transport is global, so only the
+         * owner drives it (queueTransport pins it to the owner source anyway —
+         * but the change DETECTOR must run on one thread, the owner's). */
+        if (isOwner && data.processContext) {
             const ProcessContext &pc = *data.processContext;
             rt.feedTransport((pc.state & ProcessContext::kPlaying) != 0,
                              (pc.state & ProcessContext::kTempoValid) != 0, pc.tempo,
@@ -215,7 +266,7 @@ public:
                              pc.projectTimeMusic, (uint32_t)data.numSamples, base);
         }
 
-        /* note events -> UMP (§9.10), timestamped to the sample */
+        /* note events -> UMP (§9.10), timestamped to the sample, on OUR source */
         if (data.inputEvents) {
             int32 ne = data.inputEvents->getEventCount();
             for (int32 i = 0; i < ne; i++) {
@@ -227,12 +278,12 @@ public:
                     uint32_t chan = (uint32_t)ev.noteOn.channel & 0xf; /* -> device part (P2.1) */
                     if (vel == 0) vel = 1;
                     if (vel > 127) vel = 127;
-                    rt.queueNote(ump_note_on(note, vel, chan),
+                    rt.queueNote(source_, ump_note_on(note, vel, chan),
                                  base + (uint64_t)ev.sampleOffset);
                 } else if (ev.type == Event::kNoteOffEvent) {
                     uint32_t note = (uint32_t)(ev.noteOff.pitch & 0x7f);
                     uint32_t chan = (uint32_t)ev.noteOff.channel & 0xf;
-                    rt.queueNote(ump_note_off(note, chan),
+                    rt.queueNote(source_, ump_note_off(note, chan),
                                  base + (uint64_t)ev.sampleOffset);
                 }
             }
@@ -255,7 +306,7 @@ public:
              * holds a gesture's final settling value; a "now" set delivers
              * it without inventing a timestamp the stream already passed. */
             if (pendHas_[idx] && base >= pendTs_[idx] + 256) {
-                rt.queueParamSet((uint32_t)idx + 1, pendVal_[idx], 0);
+                rt.queueParamSet(source_, (uint32_t)idx + 1, pendVal_[idx], 0);
                 lastTs_[idx] = pendTs_[idx];
                 pendHas_[idx] = false;
             }
@@ -274,11 +325,11 @@ public:
                     if (q->getPoint(k, off, v) != kResultOk) continue;
                     uint64_t ts = base + (uint64_t)off;
                     if (id == kPanicParamId) { /* DAW panic -> all-notes-off */
-                        rt.queueNote(ump_all_notes_off(), 0);
+                        rt.queueNote(source_, ump_all_notes_off(), 0);
                         continue;
                     }
                     if (idx == SIZE_MAX) {
-                        rt.queueParamSet(id, (float)v, ts);
+                        rt.queueParamSet(source_, id, (float)v, ts);
                         continue;
                     }
                     if (hasLast_[idx] && ts > lastTs_[idx] && ts - lastTs_[idx] < 256) {
@@ -290,15 +341,25 @@ public:
                     bool ramp = hasLast_[idx] && ts > lastTs_[idx] &&
                                 ts - lastTs_[idx] <= 4800; /* >100 ms gap = a jump */
                     if (ramp)
-                        rt.queueRamp(id, (float)v, lastTs_[idx], ts);
+                        rt.queueRamp(source_, id, (float)v, lastTs_[idx], ts);
                     else
-                        rt.queueParamSet(id, (float)v, ts);
+                        rt.queueParamSet(source_, id, (float)v, ts);
                     lastTs_[idx] = ts;
                     hasLast_[idx] = true;
                     pendHas_[idx] = false;
                 }
             }
         }
+
+        /* AUDIO: OWNER ONLY. The shared session's audio ring has ONE consumer
+         * (the owner pulls the MAIN MIX, which already sums every part this
+         * group injected above). An attached instance has queued its part's
+         * events and is done — it emits SILENCE and must NOT pull the ring
+         * (a second consumer would corrupt the SPSC tail and steal the owner's
+         * samples) nor drain the echo ring (also single-consumer). Per-part
+         * audio demux — each alias hearing only its own part — is the tracked
+         * follow-up P5b; until then siblings are audio-silent by design. */
+        if (!isOwner) return processSilence(data);
 
         if (data.numOutputs < 1 || data.numSamples <= 0 ||
             data.outputs[0].numChannels < 1 || !data.outputs[0].channelBuffers32)
@@ -394,22 +455,39 @@ public:
 private:
     /* The runtime this instance drives — obtained from the PROCESS-GLOBAL
      * registry (P4), not owned by value. Instances that target the SAME unit
-     * (same explicit serial) share ONE runtime / ONE USB claim; that's the
-     * prerequisite for multitimbral aliasing (P5). A single instance, or one
+     * (same explicit serial) share ONE runtime / ONE USB claim; that is what
+     * makes multitimbral aliasing possible (P5). A single instance, or one
      * that auto-selects (no explicit serial), gets its OWN fresh runtime with
      * handle_.owner == true and behaves BYTE-IDENTICALLY to the old by-value
      * member. See runtime_registry.h for the "not the old singleton" rule.
-     *   owner == true:  drive normally (configure / pull audio / queue events /
-     *                   get+set state) — exactly as today.
-     *   owner == false: ATTACHED — a sibling already owns and streams the
-     *                   shared session. This instance stays DORMANT in P4: it
-     *                   MUST NOT touch the runtime's SPSC audio ring or event
-     *                   queue (would break the single-producer/consumer
-     *                   invariants). process() outputs silence and queues
-     *                   nothing; getState reads the shared state (safe). P5
-     *                   gives attached instances their own part's audio + a
-     *                   per-shell event source. */
+     *   owner == true:  drive the session — configure / pull MAIN-MIX audio /
+     *                   anchor transport / get+set state — and queue events on
+     *                   the runtime's built-in OWNER source (byte-identical to
+     *                   today for a single instance).
+     *   owner == false: ATTACHED (P5) — a sibling owns and streams the shared
+     *                   session. This instance is no longer dormant for EVENTS:
+     *                   it queues notes/params on its OWN registered source_
+     *                   (its part), which the owner's eventPump merges onto the
+     *                   one session, so the group PLAYS multitimbrally. It stays
+     *                   AUDIO-SILENT (the owner pulls the summed main mix; per-
+     *                   part audio demux is the follow-up P5b) and does NOT
+     *                   anchor transport (the owner is canonical) or push state
+     *                   (the owner's bundle wins on the one device). */
     RuntimeHandle handle_;
+    /* This instance's event SOURCE (P5): the runtime's built-in owner source
+     * for an owner, a per-instance registered source for an attached one. All
+     * queue* route through it so each instance is the SOLE producer of its own
+     * SPSC ring. nullptr until acquired (process() emits silence then). */
+    EventSource *source_ = nullptr;
+    /* Drop our event source. For an ATTACHED instance this removes + frees the
+     * source we registered (after which the owner's eventPump never touches it);
+     * for an owner / unacquired instance it is a no-op (the owner source belongs
+     * to the runtime and persists for the session). MUST run before
+     * runtime_release (a last release destroys the runtime). Idempotent. */
+    void releaseSource() {
+        if (source_ && runtime()) runtime()->unregisterSource(source_);
+        source_ = nullptr;
+    }
     HarpRuntime *runtime() const { return handle_.rt; }
     bool owner() const { return handle_.owner; }
     uint32_t rate_ = 48000;

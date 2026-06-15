@@ -147,7 +147,7 @@ if(LIBUSB_FOUND)
       ${HARP_PLAT_SRC})
     target_include_directories(tsan-host PRIVATE
       ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
-      ${LIBUSB_INCLUDE_DIRS})
+      ${CMAKE_CURRENT_SOURCE_DIR}/.. ${LIBUSB_INCLUDE_DIRS})
     target_compile_definitions(tsan-host PRIVATE HAVE_LIBUSB)
     if(HARP_TSAN_SANITIZE)
       target_compile_options(tsan-host PRIVATE -fsanitize=thread -g -O1)

@@ -65,6 +65,7 @@ run scripts/soak.sh "${SOAK_SECONDS:-30}"
 run scripts/tempo-lock-test.sh
 run scripts/multidevice-test.sh
 run scripts/session-share-test.sh
+run scripts/alias-play-test.sh
 run scripts/replug-test.sh
 echo "════ hw-tests (linux): $PASS passed, $FAIL failed, $SKIP skipped"
 [ $FAIL -eq 0 ]

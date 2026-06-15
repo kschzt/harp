@@ -495,7 +495,11 @@ static OSStatus au_SetParameter(void *self, AudioUnitParameterID param,
     if (value > 1) value = 1;
     au->paramShadow[param - 1] = value;
     auto &rt = au->rt;
-    rt.queueParamSet(param, value,
+    /* The AU is a single-instance shell (one by-value runtime), so it is always
+     * the OWNER and drives the runtime's built-in owner source (P5). With one
+     * source the eventPump's merge is exactly the pre-P5 single-ring path —
+     * byte-identical wire. */
+    rt.queueParamSet(rt.ownerSource(), param, value,
                      offset ? rt.streamPos() + rt.latencySamples() + offset : 0);
     return noErr;
 }
@@ -512,7 +516,7 @@ static OSStatus au_ScheduleParameters(void *self, const AudioUnitParameterEvent 
             auto &rt = au->rt;
             uint64_t base = rt.streamPos() + rt.latencySamples();
             const auto &r = ev[i].eventValues.ramp;
-            rt.queueRamp(ev[i].parameter, r.endValue,
+            rt.queueRamp(rt.ownerSource(), ev[i].parameter, r.endValue,
                          base + (uint64_t)r.startBufferOffset,
                          base + (uint64_t)r.startBufferOffset +
                              (uint64_t)r.durationInFrames);
@@ -532,12 +536,14 @@ static OSStatus au_MIDIEvent(void *self, UInt32 status, UInt32 data1, UInt32 dat
     uint64_t ts = rt.streamPos() + rt.latencySamples() + offset;
     UInt32 kind = status & 0xF0;
     uint32_t chan = (uint32_t)(status & 0x0F); /* MIDI channel -> device part (P2.1) */
+    /* single-instance owner: queue on the runtime's built-in owner source (P5) */
+    EventSource *src = rt.ownerSource();
     if (kind == 0x90 && data2 > 0) {
-        rt.queueNote(ump_note_on(data1, data2, chan), ts);
+        rt.queueNote(src, ump_note_on(data1, data2, chan), ts);
     } else if (kind == 0x80 || (kind == 0x90 && data2 == 0)) {
-        rt.queueNote(ump_note_off(data1, chan), ts);
+        rt.queueNote(src, ump_note_off(data1, chan), ts);
     } else if (kind == 0xB0 && (data1 == 120 || data1 == 123)) {
-        rt.queueNote(ump_all_notes_off(), 0); /* panic, now */
+        rt.queueNote(src, ump_all_notes_off(), 0); /* panic, now */
     }
     return noErr;
 }

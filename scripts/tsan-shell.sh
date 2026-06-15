@@ -29,7 +29,10 @@ echo "── $NDEV HARP device(s) on the bus"
 
 run() {
     name=$1; shift
-    log=$(mktemp /tmp/tsan-$name.XXXX.log)
+    # X's must be the template TAIL: BSD mktemp does not expand them when a
+    # suffix (.log) follows — it would create a literal "...XXXX.log" that
+    # collides run-to-run and exits the wrapper early under `set -e`.
+    log=$(mktemp /tmp/tsan-$name.XXXXXX)
     "$BUILD/tsan-host" "$@" >"$log" 2>&1 || true
     n=$(grep -c 'WARNING: ThreadSanitizer' "$log" || true)
     if [ "$n" -gt 0 ]; then
@@ -47,5 +50,18 @@ run tight    --instances 1 --seconds 15 --block 64
 run multidev --instances 2 --seconds 15 --block 256
 [ "$NDEV" -lt 2 ] && echo "  (multidev ran with 1 device: one live + one in device-less retry;" \
     && echo "   connect a second board for two live USB sessions)"
+
+# multitimbral MERGE (P5): PIN one serial so the N instances SHARE one runtime
+# and the eventPump drains N per-instance event sources concurrently — this is
+# the only config that TSan-covers the multi-source merge (without a pinned
+# serial, --instances spins up N independent owners and never merges).
+SERIAL=$(./build/harp-probe list 2>/dev/null | grep -oE 'PI4B-[0-9]+' | head -1)
+if [ -n "$SERIAL" ]; then
+    export HARP_DEVICE_SERIAL="$SERIAL"
+    run merge --instances 4 --seconds 15 --block 256
+    unset HARP_DEVICE_SERIAL
+else
+    echo "  merge: SKIP (no board on the bus to pin for the shared-runtime merge)"
+fi
 
 [ "$FAIL" = 0 ] && echo "TSAN-SHELL PASS (runtime threads race-free)" || { echo "TSAN-SHELL FAIL"; exit 1; }
