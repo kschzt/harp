@@ -171,8 +171,12 @@ if(LIBUSB_FOUND)
   # It still links runtime.cpp (the registry news/deletes it) and thus the C
   # core/host sources + libusb runtime.cpp references, so it lives here in the
   # LIBUSB_FOUND block beside tsan-host rather than in the harpcore-only
-  # harp-tests. Runs in plain CI (ctest) — it is the cloud-side complement to
-  # the session-share HARDWARE test, which proves the same sharing on the bus.
+  # harp-tests. Runs in plain CI — it is the cloud-side complement to the
+  # session-share HARDWARE test, which proves the same sharing on the bus.
+  # NOT WIN32: registry_tests.cpp uses POSIX mkdtemp/setenv (the registry it
+  # exercises is cross-platform, but this Unix-only harness is built and run on
+  # the Linux/macOS CI jobs, not under MSVC).
+  if(NOT WIN32)
   add_executable(registry-tests
     ${HARP_ROOT}/tests/registry_tests.cpp
     ${HARP_ROOT}/shell/runtime.cpp
@@ -194,11 +198,9 @@ if(LIBUSB_FOUND)
   target_compile_definitions(registry-tests PRIVATE HAVE_LIBUSB)
   target_link_directories(registry-tests PRIVATE ${LIBUSB_LIBRARY_DIRS})
   target_link_libraries(registry-tests ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS})
-  if(WIN32)
-    target_link_libraries(registry-tests setupapi ole32) # static libusb deps
-  endif()
   add_test(NAME registry COMMAND registry-tests)
   message(STATUS "registry-tests: runtime registry keying/refcount unit test")
+  endif() # NOT WIN32
 
   # SMTG emits the bundle under VST3/<config>/ ($<CONFIG> = multi-config safe).
   set(HARP_SHELL_BUNDLE ${CMAKE_BINARY_DIR}/VST3/$<CONFIG>/harp-shell.vst3)

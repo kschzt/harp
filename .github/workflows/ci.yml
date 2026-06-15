@@ -14,9 +14,11 @@ jobs:
       - name: build shell + tools
         run: |
           cmake -B build-vst -S tools/vst3-host
-          cmake --build build-vst --target harp-vst3-host harp-shell ring-tests -j3
-      - name: ring tests (incl. cross-thread stress)
-        run: ./build-vst/ring-tests
+          cmake --build build-vst --target harp-vst3-host harp-shell ring-tests registry-tests -j3
+      - name: ring + registry tests (cross-thread stress; registry keying/refcount)
+        run: |
+          ./build-vst/ring-tests
+          ./build-vst/registry-tests
       - name: AU shell + auval (Apple's own validation gate)
         run: |
           cmake --build build-vst --target harp-au au-host -j3
@@ -117,11 +119,12 @@ jobs:
              https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
       - name: install libusb + xvfb
         run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev xvfb
-      - name: build shell + tools, ring tests
+      - name: build shell + tools, ring + registry tests
         run: |
           cmake -B build-vst -S tools/vst3-host
-          cmake --build build-vst --target harp-vst3-host harp-shell ring-tests -j
+          cmake --build build-vst --target harp-vst3-host harp-shell ring-tests registry-tests -j
           ./build-vst/ring-tests
+          ./build-vst/registry-tests
       - name: pluginval (plugin-contract abuse, strictness 10)
         run: |
           curl -sL https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Linux.zip -o pv.zip
