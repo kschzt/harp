@@ -108,6 +108,30 @@ jobs:
           Write-Host "pluginval exit code: $($p.ExitCode)"
           if ($p.ExitCode -ne 0) { throw "pluginval failed (exit $($p.ExitCode))" }
 
+  shell-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: clone VST3 SDK
+        run: git clone --depth 1 --recursive
+             https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
+      - name: install libusb + xvfb
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev xvfb
+      - name: build shell + tools, ring tests
+        run: |
+          cmake -B build-vst -S tools/vst3-host
+          cmake --build build-vst --target harp-vst3-host harp-shell ring-tests -j
+          ./build-vst/ring-tests
+      - name: pluginval (plugin-contract abuse, strictness 10)
+        run: |
+          curl -sL https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Linux.zip -o pv.zip
+          unzip -q pv.zip && chmod +x pluginval
+          # Locate the bundle by search — its config subdir depends on the generator.
+          plug=$(find build-vst -maxdepth 4 -name 'harp-shell.vst3' -type d | head -1)
+          test -n "$plug" || { echo "harp-shell.vst3 not found under build-vst"; exit 1; }
+          # xvfb: loading a VST3 module on Linux touches X even with GUI tests off.
+          xvfb-run -a ./pluginval --strictness-level 10 --skip-gui-tests --validate "$plug"
+
   core:
     runs-on: ubuntu-latest
     steps:

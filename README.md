@@ -28,14 +28,14 @@ it gets, from any conforming host:
   bypasses the OS audio stack (no aggregate-device hacks), including a
   host-paced mode where the hardware renders *deterministically*, byte-
   identical, faster than real time: offline bounce through a physical box
-  at ~25× real time, **16 ms total reported latency** at typical buffer
-  sizes — in the neighborhood of a good audio interface.
-- **Sample-accurate everything (§9)** — DAW automation becomes
+  at ~25× real time, with **16 ms of reported latency at DAW buffers ≤ 256**
+  — in the neighborhood of a good audio interface.
+- **Sample-accurate everything** — DAW automation becomes
   device-interpolated ramps applied within ±1 sample; notes travel as UMP;
   an event *fence* makes "applied late" structurally impossible rather
   than statistically rare. Turn a knob on the hardware and the DAW records
   the automation (echo).
-- **Musical time (§9.7)** — devices follow the DAW's transport: tempo,
+- **Musical time** — devices follow the DAW's transport: tempo,
   position, loops. The reference device's arpeggiator locks to Live's grid
   sample-exactly, survives loop wraps, and renders a *byte-identical
   groove* — determinism extended to musical time.
@@ -54,20 +54,15 @@ the Live set's own save/reopen, a tempo-locked arpeggiator, offline bounce
 through the hardware.
 
 **Degree of completeness:** the four protocol planes (control, state,
-events, audio) are implemented end-to-end and verified on real hardware by
-a conformance kit — recall round-trips, ±1-sample event timing, realtime
-floods across buffer sizes 64–1024, hot-replug, tempo lock, determinism
-hashes — plus fuzzed parsers and a ThreadSanitizer-clean device. The
-specification is an **editor's draft** (0.3.4): breaking changes are
-expected and versions are negotiated at hello; its changelog records what
-implementation taught us. Verified across three DAWs — **Ableton Live**
-(macOS) and **Renoise** (Windows) by hand, plus **REAPER** headless on Linux
-as an automated e2e that renders a project through the real device and
-byte-compares the result on every push. The plugin shell builds and is
-CI-validated on **macOS, Windows, and Linux** — a VST3 on all three
-(pluginval strictness 10 on macOS + Windows) plus an Audio Unit on macOS
-(`auval`). The four-actions recall UI, a CLAP port, and the Ethernet binding
-are next (see [Status](#status) for the full list).
+events, audio) are implemented end-to-end and verified on real hardware. The
+plugin shell builds and is CI-validated on **macOS, Windows, and Linux** — a
+VST3 on all three (pluginval strictness 10) plus an Audio Unit on macOS
+(`auval`) — and the device has been driven from **Ableton Live** (macOS +
+Windows) and **Renoise** (Windows) by hand, plus a headless **REAPER**
+render-and-recall e2e on Linux that runs on every push. The specification is
+an **editor's draft** (0.3.4): breaking changes are expected and negotiated at
+hello. The four-actions recall UI, a CLAP port, and the Ethernet binding are
+next — the [Status](#status) section is the full breakdown.
 
 ## Repository map
 
@@ -110,6 +105,12 @@ cmake -B build && cmake --build build
 The `demo` walks the canonical project-open flow (spec §12.2): save,
 front-panel edits dirtying state, mismatch detection on reopen,
 archive-before-push, hash-verified restore.
+
+**See it yourself:** that walkthrough reproduces the total-recall claim on
+your laptop, no hardware. The bolder claims — byte-identical renders and
+±1-sample timing — need a device: `harp-probe -d usb t15 4` renders twice and
+byte-compares (Path 2 below), and those same checks run on a real Pi in CI on
+every push (the green **hw** badge above).
 
 For the visual version, start the web panel (the device's "front panel"
 plus a live protocol inspector — refs, generations, the dirty flag in
@@ -184,58 +185,61 @@ The shell can also be driven without any DAW, which is how it is tested:
 
 ## Status
 
-Working and verified end-to-end: `harp-core`, `harp-recall`,
-`harp-stream` (free-running + host-paced with `audio.deterministic` and
-`audio.offline-rate`), the USB binding, the VST3 shell in Ableton
-Live 12, and the event plane (§9): parameter sets and ramps applied at
-exact sample timestamps (±1 sample verified on hardware), DAW
-automation synthesized into device-interpolated ramps, UMP note input
-(the refdev is a playable envelope+portamento synth), and front-panel
-echo — turn a knob on the device's web panel and the DAW records
-automation. The panel doubles as a live protocol inspector with
-actions: refs with ticking generations, the dirty flag, counters, plus
-Snapshot, Panic, and one-click Load of any archived state (patch
-time-travel; current state is archived first — nothing is ever lost).
-The hardware conformance kit (`scripts/hw-tests.sh`) runs recall
-round-trips, note-timing checks (±1 sample pitch arrival, zero late
-events), a realtime soak that floods automation + notes + panel
-traffic asserting zero silence gaps, zero drops, and bounded padding
-across DAW buffer sizes 64–1024, and an automated replug test: the
-device detaches mid-stream and the shell reconnects on its own —
-session re-established, project state re-asserted, audio back.
-Note-offs are unloseable by design, and the DAW's panic (CC 120/123)
-reaches the hardware. Every wire-facing parser is fuzzed (libFuzzer +
-ASan in CI; `fuzz/`), and a protocol-abuse test slams a live daemon
-with hostile traffic asserting sessions reset and nothing crashes.
-Certification-suite behaviors exercised in miniature: T2/T3
-(unplug/replug), T5 (silent hash-verified reopen), T9 (malformed
-input), T10 (power-loss safety), T15 (byte-identical renders), T16
-(event timing).
+**Working — verified end-to-end on real hardware:**
 
-The arpeggiator demo is in: the device declares `evt.transport` (§9.7)
-and follows the DAW's musical timeline — a note-latch arp whose step
-clock derives from the (timestamp, PPQ, tempo) anchor, landing steps on
-division boundaries sample-exactly by construction. Params grew to 12
-(the first param-map-hash change; old projects map onto matching ids
-with a warning, §9.3). The conformance kit gained T17: grid-exactness,
-loop-wrap survival, and a byte-identical "groove hash" — two renders of
-the same chord and transport are the same file.
+- **Protocol core** — `harp-core` (framing, deterministic CBOR, SHA-256,
+  content-addressed object store), `harp-recall` (save / snapshot / restore),
+  `harp-stream` (free-running and host-paced; `audio.deterministic` +
+  `audio.offline-rate`), and the USB binding.
+- **The plugin shell** — VST3 on macOS/Windows/Linux and an Audio Unit on
+  macOS, driving the device in Ableton Live (macOS + Windows), Renoise
+  (Windows), and an automated headless REAPER render (Linux).
+- **The event plane (§9)** — parameter sets and ramps at exact sample
+  timestamps (±1 sample on hardware), DAW automation synthesized into
+  device-interpolated ramps, UMP note input (the refdev is a playable
+  envelope+portamento synth), and front-panel echo (turn a knob on the device,
+  the DAW records the automation). Note-offs are unloseable; the DAW's panic
+  (CC 120/123) reaches the hardware.
+- **Musical time (§9.7)** — the device follows `evt.transport`: a note-latch
+  arpeggiator whose step clock derives from the (timestamp, PPQ, tempo) anchor
+  lands on division boundaries sample-exactly, survives loop wraps, and renders
+  a byte-identical *groove hash*. (Params grew to 12 — the first param-map-hash
+  change; old projects map onto matching ids with a warning, §9.3.)
+- **Multi-device** — two boards on one bus; each instance binds its own by USB
+  identity (saved serial, else first unclaimed same-model — never a different
+  synth), reconnect pins that exact unit, two instances claim two devices by
+  contention.
+- **The web panel** — front panel plus a live protocol inspector: refs with
+  ticking generations, the dirty flag, counters, and Snapshot / Panic /
+  one-click Load of any archived state (patch time-travel — the current state
+  is archived first, so nothing is ever lost).
 
-Multi-device works: two boards on one bus, each plugin instance binds its
-own by USB identity (the project's saved serial, else the first unclaimed
-unit of the same model — never a different synth), reconnect pins that
-exact unit, and two instances in one host claim two devices by claim
-contention.
+**Gated in CI on every push:**
 
-Not yet: four-safe-actions UI (v0 auto-resolves by Push-with-archive),
-runtime/shell process split (§15.1), firmware management (§13),
-class-audio coexistence (§8.5), free-running ASRC for analog devices,
-a CLAP port, TCP companion spec (§4.4).
+- **Hardware suite** on a real Pi (`scripts/hw-tests-linux.sh`, the `hw`
+  badge): recall round-trips, ±1-sample note timing with zero late events, a
+  realtime soak flooding automation + notes + panel traffic across DAW buffers
+  64–1024 (zero silence gaps, zero drops, bounded padding), an automated
+  mid-stream replug, an IDM-flood determinism gate, and the REAPER real-DAW
+  determinism + recall round-trip — with the daemon under test built on the
+  board from the commit being tested.
+- **Sandboxed suite**: builds + unit tests on three OSes, pluginval
+  strictness 10 (macOS / Windows / Linux), `auval` (macOS), fuzzed parsers
+  (libFuzzer + ASan), and a protocol-abuse test that slams a live daemon with
+  hostile traffic (sessions reset, nothing crashes).
+- Certification-suite behaviors in miniature: T2/T3 (unplug/replug), T5
+  (silent hash-verified reopen), T9 (malformed input), T10 (power-loss safety),
+  T15/T17 (byte-identical renders), T16 (event timing).
+
+**Not yet:** the four-safe-actions UI (v0 auto-resolves by Push-with-archive),
+runtime/shell process split (§15.1), firmware management (§13), class-audio
+coexistence (§8.5), free-running ASRC for analog devices, a CLAP port, the TCP
+companion spec (§4.4).
 
 The spec is an **editor's draft**: breaking changes expected, version
-negotiated at `core.hello`. Changes flow through HARP Enhancement
-Proposals (§18); two interoperating implementations are required before
-a HEP merges once the process formalizes.
+negotiated at `core.hello`. Changes flow through HARP Enhancement Proposals
+(§18); two interoperating implementations are required before a HEP merges once
+the process formalizes.
 
 ## Licensing
 
