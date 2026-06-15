@@ -20,19 +20,131 @@
  * g_params table order). Deterministic (content-addressed): same values ->
  * same bytes. The format change alters the state HASH vs P2.2 — EXPECTED and
  * fine (the golden checks rendered AUDIO; recall round-trips the new format
- * both ways). The OLD flat { paramId => value } map still loads (part 0). */
-static void engine_encode_params_blob(harp_cbuf *out) {
-    harp_cbuf payload;
-    harp_cbuf_init(&payload);
-    harp_cbor_map(&payload, NPARTS); /* part index => params map */
+ * both ways). The OLD flat { paramId => value } map still loads (part 0).
+ *
+ * P3 closer: the byte-level serialization is the PURE codec below
+ * (refdev_encode_params_blob / refdev_parse_params_blob). engine_encode_params_blob
+ * is now just the engine glue — snapshot the 16 parts into a float grid, run the
+ * pure encoder, wrap the result in the PARAMS_MEDIA blob header. The emitted bytes
+ * are byte-identical to the prior inline encoder (same media, same ascending
+ * order), so recall hashes and existing snapshots are unchanged. */
+
+/* PURE encoder: float grid -> inner CBOR map (no media wrapper, no store, no
+ * g_parts). Mirrors the prior inline order exactly: parts 0..15 ascending,
+ * params in g_params (== ascending id) order, f32 values via harp_cbor_float. */
+void refdev_encode_params_blob(const float v[NPARTS][NPARAMS], harp_cbuf *payload) {
+    harp_cbor_map(payload, NPARTS); /* part index => params map */
     for (int pi = 0; pi < NPARTS; pi++) {
-        harp_cbor_uint(&payload, (uint64_t)pi);
-        harp_cbor_map(&payload, NPARAMS);
+        harp_cbor_uint(payload, (uint64_t)pi);
+        harp_cbor_map(payload, NPARAMS);
         for (size_t i = 0; i < NPARAMS; i++) { /* ascending ids == deterministic order */
-            harp_cbor_uint(&payload, g_params[i].id);
-            harp_cbor_float(&payload, engine_part_param_get(pi, g_params[i].id));
+            harp_cbor_uint(payload, g_params[i].id);
+            harp_cbor_float(payload, v[pi][i]);
         }
     }
+}
+
+/* PURE decoder: inner CBOR map -> float grid + presence mask. Fails clean on
+ * ANY structural error (bad CBOR / truncation) by returning false; an
+ * out-of-range partIdx or unknown paramId is skipped, never fatal on its own,
+ * and never writes outside the grid. See header for the format contract.
+ *
+ * THE SMELL FIX (P3 critic): the prior inline parser broke out of an inner map
+ * on a malformed pair WITHOUT consuming the rest, leaving the outer decoder
+ * misaligned — it then read the following bytes as a bogus part index. Here
+ * every inner pair that fails to decode is a STRUCTURAL error -> abort whole
+ * parse; a well-formed-but-unknown id is consumed (value too) and skipped, so
+ * the cursor stays aligned for the remaining parts. */
+
+/* Stage one part's params from an inner { paramId => value } map at *dec.
+ * pi is -1 to discard (out-of-range part): the pairs are still fully consumed
+ * so the outer cursor stays aligned. Returns false on a structural decode
+ * error (the caller aborts the whole parse). */
+/* Store one (id, value) onto part pi's grid column, if the id is one of ours.
+ * Unknown ids are ignored (forward-compat). Single source of the id->column
+ * lookup — the parse paths below all route through here. */
+static void grid_set(int pi, uint64_t id, double val,
+                     float v[NPARTS][NPARAMS], bool present[NPARTS][NPARAMS]) {
+    for (size_t j = 0; j < NPARAMS; j++)
+        if (g_params[j].id == id) {
+            v[pi][j] = (float)val;
+            present[pi][j] = true;
+            return;
+        }
+}
+
+static bool parse_part_map(harp_cdec *dec, int pi,
+                           float v[NPARTS][NPARAMS], bool present[NPARTS][NPARAMS]) {
+    uint64_t n;
+    if (!harp_cdec_map(dec, &n)) return false;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t id;
+        double val;
+        /* both halves of the pair are always consumed — id then value — so a
+         * truncated/garbled pair is a structural failure (false), not a silent
+         * break that strands the cursor mid-map (the old bug) */
+        if (!harp_cdec_uint(dec, &id) || !harp_cdec_float(dec, &val)) return false;
+        if (pi >= 0) grid_set(pi, id, val, v, present); /* pi<0: consumed, discarded */
+    }
+    return true;
+}
+
+bool refdev_parse_params_blob(const uint8_t *payload, size_t len,
+                              float v[NPARTS][NPARAMS], bool present[NPARTS][NPARAMS]) {
+    harp_cdec dec;
+    harp_cdec_init(&dec, payload, len);
+    uint64_t n;
+    if (!harp_cdec_map(&dec, &n)) return false; /* not a map at all: malformed */
+    if (n == 0) return true;                    /* empty map: no-op, well-formed */
+
+    /* Format discrimination (graceful migration): peek the FIRST pair's value
+     * type after consuming its key. MAP value (CBOR major 5) => NEW per-part
+     * { partIdx => {id=>v} }; FLOAT value (major 7) => OLD flat { id => v }
+     * (-> part 0). Any other value type is a malformed blob. */
+    uint64_t first_key;
+    if (!harp_cdec_uint(&dec, &first_key)) return false;
+    int major = harp_cdec_peek(&dec);
+
+    if (major == 5) { /* NEW per-part: first value is a map */
+        /* first pair (key already consumed) */
+        if (!parse_part_map(&dec, first_key < (uint64_t)NPARTS ? (int)first_key : -1,
+                            v, present))
+            return false;
+        for (uint64_t i = 1; i < n; i++) {
+            uint64_t pidx;
+            if (!harp_cdec_uint(&dec, &pidx)) return false;
+            if (!parse_part_map(&dec, pidx < (uint64_t)NPARTS ? (int)pidx : -1, v, present))
+                return false;
+        }
+        return true;
+    }
+
+    if (major == 7) { /* OLD flat { paramId => value } -> part 0 */
+        double val;
+        if (!harp_cdec_float(&dec, &val)) return false;
+        grid_set(0, first_key, val, v, present);
+        for (uint64_t i = 1; i < n; i++) {
+            uint64_t id;
+            if (!harp_cdec_uint(&dec, &id) || !harp_cdec_float(&dec, &val)) return false;
+            grid_set(0, id, val, v, present);
+        }
+        return true;
+    }
+
+    return false; /* first value neither map nor float: malformed */
+}
+
+/* Engine glue: snapshot the 16 parts into a float grid, run the pure encoder,
+ * wrap in the PARAMS_MEDIA blob. Output is byte-identical to the prior inline
+ * encoder (same grid order -> same CBOR). */
+static void engine_encode_params_blob(harp_cbuf *out) {
+    float v[NPARTS][NPARAMS];
+    for (int pi = 0; pi < NPARTS; pi++)
+        for (size_t i = 0; i < NPARAMS; i++)
+            v[pi][i] = engine_part_param_get(pi, g_params[i].id);
+    harp_cbuf payload;
+    harp_cbuf_init(&payload);
+    refdev_encode_params_blob(v, &payload);
     harp_obj_encode_blob(out, PARAMS_MEDIA, payload.buf, payload.len);
     harp_cbuf_free(&payload);
 }
@@ -68,25 +180,20 @@ fail:
 
 /* Load a snapshot into the live engine. Returns 0, or -1 (closure incomplete
  * or malformed — nothing is applied; §11.3 atomic apply). P3: stages ALL 16
- * parts, commits atomically (all-or-nothing, like before). */
+ * parts, commits atomically (all-or-nothing, like before).
+ *
+ * P3 closer: the per-part blob parse now lives in the PURE
+ * refdev_parse_params_blob codec above; the engine staging here only fetches
+ * the blob, runs the codec, and overlays the params it reports PRESENT onto the
+ * staged grid (which started from the CURRENT live values — see
+ * engine_load_snapshot). Params/parts the blob does not carry keep their
+ * current value, exactly as before. A malformed blob fails the whole load
+ * (ctx->ok = false) so nothing is committed. */
 struct load_ctx {
     device *d;
     float staged[NPARTS][NPARAMS];
     bool ok;
 };
-
-/* Stage one part's params from an inner { paramId => value } map. */
-static void load_part_map(struct load_ctx *ctx, harp_cdec *dec, int pi) {
-    uint64_t n;
-    if (!harp_cdec_map(dec, &n)) return;
-    for (uint64_t i = 0; i < n; i++) {
-        uint64_t id;
-        double v;
-        if (!harp_cdec_uint(dec, &id) || !harp_cdec_float(dec, &v)) break;
-        for (size_t j = 0; j < NPARAMS; j++)
-            if (g_params[j].id == id) ctx->staged[pi][j] = (float)v;
-    }
-}
 
 static bool load_tree_entry(const char *name, size_t name_len, const harp_hash *h,
                             uint32_t kind, void *ud) {
@@ -107,48 +214,19 @@ static bool load_tree_entry(const char *name, size_t name_len, const harp_hash *
         ctx->ok = false;
         return false;
     }
-    harp_cdec dec;
-    harp_cdec_init(&dec, payload, payload_len);
-    uint64_t n;
-    if (harp_cdec_map(&dec, &n)) {
-        /* Format discrimination (graceful migration): the NEW per-part format
-         * has MAP values ({paramId=>value}); the OLD flat format has FLOAT
-         * values (paramId=>value). Peek the FIRST pair's value type — map (CBOR
-         * major 5) => per-part; float (major 7) => old flat -> load into part 0
-         * and leave others at their staged defaults. An empty map (n==0) is a
-         * no-op either way. */
-        if (n > 0) {
-            uint64_t first_key;
-            if (!harp_cdec_uint(&dec, &first_key)) { ctx->ok = false; goto done; }
-            if (harp_cdec_peek(&dec) == 5) { /* NEW: { partIndex => {id=>v} } */
-                if (first_key < (uint64_t)NPARTS)
-                    load_part_map(ctx, &dec, (int)first_key);
-                else
-                    harp_cdec_skip(&dec); /* unknown part index: ignore its map */
-                for (uint64_t i = 1; i < n; i++) {
-                    uint64_t pidx;
-                    if (!harp_cdec_uint(&dec, &pidx)) break;
-                    if (pidx < (uint64_t)NPARTS)
-                        load_part_map(ctx, &dec, (int)pidx);
-                    else if (!harp_cdec_skip(&dec))
-                        break;
-                }
-            } else { /* OLD flat { paramId => value } -> part 0 */
-                double v;
-                if (harp_cdec_float(&dec, &v)) {
-                    for (size_t j = 0; j < NPARAMS; j++)
-                        if (g_params[j].id == first_key) ctx->staged[0][j] = (float)v;
-                    for (uint64_t i = 1; i < n; i++) {
-                        uint64_t id;
-                        if (!harp_cdec_uint(&dec, &id) || !harp_cdec_float(&dec, &v)) break;
-                        for (size_t j = 0; j < NPARAMS; j++)
-                            if (g_params[j].id == id) ctx->staged[0][j] = (float)v;
-                    }
-                }
-            }
-        }
+    /* Run the pure codec into a scratch grid + presence mask, then overlay the
+     * present values onto the staged grid (absent ones keep the current value
+     * staged by the caller). A structural decode error fails the whole load. */
+    float v[NPARTS][NPARAMS];
+    bool present[NPARTS][NPARAMS] = {{false}};
+    if (!refdev_parse_params_blob(payload, payload_len, v, present)) {
+        harp_cbuf_free(&enc);
+        ctx->ok = false;
+        return false;
     }
-done:
+    for (int pi = 0; pi < NPARTS; pi++)
+        for (size_t i = 0; i < NPARAMS; i++)
+            if (present[pi][i]) ctx->staged[pi][i] = v[pi][i];
     harp_cbuf_free(&enc);
     return true;
 }

@@ -99,6 +99,68 @@ int main(int argc, char **argv) {
                              "seed snapshot");
     dump(dir, "obj-snapshot", m.buf, m.len);
 
+    /* params-blob parser (§10 / P3 closer) seeds: the INNER CBOR map that
+     * refdev_parse_params_blob consumes (no media wrapper — fuzz_state feeds
+     * raw bytes straight to the codec). Hand-encoded here rather than via the
+     * device encoder so the generator stays on harpcore and so the edge seeds
+     * (empty / nested / out-of-range) are expressible. Param ids are 1..13;
+     * 16 parts. These start coverage inside the codec's two format arms and
+     * its skip/abort branches — the fuzzer mutates outward from there. */
+
+    /* valid NEW 16-part blob: { part(0..15) => { id(1..13) => f32 } } —
+     * mirrors refdev_encode_params_blob's shape so it lands in the per-part
+     * arm (first outer value is a map). */
+    harp_cbuf_reset(&m);
+    harp_cbor_map(&m, 16);
+    for (uint64_t part = 0; part < 16; part++) {
+        harp_cbor_uint(&m, part);
+        harp_cbor_map(&m, 13);
+        for (uint64_t id = 1; id <= 13; id++) {
+            harp_cbor_uint(&m, id);
+            harp_cbor_float(&m, 0.5);
+        }
+    }
+    dump(dir, "params-perpart", m.buf, m.len);
+
+    /* valid LEGACY flat blob: { id => f32 } -> part 0. First outer value is a
+     * float, so the codec takes the migration arm. */
+    harp_cbuf_reset(&m);
+    harp_cbor_map(&m, 13);
+    for (uint64_t id = 1; id <= 13; id++) {
+        harp_cbor_uint(&m, id);
+        harp_cbor_float(&m, 0.25);
+    }
+    dump(dir, "params-legacy", m.buf, m.len);
+
+    /* edge: empty map — well-formed no-op (the n==0 early return). */
+    harp_cbuf_reset(&m);
+    harp_cbor_map(&m, 0);
+    dump(dir, "params-empty", m.buf, m.len);
+
+    /* edge: out-of-range part index (99 >= NPARTS) — the part map is fully
+     * consumed but discarded; cursor must stay aligned for the next part. */
+    harp_cbuf_reset(&m);
+    harp_cbor_map(&m, 2);
+    harp_cbor_uint(&m, 99); /* out of range -> skipped */
+    harp_cbor_map(&m, 1);
+    harp_cbor_uint(&m, 3);
+    harp_cbor_float(&m, 0.7);
+    harp_cbor_uint(&m, 0); /* in range, must still parse after the skip */
+    harp_cbor_map(&m, 1);
+    harp_cbor_uint(&m, 1);
+    harp_cbor_float(&m, 0.9);
+    dump(dir, "params-oob-part", m.buf, m.len);
+
+    /* edge: deeply-nested value where a float/map is expected — the codec
+     * must reject (peek != map/float) without recursing. A nested-array
+     * chain stresses the decoder's container handling on a hostile shape. */
+    harp_cbuf_reset(&m);
+    harp_cbor_map(&m, 1);
+    harp_cbor_uint(&m, 0);
+    for (int depth = 0; depth < 32; depth++) harp_cbor_array(&m, 1);
+    harp_cbor_uint(&m, 0);
+    dump(dir, "params-nested", m.buf, m.len);
+
     /* framed link byte stream: one message split across two frames */
     cap_io cap = {{cap_read, cap_write}, {0}, 0};
     harp_cbuf big;

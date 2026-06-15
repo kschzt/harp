@@ -126,6 +126,26 @@ add_executable(harp-tests tests/harp_tests.c)
 target_link_libraries(harp-tests harpcore ${HARP_MATH_LIB})
 add_test(NAME core COMMAND harp-tests)
 
+# harp-device-tests: unit tests for the params-blob codec (§10 / P3 closer
+# step 3). Links the REAL pure codec from device/state.c — not a fork — so a
+# daemon serializer regression is caught. state.c shares its TU with engine/
+# store-coupled functions and pulls device.h (pthread/POSIX), so it can't live
+# in the cross-platform, harpcore-only harp-tests; this is a separate POSIX-only
+# device-linked test (guarded NOT WIN32, like harp-deviced). It reuses
+# fuzz/state_stubs.c — the SAME real g_params[] id table + abort-stubs the
+# fuzz-state target uses — so there's one place to track id drift, not two.
+if(NOT WIN32)
+  find_package(Threads REQUIRED)
+  add_executable(harp-device-tests
+    tests/harp_device_tests.c
+    device/state.c
+    fuzz/state_stubs.c
+  )
+  target_include_directories(harp-device-tests PRIVATE device)
+  target_link_libraries(harp-device-tests harpcore ${HARP_MATH_LIB} Threads::Threads)
+  add_test(NAME device_codec COMMAND harp-device-tests)
+endif()
+
 # Fuzz targets. Apple clang ships no libFuzzer runtime -> a standalone
 # corpus-replay driver stands in there; coverage-guided runs happen on
 # Linux (CI). gen-corpus seeds both with valid wire bytes.
@@ -144,6 +164,22 @@ if(HARP_FUZZ)
       target_link_options(fuzz-${t} PRIVATE -fsanitize=fuzzer)
     endif()
   endforeach()
+
+  # fuzz-state: the params-blob codec (§10 / P3 closer). Unlike the harpcore
+  # parsers above, refdev_parse_params_blob lives in device/state.c, so this
+  # target compiles that TU directly (the real production code, not a copy)
+  # plus fuzz/state_stubs.c, which supplies the one datum the codec reads
+  # (g_params) and abort-stubs for the engine/session symbols state.c's other
+  # functions reference — keeping the audio threads / pthread state out of a
+  # pure-parser fuzzer. Needs the device/ include dir for device.h.
+  add_executable(fuzz-state fuzz/fuzz_state.c device/state.c fuzz/state_stubs.c ${FUZZ_DRIVER})
+  target_link_libraries(fuzz-state harpcore m)
+  target_include_directories(fuzz-state PRIVATE device)
+  if(NOT APPLE)
+    target_compile_options(fuzz-state PRIVATE -fsanitize=fuzzer)
+    target_link_options(fuzz-state PRIVATE -fsanitize=fuzzer)
+  endif()
+
   add_executable(gen-corpus fuzz/gen_corpus.c)
   target_link_libraries(gen-corpus harpcore m)
 endif()

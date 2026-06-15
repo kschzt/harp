@@ -223,6 +223,28 @@ void *audio_thread(void *arg);
 void audio_stop(device *d);
 
 /* ---------------- state.c ---------------- */
+
+/* RefDev params-blob CODEC (P3 closer): the on-wire multitimbral params blob
+ * (§10) factored out as a PURE, self-contained pair — no store I/O, no g_parts
+ * touch — so it is unit-testable and fuzzable in isolation. The engine wraps
+ * encode with the PARAMS_MEDIA blob header and feeds parse from a part snapshot;
+ * these functions only move bytes <-> a float[NPARTS][NPARAMS] grid.
+ *
+ * encode emits the inner CBOR map { partIdx(0..15 asc) => { paramId(g_params
+ * order asc) => f32 value } } for ALL 16 parts — byte-identical to the prior
+ * inline encoder, so recall hashes and snapshots are unchanged.
+ *
+ * parse fills v[]/present[] for the params it finds and returns false on ANY
+ * structurally malformed input (bad CBOR / truncation). It accepts both the
+ * NEW per-part outer map and the LEGACY flat { id => value } map (-> part 0),
+ * discriminated by the type of the first outer value (MAP vs FLOAT). An
+ * out-of-range partIdx or unknown paramId is SKIPPED (not fatal on its own);
+ * it never writes outside the v[0..NPARTS-1][0..NPARAMS-1] grid and never loops
+ * unbounded (every container count is the decoder's bounds-checked map count). */
+void refdev_encode_params_blob(const float v[NPARTS][NPARAMS], harp_cbuf *payload);
+bool refdev_parse_params_blob(const uint8_t *payload, size_t len,
+                              float v[NPARTS][NPARAMS], bool present[NPARTS][NPARAMS]);
+
 int engine_snapshot_objects(device *d, const harp_hash *parent, const char *msg,
                             harp_hash *out);
 int engine_load_snapshot(device *d, const harp_hash *snap_h);

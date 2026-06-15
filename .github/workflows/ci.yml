@@ -139,7 +139,7 @@ jobs:
       - name: build
         run: cmake -B build && cmake --build build -j
       - name: unit tests
-        run: ./build/harp-tests
+        run: ctest --test-dir build --output-on-failure
       - name: ring tests under ThreadSanitizer
         run: |
           clang++ -std=c++17 -fsanitize=thread -O1 -g -I shell \
@@ -165,7 +165,7 @@ jobs:
       - name: fuzz smoke (coverage-guided, seeded; §16/T9)
         run: |
           mkdir -p corpus && ./build-fuzz/gen-corpus corpus
-          for t in cbor envelope object link audio; do
+          for t in cbor envelope object link audio state; do
             echo "=== fuzz-$t"
             ./build-fuzz/fuzz-$t -runs=30000 -max_len=4096 -seed=1 corpus
           done
