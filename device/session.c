@@ -27,8 +27,11 @@ int send_ctl(device *d, const harp_cbuf *msg) {
 /* Echo a base-value change as a param event on the evt stream (§9.4:
  * REQUIRED for front-panel and internally-driven changes; host-driven
  * param events are NOT echoed back). Timestamp (0,0) = "now" until the
- * timestamping slice lands. */
-void evt_echo_param(device *d, uint32_t id, float v) {
+ * timestamping slice lands. P3: `channel` is the multitimbral part — a
+ * front-panel edit on part k echoes as part k. channel 0 OMITS the §9.4
+ * channel key (key 5) so part-0 echoes are byte-identical to P2.2; non-zero
+ * emits it (a 3-entry body map instead of 2). */
+void evt_echo_param(device *d, uint32_t id, float v, uint8_t channel) {
     /* hello gate is atomic; the io check lives under send_mu below (the
      * panel thread echoes concurrently with session teardown) */
     if (!atomic_load_explicit(&d->hello_done, memory_order_acquire)) return;
@@ -39,11 +42,15 @@ void evt_echo_param(device *d, uint32_t id, float v) {
     harp_cbor_uint(&m, 0);
     harp_cbor_uint(&m, 0);
     harp_cbor_uint(&m, 1); /* etype: param */
-    harp_cbor_map(&m, 2);
+    harp_cbor_map(&m, channel ? 3 : 2);
     harp_cbor_uint(&m, 0);
     harp_cbor_uint(&m, id);
     harp_cbor_uint(&m, 1);
     harp_cbor_float(&m, v);
+    if (channel) { /* §9.4 key 5: part (only when non-zero — ascending key order) */
+        harp_cbor_uint(&m, 5);
+        harp_cbor_uint(&m, channel);
+    }
     pthread_mutex_lock(&d->send_mu);
     if (d->io) harp_link_send(d->io, HARP_STREAM_EVT, m.buf, m.len);
     pthread_mutex_unlock(&d->send_mu);
@@ -95,7 +102,15 @@ void send_error(device *d, uint64_t rid, const char *method, const char *code,
 /* ---------------- identity (§6.2) ---------------- */
 
 static void encode_identity(device *d, harp_cbuf *m) {
-    harp_cbor_map(m, 11);
+    /* P3: top-level identity keys 0..12 (13 pairs). The count was previously
+     * 11 while 12 keys (0..11) were emitted — harmless only because the host
+     * (host/client.c parse_identity) reads exactly `n` pairs and identity is
+     * the last value in the hello body, so the under-counted tail was silently
+     * ignored. P3 adds key 12 (part count) and corrects the count to 13 so the
+     * map is well-formed CBOR and every advertised key is actually parseable.
+     * Identity is not byte-constrained by the golden (which checks rendered
+     * audio) nor by param-map-hash (computed from encode_param_array). */
+    harp_cbor_map(m, 13);
     harp_cbor_uint(m, 0); /* vendor */
     harp_cbor_map(m, 2);
     harp_cbor_uint(m, 0);
@@ -125,7 +140,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, PROTO_MAJOR);
     harp_cbor_uint(m, PROTO_MINOR);
     harp_cbor_uint(m, 6); /* capabilities */
-    harp_cbor_array(m, 12);
+    harp_cbor_array(m, 13); /* P3: + "evt.multitimbral" */
     harp_cbor_text(m, "harp-core");
     harp_cbor_text(m, "harp-recall");
     harp_cbor_text(m, "harp-stream");
@@ -139,6 +154,9 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_text(m, "evt.param.echo");
     harp_cbor_text(m, "evt.transport");
     harp_cbor_text(m, "evt.ump"); /* note input as UMP (§9.10); group map = key 11 */
+    harp_cbor_text(m, "evt.multitimbral"); /* P3: 16 independent per-part timbres;
+                                              params/notes/ramps route by §9.4 part
+                                              (channel key 5). Part count = key 12 */
     harp_cbor_text(m, "x.harp-refdev.sim");
     harp_cbor_uint(m, 7); /* channel map (§6.3): 34 slots, all D→H. §P2.2
                              exposes per-part outputs: slots 0/1 are the stereo
@@ -200,6 +218,11 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, 0); /* group index */
     harp_cbor_uint(m, 1);
     harp_cbor_text(m, "notes"); /* role */
+    harp_cbor_uint(m, 12); /* P3 multitimbral part count: 16 independent timbres.
+                              A new OPTIONAL identity key (mirrors the key-11
+                              ump-group-map style); hosts that don't know it skip
+                              it. Pairs with the "evt.multitimbral" capability. */
+    harp_cbor_uint(m, NPARTS);
 }
 
 /* ---------------- method handlers ---------------- */
@@ -940,7 +963,9 @@ static void handle_dev_params(device *d, const harp_env *e) {
         harp_cbor_array(&m, 3);
         harp_cbor_uint(&m, g_params[i].id);
         harp_cbor_text(&m, g_params[i].name);
-        harp_cbor_float(&m, param_get(&g_params[i]));
+        /* P3: this vendor read reports PART 0's values (the web panel /
+         * dev tooling dimension is part 0 for now — see panel.c). */
+        harp_cbor_float(&m, engine_part_param_get(0, g_params[i].id));
     }
     send_ctl(d, &m);
     harp_cbuf_free(&m);

@@ -51,11 +51,15 @@ static void panel_json_params(device *d, char *body, size_t sz) {
                             "{\"product\":\"harp-refdev\",\"serial\":\"%s\","
                             "\"dirty\":%s,\"params\":[",
                             d->serial, dirty ? "true" : "false");
+    /* P3: g_params no longer carries a per-instance value — the values are
+     * PER PART now (engine.c). The web panel shows/edits PART 0 for this scope;
+     * a full per-part panel dimension (a part selector in the panel API) is a
+     * follow-up. front_panel_set likewise targets part 0. */
     for (size_t i = 0; i < NPARAMS; i++)
         off += (size_t)snprintf(body + off, sz - off,
                                 "%s{\"id\":%u,\"name\":\"%s\",\"value\":%.4f}",
                                 i ? "," : "", g_params[i].id, g_params[i].name,
-                                param_get(&g_params[i]));
+                                engine_part_param_get(0, g_params[i].id));
     snprintf(body + off, sz - off, "]}");
 }
 
@@ -183,8 +187,10 @@ static bool panel_revert(device *d, const char *refname) {
     live.dirty = false;
     if (harp_store_ref_write(&d->store, &live) != 0) return false;
     ntf_state_changed(d, &live);
+    /* P3: echo PART 0's restored values (channel 0) so an attached DAW's knobs
+     * follow — the panel dimension is part 0 for now (see panel_json_params). */
     for (size_t i = 0; i < NPARAMS; i++)
-        evt_echo_param(d, g_params[i].id, param_get(&g_params[i]));
+        evt_echo_param(d, g_params[i].id, engine_part_param_get(0, g_params[i].id), 0);
     return true;
 }
 

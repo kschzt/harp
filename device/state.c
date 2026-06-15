@@ -5,6 +5,7 @@
  * live-ref write coalescing (§10.3), the canonical front-panel set path,
  * snapshot capture (§11.2), and the refset closure walk (§11.3).
  */
+#include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -13,13 +14,24 @@
 
 /* ---------------- engine state <-> objects ---------------- */
 
+/* P3: the params blob is the SHARED CONTRACT multitimbral format —
+ *     CBOR map { partIndex => { paramId => value } }
+ * for ALL 16 parts, parts in ascending index, params in ascending id (the
+ * g_params table order). Deterministic (content-addressed): same values ->
+ * same bytes. The format change alters the state HASH vs P2.2 — EXPECTED and
+ * fine (the golden checks rendered AUDIO; recall round-trips the new format
+ * both ways). The OLD flat { paramId => value } map still loads (part 0). */
 static void engine_encode_params_blob(harp_cbuf *out) {
     harp_cbuf payload;
     harp_cbuf_init(&payload);
-    harp_cbor_map(&payload, NPARAMS);
-    for (size_t i = 0; i < NPARAMS; i++) { /* ascending ids == deterministic order */
-        harp_cbor_uint(&payload, g_params[i].id);
-        harp_cbor_float(&payload, param_get(&g_params[i]));
+    harp_cbor_map(&payload, NPARTS); /* part index => params map */
+    for (int pi = 0; pi < NPARTS; pi++) {
+        harp_cbor_uint(&payload, (uint64_t)pi);
+        harp_cbor_map(&payload, NPARAMS);
+        for (size_t i = 0; i < NPARAMS; i++) { /* ascending ids == deterministic order */
+            harp_cbor_uint(&payload, g_params[i].id);
+            harp_cbor_float(&payload, engine_part_param_get(pi, g_params[i].id));
+        }
     }
     harp_obj_encode_blob(out, PARAMS_MEDIA, payload.buf, payload.len);
     harp_cbuf_free(&payload);
@@ -55,12 +67,26 @@ fail:
 }
 
 /* Load a snapshot into the live engine. Returns 0, or -1 (closure incomplete
- * or malformed — nothing is applied; §11.3 atomic apply). */
+ * or malformed — nothing is applied; §11.3 atomic apply). P3: stages ALL 16
+ * parts, commits atomically (all-or-nothing, like before). */
 struct load_ctx {
     device *d;
-    float staged[NPARAMS];
+    float staged[NPARTS][NPARAMS];
     bool ok;
 };
+
+/* Stage one part's params from an inner { paramId => value } map. */
+static void load_part_map(struct load_ctx *ctx, harp_cdec *dec, int pi) {
+    uint64_t n;
+    if (!harp_cdec_map(dec, &n)) return;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t id;
+        double v;
+        if (!harp_cdec_uint(dec, &id) || !harp_cdec_float(dec, &v)) break;
+        for (size_t j = 0; j < NPARAMS; j++)
+            if (g_params[j].id == id) ctx->staged[pi][j] = (float)v;
+    }
+}
 
 static bool load_tree_entry(const char *name, size_t name_len, const harp_hash *h,
                             uint32_t kind, void *ud) {
@@ -85,14 +111,44 @@ static bool load_tree_entry(const char *name, size_t name_len, const harp_hash *
     harp_cdec_init(&dec, payload, payload_len);
     uint64_t n;
     if (harp_cdec_map(&dec, &n)) {
-        for (uint64_t i = 0; i < n; i++) {
-            uint64_t id;
-            double v;
-            if (!harp_cdec_uint(&dec, &id) || !harp_cdec_float(&dec, &v)) break;
-            for (size_t j = 0; j < NPARAMS; j++)
-                if (g_params[j].id == id) ctx->staged[j] = (float)v;
+        /* Format discrimination (graceful migration): the NEW per-part format
+         * has MAP values ({paramId=>value}); the OLD flat format has FLOAT
+         * values (paramId=>value). Peek the FIRST pair's value type — map (CBOR
+         * major 5) => per-part; float (major 7) => old flat -> load into part 0
+         * and leave others at their staged defaults. An empty map (n==0) is a
+         * no-op either way. */
+        if (n > 0) {
+            uint64_t first_key;
+            if (!harp_cdec_uint(&dec, &first_key)) { ctx->ok = false; goto done; }
+            if (harp_cdec_peek(&dec) == 5) { /* NEW: { partIndex => {id=>v} } */
+                if (first_key < (uint64_t)NPARTS)
+                    load_part_map(ctx, &dec, (int)first_key);
+                else
+                    harp_cdec_skip(&dec); /* unknown part index: ignore its map */
+                for (uint64_t i = 1; i < n; i++) {
+                    uint64_t pidx;
+                    if (!harp_cdec_uint(&dec, &pidx)) break;
+                    if (pidx < (uint64_t)NPARTS)
+                        load_part_map(ctx, &dec, (int)pidx);
+                    else if (!harp_cdec_skip(&dec))
+                        break;
+                }
+            } else { /* OLD flat { paramId => value } -> part 0 */
+                double v;
+                if (harp_cdec_float(&dec, &v)) {
+                    for (size_t j = 0; j < NPARAMS; j++)
+                        if (g_params[j].id == first_key) ctx->staged[0][j] = (float)v;
+                    for (uint64_t i = 1; i < n; i++) {
+                        uint64_t id;
+                        if (!harp_cdec_uint(&dec, &id) || !harp_cdec_float(&dec, &v)) break;
+                        for (size_t j = 0; j < NPARAMS; j++)
+                            if (g_params[j].id == id) ctx->staged[0][j] = (float)v;
+                    }
+                }
+            }
         }
     }
+done:
     harp_cbuf_free(&enc);
     return true;
 }
@@ -110,14 +166,22 @@ int engine_load_snapshot(device *d, const harp_hash *snap_h) {
         harp_cbuf_free(&tree_enc);
         goto fail;
     }
-    struct load_ctx ctx = {d, {0}, true};
-    for (size_t i = 0; i < NPARAMS; i++) ctx.staged[i] = param_get(&g_params[i]);
+    /* stage from CURRENT live values so a partial/old blob leaves untouched
+     * parts and params exactly as they are (idempotent for absent entries) */
+    struct load_ctx ctx;
+    ctx.d = d;
+    ctx.ok = true;
+    for (int pi = 0; pi < NPARTS; pi++)
+        for (size_t i = 0; i < NPARAMS; i++)
+            ctx.staged[pi][i] = engine_part_param_get(pi, g_params[i].id);
     bool walked = harp_obj_tree_foreach(tree_enc.buf, tree_enc.len, load_tree_entry, &ctx);
     harp_cbuf_free(&tree_enc);
     if (!walked || !ctx.ok) goto fail;
 
-    /* stage, then commit: all-or-nothing into the live engine */
-    for (size_t i = 0; i < NPARAMS; i++) param_put(&g_params[i], ctx.staged[i]);
+    /* stage, then commit: all-or-nothing into the live engine — every part */
+    for (int pi = 0; pi < NPARTS; pi++)
+        for (size_t i = 0; i < NPARAMS; i++)
+            engine_part_param_put(pi, g_params[i].id, ctx.staged[pi][i]);
     harp_cbuf_free(&enc);
     return 0;
 fail:
@@ -153,6 +217,13 @@ void encode_param_array(harp_cbuf *b) {
 }
 
 void compute_param_map_hash(device *d) {
+    /* P3 lockstep guard: every part boots from PVAL_DEFAULTS (engine.c), which
+     * MUST equal g_params[].def in id order. This runs once at boot (main),
+     * BEFORE the factory snapshot, so part values are still the boot defaults —
+     * assert they match so a future edit to one table but not the other is
+     * caught immediately instead of as a silent recall/golden drift. */
+    for (size_t i = 0; i < NPARAMS; i++)
+        assert(engine_part_param_get(0, g_params[i].id) == g_params[i].def);
     harp_cbuf b;
     harp_cbuf_init(&b);
     encode_param_array(&b);
@@ -196,19 +267,17 @@ void live_cache_flush(device *d) {
 }
 
 /* The one true front-panel path: web panel, vendor knob method, and any
- * future GPIO encoders all come through here — set, dirty, echo. */
+ * future GPIO encoders all come through here — set, dirty, echo. P3: the
+ * front panel operates on PART 0 for now (echo carries channel 0). A full
+ * per-part panel dimension — a part selector on the panel API — is a
+ * follow-up; see panel.c. */
 bool front_panel_set(device *d, uint32_t id, double v) {
-    bool found = false;
     if (v < 0) v = 0;
     if (v > 1) v = 1;
-    for (size_t i = 0; i < NPARAMS; i++)
-        if (g_params[i].id == id) {
-            param_put(&g_params[i], (float)v);
-            found = true;
-        }
-    if (!found) return false;
+    if (param_index(id) < 0) return false; /* no such param */
+    engine_part_param_put(0, id, (float)v);
     live_ref_touch(d, true);
-    evt_echo_param(d, id, (float)v);
+    evt_echo_param(d, id, (float)v, 0); /* part 0 */
     return true;
 }
 

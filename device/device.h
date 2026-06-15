@@ -48,28 +48,40 @@
  * volatiles were pragmatically fine on arm64/x86 but formally UB and
  * TSan-opaque — this device is meant to be the conformance reference.) */
 
+/* P3: g_params is now the GLOBAL param DEFINITIONS table — id/name/steps/
+ * labels and the factory default. The VALUE is no longer here; it lives
+ * PER PART (part::pval, engine.c) so each of the 16 parts is an independent
+ * timbre. `def` is a plain (non-atomic) constant — it's read-only after
+ * static init, the cross-thread writes happen on the per-part pval[]. */
 typedef struct {
     uint32_t id;
     const char *name;
     uint8_t steps;          /* 0 = continuous; else stepped (§9.3 key 5) */
     const char *const *labels; /* enum labels, count == steps (§9.3 key 9) */
-    _Atomic float value; /* written by render (ramps), session (loads),
-                            panel (knobs); read everywhere. Last-write-wins
-                            is the intended semantic; relaxed — ordering for
-                            timestamped changes comes from the event queue */
+    float def;              /* factory default — every part's pval starts here */
 } dev_param;
-
-static inline float param_get(const dev_param *p) {
-    return atomic_load_explicit(&p->value, memory_order_relaxed);
-}
-static inline void param_put(dev_param *p, float v) {
-    atomic_store_explicit(&p->value, v, memory_order_relaxed);
-}
 
 /* fixed count so sizeof tricks aren't needed across modules; the arp
  * session grows this to 12 (params 9-12) — one place to change */
 #define NPARAMS 13
 extern dev_param g_params[NPARAMS];
+
+/* Per-part param value access (P3). The atomic value lives in part::pval
+ * (engine.c owns the type); these helpers are part-aware. param_value_at /
+ * param_index let the engine read p->pval[index-of-id] without re-scanning
+ * g_params in every accessor. Cross-thread semantics are UNCHANGED from the
+ * old dev_param.value: written by render (ramps), session (loads), panel
+ * (knobs); read everywhere; last-write-wins, relaxed — ordering for
+ * timestamped changes comes from the event queue. */
+int param_index(uint32_t id); /* slot in g_params, or -1 (engine.c) */
+
+/* Cross-module per-part value access (engine.c). state.c (snapshot encode/
+ * load), session.c (x.harp-refdev.params), and panel.c reach a part's pval[]
+ * only through these — the part struct itself stays private to engine.c.
+ * part_idx is 0..NPARTS-1; out-of-range reads return 0 / writes no-op. */
+#define NPARTS 16
+float engine_part_param_get(int part_idx, uint32_t id);
+void engine_part_param_put(int part_idx, uint32_t id, float v);
 
 /* Live performance note state is PRIVATE to engine.c (mono, last-note
  * priority; notes are events, not patch state — they never touch the
@@ -233,7 +245,9 @@ void closure_walk(struct closure_ctx *ctx, const harp_hash *h);
 
 /* ---------------- session.c ---------------- */
 int send_ctl(device *d, const harp_cbuf *msg);
-void evt_echo_param(device *d, uint32_t id, float v);
+/* P3: echo carries the part (channel). channel 0 omits the §9.4 channel key
+ * (key 5) so part-0 echoes are byte-identical to P2.2; non-zero emits it. */
+void evt_echo_param(device *d, uint32_t id, float v, uint8_t channel);
 void ntf_state_changed(device *d, const harp_ref *r);
 void grant_credit(device *d);
 void send_error(device *d, uint64_t rid, const char *method, const char *code,

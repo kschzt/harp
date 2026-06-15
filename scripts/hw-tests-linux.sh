@@ -57,7 +57,9 @@ run() {
     echo
 }
 run scripts/golden-test.sh
+run scripts/multitimbral-test.sh
 run scripts/recall-test.sh
+run scripts/recall-perpart-test.sh
 run scripts/timing-test.sh
 run scripts/soak.sh "${SOAK_SECONDS:-30}"
 run scripts/tempo-lock-test.sh

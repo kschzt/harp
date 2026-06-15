@@ -84,6 +84,20 @@ public:
         if (!slots.empty()) outSlots_ = slots;
     }
 
+    /* The multitimbral part (§9.4, key 5) this instance OWNS: notes already
+     * carry their channel in the UMP word (the shell stamps it per-event),
+     * but parameter sets/ramps had no channel — so on a multi-part device a
+     * host's knob edits all hit part 0. setChannel() pins the part this
+     * instance drives, so its param events carry the SAME channel as its
+     * notes and one shell fully owns its part. DEFAULT 0 => encode omits the
+     * key => byte-identical wire (golden gate). Set before start() (the
+     * event pump reads it once the session is up); a no-op mid-session is
+     * harmless since the pump re-reads it per event. */
+    void setChannel(uint8_t channel) {
+        chan_.store(channel & 0xf, std::memory_order_relaxed);
+    }
+    uint8_t channel() const { return chan_.load(std::memory_order_relaxed); }
+
     /* ---- audio thread (all lock-free) ---- */
     void queueParamSet(uint32_t id, float v, uint64_t ts);
     void queueRamp(uint32_t id, float target, uint64_t start, uint64_t end);
@@ -340,4 +354,11 @@ private:
      * the explicit {0,1} drives the same main-mix render byte-identically).
      * setOutSlots() overrides it before start() to pull a single part. */
     std::vector<uint32_t> outSlots_{0, 1};
+
+    /* §9.4 multitimbral part for this instance's PARAM events (key 5). 0 =
+     * the historical single-part default (key omitted => byte-identical wire).
+     * Atomic: written on the main/UI thread (setChannel, start's env read),
+     * read on the event-pump thread. Notes don't use this — their channel is
+     * already baked into the UMP word by the shell. */
+    std::atomic<uint8_t> chan_{0};
 };

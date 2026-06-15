@@ -440,6 +440,16 @@ bool HarpRuntime::start(uint32_t sampleRate) {
             }
             setOutSlots(slots); /* no-op if it parsed to nothing */
         }
+    /* test/field override: HARP_CHANNEL=k pins the multitimbral part this
+     * instance's PARAM events carry (key 5). The out-of-process host
+     * (harp-vst3-host --channel) reaches the in-plugin runtime through it,
+     * exactly as HARP_OUT_SLOTS carries --part. UNSET (the default) leaves
+     * chan_ = 0 => the key is omitted => byte-identical golden wire. */
+    if (const char *e = getenv("HARP_CHANNEL"))
+        if (e[0]) {
+            int v = atoi(e);
+            if (v >= 0 && v <= 15) setChannel((uint8_t)v);
+        }
     running_.store(true);
     /* One libusb context for the whole active life — every connect attempt
      * (incl. the device-less retry loop) borrows it, so we never churn
@@ -779,14 +789,18 @@ void HarpRuntime::eventPump() {
          * pipe); the cap only bounds the write size — the loop comes
          * straight back for the rest */
         harp_cbuf_reset(&batch);
+        /* this instance's part: param sets/ramps carry it so the host owns
+         * its part's knobs too (notes already carry their own channel in the
+         * UMP word). Read once per drain pass — it only changes pre-session. */
+        uint8_t chan = chan_.load(std::memory_order_relaxed);
         TimedEv te;
         int sent = 0;
         for (; sent < 64 && timedRing_.pop(te); sent++) {
             harp_cbuf_reset(&msgbuf);
             if (te.kind == 0)
-                encodeParamEvent(&msgbuf, te.a, te.v, te.ts);
+                encodeParamEvent(&msgbuf, te.a, te.v, te.ts, chan);
             else if (te.kind == 1)
-                encodeRampEvent(&msgbuf, te.a, te.v, te.ts, te.end);
+                encodeRampEvent(&msgbuf, te.a, te.v, te.ts, te.end, chan);
             else if (te.kind == 3) {
                 double ppq;
                 memcpy(&ppq, &te.end, sizeof ppq);
@@ -1053,6 +1067,63 @@ bool HarpRuntime::getStateBundle(std::vector<uint8_t> &out) {
     return true;
 }
 
+/* Decode a flat { id => float } param map at the decoder's cursor into out. */
+static void decode_param_map(harp_cdec *pd,
+                             std::vector<std::pair<uint32_t, float>> *out) {
+    uint64_t pn;
+    if (!harp_cdec_map(pd, &pn)) return;
+    for (uint64_t k = 0; k < pn; k++) {
+        uint64_t id;
+        double v;
+        if (!harp_cdec_uint(pd, &id) || !harp_cdec_float(pd, &v)) break;
+        out->push_back({(uint32_t)id, (float)v});
+    }
+}
+
+/* Parse a "params" blob payload into part 0's (id,value) pairs, tolerating
+ * both the NEW multitimbral format and the OLD flat one (SHARED CONTRACT):
+ *   NEW: CBOR map { partIndex => { id => value } } — extract part 0 (a single
+ *        instance shows its own part; multi-part UI is later).
+ *   OLD: CBOR map { id => value } — read it wholesale as part 0 (back-compat).
+ * The two are told apart by the first value's CBOR major type: a map (5) is
+ * the per-part format, anything else (a float) is the flat one. */
+static void decode_params_payload(const uint8_t *pl, size_t pll,
+                                  std::vector<std::pair<uint32_t, float>> *out) {
+    harp_cdec pd;
+    harp_cdec_init(&pd, pl, pll);
+    uint64_t pn;
+    if (!harp_cdec_map(&pd, &pn) || pn == 0) return;
+    uint64_t firstKey;
+    if (!harp_cdec_uint(&pd, &firstKey)) return; /* both formats key on a uint */
+    if (harp_cdec_peek(&pd) == 5) { /* NEW: { partIndex => { id => value } } */
+        /* firstKey was a part index; decode its inner map iff it's part 0,
+         * else skip it, then scan the remaining parts for part 0. */
+        if (firstKey == 0)
+            decode_param_map(&pd, out);
+        else
+            harp_cdec_skip(&pd); /* skip part firstKey's inner map */
+        for (uint64_t k = 1; k < pn && !pd.err; k++) {
+            uint64_t part;
+            if (!harp_cdec_uint(&pd, &part)) break;
+            if (part == 0)
+                decode_param_map(&pd, out); /* part 0: the part we display */
+            else if (!harp_cdec_skip(&pd)) /* any other part: skip its map */
+                break;
+        }
+        return;
+    }
+    /* OLD flat { id => value }: firstKey was an id; its value is a float, and
+     * the rest follow as id/value pairs. */
+    double v;
+    if (!harp_cdec_float(&pd, &v)) return;
+    out->push_back({(uint32_t)firstKey, (float)v});
+    for (uint64_t k = 1; k < pn; k++) {
+        uint64_t id;
+        if (!harp_cdec_uint(&pd, &id) || !harp_cdec_float(&pd, &v)) break;
+        out->push_back({(uint32_t)id, (float)v});
+    }
+}
+
 /* Walk a store: target snapshot -> tree -> "params" blob -> (id,value)
  * pairs. Shared by setStateBundle and the runtime-free controller path. */
 void HarpRuntime::paramsFromStore(harp_store *store, const harp_hash &target,
@@ -1082,19 +1153,8 @@ void HarpRuntime::paramsFromStore(harp_store *store, const harp_hash &target,
                         const uint8_t *pl;
                         size_t pll;
                         if (harp_obj_parse_blob(blob.buf, blob.len, nullptr, nullptr, &pl,
-                                                &pll)) {
-                            harp_cdec pd;
-                            harp_cdec_init(&pd, pl, pll);
-                            uint64_t pn;
-                            if (harp_cdec_map(&pd, &pn))
-                                for (uint64_t k = 0; k < pn; k++) {
-                                    uint64_t id;
-                                    double v;
-                                    if (!harp_cdec_uint(&pd, &id) || !harp_cdec_float(&pd, &v))
-                                        break;
-                                    c->out->push_back({(uint32_t)id, (float)v});
-                                }
-                        }
+                                                &pll))
+                            decode_params_payload(pl, pll, c->out);
                     }
                     harp_cbuf_free(&blob);
                     return true;

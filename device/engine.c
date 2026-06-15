@@ -21,6 +21,10 @@ static const char *const ARP_OCTS[] = {"1", "2", "3", "4"};
 /* division lengths in PPQ (quarter notes), indexed like ARP_DIVS */
 static const double ARP_DIV_PPQ[] = {1.0, 0.5, 1.0 / 3, 0.25, 1.0 / 6, 0.125};
 
+/* P3: g_params is the GLOBAL param DEFINITIONS table (id/name/steps/labels/
+ * default). The per-part VALUE lives in part::pval (below); the last field of
+ * each row is the factory default that every part's pval[] starts from. The
+ * map SHAPE (13 params) is unchanged — param-map-hash is unaffected. */
 dev_param g_params[NPARAMS] = {
     {1, "Osc Pitch", 0, NULL, 0.5f},    {2, "Osc Shape", 0, NULL, 0.5f},
     {3, "Filter Cutoff", 0, NULL, 0.5f}, {4, "Filter Reso", 0, NULL, 0.5f},
@@ -39,24 +43,39 @@ dev_param g_params[NPARAMS] = {
     {13, "Glide", 0, NULL, 0.0f},
 };
 
-/* stepped params quantize: normalized [0,1] -> step index */
-static int param_step_index(uint32_t id) {
+/* Compile-time mirror of g_params[].def, in id order — used to initialise
+ * every part's pval[] at static-init time (no runtime init, no main() change,
+ * no ordering hazard before the factory snapshot). MUST stay in lockstep with
+ * the table above; compute_param_map_hash() asserts it at boot (state.c). */
+#define PVAL_DEFAULTS \
+    {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.0f, 0.6f, 0.5f, 0.0f, 0.0f}
+
+/* slot of a param id in g_params, or -1. The per-part value is p->pval[idx]. */
+int param_index(uint32_t id) {
     for (size_t i = 0; i < NPARAMS; i++)
-        if (g_params[i].id == id) {
-            int n = g_params[i].steps;
-            if (n <= 1) return 0;
-            int idx = (int)(param_get(&g_params[i]) * n);
-            return idx >= n ? n - 1 : idx;
-        }
-    return 0;
+        if (g_params[i].id == id) return (int)i;
+    return -1;
 }
+
+/* ---------------- per-part ramp state (§9.4) ----------------
+ *
+ * P3: ramps are PER PART now (one set per part, embedded in `part` below) so
+ * automation on part k touches only part k's values. Defined here so the
+ * 'part' struct can contain ramps[NPARAMS] by value. Render-thread-only after
+ * activation. */
+typedef struct {
+    bool active;
+    uint64_t start, end;
+    float start_val, target;
+} dev_ramp;
 
 /* ---------------- per-part types (P2.0) ----------------
  *
  * The synth voice, the note state, and the arpeggiator are all PER PART;
  * their type defs are relocated here (verbatim, comments intact) so the
- * 'part' struct can contain them by value. Params/ramps/event-queue stay
- * global — events route to a part only on APPLICATION (evq_apply_due). */
+ * 'part' struct can contain them by value. P3 also moves the param VALUES and
+ * ramps into the part (pval[]/ramps[]) — the event queue stays global, events
+ * route to a part only on APPLICATION (evq_apply_due). */
 
 /* A small stereo drone synth: blended sine/saw oscillator (R detuned for
  * width) through a Chamberlin state-variable lowpass. Every voice parameter
@@ -105,22 +124,70 @@ typedef struct {
     uint64_t gate_off;   /* SSI to release `sounding` (0 = none pending) */
 } arp_state;
 
-/* One multitimbral part: a voice, its mono note state, and its arp. The
- * note crosses threads (panic paths from session/panel); vel and seq are
- * render-thread-only (event application happens on the render thread) and
- * stay plain. */
+/* One multitimbral part: a voice, its mono note state, its arp, AND (P3) its
+ * own param values + ramps so each part is an independent timbre. The note
+ * crosses threads (panic paths from session/panel); pval crosses threads too
+ * (render ramps, session loads, panel knobs) so it is _Atomic, exactly as the
+ * old global dev_param.value was. vel/seq/ramps are render-thread-only (event
+ * application happens on the render thread) and stay plain. */
 typedef struct {
     synth_voice voice;
     _Atomic int note;
     float note_vel;
     uint32_t note_seq;
     arp_state arp;
+    _Atomic float pval[NPARAMS]; /* per-part param values (P3) */
+    dev_ramp ramps[NPARAMS];     /* per-part automation ramps (P3) */
 } part;
-#define NPARTS 16
+/* NPARTS now lives in device.h (state.c stages all 16 parts on load). */
 /* every part starts idle: note -1 AND arp.sounding -1 (else part_active would
  * read the zero-init sounding==0 as "holding note 0" before the first stream
- * reset). GNU range designator (engine.c is gnu11). */
-static part g_parts[NPARTS] = {[0 ... NPARTS - 1] = {.note = -1, .arp = {.sounding = -1}}};
+ * reset). pval starts at the factory defaults (PVAL_DEFAULTS == g_params[].def
+ * in id order) so all 16 parts are IDENTICAL to the old globals at boot — part
+ * 0 / channel 0 therefore renders byte-identically to P2.2. ramps zero-init
+ * (inactive). GNU range designator (engine.c is gnu11). */
+static part g_parts[NPARTS] = {[0 ... NPARTS - 1] = {
+    .note = -1, .arp = {.sounding = -1}, .pval = PVAL_DEFAULTS}};
+
+/* Per-part param value accessors (P3). Same cross-thread semantics as the old
+ * global param_get/param_put: relaxed atomics, last-write-wins. Indexed by the
+ * g_params slot (param_index) so the hot paths don't re-scan the table. */
+static inline float part_pget(const part *p, size_t idx) {
+    return atomic_load_explicit(&p->pval[idx], memory_order_relaxed);
+}
+static inline void part_pput(part *p, size_t idx, float v) {
+    atomic_store_explicit(&p->pval[idx], v, memory_order_relaxed);
+}
+
+/* Cross-module per-part access (declared in device.h): state.c / session.c /
+ * panel.c reach a part's values by id without touching the private struct. */
+float engine_part_param_get(int part_idx, uint32_t id) {
+    if (part_idx < 0 || part_idx >= NPARTS) return 0.0f;
+    int idx = param_index(id);
+    return idx < 0 ? 0.0f : part_pget(&g_parts[part_idx], (size_t)idx);
+}
+void engine_part_param_put(int part_idx, uint32_t id, float v) {
+    if (part_idx < 0 || part_idx >= NPARTS) return;
+    int idx = param_index(id);
+    if (idx >= 0) part_pput(&g_parts[part_idx], (size_t)idx, v);
+}
+
+/* stepped params quantize: normalized [0,1] -> step index. Per part (P3):
+ * reads p->pval, not a global value. */
+static int param_step_index(const part *p, uint32_t id) {
+    int idx = param_index(id);
+    if (idx < 0) return 0;
+    int n = g_params[idx].steps;
+    if (n <= 1) return 0;
+    int si = (int)(part_pget(p, (size_t)idx) * n);
+    return si >= n ? n - 1 : si;
+}
+
+/* per-part value by id, render hot path (was the global param_value). */
+static float param_value(const part *p, uint32_t id) {
+    int idx = param_index(id);
+    return idx < 0 ? 0.0f : part_pget(p, (size_t)idx);
+}
 
 /* note state: p->note crosses threads (panic paths from session/panel) */
 static inline int note_get(part *p) {
@@ -169,13 +236,8 @@ bool evq_full(void) {
     return full;
 }
 
-/* per-param ramp state (§9.4); render-thread-only after activation */
-typedef struct {
-    bool active;
-    uint64_t start, end;
-    float start_val, target;
-} dev_ramp;
-static dev_ramp g_ramps[NPARAMS];
+/* (dev_ramp is defined with the per-part types up top — P3: ramps[NPARAMS]
+ * now live inside each part, not a global g_ramps[].) */
 
 /* Stream state reset (§7.1 in miniature): a new stream is a new time
  * domain — queued events and active ramps from the previous session's SSI
@@ -188,13 +250,15 @@ void evq_reset_for_new_stream(void) {
     pthread_mutex_lock(&g_evq_mu);
     g_evq_n = 0;
     pthread_mutex_unlock(&g_evq_mu);
-    memset(g_ramps, 0, sizeof g_ramps);
     /* notes are performance state OF A STREAM: a note held across a stream
      * stop/restart is a stuck note (its note-off died with the old stream).
-     * Per part now: each part's note + arp are stale BY DEFINITION. */
+     * Per part now: each part's note + arp + RAMPS are stale BY DEFINITION
+     * (P3: ramps are per part — clear every part's). pval is patch state and
+     * is NOT reset: it survives the stream restart, like the old globals. */
     for (size_t i = 0; i < NPARTS; i++) {
         part *p = &g_parts[i];
         note_put(p, -1);
+        memset(p->ramps, 0, sizeof p->ramps);
         arp_stream_reset(p); /* defined with the arp block below */
     }
     /* fence sequence space restarts with the stream (host resets its
@@ -202,28 +266,24 @@ void evq_reset_for_new_stream(void) {
     atomic_store_explicit(&g_evt_consumed, 0, memory_order_release);
 }
 /* ---------------- the sound engine ---------------- */
-/* (synth_voice is defined up top so 'part' can contain it — see P2.0.) */
-
-static float param_value(uint32_t id) {
-    for (size_t i = 0; i < NPARAMS; i++)
-        if (g_params[i].id == id) return param_get(&g_params[i]);
-    return 0.0f;
-}
+/* (synth_voice is defined up top so 'part' can contain it — see P2.0;
+ * param_value() is the per-part value accessor, also defined up top.) */
 
 #define SMOOTH_SUBBLOCK 32 /* samples; 1.5 kHz at 48 k — the declared control rate honored */
 
-/* Advance active ramps to stream position `pos`: the base value moves along
- * the line (visible to echo/refs — ramps change the stored value, §9.4). */
-static void ramps_advance(uint64_t pos) {
+/* Advance a part's active ramps to stream position `pos`: the base value moves
+ * along the line (visible to echo/refs — ramps change the stored value, §9.4).
+ * P3: per part — operates on p->ramps into p->pval. */
+static void ramps_advance(part *p, uint64_t pos) {
     for (size_t i = 0; i < NPARAMS; i++) {
-        dev_ramp *r = &g_ramps[i];
+        dev_ramp *r = &p->ramps[i];
         if (!r->active) continue;
         if (pos >= r->end || r->end <= r->start) {
-            param_put(&g_params[i], r->target);
+            part_pput(p, i, r->target);
             r->active = false;
         } else if (pos > r->start) {
             float t = (float)(pos - r->start) / (float)(r->end - r->start);
-            param_put(&g_params[i], r->start_val + (r->target - r->start_val) * t);
+            part_pput(p, i, r->start_val + (r->target - r->start_val) * t);
         }
     }
 }
@@ -245,12 +305,12 @@ static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
                           uint64_t pos, bool with_drone, bool accumulate) {
     synth_voice *v = &p->voice; /* per-part voice; note state from p too */
     if (!v->s_init) { /* first block: land on targets, no glide-in from zero */
-        v->s_pitch = param_value(1);
-        v->s_shape = param_value(2);
-        v->s_cutoff = param_value(3);
-        v->s_reso = param_value(4);
-        v->s_master = param_value(8);
-        v->s_drone = param_value(7);
+        v->s_pitch = param_value(p, 1);
+        v->s_shape = param_value(p, 2);
+        v->s_cutoff = param_value(p, 3);
+        v->s_reso = param_value(p, 4);
+        v->s_master = param_value(p, 8);
+        v->s_drone = param_value(p, 7);
         v->n_freq = 220.0f;
         v->s_init = true;
     }
@@ -263,13 +323,13 @@ static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
         uint32_t end = i + SMOOTH_SUBBLOCK;
         if (end > n) end = n;
 
-        ramps_advance(pos + i);
-        v->s_pitch += alpha * (param_value(1) - v->s_pitch);
-        v->s_shape += alpha * (param_value(2) - v->s_shape);
-        v->s_cutoff += alpha * (param_value(3) - v->s_cutoff);
-        v->s_reso += alpha * (param_value(4) - v->s_reso);
-        v->s_master += alpha * (param_value(8) - v->s_master);
-        v->s_drone += alpha * (param_value(7) - v->s_drone);
+        ramps_advance(p, pos + i);
+        v->s_pitch += alpha * (param_value(p, 1) - v->s_pitch);
+        v->s_shape += alpha * (param_value(p, 2) - v->s_shape);
+        v->s_cutoff += alpha * (param_value(p, 3) - v->s_cutoff);
+        v->s_reso += alpha * (param_value(p, 4) - v->s_reso);
+        v->s_master += alpha * (param_value(p, 8) - v->s_master);
+        v->s_drone += alpha * (param_value(p, 7) - v->s_drone);
 
         /* note voice control: gate + envelope. Pitch SNAPS on a fresh
          * attack and glides only when legato (env still high): a fixed-tau
@@ -290,7 +350,7 @@ static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
         bool gate = note >= 0;
         if (gate) {
             float target = 440.0f * exp2f(((float)note - 69.0f) / 12.0f);
-            float glide = param_value(13);
+            float glide = param_value(p, 13);
             if (glide <= 0.001f || (retrig && v->env < 0.2f)) {
                 v->n_freq = target; /* no portamento / fresh attack: arrive
                                        on time (off notes are worse than
@@ -303,8 +363,8 @@ static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
             }
         }
         /* attack 1 ms..1 s, release 5 ms..3 s (exp-mapped knobs) */
-        float atk_tau = 0.001f * exp2f(param_value(5) * 10.0f);
-        float rel_tau = 0.005f * exp2f(param_value(6) * 9.2f);
+        float atk_tau = 0.001f * exp2f(param_value(p, 5) * 10.0f);
+        float rel_tau = 0.005f * exp2f(param_value(p, 6) * 9.2f);
         if (v->env_reset) {
             v->env *= 0.25f; /* fast decay sub-block */
             v->env_reset--;
@@ -602,10 +662,10 @@ void *audio_thread(void *arg) {
  * Per part now: every function takes 'part *p' and operates on p->arp and
  * p->note/note_seq/note_vel. The arp type + ARP_LATCH_MAX are defined up
  * top so 'part' can contain the state by value; the step/latch/anchor/gate
- * MATH is unchanged. arp_active() reads the GLOBAL Arp Mode param and so
- * needs no part. */
+ * MATH is unchanged. P3: arp_active() reads THIS PART's Arp Mode param (the
+ * arp params 9..12 are per part now), so it takes the part. */
 
-static bool arp_active(void) { return param_step_index(9) != 0; }
+static bool arp_active(const part *p) { return param_step_index(p, 9) != 0; }
 
 static void arp_reset(part *p);
 static void arp_voice_off(part *p);
@@ -671,7 +731,7 @@ static uint64_t arp_ssi_at(part *p, double ppq, double rate) {
  * pos-1?", so fire and deadline agree by construction — no epsilon games
  * across the ppq<->ssi rounding. */
 static uint64_t arp_next_step_ssi(part *p, uint64_t after, double rate) {
-    double div = ARP_DIV_PPQ[param_step_index(10)];
+    double div = ARP_DIV_PPQ[param_step_index(p, 10)];
     double k = floor(arp_ppq_at(p, after, rate) / div + 1e-9) + 1.0;
     uint64_t bssi = arp_ssi_at(p, k * div, rate);
     while (bssi <= after) bssi = arp_ssi_at(p, (k += 1.0) * div, rate);
@@ -681,7 +741,7 @@ static uint64_t arp_next_step_ssi(part *p, uint64_t after, double rate) {
 /* next arp deadline strictly after `pos`: a step boundary or a pending
  * gate-off, whichever first. 0 = nothing scheduled. */
 static uint64_t arp_next_deadline(part *p, uint64_t pos, double rate) {
-    if (!arp_active() || !p->arp.playing || !p->arp.anchor_valid ||
+    if (!arp_active(p) || !p->arp.playing || !p->arp.anchor_valid ||
         p->arp.tempo <= 0)
         return 0;
     uint64_t next = 0;
@@ -694,7 +754,7 @@ static uint64_t arp_next_deadline(part *p, uint64_t pos, double rate) {
 
 /* fire whatever is due exactly AT `pos` (called between render segments) */
 static void arp_fire_due(part *p, uint64_t pos, double rate) {
-    if (!arp_active()) return;
+    if (!arp_active(p)) return;
     if (p->arp.gate_off && pos >= p->arp.gate_off) arp_voice_off(p);
     if (!p->arp.playing || !p->arp.anchor_valid || p->arp.tempo <= 0 ||
         p->arp.nlatch == 0 || pos == 0)
@@ -702,10 +762,10 @@ static void arp_fire_due(part *p, uint64_t pos, double rate) {
     if (arp_next_step_ssi(p, pos - 1, rate) != pos) return; /* not a boundary */
 
     /* which latched note does this step sound? */
-    int span = p->arp.nlatch * (param_step_index(12) + 1); /* notes x octaves */
+    int span = p->arp.nlatch * (param_step_index(p, 12) + 1); /* notes x octaves */
     int s = p->arp.step % span;
     int idx, oct;
-    switch (param_step_index(9)) {
+    switch (param_step_index(p, 9)) {
         default:
         case 1: /* up */
             idx = s % p->arp.nlatch;
@@ -731,7 +791,7 @@ static void arp_fire_due(part *p, uint64_t pos, double rate) {
     /* up/down sort by pitch; as-played keeps press order */
     int order[ARP_LATCH_MAX];
     for (int i = 0; i < p->arp.nlatch; i++) order[i] = i;
-    if (param_step_index(9) != 4)
+    if (param_step_index(p, 9) != 4)
         for (int i = 0; i < p->arp.nlatch; i++)
             for (int j = i + 1; j < p->arp.nlatch; j++)
                 if (p->arp.latch[order[j]] < p->arp.latch[order[i]]) {
@@ -747,9 +807,9 @@ static void arp_fire_due(part *p, uint64_t pos, double rate) {
     p->note_seq++;
     p->arp.sounding = note;
     /* gate: release after gate-fraction of the step length */
-    double div = ARP_DIV_PPQ[param_step_index(10)];
+    double div = ARP_DIV_PPQ[param_step_index(p, 10)];
     double step_samples = div * 60.0 * rate / p->arp.tempo;
-    double gate = param_value(11);
+    double gate = param_value(p, 11);
     gate = gate < 0.05 ? 0.05 : gate > 0.98 ? 0.98 : gate;
     p->arp.gate_off = pos + (uint64_t)(step_samples * gate + 0.5);
     if (p->arp.gate_off <= pos) p->arp.gate_off = pos + 1;
@@ -770,9 +830,11 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                 if (ev->end && ev->end < pos) CTR_INC(g_ramp_late);
             } else if (ev->ts && ev->ts < pos)
                 CTR_INC(g_evt_late);
-            /* route to the event's part (real routing now, §P2.1); the note +
-             * arp cases mutate p, PARAM_SET/RAMP apply to GLOBAL params/ramps,
-             * and ALL_OFF/TRANSPORT act across ALL parts (see below) */
+            /* route to the event's part (real routing now, §P2.1). P3: the
+             * note + arp cases mutate p, AND PARAM_SET/RAMP now apply to the
+             * ROUTED part's pval/ramps (per-part params on the wire — channel
+             * 0 -> part 0, so the golden's --set ch0 still hits part 0). ALL_OFF
+             * / TRANSPORT act across ALL parts (see below). */
             part *p = &g_parts[ev->channel % NPARTS];
             switch (ev->kind) {
                 case DEV_EV_NOTE_ON:
@@ -780,7 +842,7 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                      * owns the voice. Arp off (or transport stopped):
                      * direct mono voice as ever — audition while stopped */
                     arp_latch_add(p, (uint8_t)ev->a, ev->v);
-                    if (!arp_active() || !p->arp.playing || !p->arp.anchor_valid) {
+                    if (!arp_active(p) || !p->arp.playing || !p->arp.anchor_valid) {
                         p->note_vel = ev->v;
                         note_put(p, (int)ev->a);
                         p->note_seq++;
@@ -788,7 +850,7 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                     break;
                 case DEV_EV_NOTE_OFF:
                     arp_latch_remove(p, (uint8_t)ev->a);
-                    if (!arp_active() || !p->arp.playing || !p->arp.anchor_valid) {
+                    if (!arp_active(p) || !p->arp.playing || !p->arp.anchor_valid) {
                         if (note_get(p) == (int)ev->a) note_put(p, -1);
                     } else if (p->arp.nlatch == 0) {
                         arp_voice_off(p); /* all keys released = latch clears */
@@ -821,22 +883,24 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                     break;
                 }
                 case DEV_EV_PARAM_SET:
+                    /* P3: apply to the ROUTED part's pval/ramps (was global) */
                     for (size_t j = 0; j < NPARAMS; j++)
                         if (g_params[j].id == ev->a) {
-                            param_put(&g_params[j], ev->v);
-                            g_ramps[j].active = false; /* set supersedes ramp (§9.4) */
+                            part_pput(p, j, ev->v);
+                            p->ramps[j].active = false; /* set supersedes ramp (§9.4) */
                         }
                     atomic_store_explicit(&g_touch_pending, 1,
                                           memory_order_release);
                     break;
                 case DEV_EV_RAMP:
+                    /* P3: ramp the ROUTED part's value (was global) */
                     for (size_t j = 0; j < NPARAMS; j++)
                         if (g_params[j].id == ev->a) {
-                            g_ramps[j].active = true;
-                            g_ramps[j].start = pos;
-                            g_ramps[j].end = ev->end;
-                            g_ramps[j].start_val = param_get(&g_params[j]);
-                            g_ramps[j].target = ev->v;
+                            p->ramps[j].active = true;
+                            p->ramps[j].start = pos;
+                            p->ramps[j].end = ev->end;
+                            p->ramps[j].start_val = part_pget(p, j);
+                            p->ramps[j].target = ev->v;
                         }
                     atomic_store_explicit(&g_touch_pending, 1,
                                           memory_order_release);

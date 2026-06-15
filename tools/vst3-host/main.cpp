@@ -255,6 +255,24 @@ int main(int argc, char **argv) {
         printf("part: %d -> output slots {%s}\n", part, slots);
     }
 
+    /* --channel k tags this instance's NOTES (the per-event UMP word, below)
+     * AND its PARAM sets/ramps with part k, so --set/--ramp/--lfo drive the
+     * SAME part the notes reach — one host fully owns its part (P3). Notes
+     * carry the channel in their word directly; params are tagged inside the
+     * runtime (it owns the param event encode), so we reach it the same way
+     * --part reaches it: an env var read at the plugin's start(). channel 0
+     * (the default) leaves it unset -> key omitted -> golden byte-identical. */
+    if (channel != 0) {
+        char chbuf[8];
+        snprintf(chbuf, sizeof chbuf, "%d", channel);
+#ifdef _WIN32
+        _putenv_s("HARP_CHANNEL", chbuf);
+#else
+        setenv("HARP_CHANNEL", chbuf, 1);
+#endif
+        printf("channel: %d (notes + params -> part %d)\n", channel, channel);
+    }
+
     /* ---- host context + module ---- */
     static HostApplication hostApp;
     PluginContextFactory::instance().setPluginContext(&hostApp);
