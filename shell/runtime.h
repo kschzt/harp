@@ -63,6 +63,47 @@ struct EventSource {
     explicit EventSource(uint8_t channel = 0) : chan(channel & 0xf) {}
 };
 
+/* §8.2 per-part AUDIO demux (P5b). The device streams ONE frame per pacing
+ * range carrying the UNION of every instance's requested output slots
+ * (audio.start key 4), interleaved by slot. Each ATTACHED instance that wants
+ * its OWN part's audio (not the summed main mix) registers an AudioSink keyed
+ * to the slots it requested; reader() splits each device frame, copying THIS
+ * sink's slot columns out of the union into ITS ring. pullAudio(sink) then
+ * drains that ring — so every instance hears exactly the slot(s) it subscribed
+ * to, demuxed from the one shared stream.
+ *
+ * Each sink is strictly SPSC: ONE producer (reader(), demuxing each frame) and
+ * ONE consumer (that instance's pullAudio). The reader is the sole writer of
+ * every sink (it iterates the SET); the only shared mutable structure is the
+ * sink REGISTRY (added on acquire, removed on release), synchronised against the
+ * reader's iteration by sinksMutex_ — which the audio thread never touches.
+ *
+ * SINGLE-INSTANCE / DEFAULT MAIN MIX is unchanged: the owner's main-mix audio
+ * is the runtime's built-in audioRing_ (NOT an AudioSink), and pullAudio()/
+ * pullAudioBlocking() with no sink drain it exactly as pre-P5b — byte-identical
+ * (the golden gate). The demux loop touches audioRing_ only when the union is
+ * the bare {0,1} owner default, in which case the column copy IS the same
+ * contiguous nsamples*2 write the pre-P5b reader did (see reader()).
+ *
+ * `cols` are the COLUMN INDICES of this sink's slots WITHIN the union frame
+ * (the order slots appear in the audio.start request), resolved at audioStart.
+ * pullAudio always delivers a stereo interleaved pair: a 2-slot sink is its two
+ * columns interleaved; a 1-slot sink resolves cols[1]=cols[0] so the same demux
+ * write duplicates L=R. */
+struct AudioSink {
+    FloatRing ring{1 << 15}; /* 32768 floats = 16384 stereo frames, like audioRing_ */
+    uint16_t cols[2] = {0, 1}; /* union-frame column indices this sink reads */
+    /* the slots this instance requested (P2.2 part pair {2+2k,3+2k}); resolved
+     * to `cols` against the union at audioStart. Kept so a re-negotiation could
+     * recompute columns; held only off the audio path. */
+    std::vector<uint32_t> slots;
+    /* pad-debt bookkeeping, exactly the per-sink analogue of padDebtFloats_:
+     * a padded SSI is spent, and late arrivals for it are dropped (audio thread
+     * only — this sink's pullAudio is its sole toucher). */
+    size_t padDebt = 0;
+    explicit AudioSink(const std::vector<uint32_t> &s) : slots(s) {}
+};
+
 extern "C" {
 #include "harp/audio.h"
 #include "harp/cbor.h"
@@ -181,17 +222,37 @@ public:
      * the stream domain (streamPos + latency). */
     void feedTransport(bool playing, bool tempoValid, double tempo, bool posValid,
                        double ppq, uint32_t blockSamples, uint64_t base);
+    /* ---- per-instance audio sink (P5b per-part demux) ----
+     * The OWNER pulls the main mix via the built-in audioRing_ (the no-sink
+     * pullAudio below). An ATTACHED instance that wants its OWN part's audio
+     * registers a sink for the slots it requested (its P2.2 part pair) and
+     * pulls THAT sink — reader() demuxes the device's union frame into it.
+     * Register BEFORE start() so the slots enter the audio.start union (an
+     * instance whose slots aren't in the live union gets silence until the next
+     * audio.start — the P5b mid-attach limitation, documented in audioStart). */
+    AudioSink *registerAudioSink(const std::vector<uint32_t> &slots);
+    /* Remove + free a sink on release. Like unregisterSource: take sinksMutex_,
+     * remove from the registry FIRST (so reader() can't touch it again), then
+     * free it. The producer (reader, if alive) iterates only the registry under
+     * the lock, so the removed sink is ours alone to free. Idempotent on null. */
+    void unregisterAudioSink(AudioSink *sink);
+
     /* SSI of the next sample pullAudio will deliver: the stream-domain "now"
      * for timestamping. Events for DAW offset s in the current block go to
      * streamPos() + s + latencySamples() — PDC makes that land on time. */
     uint64_t streamPos() const { return ssiRead_.load(std::memory_order_relaxed); }
     /* Fill n interleaved-stereo samples; pads with silence on underrun
-     * (counted). Returns samples padded (0 = clean). */
+     * (counted). Returns samples padded (0 = clean). The no-sink form drains the
+     * OWNER's built-in main-mix ring (audioRing_) — byte-identical to pre-P5b.
+     * The sink form drains that instance's demuxed per-part ring. */
     size_t pullAudio(float *interleavedLR, size_t nFrames);
+    size_t pullAudio(AudioSink *sink, float *interleavedLR, size_t nFrames);
     /* Offline-mode variant (§8.3 / VST3 kOffline): block until the device
      * has rendered the requested range — offline bounce through hardware
      * may legitimately wait for the wire. */
     size_t pullAudioBlocking(float *interleavedLR, size_t nFrames, unsigned timeoutMs);
+    size_t pullAudioBlocking(AudioSink *sink, float *interleavedLR, size_t nFrames,
+                             unsigned timeoutMs);
 
     /* Reported latency = ring target + EVENT HEADROOM of one block — and
      * "block" means whichever is larger, the DAW's or the 256-sample
@@ -333,7 +394,16 @@ private:
      * transport (owner source only) is global. */
     int drainSource(EventSource &src, harp_cbuf &batch, harp_cbuf &msgbuf, int budget);
     void settlePadDebt(); /* drop late arrivals for already-padded SSIs */
+    /* the per-sink analogue: drop late arrivals owed to a sink's padded SSIs. */
+    void settleSinkPadDebt(AudioSink &sink);
     bool helloAndIdentity();
+    /* Build unionSlots_ = owner outSlots_ then every registered sink's slots
+     * (deduped, order preserved) and resolve each sink's `cols` to its slots'
+     * column indices within that union. Called under sinksMutex_ from
+     * audioStart, BEFORE the audio.start request encodes unionSlots_. With no
+     * sink registered the union is exactly outSlots_ ({0,1} by default) — the
+     * byte-identical golden request. */
+    void computeUnionSlotsLocked();
     bool audioStart(uint32_t rate);
     void audioStopLocked();
     /* encode one event message into `out` (no I/O) — the feeder batches
@@ -413,6 +483,38 @@ private:
 
     FloatRing audioRing_{1 << 15}; /* 32768 floats = 16384 stereo frames */
     std::atomic<uint64_t> framesRecvAtomic_{0}; /* written by reader, read by feeder */
+
+    /* P5b per-part AUDIO demux (see AudioSink doc above). The OWNER's main mix
+     * stays audioRing_ (NOT a sink) — the no-sink pullAudio path is byte-
+     * identical. Each ATTACHED per-part instance registers an AudioSink; the
+     * registry is a fixed array guarded by sinksMutex_. reader() holds that
+     * mutex while it DEMUXES each device frame into every sink's ring (pure
+     * memory work — column copy, no I/O), exactly as the eventPump holds
+     * sourcesMutex_ over its drain. register/unregisterAudioSink take the same
+     * mutex to add/remove a sink — both OFF the RT audio path; pullAudio(sink)
+     * never touches the registry (the consumer holds its own sink pointer). So
+     * no sink ring is ever multi-producer (reader is the sole writer) or multi-
+     * consumer (one instance per sink), and the only shared mutable structure —
+     * the pointer array — is mutated only off the RT path under the mutex.
+     * SAFE-FREE: unregisterAudioSink removes the sink from the array under the
+     * lock FIRST, so reader()'s next demux can never write a freed ring. */
+    static constexpr size_t kMaxSinks = 16; /* one per multitimbral part */
+    std::mutex sinksMutex_;
+    AudioSink *sinks_[kMaxSinks] = {nullptr};
+    size_t nSinks_ = 0;
+    /* relaxed mirror of nSinks_ != 0 so reader()'s hot loop SKIPS the demux lock
+     * entirely when no per-part sink exists — the single-instance / default
+     * main-mix reader stays exactly the pre-P5b lock-free path. Published with
+     * release under sinksMutex_ on every add/remove; the reader's relaxed load
+     * only ever turns the (locked) demux on AFTER a sink is registered (off the
+     * audio path, before that session's frames matter). */
+    std::atomic<bool> haveSinks_{false};
+    /* The UNION of every instance's requested output slots, in the exact order
+     * sent as audio.start key 4 (owner outSlots_ first, then each registered
+     * sink's slots, deduplicated). reader() demuxes the device frame's columns
+     * by this order; each sink's `cols` index into it. Fixed at audioStart (the
+     * P5b mid-attach limitation — see audioStart). */
+    std::vector<uint32_t> unionSlots_;
 
     /* P5 event-source MERGE (see EventSource doc above). The OWNER source is
      * built in and always present — it IS the pre-P5 timedRing_ + chan_, so a

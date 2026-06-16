@@ -83,6 +83,19 @@ bool HarpRuntime::helloAndIdentity() {
 }
 
 bool HarpRuntime::audioStart(uint32_t rate) {
+    /* P5b: the audio.start subscription is the UNION of every instance's
+     * requested output slots — the owner's outSlots_ (the main mix {0,1} by
+     * default) PLUS each registered per-part sink's slots. The device streams
+     * that union in ONE frame, interleaved by slot in this exact order, and
+     * reader() demuxes each instance's columns out of it. With NO sink
+     * registered the union is exactly outSlots_, so a single instance (or any
+     * instance requesting only the main mix) sends the byte-identical {0,1}
+     * request — the golden gate. computeUnionSlotsLocked resolves each sink's
+     * column indices against this order under sinksMutex_. */
+    {
+        std::lock_guard<std::mutex> lk(sinksMutex_);
+        computeUnionSlotsLocked();
+    }
     harp_cbuf req, rsp;
     harp_cbuf_init(&req);
     harp_cbuf_init(&rsp);
@@ -98,14 +111,14 @@ bool HarpRuntime::audioStart(uint32_t rate) {
     harp_cbor_array(&req, 2);
     harp_cbor_uint(&req, 0);
     harp_cbor_uint(&req, 1);
-    harp_cbor_uint(&req, 4); /* active-slots-out: the slots the host subscribes
-                              * to. DEFAULT outSlots_ = {0,1} (the stereo main
-                              * mix) renders exactly as the historical empty []
-                              * did — the golden byte-identical default. A
-                              * single part's pair {2+2N,3+2N} pulls that part
-                              * in isolation (set via setOutSlots before start). */
-    harp_cbor_array(&req, outSlots_.size());
-    for (uint32_t slot : outSlots_) harp_cbor_uint(&req, slot);
+    harp_cbor_uint(&req, 4); /* active-slots-out: the UNION the host subscribes
+                              * to. DEFAULT (no per-part sink) = outSlots_ {0,1}
+                              * (the stereo main mix), which renders exactly as
+                              * the historical empty [] did — the golden byte-
+                              * identical default. Per-part sinks append their
+                              * pairs {2+2N,3+2N}; reader() demuxes them out. */
+    harp_cbor_array(&req, unionSlots_.size());
+    for (uint32_t slot : unionSlots_) harp_cbor_uint(&req, slot);
     harp_cbor_uint(&req, 5);
     harp_cbor_uint(&req, 1); /* host-paced */
     harp_env e;
@@ -113,6 +126,39 @@ bool HarpRuntime::audioStart(uint32_t rate) {
     harp_cbuf_free(&req);
     harp_cbuf_free(&rsp);
     return ok;
+}
+
+/* Build the union of all subscribed output slots and resolve each sink's column
+ * indices. unionSlots_ = owner outSlots_ first, then each registered sink's
+ * slots, with duplicates dropped (the same physical slot appears once in the
+ * frame and several sinks can read that one column). Each slot's column index
+ * is its position in unionSlots_. Caller holds sinksMutex_. */
+void HarpRuntime::computeUnionSlotsLocked() {
+    unionSlots_.clear();
+    auto addSlot = [&](uint32_t s) {
+        for (uint32_t u : unionSlots_)
+            if (u == s) return; /* already in the union — one column for it */
+        unionSlots_.push_back(s);
+    };
+    /* owner main mix first, so its columns are the contiguous prefix {0,1,...}:
+     * the default {0,1}-only union puts the main mix at columns 0,1 exactly as
+     * the pre-P5b contiguous frame, keeping the owner's reader copy identical. */
+    for (uint32_t s : outSlots_) addSlot(s);
+    for (size_t i = 0; i < nSinks_; i++)
+        for (uint32_t s : sinks_[i]->slots) addSlot(s);
+    /* resolve each sink's slots -> column indices within the union order */
+    for (size_t i = 0; i < nSinks_; i++) {
+        AudioSink *sk = sinks_[i];
+        size_t n = sk->slots.size();
+        if (n > 2) n = 2; /* a sink delivers a stereo pair at most */
+        for (size_t c = 0; c < n; c++) {
+            uint16_t col = 0;
+            for (size_t u = 0; u < unionSlots_.size(); u++)
+                if (unionSlots_[u] == sk->slots[c]) { col = (uint16_t)u; break; }
+            sk->cols[c] = col;
+        }
+        if (n == 1) sk->cols[1] = sk->cols[0]; /* mono pair: L=R */
+    }
 }
 
 void HarpRuntime::audioStopLocked() {
@@ -360,6 +406,16 @@ bool HarpRuntime::sessionUp() {
     padDebtFloats_ = 0;
     ahead_ = 2; /* small fixed pipeline; the reader thread keeps RTT short */
     audioRing_.clear();
+    /* P5b: clear every per-part sink's ring + pad debt for the new SSI domain,
+     * exactly as audioRing_/padDebtFloats_ above. No reader runs yet (spawned
+     * below), and the lock guards against a sink register/unregister racing. */
+    {
+        std::lock_guard<std::mutex> lk(sinksMutex_);
+        for (size_t i = 0; i < nSinks_; i++) {
+            sinks_[i]->ring.clear();
+            sinks_[i]->padDebt = 0;
+        }
+    }
     /* connected_ goes true BEFORE the pump spawns: its run loop gates on
      * it, and spawning first would race a clean instant exit */
     connected_.store(true, std::memory_order_release);
@@ -621,6 +677,58 @@ void HarpRuntime::unregisterSource(EventSource *src) {
     }
 }
 
+/* ---- audio sink registry (P5b; off the audio path) ---- */
+
+/* Register a per-part audio sink for `slots`. Allocates an AudioSink and adds it
+ * under sinksMutex_; reader()'s next demux pass splits the device frame into it
+ * (its column indices are resolved by computeUnionSlotsLocked, called from
+ * audioStart). Returns nullptr if the table is full (kMaxSinks parts) — the
+ * caller then pulls silence, like an event-dormant 17th part. Empty slots is a
+ * no-op (nullptr): such an instance just pulls the owner main mix or silence.
+ *
+ * P5b LIMITATION: the union is fixed at audio.start. A sink registered while a
+ * session is ALREADY streaming is in the registry (reader() demuxes it) but its
+ * slots are NOT in the live union, so its columns resolve to 0 — it would read
+ * the owner's main-mix column, not its part. To avoid surprising audio we leave
+ * cols at their default and the caller gets the main mix until the next
+ * audio.start; in practice a DAW's tracks activate together at project load, so
+ * every part's sink is registered before the owner starts and enters the union
+ * then. (A clean stop+restart re-negotiation is possible but a mid-session
+ * audio glitch is worse than fixed-at-start; see audioStart.) */
+AudioSink *HarpRuntime::registerAudioSink(const std::vector<uint32_t> &slots) {
+    if (slots.empty()) return nullptr;
+    AudioSink *sink = new AudioSink(slots);
+    std::lock_guard<std::mutex> lk(sinksMutex_);
+    if (nSinks_ >= kMaxSinks) {
+        delete sink;
+        return nullptr;
+    }
+    sinks_[nSinks_++] = sink;
+    haveSinks_.store(true, std::memory_order_release);
+    return sink;
+}
+
+/* Remove + free a sink on release, keeping reader() safe. SAFE-FREE mirrors
+ * unregisterSource: a sink's ring is only WRITTEN by reader(), and only while it
+ * holds sinksMutex_ (it demuxes every frame into every registered sink under the
+ * lock — see reader). We take that SAME lock and remove the sink from the array
+ * FIRST: reader()'s next pass can no longer see it, so we are its sole accessor
+ * (the consumer is quiescent — the host stops process() before release) and can
+ * free it. Idempotent on nullptr. */
+void HarpRuntime::unregisterAudioSink(AudioSink *sink) {
+    if (!sink) return;
+    std::lock_guard<std::mutex> lk(sinksMutex_);
+    for (size_t i = 0; i < nSinks_; i++) {
+        if (sinks_[i] == sink) {
+            sinks_[i] = sinks_[nSinks_ - 1]; /* compact: last fills the hole */
+            sinks_[--nSinks_] = nullptr;
+            if (nSinks_ == 0) haveSinks_.store(false, std::memory_order_release);
+            delete sink;
+            return;
+        }
+    }
+}
+
 void HarpRuntime::feedTransport(bool playing, bool tempoValid, double tempo,
                                 bool posValid, double ppq, uint32_t blockSamples,
                                 uint64_t base) {
@@ -716,6 +824,20 @@ void HarpRuntime::settlePadDebt() {
     }
 }
 
+/* per-sink analogue of settlePadDebt: a demuxed sink rings just like audioRing_,
+ * so the same spent-SSI policy applies — drop late arrivals owed to its padded
+ * positions. The sink's pullAudio is its sole consumer (SPSC), so padDebt is
+ * audio-thread-owned just like padDebtFloats_. */
+void HarpRuntime::settleSinkPadDebt(AudioSink &sink) {
+    while (sink.padDebt) {
+        float scratch[1024];
+        size_t take = sink.padDebt < 1024 ? sink.padDebt : 1024;
+        size_t got = sink.ring.read(scratch, take);
+        if (!got) break; /* not arrived yet; keep owing */
+        sink.padDebt -= got;
+    }
+}
+
 size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
     settlePadDebt();
     size_t want = nFrames * 2;
@@ -724,6 +846,34 @@ size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
     if (got < want) {
         memset(dst + got, 0, (want - got) * sizeof(float));
         padDebtFloats_ += want - got;
+        if (connected_.load(std::memory_order_acquire)) {
+            underruns_.fetch_add(1, std::memory_order_relaxed);
+            padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
+        }
+        return (want - got) / 2;
+    }
+    return 0;
+}
+
+/* Per-part pull: drain THIS sink's demuxed stereo ring. Structurally identical
+ * to the owner pull above but on the sink's own ring/padDebt — the sink's ring
+ * holds interleaved L/R, written by reader()'s demux. It does NOT advance
+ * ssiRead_: that is the OWNER's main-mix stream clock (pacing + event timing)
+ * and only the owner pull moves it; per-part instances ride the owner's clock,
+ * which is why their process() timestamps against the shared streamPos(). A null
+ * sink (the registry was full, or no per-part slots) pulls clean silence — the
+ * caller is the audio-silent fallback (like an event-dormant part). */
+size_t HarpRuntime::pullAudio(AudioSink *sink, float *dst, size_t nFrames) {
+    if (!sink) {
+        memset(dst, 0, nFrames * 2 * sizeof(float));
+        return nFrames;
+    }
+    settleSinkPadDebt(*sink);
+    size_t want = nFrames * 2;
+    size_t got = sink->ring.read(dst, want);
+    if (got < want) {
+        memset(dst + got, 0, (want - got) * sizeof(float));
+        sink->padDebt += want - got;
         if (connected_.load(std::memory_order_acquire)) {
             underruns_.fetch_add(1, std::memory_order_relaxed);
             padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
@@ -745,6 +895,35 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
         if (!connected_.load(std::memory_order_acquire) || waited >= timeoutMs) {
             memset(dst + got, 0, (want - got) * sizeof(float));
             padDebtFloats_ += want - got;
+            underruns_.fetch_add(1, std::memory_order_relaxed);
+            padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
+            return (want - got) / 2;
+        }
+        harp_sleep_ns(500000ull); /* 0.5 ms */
+        waited++;
+    }
+    return 0;
+}
+
+/* Offline per-part pull: block until the sink's demuxed range has arrived. Like
+ * the owner blocking pull but on the sink's ring/padDebt and WITHOUT advancing
+ * ssiRead_ (the owner's clock). A null sink yields silence immediately. */
+size_t HarpRuntime::pullAudioBlocking(AudioSink *sink, float *dst, size_t nFrames,
+                                      unsigned timeoutMs) {
+    if (!sink) {
+        memset(dst, 0, nFrames * 2 * sizeof(float));
+        return nFrames;
+    }
+    settleSinkPadDebt(*sink);
+    size_t want = nFrames * 2;
+    size_t got = 0;
+    unsigned waited = 0;
+    while (got < want) {
+        got += sink->ring.read(dst + got, want - got);
+        if (got >= want) break;
+        if (!connected_.load(std::memory_order_acquire) || waited >= timeoutMs) {
+            memset(dst + got, 0, (want - got) * sizeof(float));
+            sink->padDebt += want - got;
             underruns_.fetch_add(1, std::memory_order_relaxed);
             padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
             return (want - got) / 2;
@@ -1002,8 +1181,77 @@ void HarpRuntime::reader() {
             }
             size_t need = HARP_AUDIO_HDR_LEN + harp_audio_payload_len(&h);
             if (accLen - off < need) break;
-            audioRing_.write((const float *)(acc + off + HARP_AUDIO_HDR_LEN),
-                             (size_t)h.nsamples * 2);
+            const float *pl = (const float *)(acc + off + HARP_AUDIO_HDR_LEN);
+            size_t ns = (size_t)h.nsamples;
+            uint16_t S = h.slots; /* columns in this frame == |unionSlots_| */
+            /* OWNER main mix: the owner subscribes to the contiguous union
+             * PREFIX (computeUnionSlotsLocked puts outSlots_ first), so its
+             * two columns are 0 and 1. When the frame carries EXACTLY 2 slots
+             * (the default {0,1}-only union — a single instance, or any group
+             * where no sibling requested a per-part slot), the prefix IS the
+             * whole frame and this write is the SAME contiguous nsamples*2 copy
+             * the pre-P5b reader did — BYTE-IDENTICAL (the golden gate). With a
+             * wider union (per-part sinks present) we still write the owner's
+             * columns 0,1, demuxed below; the {0,1} sub-case stays the fast
+             * contiguous path. */
+            if (S == 2) {
+                audioRing_.write(pl, ns * 2);
+            } else if (S > 2) {
+                /* wider union: gather the owner's columns 0,1 (the main mix) out
+                 * of the slot-interleaved frame into an interleaved L/R chunk. */
+                float tmp[1024 * 2];
+                size_t i = 0;
+                while (i < ns) {
+                    size_t chunk = ns - i < 1024 ? ns - i : 1024;
+                    for (size_t j = 0; j < chunk; j++) {
+                        tmp[2 * j] = pl[(i + j) * S + 0];
+                        tmp[2 * j + 1] = pl[(i + j) * S + 1];
+                    }
+                    audioRing_.write(tmp, chunk * 2);
+                    i += chunk;
+                }
+            } else if (S == 1) {
+                /* mono union (a single-slot owner subscription): duplicate L=R
+                 * so the owner ring stays interleaved-stereo. The default path
+                 * is always a 2-slot {0,1} pair, so this is a robustness branch,
+                 * never the golden case. */
+                float tmp[1024 * 2];
+                size_t i = 0;
+                while (i < ns) {
+                    size_t chunk = ns - i < 1024 ? ns - i : 1024;
+                    for (size_t j = 0; j < chunk; j++)
+                        tmp[2 * j] = tmp[2 * j + 1] = pl[i + j];
+                    audioRing_.write(tmp, chunk * 2);
+                    i += chunk;
+                }
+            }
+            /* P5b DEMUX: split this frame's slot columns into every per-part
+             * sink's ring. reader() is the SOLE writer of every sink (SPSC
+             * producer side); the lock is the safe-free invariant against
+             * unregisterAudioSink (it removes a sink under the same lock before
+             * freeing, so we never write a freed ring). Pure memory work — no
+             * I/O under the lock. The relaxed haveSinks_ gate keeps the single-
+             * instance / default-main-mix reader on its pre-P5b LOCK-FREE path:
+             * with no sink registered the demux lock is never taken at all. */
+            if (haveSinks_.load(std::memory_order_relaxed)) {
+                std::lock_guard<std::mutex> lk(sinksMutex_);
+                for (size_t si = 0; si < nSinks_; si++) {
+                    AudioSink *sk = sinks_[si];
+                    uint16_t cL = sk->cols[0], cR = sk->cols[1];
+                    if (cL >= S || cR >= S) continue; /* slot not in this union */
+                    float tmp[1024 * 2];
+                    size_t i = 0;
+                    while (i < ns) {
+                        size_t chunk = ns - i < 1024 ? ns - i : 1024;
+                        for (size_t j = 0; j < chunk; j++) {
+                            tmp[2 * j] = pl[(i + j) * S + cL];
+                            tmp[2 * j + 1] = pl[(i + j) * S + cR];
+                        }
+                        sk->ring.write(tmp, chunk * 2);
+                        i += chunk;
+                    }
+                }
+            }
             framesRecvAtomic_.fetch_add(1, std::memory_order_release);
             off += need;
         }

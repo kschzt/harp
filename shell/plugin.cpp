@@ -175,11 +175,7 @@ public:
                  * is NO LONGER DORMANT FOR EVENTS — it registers its OWN event
                  * source (its part) and queues notes/params on it; the owner's
                  * eventPump merges every source onto the one session, so the
-                 * group PLAYS multitimbrally. AUDIO stays dormant though: the
-                 * owner pulls the MAIN MIX (which sums all parts) and this
-                 * sibling emits silence — per-part audio demux is P5b. The
-                 * part comes from HARP_CHANNEL (the out-of-process host's
-                 * --channel), exactly as the owner reads it in start(). */
+                 * group PLAYS multitimbrally. */
                 /* P6 (closes the P5c gap): this instance registers its OWN source
                  * on ITS part — part_, the per-instance "Part" param (id 98).
                  * part_ defaults to the HARP_CHANNEL env (so the headless tsan/
@@ -189,6 +185,27 @@ public:
                  * project, instead of every instance collapsing onto the one
                  * process-global env value. */
                 source_ = runtime()->registerSource(part_);
+                /* P5b per-part AUDIO (OPT-IN). DEFAULT (env unset): this attached
+                 * instance stays AUDIO-SILENT exactly as P5 — the owner pulls the
+                 * summed main mix and we emit silence, byte-identical to before
+                 * P5b. When HARP_PART_AUDIO is set the instance OPTS IN to its OWN
+                 * part's audio: it registers a per-part sink for that part's
+                 * stereo pair (P2.2 slots {2+2k,3+2k}), which the owner's reader
+                 * demuxes out of the shared device stream, and process() pulls
+                 * THAT sink instead of silence. (See sink_ + process().)
+                 *
+                 * P5b LIMITATION: the audio.start UNION is fixed when the OWNER
+                 * starts. A sink registered here AFTER the owner has started is in
+                 * the registry but its slots are not in the live union, so it
+                 * reads silence until the next audio.start. DAW tracks activate
+                 * together at project load, so registering every part's sink
+                 * before the owner starts puts them all in the union — a mid-
+                 * session glitchy restart is worse than this fixed-at-start union
+                 * (see HarpRuntime::audioStart). */
+                if (const char *e = getenv("HARP_PART_AUDIO"); e && e[0] && e[0] != '0') {
+                    std::vector<uint32_t> slots = {2u + 2u * part_, 3u + 2u * part_};
+                    sink_ = runtime()->registerAudioSink(slots);
+                }
             }
         } else {
             /* Release: an ATTACHED instance first removes its event source so
@@ -378,15 +395,20 @@ public:
             }
         }
 
-        /* AUDIO: OWNER ONLY. The shared session's audio ring has ONE consumer
-         * (the owner pulls the MAIN MIX, which already sums every part this
-         * group injected above). An attached instance has queued its part's
-         * events and is done — it emits SILENCE and must NOT pull the ring
-         * (a second consumer would corrupt the SPSC tail and steal the owner's
-         * samples) nor drain the echo ring (also single-consumer). Per-part
-         * audio demux — each alias hearing only its own part — is the tracked
-         * follow-up P5b; until then siblings are audio-silent by design. */
-        if (!isOwner) return processSilence(data);
+        /* AUDIO. The OWNER pulls the shared session's MAIN MIX (audioRing_, the
+         * one consumer — it sums every part this group injected above). An
+         * ATTACHED instance has two cases:
+         *   - default (no per-part sink): AUDIO-SILENT, exactly as P5. It must
+         *     NOT pull audioRing_ (a second consumer corrupts the SPSC tail and
+         *     steals the owner's samples) nor drain the echo ring (also single-
+         *     consumer). Byte-identical to pre-P5b.
+         *   - P5b opt-in (sink_ set): pull ITS OWN per-part ring — the owner's
+         *     reader DEMUXED this instance's slot columns out of the shared
+         *     device stream into sink_. That is its own SPSC ring (the owner's
+         *     reader is the sole producer, this process() the sole consumer), so
+         *     no SPSC invariant is touched. It still must NOT drain the echo ring
+         *     (owner-only). */
+        if (!isOwner && !sink_) return processSilence(data);
 
         if (data.numOutputs < 1 || data.numSamples <= 0 ||
             data.outputs[0].numChannels < 1 || !data.outputs[0].channelBuffers32)
@@ -396,17 +418,26 @@ public:
         float *R = nch > 1 ? data.outputs[0].channelBuffers32[1] : nullptr;
         if (!L) return kResultOk;
 
-        /* pull interleaved from the ring; deinterleave into bus channels
-         * (mono hosts get L+R summed) */
+        /* pull interleaved from the relevant ring; deinterleave into bus channels
+         * (mono hosts get L+R summed). The OWNER pulls the main-mix ring (the
+         * no-sink pullAudio — byte-identical); an opted-in attached instance
+         * pulls its demuxed per-part sink. */
         float tmp[4096 * 2];
         int32 remaining = data.numSamples;
         int32 written = 0;
         while (remaining > 0) {
             int32 chunk = remaining > 4096 ? 4096 : remaining;
-            if (offline_) /* offline bounce: waiting for the wire is correct */
-                rt.pullAudioBlocking(tmp, (size_t)chunk, 1000);
-            else
-                rt.pullAudio(tmp, (size_t)chunk); /* RT: silence on underrun */
+            if (isOwner) {
+                if (offline_) /* offline bounce: waiting for the wire is correct */
+                    rt.pullAudioBlocking(tmp, (size_t)chunk, 1000);
+                else
+                    rt.pullAudio(tmp, (size_t)chunk); /* RT: silence on underrun */
+            } else {
+                if (offline_)
+                    rt.pullAudioBlocking(sink_, tmp, (size_t)chunk, 1000);
+                else
+                    rt.pullAudio(sink_, tmp, (size_t)chunk);
+            }
             for (int32 s = 0; s < chunk; s++) {
                 if (R) {
                     L[written + s] = tmp[2 * s];
@@ -420,9 +451,10 @@ public:
         }
         data.outputs[0].silenceFlags = 0;
 
-        /* device front-panel echoes (§9.4) -> output parameter changes:
-         * the sanctioned RT path for plugin-originated edits; the host
-         * updates the controller and records automation when armed */
+        /* device front-panel echoes (§9.4) -> output parameter changes: OWNER
+         * ONLY (the echo ring is single-consumer). An attached per-part instance
+         * skips this — it rendered its part's audio above and is done. */
+        if (!isOwner) return kResultOk;
         {
             uint32_t id;
             float v;
@@ -533,12 +565,25 @@ private:
      * queue* route through it so each instance is the SOLE producer of its own
      * SPSC ring. nullptr until acquired (process() emits silence then). */
     EventSource *source_ = nullptr;
+    /* P5b per-part AUDIO sink: an ATTACHED instance that OPTED IN (HARP_PART_AUDIO)
+     * registers a sink for its part's stereo pair; the owner's reader demuxes the
+     * shared stream into it and process() pulls IT instead of emitting silence.
+     * nullptr for the owner, for the default audio-silent attached instance, or
+     * when the sink table is full — process() then pulls main mix (owner) or
+     * silence (attached), exactly as P5. */
+    AudioSink *sink_ = nullptr;
     /* Drop our event source. For an ATTACHED instance this removes + frees the
      * source we registered (after which the owner's eventPump never touches it);
      * for an owner / unacquired instance it is a no-op (the owner source belongs
      * to the runtime and persists for the session). MUST run before
      * runtime_release (a last release destroys the runtime). Idempotent. */
     void releaseSource() {
+        /* P5b: drop our per-part audio sink too (after which the owner's reader
+         * never demuxes into it / touches a freed ring), before the source and
+         * before runtime_release. No-op when we never registered one (the
+         * default audio-silent attached path / owner). */
+        if (sink_ && runtime()) runtime()->unregisterAudioSink(sink_);
+        sink_ = nullptr;
         if (source_ && runtime()) runtime()->unregisterSource(source_);
         source_ = nullptr;
     }

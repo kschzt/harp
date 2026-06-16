@@ -391,6 +391,8 @@ int main(int argc, char **argv) {
                 "       [--instances N | --aliases ch0,ch1,..] [--serial SERIAL]\n"
                 "  --part N   pull device part N's (0..15) stereo output instead of the\n"
                 "             main mix (slots {2+2N,3+2N}); default = main mix\n"
+                "  --part-audio   multi-instance: attached aliases pull their OWN part\n"
+                "             (P5b demux), not silence; default off (siblings silent)\n"
                 "  --instances N   load N plugin instances in ONE process, sharing the\n"
                 "             device (pinned serial -> one claim, P4 registry). Instance\n"
                 "             i drives part/channel i (Part param id 98) with a distinct\n"
@@ -404,6 +406,9 @@ int main(int argc, char **argv) {
     std::string plugin_path = argv[1];
     bool do_list = false, do_hash = false, realtime = false;
     bool do_flood = false, do_json = false, do_reset = false;
+    bool part_audio = false; /* --part-audio: attached aliases pull their OWN part
+                              * (P5b) — sets HARP_PART_AUDIO so each attached plugin
+                              * registers a per-part sink the owner demuxes for it */
     std::string expect_hash; /* if set, assert the output hash (exit 3 on mismatch) */
     uint32_t rate = 48000, block = 256;
     double seconds = 2.0;
@@ -533,6 +538,8 @@ int main(int argc, char **argv) {
             lfos.push_back(l);
         } else if (a == "--reset") {
             do_reset = true;
+        } else if (a == "--part-audio") {
+            part_audio = true;
         } else if (a == "--flood") {
             do_flood = true;
         } else if (a == "--json") {
@@ -584,6 +591,26 @@ int main(int argc, char **argv) {
         setenv("HARP_OUT_SLOTS", slots, 1);
 #endif
         printf("part: %d -> output slots {%s}\n", part, slots);
+    }
+
+    /* --part-audio (P5b, multi-instance): tell every ATTACHED plugin instance to
+     * pull its OWN part's audio instead of staying audio-silent. The plugin reads
+     * HARP_PART_AUDIO at setActive and registers a per-part AudioSink for its part
+     * pair {2+2k,3+2k}; the owner's reader demuxes the shared device stream into
+     * it. NOTE (P5b limitation): the audio.start UNION is fixed when the OWNER
+     * activates; aliases activating AFTER it (the usual sequential order) register
+     * their sink too late for the union and read silence until the next
+     * audio.start. So this flag exercises the per-part REGISTRATION/teardown path
+     * through the real plugin; the owner's main-mix capture below is unchanged
+     * and stays the byte-deterministic e2e signal. Default off => attached aliases
+     * are audio-silent exactly as P5, byte-identical. */
+    if (part_audio) {
+#ifdef _WIN32
+        _putenv_s("HARP_PART_AUDIO", "1");
+#else
+        setenv("HARP_PART_AUDIO", "1", 1);
+#endif
+        printf("part-audio: attached aliases pull their own part (P5b)\n");
     }
 
     /* --channel k tags this instance's NOTES (the per-event UMP word, below)

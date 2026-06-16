@@ -59,6 +59,13 @@ SERIAL=$(./build/harp-probe list 2>/dev/null | grep -oE 'PI4B-[0-9]+' | head -1)
 if [ -n "$SERIAL" ]; then
     export HARP_DEVICE_SERIAL="$SERIAL"
     run merge --instances 4 --seconds 15 --block 256
+    # P5b: --part-audio adds the per-part AUDIO demux to the merge — the owner's
+    # reader() now ALSO splits each device frame into every attached instance's
+    # sink ring (one producer, each sink one consumer), on top of the event
+    # merge. With per-channel notes the attached parts SOUND, so the demux moves
+    # real signal under TSan, not silence. The only config that covers reader()'s
+    # multi-sink demux concurrently with the eventPump merge.
+    run partaudio --instances 4 --part-audio --seconds 15 --block 256
     unset HARP_DEVICE_SERIAL
 else
     echo "  merge: SKIP (no board on the bus to pin for the shared-runtime merge)"
