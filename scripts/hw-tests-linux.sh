@@ -26,20 +26,22 @@ export PROBE="${PROBE:-./build/harp-probe}"
 export PI="${PI:-ci@harptest.local}"               # replug ssh target (NOT jak)
 export SERIAL="$HARP_DEVICE_SERIAL"                # replug pins this board
 
-# Preflight: reset the device to a known-clean state. A CI job killed mid-
-# USB-stream (job cancellation, timeout) can leave the bus poisoned until a
-# device-side reattach (see host/usb_io.c lore); restart the daemon so every
-# run starts clean regardless of how the previous one died. Graceful if the
-# Pi is unreachable.
-echo "──── preflight: device reset (daemon restart on $PI)"
-if ssh -o BatchMode=yes -o ConnectTimeout=8 "$PI" 'sudo -n systemctl restart harp-deviced-usb' 2>&1; then
+# recover: reset the device to a known-clean state by restarting the daemon, then
+# wait until it is claimable. A CI job killed mid-USB-stream (cancellation/timeout)
+# OR a long suite's cumulative rapid claim/release can leave the gadget poisoned
+# ("device busy / never connects") until a device-side reattach (see host/usb_io.c
+# lore). Used as the start-of-suite preflight AND, in run(), to self-heal a test
+# that reports the bus busy (rc=3). Graceful if the Pi is unreachable.
+recover() {
+    ssh -o BatchMode=yes -o ConnectTimeout=8 "$PI" 'sudo -n systemctl restart harp-deviced-usb' 2>/dev/null \
+        || { echo "   (recover skipped: $PI unreachable)"; return 0; }
     for i in $(seq 1 20); do
-        "$PROBE" -d "usb:$SERIAL" identify >/dev/null 2>&1 && { echo "   device claimable after ~${i}s"; break; }
+        "$PROBE" -d "usb:$SERIAL" identify >/dev/null 2>&1 && { echo "   device claimable after ~${i}s"; return 0; }
         sleep 1
     done
-else
-    echo "   (skipped: $PI unreachable)"
-fi
+}
+echo "──── preflight: device reset (daemon restart on $PI)"
+recover
 echo
 
 PASS=0; FAIL=0; SKIP=0
@@ -50,10 +52,19 @@ PASS=0; FAIL=0; SKIP=0
 run() {
     echo "──── $1"
     "$@"; rc=$?
+    # rc=3 = bus busy/poisoned. On a runner that owns the device exclusively this
+    # is a cycling-poisoned gadget (the prior claim-heavy test left it wedged), not
+    # a stray claimer — recover (daemon restart) and retry the test ONCE before
+    # ruling. A genuine inability to claim then still fails (one retry, no masking).
+    if [ $rc -eq 3 ]; then
+        echo "   ↻ device reported busy (rc=3) — recovering and retrying once"
+        recover
+        "$@"; rc=$?
+    fi
     if   [ $rc -eq 0 ]; then PASS=$((PASS+1));
     elif [ $rc -eq 2 ]; then SKIP=$((SKIP+1));
     else FAIL=$((FAIL+1));
-         [ $rc -eq 3 ] && echo "   ↑ device was not exclusively claimable — counted as a FAILURE, not a skip"; fi
+         [ $rc -eq 3 ] && echo "   ↑ device still not exclusively claimable after recovery — FAILURE"; fi
     echo
 }
 run scripts/golden-test.sh

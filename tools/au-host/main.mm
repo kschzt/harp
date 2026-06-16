@@ -8,6 +8,13 @@
  *   au-host [--type aumu --subtype rfdv --manu HARP]
  *           [--set ID=V]... [--notes N,..] [--chord N,..] [--bpm B]
  *           [--loop A:B] [--block N] [--seconds S] [--out f.wav] [--hash]
+ *           [--part N] [--save-state FILE] [--load-state FILE]
+ *
+ * --part/--save-state/--load-state mirror tools/vst3-host so a project can be
+ * MOVED across formats: the on-disk state file uses the exact same layout
+ * ([u32 comp_len][comp][u32 ctrl_len][ctrl]) and the comp bytes are the same
+ * 'HP1'+part+bundle both shells persist, so a file written by either host loads
+ * into the other byte-for-byte.
  */
 #include <AudioToolbox/AudioToolbox.h>
 #include <cmath>
@@ -24,7 +31,93 @@ static void die(const std::string &m) {
     exit(1);
 }
 
+/* ---- AU identity (matches shell/au/harp_au.mm + its Info.plist) ---- */
+static const OSType kHarpAuType = 'aumu';
+static const OSType kHarpAuSubtype = 'rfdv';
+static const OSType kHarpAuManu = 'HARP';
+static constexpr AudioUnitParameterID kHarpPartParamId = 98; /* host-side router */
 
+/* ---- on-disk state container: [u32 comp_len][comp][u32 ctrl_len][ctrl] ----
+ *
+ * IDENTICAL layout to tools/vst3-host's save_state_file/load_state_file. The
+ * comp portion is the SAME 'HP1'+part+bundle payload both shells persist (the
+ * VST3 component getState == the AU's ClassInfo 'harp-bundle' CFData), so a
+ * file written by either host loads into the other byte-for-byte. The AU has no
+ * separate controller object, so ctrl is always empty (ctrl_len == 0). */
+static void save_state_file(const std::string &path, const std::vector<uint8_t> &comp) {
+    FILE *f = fopen(path.c_str(), "wb");
+    if (!f) die("cannot write state file");
+    uint32_t a = (uint32_t)comp.size(), b = 0; /* no controller in the AU */
+    fwrite(&a, 4, 1, f);
+    fwrite(comp.data(), 1, a, f);
+    fwrite(&b, 4, 1, f);
+    fclose(f);
+}
+
+static bool load_state_file(const std::string &path, std::vector<uint8_t> &comp) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    uint32_t a = 0;
+    bool ok = false;
+    if (fread(&a, 4, 1, f) != 1) goto done;
+    comp.resize(a);
+    if (a && fread(comp.data(), 1, a, f) != a) goto done;
+    ok = true; /* ctrl_len + ctrl follow but the AU ignores them */
+done:
+    fclose(f);
+    return ok;
+}
+
+/* Pull the AU's component-state bytes — the 'harp-bundle' CFData payload, the
+ * raw 'HP1'+part+bundle that is byte-identical to the VST3 component getState.
+ * kAudioUnitProperty_ClassInfo hands back a CFDictionary (caller releases). */
+static bool au_get_component_state(AudioComponentInstance au, std::vector<uint8_t> &out) {
+    CFPropertyListRef plist = nullptr;
+    UInt32 sz = sizeof plist;
+    if (AudioUnitGetProperty(au, kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global,
+                             0, &plist, &sz) != noErr || !plist)
+        return false;
+    bool ok = false;
+    if (CFGetTypeID(plist) == CFDictionaryGetTypeID()) {
+        CFDataRef data = (CFDataRef)CFDictionaryGetValue((CFDictionaryRef)plist,
+                                                         CFSTR("harp-bundle"));
+        if (data && CFGetTypeID(data) == CFDataGetTypeID()) {
+            const uint8_t *p = CFDataGetBytePtr(data);
+            CFIndex n = CFDataGetLength(data);
+            out.assign(p, p + n);
+            ok = true;
+        }
+    }
+    CFRelease(plist);
+    return ok;
+}
+
+/* Wrap raw component-state bytes ('HP1'+part+bundle, from au-host OR vst3-host)
+ * into a minimal ClassInfo plist and push it via kAudioUnitProperty_ClassInfo so
+ * au_apply_classinfo strips the header, adopts the Part, and stages the bundle.
+ * Carries the standard component-type/subtype/manufacturer keys the AU's apply
+ * tolerates; the load-bearing key is 'harp-bundle' = the comp bytes verbatim. */
+static bool au_set_component_state(AudioComponentInstance au,
+                                   const std::vector<uint8_t> &comp) {
+    CFMutableDictionaryRef d = CFDictionaryCreateMutable(
+        nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    auto put_int = [&](CFStringRef k, SInt64 v) {
+        CFNumberRef n = CFNumberCreate(nullptr, kCFNumberSInt64Type, &v);
+        CFDictionarySetValue(d, k, n);
+        CFRelease(n);
+    };
+    put_int(CFSTR(kAUPresetVersionKey), 0);
+    put_int(CFSTR(kAUPresetTypeKey), (SInt64)kHarpAuType);
+    put_int(CFSTR(kAUPresetSubtypeKey), (SInt64)kHarpAuSubtype);
+    put_int(CFSTR(kAUPresetManufacturerKey), (SInt64)kHarpAuManu);
+    CFDataRef data = CFDataCreate(nullptr, comp.data(), (CFIndex)comp.size());
+    CFDictionarySetValue(d, CFSTR("harp-bundle"), data);
+    CFRelease(data);
+    OSStatus rc = AudioUnitSetProperty(au, kAudioUnitProperty_ClassInfo,
+                                       kAudioUnitScope_Global, 0, &d, sizeof d);
+    CFRelease(d);
+    return rc == noErr;
+}
 
 /* ---- transport simulation handed to the AU via HostCallbacks ---- */
 struct SimTransport {
@@ -66,9 +159,10 @@ int main(int argc, char **argv) {
     std::vector<int> notes, chord;
     double seconds = 2, bpm = 0, loop_a = -1, loop_b = -1, note_period = 0.6;
     uint32_t block = 256, rate = 48000;
-    std::string out_path;
+    std::string out_path, save_state_path, load_state_path;
     bool do_hash = false;
     int instances = 1; /* >1: prove N AU instances coexist in one process */
+    int part = -1; /* 0..15: set the host-side Part param (id 98); -1 = leave default */
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -105,7 +199,16 @@ int main(int argc, char **argv) {
             note_period = atof(need("--note-period").c_str());
         else if (a == "--out")
             out_path = need("--out");
-        else if (a == "--hash")
+        else if (a == "--save-state")
+            save_state_path = need("--save-state");
+        else if (a == "--load-state")
+            load_state_path = need("--load-state");
+        else if (a == "--part") {
+            /* host-side multitimbral router (id 98), mirroring vst3-host --part.
+             * 0..15: the per-instance part this AU owns, persisted in the state. */
+            part = atoi(need("--part").c_str());
+            if (part < 0 || part > 15) die("--part wants 0..15");
+        } else if (a == "--hash")
             do_hash = true;
         else if (a == "--instances")
             instances = atoi(need("--instances").c_str());
@@ -172,6 +275,28 @@ int main(int argc, char **argv) {
     cb.transportStateProc = sim_transport_state;
     AudioUnitSetProperty(au, kAudioUnitProperty_HostCallbacks,
                          kAudioUnitScope_Global, 0, &cb, sizeof cb);
+
+    /* --load-state: restore as a DAW project-open would — BEFORE Initialize, so
+     * the AU stages the bundle (and adopts the recalled Part) exactly the way it
+     * stages a setState pre-activate, and the owner applies it at start(). The
+     * file's comp bytes are 'HP1'+part+bundle whether it came from au-host OR
+     * vst3-host, so a VST3-saved project loads here unchanged. */
+    if (!load_state_path.empty()) {
+        std::vector<uint8_t> comp;
+        if (!load_state_file(load_state_path, comp)) die("cannot read state file");
+        if (!au_set_component_state(au, comp)) die("ClassInfo setState failed");
+        fprintf(stderr, "au-host: state restored from %s (%zu bytes)\n",
+                load_state_path.c_str(), comp.size());
+    }
+
+    /* --part: set the host-side Part router (id 98) BEFORE Initialize so the
+     * owner source is pinned to this part at start() (mirrors vst3-host, which
+     * sets it before setActive). au_SetParameter's Part path just stores part +
+     * applyPart() (a no-op pre-activate), so this is safe before Initialize. A
+     * recalled Part from --load-state is overridden here only if --part is given. */
+    if (part >= 0)
+        AudioUnitSetParameter(au, kHarpPartParamId, kAudioUnitScope_Global, 0,
+                              (AudioUnitParameterValue)part, 0);
 
     if (AudioUnitInitialize(au) != noErr) die("initialize failed");
 
@@ -243,6 +368,20 @@ int main(int argc, char **argv) {
             sim.ppq += (double)n * sim.bpm / (60.0 * rate);
         }
         done += n;
+    }
+
+    /* --save-state: persist as a DAW project-save would. The component state is
+     * the ClassInfo 'harp-bundle' CFData — the raw 'HP1'+part+bundle, byte-
+     * identical to what vst3-host's component getState writes — and we frame it
+     * in the SAME [u32 comp_len][comp][u32 ctrl_len][ctrl] file (ctrl_len = 0,
+     * the AU has no controller). Done after render so the saved bundle reflects
+     * the --set params, mirroring vst3-host's post-process-loop getState. */
+    if (!save_state_path.empty()) {
+        std::vector<uint8_t> comp;
+        if (!au_get_component_state(au, comp)) die("ClassInfo getState failed");
+        save_state_file(save_state_path, comp);
+        printf("state: saved to %s (%zu+0 bytes)\n", save_state_path.c_str(),
+               comp.size());
     }
 
     double acc = 0;
