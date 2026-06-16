@@ -26,9 +26,10 @@ latency-profile = [* { 0 => uint, 1 => uint, 2 => uint, ? 3 => uint }]
 
 ; --- events ---
 event = [ tstamp, etype: 0..7, any ]
+; optional addressing is uniform across set/ramp/mod: voice=>3, txn-id=>4, channel=>5
 param-event = { 0 => uint, 1 => float32, ? 2 => int, ? 3 => uint, ? 4 => uint, ? 5 => uint }
 ramp-event  = { 0 => uint, 1 => float32, 2 => tstamp, ? 3 => uint, ? 4 => uint, ? 5 => uint }
-mod-event   = { 0 => uint, 1 => float32, ? 2 => uint, ? 3 => uint }
+mod-event   = { 0 => uint, 1 => float32, ? 3 => uint, ? 4 => uint, ? 5 => uint }
 transport-event = { 0 => uint, ? 1 => float64, ? 2 => [uint, uint], ? 3 => uint64,
                     ? 4 => float64, ? 5 => [float64, float64], ? 6 => float64 }
 param  = { 0 => uint, 1 => tstr, ? 2 => tstr, ? 3 => tstr, ? 4 => [float, float],

@@ -2,7 +2,7 @@
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 
-Specification, Draft 0.3.6 — 15 June 2026
+Specification, Draft 0.3.7 — 16 June 2026
 
 | | |
 |---|---|
@@ -13,6 +13,8 @@ Specification, Draft 0.3.6 — 15 June 2026
 | **Schema & reference code license** | Apache-2.0 |
 | **Patent policy** | Royalty-free; contributors sign a non-assertion covenant (§19) |
 | **Feedback** | via HARP Enhancement Proposals (HEPs), see §18 |
+
+> **Changes in 0.3.7** — Errata surfaced while sizing the per-voice/modulation event layer against the reference engine and exercising cross-format (VST3↔AU) recall. **Event addressing made uniform**: the optional `voice` / `txn-id` / `channel` fields now sit at keys 3 / 4 / 5 on `param-event`, `ramp-event`, *and* `mod-event` alike — `mod-event` previously carried voice/txn at keys 2/3 and could not address a part at all, forcing encoders/decoders to special-case it. One addressing convention now spans all parameter events, and modulation can target a multitimbral part's base value (key 5), not only a sounding voice (§9.4). No deployed implementation decodes `mod` yet, so this is a pre-implementation consistency fix, not a break. **MPE vs. part**: clarified that the UMP channel nibble *is* the multitimbral part, so a shell bridging classic MPE — which spreads one instrument's notes across channels for per-note expression — MUST collapse an MPE zone onto a single part and carry the per-note dimension as per-voice events (§9.5) or UMP per-note controllers (§9.10), never by letting an MPE member channel become the HARP part (which would scatter a chord across timbres) (§9.4, §9.10). **Recall bundle**: made explicit that the serialized bundle is *not* byte-canonical across saves — the embedded ref generation advances on each snapshot — so recall equivalence is the *state-closure* content hash (§11.3), never a byte comparison of two bundles (§15.3).
 
 > **Changes in 0.3.6** — Host-runtime model clarified where the shell↔device mapping is many-to-one (§15.1, §15.2). A device is a single transport client (one session, one claim), but several shells MAY share that session — the runtime keys sessions by `(vendor, product, serial)` and a shell binding an already-bound unit *attaches* rather than opening a second claim the transport forbids. Arbitration is split: **state** stays single-writer (one *controller* owns the patch — `live/project`, params, `state.*`), but **events are not state** (a note is momentary input, not a persistent edit), so shells sharing a session form a *multitimbral group* — each assigned a disjoint §9.10 channel range, contributions merged in timestamp order. This is how one physical unit appears as several DAW instrument tracks. A multitimbral device exposes per-part output channels (§6.3) demultiplexed to each shell — every track gets its own audio — optionally alongside a summed main mix; a single-mix device falls back to one *audio owner* with silent siblings. No wire-protocol change — this constrains host behavior only; the reference runtime is embedded in-process (a process-global registry) and migrates to the §15.1 daemon without changing the contract.
 
@@ -584,14 +586,17 @@ ramp-event  = { 0 => uint param-id, 1 => float32 target,
                 ? 3 => uint voice, ? 4 => uint txn-id,
                 ? 5 => uint channel }
 mod-event   = { 0 => uint param-id, 1 => float32 offset,        ; signed, normalized
-                ? 2 => uint voice, ? 3 => uint txn-id }
+                ? 3 => uint voice, ? 4 => uint txn-id,
+                ? 5 => uint channel }
 ```
+
+The optional addressing fields are uniform across all three: **`voice` is always key 3, `txn-id` key 4, `channel` key 5** — so one decode path serves set, ramp, and mod. (`param-event` key 2 is an optional raw integer value; `ramp-event` key 2 is the ramp `end` timestamp; `mod-event` has no key-2 field.)
 
 **Set** applies a value at its timestamp. **Ramp** interpolates linearly in normalized space from the value in effect at the event's timestamp to `target` at `end`; the device interpolates at no less than its declared control rate, which is what makes automation zipper-free *and* cheap — a DAW curve becomes a handful of ramps per block instead of a point per tick. A new set or ramp on the same (param, voice) supersedes any ramp in flight. Devices claiming `evt.param` MUST implement ramps.
 
 **Mod** (capability `evt.param.mod`) sets the current additive modulation offset on top of the base value, clamped after summation; it MUST NOT alter the stored base value and MUST NOT appear in base-value echo. This is CLAP's automation/modulation split, and it maps naturally onto hardware mod-matrix thinking: the knob position is sacred; modulation breathes around it. Devices SHOULD smooth offset changes at control rate.
 
-**Channel** (the optional `channel` field, 0..15, absent ⇒ 0) selects the **multitimbral part** the set/ramp addresses, on a device that declares more than one part (capability `evt.multitimbral`; §15.2). It addresses a part's *base parameter* — persistent, stored in the part's state, and echoed — and is therefore distinct from `voice` (§9.5), which addresses a *transient sounding voice* and MAY be ignored once that voice is gone. A single-part device ignores `channel`; absence is part 0, so the single-part wire is unchanged. Notes carry their part in the UMP channel nibble (§9.10) by the same numbering, so a shell's notes and its parameter edits land on the same part.
+**Channel** (the optional `channel` field, 0..15, absent ⇒ 0) selects the **multitimbral part** the set, ramp, or mod addresses, on a device that declares more than one part (capability `evt.multitimbral`; §15.2). It addresses a part's *base parameter* — persistent, stored in the part's state, and echoed — and is therefore distinct from `voice` (§9.5), which addresses a *transient sounding voice* and MAY be ignored once that voice is gone. A single-part device ignores `channel`; absence is part 0, so the single-part wire is unchanged. Notes carry their part in the UMP channel nibble (§9.10) by the same numbering, so a shell's notes and its parameter edits land on the same part. Because that channel nibble *is* the part, a shell bridging classic MPE — which spreads one instrument's notes across channels for per-note pitch and expression — MUST collapse the MPE zone onto a single part and carry the per-note dimension as per-voice events (§9.5) or UMP per-note controllers (§9.10); it MUST NOT let an MPE member channel become the HARP `channel`, which would scatter a single chord across parts.
 
 **Echo**: devices MUST emit `param` events for front-panel and internally-driven base-value changes (`evt.param.echo`, REQUIRED for `harp-recall`) so shells reflect knob movements and record automation, timestamped by the device.
 
@@ -928,7 +933,7 @@ recall-bundle = { 0 => tstr "harpb", 1 => uint version,
                   ? 6 => tstr }                     ; user note
 ```
 
-Shells MUST embed the full **state closure** of `live/project` (as defined in §11.3 — snapshot parent links excluded; embedding history is OPTIONAL and usually wasteful; typical sizes are small, patches are kilobytes) and SHOULD embed `sys/settings`. For `lib/samples`, shells embed hashes always and content optionally (user setting; sample libraries can be gigabytes) — a project with hash-only samples reopens with verification and a "fetch from device / locate library" flow rather than blind trust. Because bundles are content-addressed, a project moved to another machine, or another *unit* of the same model, restores exactly: that is the portability story, and it falls out of §10 with no extra machinery.
+Shells MUST embed the full **state closure** of `live/project` (as defined in §11.3 — snapshot parent links excluded; embedding history is OPTIONAL and usually wasteful; typical sizes are small, patches are kilobytes) and SHOULD embed `sys/settings`. For `lib/samples`, shells embed hashes always and content optionally (user setting; sample libraries can be gigabytes) — a project with hash-only samples reopens with verification and a "fetch from device / locate library" flow rather than blind trust. Because bundles are content-addressed, a project moved to another machine, or another *unit* of the same model, restores exactly: that is the portability story, and it falls out of §10 with no extra machinery. The serialized bundle is **not byte-canonical across saves** — a ref's generation advances on each snapshot, so two saves of the same logical state differ in those bytes — therefore recall equivalence is the **state-closure content hash** (§11.3, the hash-equality of T5), never a byte comparison of two bundles. This also makes the bundle format-agnostic: a VST3 and an AU shell persisting the same state produce the same closure (the cross-format move of §15.4 compares restored render/content, not raw bytes).
 
 ### 15.4 Shell behavior
 
@@ -1039,9 +1044,10 @@ latency-profile = [* { 0 => uint, 1 => uint, 2 => uint, ? 3 => uint }]
 
 ; --- events ---
 event = [ tstamp, etype: 0..7, any ]
-param-event = { 0 => uint, 1 => float32, ? 2 => int, ? 3 => uint, ? 4 => uint }
-ramp-event  = { 0 => uint, 1 => float32, 2 => tstamp, ? 3 => uint, ? 4 => uint }
-mod-event   = { 0 => uint, 1 => float32, ? 2 => uint, ? 3 => uint }
+; optional addressing is uniform across set/ramp/mod: voice=>3, txn-id=>4, channel=>5
+param-event = { 0 => uint, 1 => float32, ? 2 => int, ? 3 => uint, ? 4 => uint, ? 5 => uint }
+ramp-event  = { 0 => uint, 1 => float32, 2 => tstamp, ? 3 => uint, ? 4 => uint, ? 5 => uint }
+mod-event   = { 0 => uint, 1 => float32, ? 3 => uint, ? 4 => uint, ? 5 => uint }
 transport-event = { 0 => uint, ? 1 => float64, ? 2 => [uint, uint], ? 3 => uint64,
                     ? 4 => float64, ? 5 => [float64, float64], ? 6 => float64 }
 param  = { 0 => uint, 1 => tstr, ? 2 => tstr, ? 3 => tstr, ? 4 => [float, float],

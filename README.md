@@ -83,14 +83,14 @@ real devices on top of the protocol is the roadmap, not a claim about the
 present. The reference engine is also still monophonic *per part* — real
 polyphony, per-voice/MPE expression, and CLAP-style non-destructive modulation
 are the next big step toward a first-class modern instrument. The spec is an
-**editor's draft** (0.3.6): breaking changes are expected and negotiated at
+**editor's draft** (0.3.7): breaking changes are expected and negotiated at
 `hello`. The four-actions recall UI, a CLAP port, and the Ethernet binding are
 next — the [Status](#status) section is the full breakdown.
 
 ## Repository map
 
 ```
-spec/             the specification (draft 0.3.6) + machine-readable CDDL
+spec/             the specification (draft 0.3.7) + machine-readable CDDL
 core/             portable C11 protocol library, no dependencies:
                   framing, deterministic CBOR, SHA-256, content-addressed
                   objects, crash-atomic ref store, audio frame codec
