@@ -23,8 +23,9 @@ sync, and DAW compatibility from scratch.
 
 HARP is a complete, working implementation of that integration — with an open
 spec underneath, if you want to build a device on it. The reference device is
-a Raspberry Pi running an 8-knob stereo synth; anything that speaks the
-protocol gets the same treatment from any conforming host:
+a Raspberry Pi running a 16-part multitimbral synth (13 params per part);
+anything that speaks the protocol gets the same treatment from any conforming
+host:
 
 - **Total recall, Git-style** — device state is content-addressed and
   hash-verified; a saved project reopens with the hardware *provably* in
@@ -38,6 +39,13 @@ protocol gets the same treatment from any conforming host:
   identical, faster than real time: offline bounce through a physical box
   at ~25× real time, with **16 ms of reported latency at DAW buffers ≤ 256**
   — in the neighborhood of a good audio interface.
+- **Multitimbral, addressed like plugins** — one physical device is one
+  session, and several shell instances can share it: drop the plugin on a
+  handful of DAW tracks and each instance drives its own *part* — its own
+  channel, params, recall state, and stereo output (16 parts, with a summed
+  main mix alongside the per-part outputs). A recall-safe **Part** knob persists
+  each track's part in the project, and that per-part state moves intact between
+  the VST3 and AU formats.
 - **Sample-accurate everything** — DAW automation becomes
   device-interpolated ramps applied within ±1 sample; notes travel as UMP;
   an event *fence* makes "applied late" structurally impossible rather
@@ -59,17 +67,22 @@ protocol gets the same treatment from any conforming host:
 **What "works" means here:** the four protocol planes (control, state, events,
 audio) are implemented end-to-end and verified on real hardware — recall
 through Ableton's own save/reopen, a tempo-locked arpeggiator, sample-accurate
-automation, offline bounce through the box. The plugin shell builds and is
-CI-validated on **macOS, Windows, and Linux** — a VST3 on all three (pluginval
-strictness 10) plus an Audio Unit on macOS (`auval`) — and the device has been
-driven from **Ableton Live** (macOS + Windows) and **Renoise** (Windows) by
-hand, plus a headless **REAPER** render-and-recall e2e on Linux that runs on
-every push.
+automation, offline bounce through the box, and a 16-part multitimbral instrument
+driven by several plugin instances over one shared session. The plugin shell
+builds and is CI-validated on **macOS, Windows, and Linux** — a VST3 on all
+three (pluginval strictness 10) plus an Audio Unit on macOS (`auval`) at full
+parity, with a project's per-part recall state moving between the two formats —
+and the device has been driven from **Ableton Live** (macOS + Windows) and
+**Renoise** (Windows) by hand, plus a headless **REAPER** render-and-recall e2e
+on Linux that runs on every push.
 
 **What it is, and isn't, yet:** today HARP is a complete recall + audio system
-with one reference device — a Raspberry Pi synth. It is *not* yet an ecosystem
-of instruments; building richer synths and shipping real devices on top of the
-protocol is the roadmap, not a claim about the present. The spec is an
+with one reference device — a Raspberry Pi synth, now 16-part multitimbral. It
+is *not* yet an ecosystem of instruments; building richer synths and shipping
+real devices on top of the protocol is the roadmap, not a claim about the
+present. The reference engine is also still monophonic *per part* — real
+polyphony, per-voice/MPE expression, and CLAP-style non-destructive modulation
+are the next big step toward a first-class modern instrument. The spec is an
 **editor's draft** (0.3.6): breaking changes are expected and negotiated at
 `hello`. The four-actions recall UI, a CLAP port, and the Ethernet binding are
 next — the [Status](#status) section is the full breakdown.
@@ -81,20 +94,25 @@ spec/             the specification (draft 0.3.6) + machine-readable CDDL
 core/             portable C11 protocol library, no dependencies:
                   framing, deterministic CBOR, SHA-256, content-addressed
                   objects, crash-atomic ref store, audio frame codec
-device/           harp-deviced — the reference device daemon: an 8-knob
-                  stereo synth engine behind the protocol. Transports:
-                  TCP (simulation, any OS) and FunctionFS USB gadget (Linux)
+device/           harp-deviced — the reference device daemon: a 16-part
+                  multitimbral synth engine (13 params/part) behind the
+                  protocol. Transports: TCP (simulation, any OS) and
+                  FunctionFS USB gadget (Linux)
 host/             harp-probe — host-side CLI: recall flows, audio capture,
                   offline render, determinism checks (libusb)
 shell/            the plugin shells over one embedded runtime:
                   VST3 ("HARP RefDev") and Audio Unit (shell/au) — same
-                  params, same Recall Bundle in the project file; the AU
-                  also joins the host's CoreAudio workgroup. Both render
-                  BYTE-IDENTICAL audio from the same drive (asserted by
+                  params, same Recall Bundle, same "Part" routing param. The
+                  runtime registry lets several instances naming one device
+                  SHARE its session (each owns a part); the AU also joins the
+                  host's CoreAudio workgroup. Both render BYTE-IDENTICAL audio
+                  and a project's recall state moves between them (asserted by
                   the conformance kit)
 tools/vst3-host/  CLI VST3 host for automated testing of any plugin —
-                  params, block processing, WAV+hash, state round-trips
-tools/au-host/    its Audio Unit twin (drives the AU shell; same hashes)
+                  params, block processing, WAV+hash, state round-trips,
+                  multi-instance shared-session driving
+tools/au-host/    its Audio Unit twin (drives the AU shell; same hashes;
+                  save/load-state for the cross-format recall e2e)
 tests/            unit tests for the core (RFC 8949 vectors included)
 docs/             architecture one-pager, VST3 shell design plan
 scripts/          Raspberry Pi provisioning + operations runbook
@@ -190,6 +208,10 @@ The shell can also be driven without any DAW, which is how it is tested:
   — components, planes, and the shell's threading model.
 - **VST3 shell design plan**: [`docs/vst3-shell-plan.md`](docs/vst3-shell-plan.md)
   — decisions, DAW-compatibility lore, and what's deliberately deferred.
+- **Multitimbral plan + test matrix**: [`docs/multitimbral-plan.md`](docs/multitimbral-plan.md)
+  — the per-part build (device parts → per-part params → session sharing →
+  event merge → per-part audio → Part param), what each phase verified, and
+  the deferred items.
 - **Pi runbook**: [`scripts/pi-bringup.md`](scripts/pi-bringup.md) —
   provisioning, the sudo-free deploy loop, USB debugging tricks.
 
@@ -213,12 +235,21 @@ The shell can also be driven without any DAW, which is how it is tested:
 - **Musical time (§9.7)** — the device follows `evt.transport`: a note-latch
   arpeggiator whose step clock derives from the (timestamp, PPQ, tempo) anchor
   lands on division boundaries sample-exactly, survives loop wraps, and renders
-  a byte-identical *groove hash*. (Params grew to 12 — the first param-map-hash
-  change; old projects map onto matching ids with a warning, §9.3.)
-- **Multi-device** — two boards on one bus; each instance binds its own by USB
-  identity (saved serial, else first unclaimed same-model — never a different
-  synth), reconnect pins that exact unit, two instances claim two devices by
-  contention.
+  a byte-identical *groove hash*. (The param map is now 13 ids, applied per
+  part; old projects map onto matching ids with a warning, §9.3.)
+- **Multitimbral (§9.4, §15.1–§15.2)** — one device is one session, and several
+  shell instances that name the same unit *share* it, each owning a part
+  (channel): its own params, its own recall, its own demuxed stereo output (16
+  parts; a summed main mix alongside the per-part pairs). A recall-safe **Part**
+  parameter persists each instance's part in the project, and per-part state
+  moves between the VST3 and AU formats. Verified on hardware: channel→part
+  routing is exclusive (no bleed), per-part timbres restore losslessly across
+  save/reopen, sibling parts engage in the summed mix, a part added mid-session
+  re-negotiates its own audio, and a per-part param reaches only its own part.
+- **Multi-device** — two *separate* boards on one bus (distinct from
+  multitimbral above): each instance binds its own by USB identity (saved
+  serial, else first unclaimed same-model — never a different synth), reconnect
+  pins that exact unit, two instances claim two devices by contention.
 - **The web panel** — front panel plus a live protocol inspector: refs with
   ticking generations, the dirty flag, counters, and Snapshot / Panic /
   one-click Load of any archived state (patch time-travel — the current state
@@ -230,9 +261,13 @@ The shell can also be driven without any DAW, which is how it is tested:
   badge): recall round-trips, ±1-sample note timing with zero late events, a
   realtime soak flooding automation + notes + panel traffic across DAW buffers
   64–1024 (zero silence gaps, zero drops, bounded padding), an automated
-  mid-stream replug, an IDM-flood determinism gate, and the REAPER real-DAW
-  determinism + recall round-trip — with the daemon under test built on the
-  board from the commit being tested.
+  mid-stream replug, an IDM-flood determinism gate, the REAPER real-DAW
+  determinism + recall round-trip, and the **multitimbral matrix** — channel→part
+  routing, per-part recall, session sharing, an alias group playing, per-part
+  audio demux (incl. a mid-session re-negotiation), per-part param isolation,
+  and cross-format VST3↔AU recall (macOS) — with the daemon under test built on
+  the board from the commit being tested. The runtime threads are also
+  ThreadSanitizer-clean (incl. the multi-source event merge + demux) on the rig.
 - **Sandboxed suite**: builds + unit tests on three OSes, pluginval
   strictness 10 (macOS / Windows / Linux), `auval` (macOS), fuzzed parsers
   (libFuzzer + ASan), and a protocol-abuse test that slams a live daemon with
@@ -242,9 +277,11 @@ The shell can also be driven without any DAW, which is how it is tested:
   T15/T17 (byte-identical renders), T16 (event timing).
 
 **Not yet:** the four-safe-actions UI (v0 auto-resolves by Push-with-archive),
-runtime/shell process split (§15.1), firmware management (§13), class-audio
-coexistence (§8.5), free-running ASRC for analog devices, a CLAP port, the TCP
-companion spec (§4.4).
+per-part **polyphony** + per-voice/MPE expression and non-destructive modulation
+(§9.5–§9.6), output metering (§9.9), the deeper diagnostics (`diag.bundle` /
+loopback, §14), runtime/shell process split (§15.1), firmware management (§13),
+class-audio coexistence (§8.5), free-running ASRC for analog devices, a CLAP
+port, the TCP companion spec (§4.4).
 
 The spec is an **editor's draft**: breaking changes expected, version
 negotiated at `core.hello`. Changes flow through HARP Enhancement Proposals
