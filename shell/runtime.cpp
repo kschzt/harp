@@ -584,7 +584,7 @@ void HarpRuntime::supervisor() {
 }
 
 bool HarpRuntime::start(uint32_t sampleRate) {
-    if (running_.load()) return connected();
+    if (running_.load(std::memory_order_acquire)) return connected();
     harp_plat_init(); /* hi-res timers for the sub-ms pacing/idle waits (Windows) */
     rate_ = sampleRate;
     /* test/field override: HARP_OUT_SLOTS="a,b,..." forces the active-slots-out
@@ -655,8 +655,8 @@ void HarpRuntime::stop() {
     harp_usb_ctx_destroy(usbCtx_);
     usbCtx_ = nullptr;
     log_msg("stopped (underruns: %llu, padded samples: %llu)",
-            (unsigned long long)underruns_.load(),
-            (unsigned long long)padSamples_.load());
+            (unsigned long long)underruns_.load(std::memory_order_relaxed),
+            (unsigned long long)padSamples_.load(std::memory_order_relaxed));
 }
 
 /* ---------------- audio thread side ---------------- */

@@ -53,10 +53,11 @@
  * pump drains exactly that one ring with that one channel — byte-identical to
  * the pre-P5 timedRing_ + chan_ path (the golden gate).
  *
- * SCOPE: P5 merges EVENTS only. Per-part AUDIO demux (each alias hearing only
- * its own part) is OUT OF SCOPE — the owner still pulls the MAIN MIX (which
- * sums all parts), and attached/sibling instances stay audio-SILENT. That is
- * tracked as the follow-up P5b. */
+ * SCOPE: this struct is the EVENT plane merge. The per-part AUDIO demux (each
+ * alias hearing only its own part) is implemented separately by the AudioSink
+ * registry below (P5b) — the owner's reader() splits the device frame into
+ * per-part sink rings; an instance with no sink still pulls the summed MAIN MIX,
+ * the byte-identical default. */
 struct EventSource {
     TimedRing ring;            /* this instance's outbound events (SPSC) */
     std::atomic<uint8_t> chan; /* the part (§9.4 key 5) every event carries */

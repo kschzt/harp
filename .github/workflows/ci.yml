@@ -141,7 +141,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: build
         run: cmake -B build && cmake --build build -j
-      - name: unit tests
+      - name: unit tests (core + device_codec params-blob)
         run: ctest --test-dir build --output-on-failure
       - name: ring tests under ThreadSanitizer
         run: |

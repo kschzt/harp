@@ -134,6 +134,9 @@ add_test(NAME core COMMAND harp-tests)
 # device-linked test (guarded NOT WIN32, like harp-deviced). It reuses
 # fuzz/state_stubs.c — the SAME real g_params[] id table + abort-stubs the
 # fuzz-state target uses — so there's one place to track id drift, not two.
+# NOT WIN32: device/state.c (the per-part params-blob codec under test) pulls
+# pthread/POSIX, so device_codec runs on Linux/macOS CI; on Windows the codec is
+# exercised end-to-end over the live device protocol in the hw suite instead.
 if(NOT WIN32)
   find_package(Threads REQUIRED)
   add_executable(harp-device-tests

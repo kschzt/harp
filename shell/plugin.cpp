@@ -26,6 +26,7 @@
 
 #include "runtime.h"
 #include "runtime_registry.h"
+#include "shell_constants.h"
 #include "ump.h"
 
 using namespace Steinberg;
@@ -59,22 +60,16 @@ static constexpr int kNumParams = sizeof(kParams) / sizeof(kParams[0]);
  * can show/persist it per-instance and several aliases each pick a distinct
  * part (the P5c gap — see setActive). It must NOT enter the device param-set
  * path (process() special-cases it, exactly like kPanicParamId) and must NOT
- * affect param-map-hash (it isn't a device param). */
-static constexpr uint32_t kPartParamId = 98;
-static constexpr int32 kPartStepCount = 15; /* 16 parts (0..15); VST3 steps = N-1 */
-/* hidden parameter the DAW's panic (CC 120/123) maps onto via IMidiMapping */
+ * affect param-map-hash (it isn't a device param).
+ *
+ * kPartParamId / kPartStepCount and the recall component-state header
+ * (kStateHeaderMagic / kStateHeaderLen) are SHARED with the AU shell via
+ * shell_constants.h — both formats must agree for a project to move between them
+ * (cross-format-recall-test.sh). See that header for why 'H'=0x48 can never start
+ * a recall bundle (so an old header-less state migrates to Part 0). */
+/* hidden parameter the DAW's panic (CC 120/123) maps onto via IMidiMapping
+ * (VST3-only — the AU surfaces panic through MIDI CC directly, no param) */
 static constexpr uint32_t kPanicParamId = 99;
-
-/* Component-state header (P6 recall-safe Part persistence). getState writes
- * this small versioned header carrying the Part, THEN the existing recall
- * bundle bytes verbatim; setState parses it and hands the REMAINING bundle to
- * setStateBundle exactly as before. The magic's first byte (ASCII 'H' = 0x48,
- * CBOR major type 2 / byte-string) can NEVER be a recall bundle's first byte
- * (every bundle starts with a CBOR MAP — encode_bundle's harp_cbor_map(out, 6)
- * => 0xA6, major type 5), so an OLD header-less component state (a raw bundle)
- * is detected unambiguously and migrates with Part=0, byte-compatible. */
-static const uint8_t kStateHeaderMagic[3] = {'H', 'P', '1'};
-static constexpr size_t kStateHeaderLen = sizeof kStateHeaderMagic + 1; /* magic + part byte */
 
 /* ---------------- processor ---------------- */
 
@@ -244,9 +239,10 @@ public:
         return symbolicSampleSize == kSample32 ? kResultTrue : kResultFalse;
     }
 
-    /* Zero the output bus and flag it silent. The dormant-attached path (P4)
-     * and any pre-acquire call route here: no runtime touch, no event queueing,
-     * just clean silence so the host bus is well-defined. */
+    /* Zero the output bus and flag it silent. Routed here by: a pre-acquire call
+     * (no runtime yet), and an attached instance with NO per-part audio sink (the
+     * default — audio-silent, though it still merges EVENTS per P5). No runtime
+     * touch, no event queueing — just clean silence so the host bus is well-defined. */
     tresult processSilence(ProcessData &data) {
         if (data.numOutputs < 1 || data.numSamples <= 0 ||
             data.outputs[0].numChannels < 1 || !data.outputs[0].channelBuffers32)

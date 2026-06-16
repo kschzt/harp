@@ -10,7 +10,9 @@
 #   - PLUG/VST point at ~/.vst3 instead of ~/Library/Audio/Plug-Ins
 #   - the bus board is PI4B-0002, not the desk unit PI4B-0001
 #   - replug restarts the daemon as ci@harptest.local (never jak)
-#   - no AU: it is macOS-only, so golden/tempo-lock auto-skip the AU half
+#   - no AU: it is macOS-only, so golden/tempo-lock auto-skip the AU half and
+#     cross-format-recall-test self-SKIPs (exit 2) — VST3<->AU project move is
+#     exercised only on the macOS desk unit (no AU-capable automated runner)
 #   - multidevice-test self-skips (it needs two boards; the rig has one)
 # The Ableton "Live" claim guards are harmless here (no DAW on the runner).
 set -u
@@ -71,6 +73,7 @@ run scripts/golden-test.sh
 run scripts/multitimbral-test.sh
 run scripts/recall-test.sh
 run scripts/recall-perpart-test.sh
+run scripts/cross-format-recall-test.sh  # self-SKIPs on Linux (AU is macOS-only) — keeps the macOS-only gate visible in the log
 run scripts/timing-test.sh
 run scripts/soak.sh "${SOAK_SECONDS:-30}"
 run scripts/tempo-lock-test.sh

@@ -91,6 +91,8 @@ XT=$(sink_rms "0.9,0.2"); echo "   part-1 sink-rms (XTALK)= $XT"
 
 case "$HI$LO$XT" in *-1*) echo "PART-PARAM-ISO FAIL: a run never connected/produced audio (device busy?)"; exit 3 ;; esac
 
+# 1.5x is conservative vs the observed separation on PI4B-0001 (HIGH/LOW ~2–4x;
+# XTALK lands within ~1x of LOW), leaving margin for the realtime pull's RMS jitter.
 ROUTES=$(python3 -c "print(1 if $HI > 1.5*$LO else 0)")
 ISOLATED=$(python3 -c "print(1 if $XT < 1.5*$LO else 0)")
 echo "── HIGH=$HI LOW=$LO XTALK=$XT  (routes: HIGH>1.5·LOW ; isolated: XTALK<1.5·LOW)"

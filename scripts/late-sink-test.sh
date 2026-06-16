@@ -33,7 +33,7 @@ BUILD="${BUILD:-build-mt-host}"      # the multi-instance harness, built WITHOUT
 INSTANCES="${INSTANCES:-4}"          # owner + 3 attached parts; the first late sink captures
 SECONDS_RUN="${SECONDS_RUN:-8}"
 RUNS="${RUNS:-5}"                    # >=5: reliability, not a single lucky capture
-FLOOR="${FLOOR:-0.002}"             # sink-rms floor: clearly non-silent (obs ~0.03)
+FLOOR="${FLOOR:-0.002}"             # sink-rms floor: clearly non-silent (obs ~0.013–0.05 on PI4B-0001)
 
 # claim guard: a DAW holding the device steals the claim and every render is
 # silence (a bogus fail) — a hard error, never a silent skip.
@@ -82,7 +82,7 @@ capture() {
         # retry it (mirrors alias-part-audio-test retrying a silent capture). Once
         # the session is healthy, sink-rms is the post-re-neg part energy we assert
         # on (silent or not — a connected+reneg'd+audible-session silent sink is a
-        # REAL late-sink failure, never retried away). */
+        # REAL late-sink failure, never retried away).
         if [ "$conn" -gt 0 ] && [ "$reneg" -gt 0 ] && [ -n "$s" ] && [ -n "$m" ] \
            && [ "$(python3 -c "print(1 if $m > $FLOOR else 0)")" = 1 ]; then
             echo "$s"; return

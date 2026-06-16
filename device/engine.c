@@ -888,6 +888,7 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                         if (g_params[j].id == ev->a) {
                             part_pput(p, j, ev->v);
                             p->ramps[j].active = false; /* set supersedes ramp (§9.4) */
+                            break; /* param ids are unique — stop scanning */
                         }
                     atomic_store_explicit(&g_touch_pending, 1,
                                           memory_order_release);
@@ -901,6 +902,7 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                             p->ramps[j].end = ev->end;
                             p->ramps[j].start_val = part_pget(p, j);
                             p->ramps[j].target = ev->v;
+                            break; /* param ids are unique — stop scanning */
                         }
                     atomic_store_explicit(&g_touch_pending, 1,
                                           memory_order_release);

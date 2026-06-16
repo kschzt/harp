@@ -26,6 +26,7 @@
 
 #include "runtime.h"
 #include "runtime_registry.h"
+#include "shell_constants.h"
 #include "ump.h"
 
 #include <string>
@@ -50,27 +51,16 @@ static const AuParam kAuParams[] = {
 };
 static constexpr UInt32 kNumAuParams = sizeof(kAuParams) / sizeof(kAuParams[0]);
 
-/* HOST-SIDE routing parameter (NOT a device param) — id 98, mirroring the VST3
- * shell's kPartParamId (shell/plugin.cpp). It selects the multitimbral PART
- * (§9.4 channel 0..15) this AU instance owns; a DAW can show/persist it per-
- * instance so several aliases on one unit each pick a distinct part (P6). It
- * must NOT enter the device param-set path (au_SetParameter special-cases it,
- * exactly as the VST3 process() does) nor affect the param-map-hash (it isn't a
- * device param). Stepped 0..15, default 0 => part 0, the single-instance/golden
- * default. Reported AFTER the 13 device params in the parameter list. */
-static constexpr AudioUnitParameterID kPartParamId = 98;
-static constexpr int kPartStepCount = 15; /* 16 parts (0..15) */
-
-/* Component-state header (P6 recall-safe Part persistence) — IDENTICAL to the
- * VST3 shell's kStateHeaderMagic/kStateHeaderLen so a project's component state
- * moves between formats byte-for-byte. ClassInfo's harp-bundle now carries this
- * versioned header (magic + part byte) THEN the unchanged recall bundle bytes;
- * apply strips it and adopts the Part. The magic's first byte (ASCII 'H' =
- * 0x48, CBOR major type 2) can NEVER be a recall bundle's first byte (every
- * bundle starts with a CBOR map => 0xA6), so an OLD header-less blob is detected
- * unambiguously and migrates with Part=0, byte-compatible. */
-static const uint8_t kStateHeaderMagic[3] = {'H', 'P', '1'};
-static constexpr size_t kStateHeaderLen = sizeof kStateHeaderMagic + 1; /* magic + part byte */
+/* The "Part" routing parameter id (98), its step count, and the recall
+ * component-state header (kStateHeaderMagic/kStateHeaderLen) are SHARED with the
+ * VST3 shell via shell_constants.h — both formats must agree for a project's
+ * component state to move between VST3 and AU byte-for-byte (P6;
+ * cross-format-recall-test.sh). HOST-SIDE routing only: au_SetParameter special-
+ * cases id 98 out of the device param-set path (exactly as the VST3 process()
+ * does), so it never affects the wire or param-map-hash. The Part is reported
+ * AFTER the 13 device params in the parameter list; default 0 => part 0, the
+ * single-instance/golden default. kPartParamId is used where an
+ * AudioUnitParameterID is expected (== uint32_t). */
 
 struct HarpAU {
     AudioComponentPlugInInterface iface; /* MUST be first */
