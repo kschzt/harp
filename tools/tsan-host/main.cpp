@@ -70,6 +70,15 @@ static size_t g_capture_cap = 0;     /* max floats to retain (0 = capture off) *
  * that the structure is race-free. Same bound/oracle as the owner capture. */
 static std::vector<float> g_sink_capture;
 static size_t g_sink_capture_cap = 0;
+/* --late-sink: gate the designated sink's CAPTURE so it begins only AFTER the
+ * P5b re-negotiation has actually streamed the wider union. The sink's audio
+ * thread starts (its sole consumer — SPSC) the moment the sink is registered, but
+ * retains samples into g_sink_capture only once main() arms this (it polls the
+ * owner's renegCount() and a short settle). That makes the non-silent proof
+ * DETERMINISTIC: the capture never accumulates the pre-re-neg silence that used
+ * to dilute the RMS run-to-run. Default true (every other config captures from
+ * the start, unchanged); --late-sink sets it false until the re-neg lands. */
+static std::atomic<bool> g_capture_armed{true};
 /* HARP_ISO_LEVELS="l0,l1,.." — the param-isolation e2e: instead of the random
  * param flood, each instance drives ONLY a controlled, audible voice on ITS part
  * (fixed tone+env, level = its entry here). So an attached sink's energy tracks
@@ -119,7 +128,8 @@ static void part_audio_thread(HarpRuntime *rt, AudioSink *sink, uint32_t block, 
         /* --part-audio play-proof: keep ONE designated attached sink's demuxed
          * audio so the script can show it is non-silent (the alias hears its
          * part). One producer here, sole consumer of g_sink_capture. */
-        if (capture && g_sink_capture_cap && g_sink_capture.size() < g_sink_capture_cap) {
+        if (capture && g_capture_armed.load(std::memory_order_acquire) &&
+            g_sink_capture_cap && g_sink_capture.size() < g_sink_capture_cap) {
             size_t take = (size_t)block * 2;
             if (g_sink_capture.size() + take > g_sink_capture_cap)
                 take = g_sink_capture_cap - g_sink_capture.size();
@@ -193,6 +203,11 @@ int main(int argc, char **argv) {
     bool partAudio = false; /* --part-audio: each attached instance pulls its OWN
                              * demuxed part sink (P5b), not silence — exercises the
                              * per-part sink registry + reader() demux under TSan */
+    bool lateSink = false; /* --late-sink: register the attached sinks AFTER the
+                            * owner has started + run a few seconds, exercising the
+                            * P5b RE-NEGOTIATION path — the late sink is in the
+                            * registry but NOT the live audio.start union until the
+                            * feeder re-streams it. Implies --part-audio. */
     std::string outPath; /* --out: write the owner main-mix WAV + emit its hash */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--instances") && i + 1 < argc) instances = atoi(argv[++i]);
@@ -200,6 +215,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--block") && i + 1 < argc) block = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outPath = argv[++i];
         else if (!strcmp(argv[i], "--part-audio")) partAudio = true;
+        else if (!strcmp(argv[i], "--late-sink")) { lateSink = true; partAudio = true; }
     }
     /* Bound the play-proof capture to the run length (+1 s slack), so --out on a
      * long soak never balloons memory; only the owner audio thread fills it. */
@@ -248,8 +264,13 @@ int main(int argc, char **argv) {
      * together at load, registers them up front. Owner-only --part-audio is
      * harmless: with one instance there is no attached sink, the union stays
      * {0,1}, and the owner pulls the byte-identical main mix. For a shared serial
-     * every attached handle's rt is the owner runtime, so the sink lands there. */
-    if (partAudio)
+     * every attached handle's rt is the owner runtime, so the sink lands there.
+     *
+     * --late-sink DEFERS this: the sinks are registered AFTER the owner has
+     * started + run (below), so each lands in the registry but NOT the live
+     * audio.start union — the P5b RE-NEGOTIATION path the feeder must fix. The
+     * default (before-start) path is unchanged. */
+    if (partAudio && !lateSink)
         for (size_t k = 0; k < handles.size(); k++)
             if (!handles[k].owner) {
                 std::vector<uint32_t> slots = {2u + 2u * (uint32_t)(k & 0xf),
@@ -302,7 +323,89 @@ int main(int argc, char **argv) {
         }
         control.emplace_back(control_thread, h.rt, sources[k], h.owner, seconds);
     }
-    for (int t = 0; t < seconds; t++) nanosleep(&s, nullptr);
+    if (!lateSink) {
+        for (int t = 0; t < seconds; t++) nanosleep(&s, nullptr);
+    } else {
+        /* P5b RE-NEGOTIATION exercise: let the owner's session stream the INITIAL
+         * union (no per-part sink yet -> just {0,1}) for a few seconds, THEN
+         * register every attached instance's sink. Each registerAudioSink lands a
+         * sink whose slots are NOT in the live union, raising audioRenegPending_;
+         * the feeder then audio.stop -> new union -> audio.start + fence reset, and
+         * the late sink begins hearing its part. We spawn each late sink's
+         * part_audio_thread the moment it is registered (its sole consumer, fed by
+         * the owner's reader demux on the NEW wider frames). The FIRST late sink
+         * captures, so the play-proof can show it is non-silent AFTER the re-neg —
+         * proof the feeder added its slots mid-session. */
+        /* Wait for the owner's session to be LIVE before the late add, so the
+         * sink registers DURING a connected stream and the feeder runs the
+         * re-negotiation while the reader + eventPump are active (the whole point
+         * under TSan). Poll the owner runtime's connected() up to ~5 s; if it
+         * never connects (device absent / claim race) we register anyway — the
+         * flag is set and a later sessionUp's audio.start absorbs the sink from
+         * the registry — but on a healthy rig this lands a true mid-session
+         * re-negotiation. A short settle lets the initial {0,1} union stream a
+         * bit first so the re-neg is visibly a CHANGE. */
+        HarpRuntime *owner = nullptr;
+        for (auto &h : handles)
+            if (h.owner) { owner = h.rt; break; }
+        for (int t = 0; t < 50 && owner && !owner->connected(); t++) {
+            struct timespec ms100 = {0, 100000000L};
+            nanosleep(&ms100, nullptr);
+        }
+        /* Brief settle so the initial {0,1} union streams a little (the re-neg is
+         * then visibly a CHANGE). HARP_LATE_SETTLE_MS overrides it: under TSan the
+         * device link can time the slow instrumented host out within ~1 s, so the
+         * tsan run sets it to 0 to register the sink the INSTANT the session is up
+         * and catch the brief live window; the hardware (non-TSan) run leaves the
+         * default so the re-neg is a clear mid-stream change. */
+        long settleMs = 300;
+        if (const char *e = getenv("HARP_LATE_SETTLE_MS")) settleMs = atol(e);
+        struct timespec settle = {settleMs / 1000, (settleMs % 1000) * 1000000L};
+        nanosleep(&settle, nullptr);
+        /* DISARM the designated capture until the re-neg has streamed the wider
+         * union: the sink threads spawn now (each its sole consumer, SPSC) and
+         * pull/drain immediately, but the capturer retains nothing until we arm it
+         * below. So the proof can never accumulate the pre-re-neg silence — it is
+         * deterministic, not 7/8. */
+        g_capture_armed.store(false, std::memory_order_release);
+        uint32_t baseReneg = owner ? owner->renegCount() : 0;
+        for (size_t k = 0; k < handles.size(); k++) {
+            RuntimeHandle &h = handles[k];
+            if (h.owner) continue;
+            std::vector<uint32_t> slots = {2u + 2u * (uint32_t)(k & 0xf),
+                                           3u + 2u * (uint32_t)(k & 0xf)};
+            sinks[k] = h.rt->registerAudioSink(slots); /* -> re-negotiation */
+            if (sinks[k]) {
+                audio.emplace_back(part_audio_thread, h.rt, sinks[k], block,
+                                   !sinkCapturerAssigned);
+                sinkCapturerAssigned = true;
+            }
+        }
+        /* Wait for the re-negotiation(s) to FULLY SETTLE before arming. With
+         * several late sinks registering near-simultaneously the feeder may run
+         * the re-neg in ONE pass or TWO (coalescing is best-effort); a SECOND
+         * re-neg's per-sink ring reset (syncSinkEpoch) would momentarily blank a
+         * capture armed after only the FIRST — the ~1% intermittent silence. So
+         * poll renegCount() until it has occurred AND been STABLE (no further
+         * re-neg) for ~500 ms, then arm: the capture is steady-state, after the
+         * LAST re-neg, deterministically non-silent. Poll up to ~6 s; if the
+         * device drops (no re-neg) we arm anyway so a real silence is a REPORTED
+         * fail, not a hang. */
+        uint32_t lastReneg = baseReneg;
+        int stable = 0;
+        for (int t = 0; t < 60 && owner && g_run.load(); t++) {
+            struct timespec ms100 = {0, 100000000L};
+            nanosleep(&ms100, nullptr);
+            uint32_t rc = owner->renegCount();
+            if (rc != lastReneg) { lastReneg = rc; stable = 0; }       /* a (further) re-neg */
+            else if (rc != baseReneg && ++stable >= 5) break;          /* re-neg'd + stable 500 ms */
+        }
+        struct timespec armSettle = {0, 200000000L}; /* 200 ms: demux fills the ring */
+        nanosleep(&armSettle, nullptr);
+        g_capture_armed.store(true, std::memory_order_release);
+        /* run the remainder with the wider union streaming + the late sinks pulling */
+        for (int t = 0; t < seconds; t++) nanosleep(&s, nullptr);
+    }
     g_run.store(false);
     for (auto &th : control) th.join();
     for (auto &th : audio) th.join();

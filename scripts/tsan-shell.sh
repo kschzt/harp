@@ -66,6 +66,28 @@ if [ -n "$SERIAL" ]; then
     # real signal under TSan, not silence. The only config that covers reader()'s
     # multi-sink demux concurrently with the eventPump merge.
     run partaudio --instances 4 --part-audio --seconds 15 --block 256
+    # P5b RE-NEGOTIATION (--late-sink): the attached sinks register AFTER the owner
+    # is already streaming, so each lands in the registry but NOT the live
+    # audio.start union — the feeder must RE-STREAM the wider union mid-session
+    # (audio.stop -> new union -> audio.start) on the CONTINUOUS SSI domain. This
+    # is the only config that TSan-covers the re-neg's reader quiesce/respawn, the
+    # monotonic-fence epoch baseline (no store(0) racing queue*), and the sink
+    # epoch reset — concurrently with the live reader, eventPump and audio pulls.
+    # HARP_LATE_SETTLE_MS=0: register the sink the INSTANT the session is up, so
+    # the re-neg's reader quiesce/respawn + fence-baseline + sink-epoch transitions
+    # run while the link is live. NOTE: under heavy instrumentation the device often
+    # times the slow TSan host out DURING the re-neg's audio.stop/start, so the
+    # audio.start may not COMPLETE (you'll see "re-negotiation: audio.start failed
+    # / device gone"). That is fine for THIS config: what TSan must watch is the
+    # concurrent STATE TRANSITIONS (the feeder quiescing+respawning the reader,
+    # storing the epoch baseline, resetting sink epochs) racing the live reader /
+    # eventPump / audio pulls — that race surface executes whether or not the wire
+    # audio.start lands. The FUNCTIONAL "the late sink hears its part" reliability
+    # is the non-TSan late-sink-test.sh's job. 8 s (vs 15) keeps the heavily-
+    # instrumented run practical — the re-neg attempt happens once, right at start.
+    export HARP_LATE_SETTLE_MS=0
+    run latesink --instances 4 --late-sink --seconds 8 --block 256
+    unset HARP_LATE_SETTLE_MS
     unset HARP_DEVICE_SERIAL
 else
     echo "  merge: SKIP (no board on the bus to pin for the shared-runtime merge)"

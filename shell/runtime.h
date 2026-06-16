@@ -101,6 +101,18 @@ struct AudioSink {
      * a padded SSI is spent, and late arrivals for it are dropped (audio thread
      * only — this sink's pullAudio is its sole toucher). */
     size_t padDebt = 0;
+    /* STREAM EPOCH — bumped (off the audio path, under sinksMutex_) by audioStart
+     * each time this sink's slots are present in the union it just (re)negotiated.
+     * A LATE sink registered mid-session pulls silence (accruing padDebt) for the
+     * whole gap before the re-neg streams its slots; without correction
+     * settleSinkPadDebt would then DROP the first real post-re-neg samples to pay
+     * that bogus debt, leaving the sink silent (the B3 1-in-8 failure). On its
+     * first pull after the epoch advances, pullAudio (the SOLE consumer, so no
+     * race) ZEROES padDebt and clear()s the stale ring — consumer-side ops, safe
+     * against the reader's producer writes — so real audio plays from the first
+     * demuxed frame. epochSeen is consumer-private (pullAudio only). */
+    std::atomic<uint32_t> epoch{0};
+    uint32_t epochSeen = 0;
     explicit AudioSink(const std::vector<uint32_t> &s) : slots(s) {}
 };
 
@@ -146,6 +158,13 @@ public:
     bool start(uint32_t sampleRate);
     void stop();
     bool connected() const { return connected_.load(std::memory_order_acquire); }
+    /* Count of COMPLETED P5b audio re-negotiations this runtime has performed
+     * (a late/removed sink changed the union -> the feeder re-streamed it). 0 on
+     * the single-instance / owner-only / no-sink path, which never re-negotiates.
+     * A test harness polls this to start a late-sink capture only AFTER the
+     * re-neg has actually streamed the wider union (so the proof is deterministic,
+     * not racing the re-neg). Incremented only on a SUCCESSFUL audio.start. */
+    uint32_t renegCount() const { return renegCount_.load(std::memory_order_acquire); }
 
     /* Which device output slots audio.start subscribes to (§9.x active-slots-out,
      * key 4). DEFAULT {0,1} = the stereo MAIN MIX — the exact render the device
@@ -396,6 +415,11 @@ private:
     void settlePadDebt(); /* drop late arrivals for already-padded SSIs */
     /* the per-sink analogue: drop late arrivals owed to a sink's padded SSIs. */
     void settleSinkPadDebt(AudioSink &sink);
+    /* B3: on a sink's first pull after its slots (re)entered the union, drop the
+     * pad debt + stale ring it accrued while waiting for the re-negotiation, so
+     * the first real demuxed frame is not eaten paying that bogus debt. Consumer-
+     * side (pullAudio) only. */
+    void syncSinkEpoch(AudioSink &sink);
     bool helloAndIdentity();
     /* Build unionSlots_ = owner outSlots_ then every registered sink's slots
      * (deduped, order preserved) and resolve each sink's `cols` to its slots'
@@ -404,8 +428,45 @@ private:
      * sink registered the union is exactly outSlots_ ({0,1} by default) — the
      * byte-identical golden request. */
     void computeUnionSlotsLocked();
+    /* P5b RE-NEGOTIATION decision (off the wire). Build the union that the
+     * current sink set WOULD produce — owner outSlots_ then every registered
+     * sink's slots, deduped, order preserved, exactly as computeUnionSlotsLocked
+     * — into a LOCAL vector and compare it to the LIVE unionSlots_. Returns true
+     * iff they differ. Pure read of the registry + outSlots_; touches NO live
+     * state (not unionSlots_, not any sink's cols), so register/unregisterAudioSink
+     * can call it to decide whether a re-neg is needed WITHOUT disturbing the
+     * reader's in-flight demux. Caller holds sinksMutex_. */
+    bool unionWouldChangeLocked() const;
     bool audioStart(uint32_t rate);
     void audioStopLocked();
+    /* P5b RE-NEGOTIATION (feeder/control thread, under ctlMutex_). A sink that
+     * registered/unregistered mid-session changed the required slot set, so the
+     * live audio.start union is stale and the late sink reads silence. Re-stream
+     * the NEW union WITHOUT a sessionUp (which would reset RT state under the live
+     * audio threads — the B1 race) and WITHOUT a reconnect:
+     *   1. QUIESCE the reader (set readerStop_, join it) so the audio-IN endpoint
+     *      has a SINGLE owner for the stop/start window — the reconnect-free analogue
+     *      of sessionDown joining the reader. connected_ stays TRUE throughout, so
+     *      the feeder/supervisor never tear the session down (no sessionUp -> no
+     *      reset of ssi_/ssiRead_/framesSent_/framesRecv_/padDebtFloats_/the rings
+     *      while the audio threads pull — the B1 race is structurally impossible).
+     *   2. audio.stop -> DRAIN the stream tail (sole reader, like sessionDown) so
+     *      the device's audio writes never block its session loop during the slow
+     *      instrumented round-trip -> audio.start with the NEW union (audioStart
+     *      recomputes unionSlots_ + every sink's cols). Draining the tail is what
+     *      makes the stop/start RELIABLE under TSan (B3) instead of timing the
+     *      control link out.
+     *   3. Advance the §8.3.1 fence EPOCH: evtEpochBase_ = evtQueuedSeq_.load()
+     *      (a single store under ctlMutex_; the monotonic counter is NEVER reset,
+     *      so it never races queue*'s fetch_add — the B2 fix). Events queued before
+     *      the re-neg fall below the new baseline -> they UNDER-count -> at worst
+     *      evt_late at the boundary, never a wedge.
+     *   4. RESPAWN the reader: SSI stays continuous (no reset), it just reads the
+     *      now-wider frames and demuxes the late sink's columns. The brief gap pads
+     *      as silence in pullAudio (the acceptable track-add glitch).
+     * Caller holds ctlMutex_; only ever called from the feeder thread, which owns
+     * readerThread_'s lifecycle (same thread as sessionUp/sessionDown). */
+    void audioRenegotiateLocked();
     /* encode one event message into `out` (no I/O) — the feeder batches
      * many messages into a single framed bulk write per cycle */
     /* channel = multitimbral part (§9.4, key 5); 0 omits the key so the
@@ -478,8 +539,28 @@ private:
      * that many evt messages. unregisterSource decrements it by a released
      * source's leftover (queued-but-unwritten) events, so the high-water mark
      * stays equal to what the device will actually consume. Resets with the
-     * session, like the SSI domain. */
+     * session, like the SSI domain.
+     *
+     * MONOTONIC across re-negotiations (P5b): queue* only ever fetch_add's it and
+     * unregisterSource fetch_sub's it — a re-neg NEVER store(0)'s it (that would
+     * race the lock-free queue* on the audio/control threads — the old B2 race).
+     * The value a pacing frame FENCES with is (evtQueuedSeq_ - evtEpochBase_): the
+     * events queued SINCE the current epoch's audio.start. See evtEpochBase_. */
     std::atomic<uint32_t> evtQueuedSeq_{0};
+    /* §8.3.1 fence EPOCH baseline: evtQueuedSeq_'s value at the current stream's
+     * audio.start. The device runs evq_reset_for_new_stream() (g_evt_consumed = 0)
+     * at every audio.start, so the host must fence with a count that ALSO restarts
+     * at 0 per stream — but without resetting the monotonic counter. The pacing
+     * frame stamps (evtQueuedSeq_.load() - evtEpochBase_). At the INITIAL audio.start
+     * evtQueuedSeq_ == 0 and evtEpochBase_ == 0, so the fenced value is identical to
+     * the pre-P5b wire (byte-identical golden). At a re-neg the feeder sets
+     * evtEpochBase_ = evtQueuedSeq_.load() (a single store under ctlMutex_, NO race
+     * with queue*); events queued before the re-neg fall below the baseline so they
+     * UNDER-count — per §8.3.1 the fence is a MINIMUM, so an under-count makes the
+     * device render a touch early (at worst evt_late at the boundary), NEVER the
+     * over-count that would wedge every later fenced frame. Written only under
+     * ctlMutex_ (initial sessionUp and the re-neg); read by the feeder's pacing. */
+    std::atomic<uint32_t> evtEpochBase_{0};
 
     FloatRing audioRing_{1 << 15}; /* 32768 floats = 16384 stereo frames */
     std::atomic<uint64_t> framesRecvAtomic_{0}; /* written by reader, read by feeder */
@@ -502,6 +583,31 @@ private:
     std::mutex sinksMutex_;
     AudioSink *sinks_[kMaxSinks] = {nullptr};
     size_t nSinks_ = 0;
+    /* P5b RE-NEGOTIATION. A sink that registered/unregistered while the session
+     * is already streaming changed the required slot set; the live audio.start
+     * union no longer carries the late sink's slots, so it would read silence
+     * (the pre-reneg fixed-at-start limitation). register/unregisterAudioSink set
+     * this flag (under sinksMutex_, OFF the wire — they run on the plugin's
+     * setActive/main thread) when unionWouldChangeLocked(); the feeder, at a safe
+     * boundary under ctlMutex_, observes it and runs audioRenegotiateLocked()
+     * (audio.stop -> new union -> audio.start + fence reset). Cleared by the
+     * feeder once the re-neg has run. NEVER set by the single-instance / owner-
+     * only / no-sink path (the union never changes), so that path NEVER
+     * re-negotiates and stays byte-identical (the golden gate). */
+    std::atomic<bool> audioRenegPending_{false};
+    /* Signal to the reader to EXIT its loop for a re-negotiation WITHOUT tearing
+     * the session down. The reader loops on running_ && !readerStop_; the re-neg
+     * sets it, joins the reader (so the audio-IN endpoint has a single owner for
+     * the stop/drain/start window), then clears it and respawns the reader. Unlike
+     * connected_=false (which the feeder/supervisor read as "session died" ->
+     * sessionDown/sessionUp -> the B1 state reset), this quiesces ONLY the reader;
+     * connected_ stays true and the session continues with a continuous SSI domain.
+     * Only the feeder thread sets/clears it and joins/respawns readerThread_ (the
+     * same thread sessionUp/sessionDown manage it on), so no concurrent join. */
+    std::atomic<bool> readerStop_{false};
+    /* monotonic count of completed re-negotiations (see renegCount()); bumped by
+     * audioRenegotiateLocked on a successful audio.start, read by a test harness. */
+    std::atomic<uint32_t> renegCount_{0};
     /* relaxed mirror of nSinks_ != 0 so reader()'s hot loop SKIPS the demux lock
      * entirely when no per-part sink exists — the single-instance / default
      * main-mix reader stays exactly the pre-P5b lock-free path. Published with

@@ -158,7 +158,35 @@ void HarpRuntime::computeUnionSlotsLocked() {
             sk->cols[c] = col;
         }
         if (n == 1) sk->cols[1] = sk->cols[0]; /* mono pair: L=R */
+        /* This sink's slots are now part of the streamed union (its cols index
+         * real columns), so the next demuxed frame carries its audio. Advance its
+         * epoch: a LATE sink that padded silence (accruing padDebt) before its
+         * slots joined the union learns, on its next pull, to drop that bogus debt
+         * + clear the stale ring instead of eating the first real samples — the
+         * B3 fix. A sink already streaming bumps too; pullAudio's reset is then a
+         * no-op (padDebt already ~0, ring current). */
+        sk->epoch.fetch_add(1, std::memory_order_release);
     }
+}
+
+/* Would the audio.start union change if recomputed now? Build the candidate
+ * union (owner outSlots_ then each registered sink's slots, deduped, order
+ * preserved — exactly the prefix computeUnionSlotsLocked builds) into a local
+ * vector and compare element-for-element to the LIVE unionSlots_. Read-only: it
+ * never writes unionSlots_ or any sink's cols, so register/unregisterAudioSink
+ * can ask "do I need a re-neg?" without disturbing the reader's in-flight demux.
+ * Caller holds sinksMutex_. */
+bool HarpRuntime::unionWouldChangeLocked() const {
+    std::vector<uint32_t> cand;
+    auto addSlot = [&](uint32_t s) {
+        for (uint32_t u : cand)
+            if (u == s) return;
+        cand.push_back(s);
+    };
+    for (uint32_t s : outSlots_) addSlot(s);
+    for (size_t i = 0; i < nSinks_; i++)
+        for (uint32_t s : sinks_[i]->slots) addSlot(s);
+    return cand != unionSlots_;
 }
 
 void HarpRuntime::audioStopLocked() {
@@ -170,6 +198,82 @@ void HarpRuntime::audioStopLocked() {
     request(&req, &rsp, &e);
     harp_cbuf_free(&req);
     harp_cbuf_free(&rsp);
+}
+
+/* P5b RE-NEGOTIATION on the feeder/control thread (under ctlMutex_). See the
+ * header for the full contract. The §8.6 transition is audio.stop -> (new
+ * union) -> audio.start, on a CONTINUOUS SSI domain and a fresh fence epoch,
+ * WITHOUT a session teardown.
+ *
+ * NO RECONNECT / NO STATE RESET (B1). The initial audio.start is safe to pair
+ * with sessionUp's RT-state reset because no audio thread is live yet; a
+ * MID-SESSION re-neg is NOT. So we never go through sessionDown/sessionUp here:
+ * connected_ stays true the whole time, and ssi_/ssiRead_/framesSent_/
+ * framesRecv_/framesRecvAtomic_/padDebtFloats_ and the audio + sink rings — all
+ * owned by the live reader/audio threads — are left UNTOUCHED. The SSI domain is
+ * continuous: the device renders whatever range each pacing frame names. The
+ * reader observes the restart as old-width frames followed by new-width frames,
+ * each self-describing (h.slots), and adapts per frame.
+ *
+ * RELIABLE STOP/START (B3). We QUIESCE the reader (readerStop_ + join) so the
+ * audio-IN endpoint has a SINGLE owner across the stop/start, then audio.stop ->
+ * drain the stream tail (sole reader, exactly as sessionDown does) so the device's
+ * audio writes never block its single-threaded session loop while the slow
+ * instrumented control round-trip is in flight -> audio.start. With the tail
+ * drained the round-trip completes instead of timing the link out (the old
+ * intermittent "audio.start failed"). Then respawn the reader on the new union.
+ *
+ * FENCE EPOCH (§8.3.1, B2). evtEpochBase_ = evtQueuedSeq_.load() — a single store
+ * under ctlMutex_, no reset of the monotonic counter, so it never races queue*'s
+ * lock-free fetch_add. The device's audio.start wipes g_evt_consumed to 0; the
+ * host's per-frame fence becomes (evtQueuedSeq_ - evtEpochBase_), which also
+ * restarts at 0 for events queued AFTER this point. Straddling events (queued
+ * pre-reneg, written post-reset) are below the baseline -> they under-count ->
+ * §8.3.1 fence is a minimum -> at worst evt_late, never a wedge. */
+void HarpRuntime::audioRenegotiateLocked() {
+    /* 1. quiesce the reader so we own the audio-IN endpoint for the stop/start.
+     * connected_ stays TRUE — this is NOT a teardown, just a reader handoff. */
+    readerStop_.store(true, std::memory_order_release);
+    if (readerThread_.joinable()) readerThread_.join();
+    readerStop_.store(false, std::memory_order_release);
+
+    /* 2. audio.stop -> drain the stream tail (sole owner now) -> audio.start with
+     * the NEW union. audioStart() takes sinksMutex_ and calls computeUnionSlotsLocked,
+     * which rebuilds unionSlots_ AND re-resolves every sink's `cols` against the new
+     * order, so the late sink's columns are correct the moment the wider frames
+     * arrive. Draining with no concurrent reader is what makes audio.start reliable
+     * under the instrumented host (the device's session loop is never write-blocked). */
+    audioStopLocked();
+    if (io_) {
+        uint8_t junk[16384];
+        int quiet = 0;
+        while (quiet < 2) {
+            int r = harp_usb_audio_read(io_, junk, sizeof junk, 80);
+            if (r < 0) break;
+            quiet = (r == 0) ? quiet + 1 : 0;
+        }
+    }
+
+    /* 3. fence epoch baseline (monotonic counter untouched — no race with queue*) */
+    evtEpochBase_.store(evtQueuedSeq_.load(std::memory_order_acquire),
+                        std::memory_order_release);
+
+    bool ok = audioStart(rate_);
+
+    /* 4. respawn the reader on the new union (SSI continuous — no reset). Even if
+     * audio.start failed, respawn so a subsequent device recovery still streams;
+     * a true transport death surfaces as the reader's r<0 -> connected_=false ->
+     * the supervisor reconnects (a real sessionUp, with no live race because that
+     * path tears down first). */
+    readerThread_ = std::thread([this] { reader(); });
+
+    if (!ok) {
+        log_msg("re-negotiation: audio.start failed (sink reads silence until it recovers)");
+    } else {
+        renegCount_.fetch_add(1, std::memory_order_release);
+        log_msg("re-negotiated audio stream: %zu union slot(s) now streamed",
+                unionSlots_.size());
+    }
 }
 
 /* Param set as a §9.4 event message: fire-and-forget, no response.
@@ -400,6 +504,7 @@ bool HarpRuntime::sessionUp() {
         }
     }
     evtQueuedSeq_.store(0, std::memory_order_release);
+    evtEpochBase_.store(0, std::memory_order_release); /* fresh fence epoch == 0 */
     ssi_ = framesSent_ = framesRecv_ = 0;
     framesRecvAtomic_.store(0, std::memory_order_relaxed);
     ssiRead_.store(0, std::memory_order_relaxed);
@@ -705,6 +810,16 @@ AudioSink *HarpRuntime::registerAudioSink(const std::vector<uint32_t> &slots) {
     }
     sinks_[nSinks_++] = sink;
     haveSinks_.store(true, std::memory_order_release);
+    /* P5b RE-NEGOTIATION: if we are ALREADY streaming and this sink's slots are
+     * not in the live union, the feeder must re-stream the new union so the late
+     * sink hears its part (otherwise its cols resolve outside the frame and it
+     * reads silence — the pre-reneg fixed-at-start limitation). We do NOT touch
+     * the wire here (this is the plugin's setActive / main thread); we only raise
+     * a flag the feeder acts on at a safe boundary under ctlMutex_. Before start()
+     * (not running_) this sink's slots simply enter the initial audio.start union
+     * — unchanged, no re-neg. */
+    if (running_.load(std::memory_order_acquire) && unionWouldChangeLocked())
+        audioRenegPending_.store(true, std::memory_order_release);
     return sink;
 }
 
@@ -724,6 +839,13 @@ void HarpRuntime::unregisterAudioSink(AudioSink *sink) {
             sinks_[--nSinks_] = nullptr;
             if (nSinks_ == 0) haveSinks_.store(false, std::memory_order_release);
             delete sink;
+            /* P5b RE-NEGOTIATION on removal too: dropping a sink can shrink the
+             * union (its private slots leave it), so re-stream the narrower union
+             * — same feeder-driven, off-the-wire flag as registerAudioSink. If the
+             * removed slots were shared with another sink / the owner the union is
+             * unchanged and unionWouldChangeLocked() is false, so nothing fires. */
+            if (running_.load(std::memory_order_acquire) && unionWouldChangeLocked())
+                audioRenegPending_.store(true, std::memory_order_release);
             return;
         }
     }
@@ -838,6 +960,24 @@ void HarpRuntime::settleSinkPadDebt(AudioSink &sink) {
     }
 }
 
+/* B3: when this sink's slots (re)enter the streamed union, computeUnionSlotsLocked
+ * advances sink.epoch. On the FIRST pull that observes a new epoch the consumer
+ * (pullAudio — sole toucher of padDebt + sole ring reader) ZEROES the pad debt and
+ * clear()s the ring. This discards the silence the sink padded WHILE WAITING for a
+ * late re-negotiation to stream its slots (and any stale pre-re-neg ring contents),
+ * so the first real demuxed frame plays instead of being eaten by settleSinkPadDebt
+ * paying down a bogus debt. ring.clear() is a consumer-side tail move — safe against
+ * the reader's producer-side writes. A no-op cost on a sink already in the union
+ * (epoch unchanged between pulls). */
+void HarpRuntime::syncSinkEpoch(AudioSink &sink) {
+    uint32_t ep = sink.epoch.load(std::memory_order_acquire);
+    if (ep != sink.epochSeen) {
+        sink.epochSeen = ep;
+        sink.padDebt = 0;
+        sink.ring.clear();
+    }
+}
+
 size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
     settlePadDebt();
     size_t want = nFrames * 2;
@@ -868,6 +1008,7 @@ size_t HarpRuntime::pullAudio(AudioSink *sink, float *dst, size_t nFrames) {
         memset(dst, 0, nFrames * 2 * sizeof(float));
         return nFrames;
     }
+    syncSinkEpoch(*sink); /* B3: drop pre-(re)negotiation pad debt + stale ring */
     settleSinkPadDebt(*sink);
     size_t want = nFrames * 2;
     size_t got = sink->ring.read(dst, want);
@@ -914,6 +1055,7 @@ size_t HarpRuntime::pullAudioBlocking(AudioSink *sink, float *dst, size_t nFrame
         memset(dst, 0, nFrames * 2 * sizeof(float));
         return nFrames;
     }
+    syncSinkEpoch(*sink); /* B3: drop pre-(re)negotiation pad debt + stale ring */
     settleSinkPadDebt(*sink);
     size_t want = nFrames * 2;
     size_t got = 0;
@@ -948,6 +1090,20 @@ void HarpRuntime::feeder() {
         wgMaintain(wg);
 #endif
         bool didWork = false;
+
+        /* 0. P5b RE-NEGOTIATION at a SAFE boundary (between pacing cycles — we
+         * are never mid-frame here). A sink registered/unregistered mid-session
+         * and changed the required slot set, so re-stream the new union: take
+         * ctlMutex_ (serialized against getState/setState and the eventPump's evt
+         * writes), audio.stop -> new union -> audio.start + fence reset. We clear
+         * the flag BEFORE acting and only act when STILL connected; if it fires
+         * but the session dropped, the next sessionUp's audio.start picks up the
+         * sink set from the registry anyway. The single-instance / no-sink path
+         * never sets the flag, so it never reaches this block. */
+        if (audioRenegPending_.exchange(false, std::memory_order_acq_rel)) {
+            std::lock_guard<std::mutex> lk(ctlMutex_);
+            if (connected_.load(std::memory_order_relaxed)) audioRenegotiateLocked();
+        }
 
         /* 1. inbound async traffic FIRST: keeping the IN direction drained
          * means the device is never blocked writing to us — which means OUR
@@ -997,7 +1153,19 @@ void HarpRuntime::feeder() {
                                    HARP_AUDIO_FMT_F32};
             uint8_t ph[HARP_AUDIO_HDR_LEN + HARP_AUDIO_FENCE_LEN];
             harp_audio_hdr_encode(&pace, ph);
-            uint32_t seq = evtQueuedSeq_.load(std::memory_order_acquire);
+            /* §8.3.1 fence = events queued SINCE this stream's audio.start =
+             * monotonic high-water MINUS the current epoch baseline. At the initial
+             * start base == 0, so this is byte-identical to the pre-P5b fence; after
+             * a re-neg the device reset g_evt_consumed to 0 and base caught up to the
+             * counter, so the count restarts at 0 here too — no over-count, no wedge.
+             * SATURATE at 0: unregisterSource fetch_sub's a removed source's leftover
+             * (queued-but-unwritten) events, which can pull the monotonic counter
+             * BELOW a baseline that had counted them — a raw subtraction would wrap
+             * to a huge OVER-count and wedge every later frame. An under-count is
+             * always safe (the fence is a minimum -> at worst evt_late), so clamp. */
+            uint32_t hw = evtQueuedSeq_.load(std::memory_order_acquire);
+            uint32_t base = evtEpochBase_.load(std::memory_order_acquire);
+            uint32_t seq = hw > base ? hw - base : 0;
             ph[HARP_AUDIO_HDR_LEN + 0] = (uint8_t)seq;
             ph[HARP_AUDIO_HDR_LEN + 1] = (uint8_t)(seq >> 8);
             ph[HARP_AUDIO_HDR_LEN + 2] = (uint8_t)(seq >> 16);
@@ -1127,6 +1295,15 @@ void HarpRuntime::eventPump() {
         }
         if (sent) {
             std::lock_guard<std::mutex> lk(ctlMutex_);
+            /* A P5b re-negotiation may run (under ctlMutex_, serialized against this
+             * write) between our drain and here. With the MONOTONIC fence + epoch
+             * baseline it is SAFE to write these events across a re-neg: the device's
+             * audio.start reset its g_evt_consumed, and these straddling events were
+             * counted into evtQueuedSeq_ BELOW the new evtEpochBase_, so they do not
+             * count toward any post-reneg frame's (evtQueuedSeq_ - evtEpochBase_)
+             * fence. The device simply consumes them (a fence is a §8.3.1 minimum —
+             * consuming MORE than required never wedges), so no batch needs dropping
+             * and no event is lost. */
             if (!io_->write_all(io_, batch.buf, batch.len)) {
                 log_msg("event write failed; device gone?");
                 connected_.store(false, std::memory_order_release);
@@ -1159,7 +1336,12 @@ void HarpRuntime::reader() {
 #ifdef __APPLE__
     WgState wg;
 #endif
-    while (running_.load(std::memory_order_relaxed)) {
+    /* readerStop_ lets a P5b re-negotiation reclaim the audio-IN endpoint WITHOUT
+     * tearing the session down: the feeder sets it, we exit, it drains the stream
+     * tail + does audio.stop/start, then respawns us. connected_ stays true, so
+     * this is NOT the device-gone path (that flips connected_ and breaks below). */
+    while (running_.load(std::memory_order_relaxed) &&
+           !readerStop_.load(std::memory_order_acquire)) {
 #ifdef __APPLE__
         wgMaintain(wg);
 #endif
