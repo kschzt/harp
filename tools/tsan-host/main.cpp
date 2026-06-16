@@ -70,6 +70,13 @@ static size_t g_capture_cap = 0;     /* max floats to retain (0 = capture off) *
  * that the structure is race-free. Same bound/oracle as the owner capture. */
 static std::vector<float> g_sink_capture;
 static size_t g_sink_capture_cap = 0;
+/* HARP_ISO_LEVELS="l0,l1,.." — the param-isolation e2e: instead of the random
+ * param flood, each instance drives ONLY a controlled, audible voice on ITS part
+ * (fixed tone+env, level = its entry here). So an attached sink's energy tracks
+ * exactly ONE part's level, and we can prove a part's level param routes to that
+ * part's audio and ONLY that part (no cross-talk from a sibling). Empty = the
+ * normal flood (every other config). Parsed once in main, read-only after. */
+static std::vector<float> g_iso_levels;
 
 /* the simulated DAW audio thread: pull blocks at ~block cadence, and do
  * exactly what the plugin's process() does around the pull (timestamp
@@ -137,9 +144,23 @@ static void control_thread(HarpRuntime *rt, EventSource *src, bool isOwner,
     std::vector<uint8_t> bundle;
     for (int t = 0; t < seconds * 1000 && g_run.load(); t++) {
         uint64_t base = rt->streamPos() + rt->latencySamples();
-        /* params, ramps, notes — the whole queue* surface, on OUR source */
-        rt->queueParamSet(src, 1 + (n % 8), (float)(n % 100) / 100.f, base + (n % 256));
-        rt->queueRamp(src, 3, (float)(n % 50) / 50.f, base, base + 256);
+        uint8_t chan = src->chan.load(std::memory_order_relaxed) & 0xf;
+        float iso = chan < g_iso_levels.size() ? g_iso_levels[chan] : -1.f;
+        if (iso >= 0.f) {
+            /* param-isolation e2e: a CONTROLLED, audible voice on THIS part —
+             * fixed tone + fast env so each struck note sounds, and level = this
+             * part's HARP_ISO_LEVELS entry. No random flood, so the captured sink's
+             * energy tracks THIS part's level alone (routed via the source channel /
+             * §9.4 key 5), letting the test isolate per-part param routing. */
+            rt->queueParamSet(src, 3, 0.7f, base);  /* tone */
+            rt->queueParamSet(src, 5, 0.05f, base); /* fast attack */
+            rt->queueParamSet(src, 6, 0.1f, base);  /* fast decay */
+            rt->queueParamSet(src, 8, iso, base);   /* level — the variable under test */
+        } else {
+            /* params, ramps, notes — the whole queue* surface, on OUR source */
+            rt->queueParamSet(src, 1 + (n % 8), (float)(n % 100) / 100.f, base + (n % 256));
+            rt->queueRamp(src, 3, (float)(n % 50) / 50.f, base, base + 256);
+        }
         /* Bake THIS source's channel (part) into the note's UMP word, exactly as
          * a DAW/shell does (the eventPump does NOT restamp note channels — §9.4
          * "notes already carry their channel in the word"). Without this every
@@ -147,7 +168,7 @@ static void control_thread(HarpRuntime *rt, EventSource *src, bool isOwner,
          * captured pure silence; on its own channel each attached instance now
          * SOUNDS its part, so the demux carries real signal. The owner is ch0, so
          * its notes are unchanged (golden-irrelevant: tsan-host isn't the oracle). */
-        uint32_t nch = (uint32_t)(src->chan.load(std::memory_order_relaxed) & 0xf) << 16;
+        uint32_t nch = (uint32_t)chan << 16;
         if (n % 7 == 0)
             rt->queueNote(src, 0x20900000u | nch | ((60 + (n % 12)) << 8) | 0x50, base);
         if (n % 11 == 0)
@@ -188,6 +209,17 @@ int main(int argc, char **argv) {
         if (partAudio) { /* also keep one attached sink's part audio (P5b proof) */
             g_sink_capture_cap = g_capture_cap;
             g_sink_capture.reserve(g_sink_capture_cap);
+        }
+    }
+    /* HARP_ISO_LEVELS="l0,l1,..": per-part level for the param-isolation e2e
+     * (parsed once here, read-only by every control thread). Empty -> normal flood. */
+    if (const char *iso = getenv("HARP_ISO_LEVELS"); iso && iso[0]) {
+        const char *p = iso;
+        while (*p) {
+            g_iso_levels.push_back((float)atof(p));
+            const char *c = strchr(p, ',');
+            if (!c) break;
+            p = c + 1;
         }
     }
     /* The registry key, exactly as the plugin computes it: HARP_DEVICE_SERIAL
