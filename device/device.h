@@ -138,7 +138,11 @@ enum {
     DEV_EV_PARAM_SET,
     DEV_EV_RAMP,
     DEV_EV_ALL_OFF,
-    DEV_EV_TRANSPORT /* §9.7 anchor: (ts, ppq, tempo) defines musical time */
+    DEV_EV_TRANSPORT, /* §9.7 anchor: (ts, ppq, tempo) defines musical time */
+    DEV_EV_MOD        /* §9.4 non-destructive modulation (etype 6): an additive,
+                         signed per-(param[,voice]) offset on the base value.
+                         DECODED here; the per-voice mod layer that APPLIES it is
+                         Phase 2 (voice pool) — until then the engine ignores it. */
 };
 
 typedef struct {
@@ -149,9 +153,11 @@ typedef struct {
     uint64_t end;  /* ramp end position */
     double ppq;    /* transport: song position at ts (§9.7 key 4) */
     uint8_t channel; /* multitimbral part = UMP channel (notes) / event body
-                        key 5 (param/ramp); 0..15, default 0 (§9.4, §15.2).
-                        Appended last so positional initializers default it
-                        to part 0 — single-part is channel 0. */
+                        key 5 (param/ramp/mod); 0..15, default 0 (§9.4, §15.2). */
+    uint32_t voice;  /* §9.5 per-voice address (event body key 3): packed
+                        (group<<12)|(channel<<8)|note, 0 = whole-part (no voice).
+                        Appended last so positional initializers default it to 0
+                        (whole-part) — single-part / non-per-voice wire unchanged. */
 } dev_event;
 
 #define DEV_EVQ_CAP 256

@@ -210,7 +210,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, PROTO_MAJOR);
     harp_cbor_uint(m, PROTO_MINOR);
     harp_cbor_uint(m, 6); /* capabilities */
-    harp_cbor_array(m, 14); /* P3: + "evt.multitimbral"; §9.9: + "evt.param.meter" */
+    harp_cbor_array(m, 15); /* P3: +evt.multitimbral; §9.9: +evt.param.meter; +evt.param.mod */
     harp_cbor_text(m, "harp-core");
     harp_cbor_text(m, "harp-recall");
     harp_cbor_text(m, "harp-stream");
@@ -222,6 +222,10 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_text(m, "audio.offline-rate");
     harp_cbor_text(m, "evt.param");
     harp_cbor_text(m, "evt.param.echo");
+    harp_cbor_text(m, "evt.param.mod"); /* §9.4 non-destructive modulation: device
+                                           decodes mod events (etype 6) + the §9.5
+                                           per-voice key; the per-voice mod layer
+                                           that renders them is Phase 2 */
     harp_cbor_text(m, "evt.transport");
     harp_cbor_text(m, "evt.ump"); /* note input as UMP (§9.10); group map = key 11 */
     harp_cbor_text(m, "evt.multitimbral"); /* P3: 16 independent per-part timbres;
@@ -878,7 +882,7 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
         if (mt == 2) { /* MIDI 1.0 channel voice in UMP */
             uint32_t status = (w >> 20) & 0xf, note = (w >> 8) & 0x7f, vel = w & 0x7f;
             dev_event ev = {msc, 0, note, 0, 0, 0,
-                            (uint8_t)((w >> 16) & 0xf)}; /* channel = part (§15.2) */
+                            (uint8_t)((w >> 16) & 0xf), 0}; /* channel = part (§15.2); voice 0 */
             if (status == 0x9 && vel > 0) {
                 ev.kind = DEV_EV_NOTE_ON;
                 ev.v = (float)vel / 127.0f;
@@ -905,7 +909,7 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
         return;
     }
     if (etype == 5) { /* ramp (§9.4): {0 param, 1 target, 2 end tstamp} */
-        uint64_t n, key, id = 0, eep = 0, ets = 0, channel = 0;
+        uint64_t n, key, id = 0, eep = 0, ets = 0, channel = 0, voice = 0;
         double target = 0;
         bool have_id = false, have_t = false, have_end = false;
         if (!harp_cdec_map(&dec, &n)) {
@@ -926,6 +930,8 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
                     !harp_cdec_uint(&dec, &ets))
                     return;
                 have_end = true;
+            } else if (key == 3) { /* §9.5 per-voice (decoded; applied in Phase 2) */
+                if (!harp_cdec_uint(&dec, &voice)) return;
             } else if (key == 5) { /* multitimbral part (§9.4): 0..15, default 0 */
                 if (!harp_cdec_uint(&dec, &channel)) return;
             } else if (!harp_cdec_skip(&dec))
@@ -935,7 +941,7 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
         if (target < 0) target = 0;
         if (target > 1) target = 1;
         dev_event ev = {msc, DEV_EV_RAMP, (uint32_t)id, (float)target, ets, 0,
-                        (uint8_t)(channel & 0xf)};
+                        (uint8_t)(channel & 0xf), (uint32_t)voice};
         evq_push(ev);
         live_ref_touch(d, true);
         return;
@@ -958,7 +964,32 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
             } else if (!harp_cdec_skip(&dec))
                 return;
         }
-        dev_event ev = {msc, DEV_EV_TRANSPORT, (uint32_t)flags, (float)tempo, 0, ppq, 0};
+        dev_event ev = {msc, DEV_EV_TRANSPORT, (uint32_t)flags, (float)tempo, 0, ppq, 0, 0};
+        evq_push(ev);
+        return;
+    }
+    if (etype == 6) { /* mod (§9.4): {0 param, 1 signed offset, ?3 voice, ?4 txn,
+                       * ?5 channel}. NON-DESTRUCTIVE — decoded here; the per-voice
+                       * mod layer that APPLIES it is Phase 2, so the engine ignores
+                       * DEV_EV_MOD for now (no render effect → golden byte-identical).
+                       * MUST NOT alter the base value / dirty state (§9.4): no
+                       * live_ref_touch, and the offset is NOT clamped to [0,1] (it is
+                       * signed, clamped only after summation onto the base). */
+        uint64_t n, key, id = 0, channel = 0, voice = 0;
+        double offset = 0;
+        bool have_id = false, have_o = false;
+        if (!harp_cdec_map(&dec, &n)) { CTR_INC(d->frame_errors); return; }
+        for (uint64_t i = 0; i < n; i++) {
+            if (!harp_cdec_uint(&dec, &key)) return;
+            if (key == 0) { if (!harp_cdec_uint(&dec, &id)) return; have_id = true; }
+            else if (key == 1) { if (!harp_cdec_float(&dec, &offset)) return; have_o = true; }
+            else if (key == 3) { if (!harp_cdec_uint(&dec, &voice)) return; }
+            else if (key == 5) { if (!harp_cdec_uint(&dec, &channel)) return; }
+            else if (!harp_cdec_skip(&dec)) return;
+        }
+        if (!have_id || !have_o) return;
+        dev_event ev = {msc, DEV_EV_MOD, (uint32_t)id, (float)offset, 0, 0,
+                        (uint8_t)(channel & 0xf), (uint32_t)voice};
         evq_push(ev);
         return;
     }
@@ -970,7 +1001,7 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
         CTR_INC(d->frame_errors);
         return;
     }
-    uint64_t channel = 0;
+    uint64_t channel = 0, voice = 0;
     for (uint64_t i = 0; i < n; i++) {
         if (!harp_cdec_uint(&dec, &key)) return;
         if (key == 0) {
@@ -979,6 +1010,8 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
         } else if (key == 1) {
             if (!harp_cdec_float(&dec, &v)) return;
             have_v = true;
+        } else if (key == 3) { /* §9.5 per-voice (decoded; applied in Phase 2) */
+            if (!harp_cdec_uint(&dec, &voice)) return;
         } else if (key == 5) { /* multitimbral part (§9.4): 0..15, default 0 */
             if (!harp_cdec_uint(&dec, &channel)) return;
         } else if (!harp_cdec_skip(&dec))
@@ -991,7 +1024,7 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
      * (instead of the old direct write) keeps ramp state render-owned —
      * the direct path raced ramps_advance on g_ramps[i].active */
     dev_event ev = {msc, DEV_EV_PARAM_SET, (uint32_t)id, (float)v, 0, 0,
-                    (uint8_t)(channel & 0xf)};
+                    (uint8_t)(channel & 0xf), (uint32_t)voice};
     evq_push(ev);
     live_ref_touch(d, true);
 }

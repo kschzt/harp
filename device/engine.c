@@ -967,6 +967,12 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                     atomic_store_explicit(&g_touch_pending, 1,
                                           memory_order_release);
                     break;
+                case DEV_EV_MOD:
+                    /* §9.4 non-destructive modulation: decoded + queued (Phase 1)
+                     * but NOT yet applied — the per-voice mod offset layer is
+                     * Phase 2 (voice pool). Ignored here so the render is
+                     * unchanged (golden byte-identical). */
+                    break;
             }
             continue; /* consumed */
         }
