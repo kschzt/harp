@@ -267,10 +267,38 @@ fail:
     return -1;
 }
 
+/* §9.3 param FLAG bits (key 8). Bit 0 automatable; bit 1 readonly/output (the
+ * meters); P2 adds bit 5 MODULATABLE and bit 6 PER-VOICE MODULATABLE — the
+ * §9.4/§9.5 capability that a host needs to know a param accepts non-destructive
+ * (and per-voice) modulation. */
+#define PFLAG_AUTOMATABLE 0x01u
+#define PFLAG_MODULATABLE 0x20u  /* bit 5: accepts §9.4 non-destructive mod */
+#define PFLAG_PER_VOICE_MOD 0x40u /* bit 6: accepts §9.5 per-voice mod */
+
+/* Which params advertise the P2 modulation capability. Filter Cutoff (id 3) is
+ * the canonical per-voice modulation target (the kernel applies the per-voice
+ * mod offset to it through voice_param); kept as a single predicate so the set
+ * is one place to grow. */
+static bool param_modulatable(const dev_param *p) { return p->id == 3; }
+
+/* The §9.3 flag word for a param. `include_caps` gates the P2 capability bits:
+ * the param-map-hash input (encode_param_array_automatable) passes false so the
+ * hash sees the SAME bytes as pre-P2 firmware (a capability-add never
+ * invalidates stored automation — 0.3.8 §9.3), keeping param-map-hash and
+ * recall byte-identical; the advertised array passes true so hosts learn the
+ * capability. */
+static uint64_t param_flags(const dev_param *p, bool include_caps) {
+    uint64_t f = PFLAG_AUTOMATABLE;
+    if (include_caps && param_modulatable(p)) f |= PFLAG_MODULATABLE | PFLAG_PER_VOICE_MOD;
+    return f;
+}
+
 /* Encode ONE automatable device-param descriptor (§9.3) into `b`. Shared by
- * the hash input (automatable subset) and the full advertised array so the two
- * cannot drift in shape — the 13 params are byte-identical in both. */
-static void encode_one_param(harp_cbuf *b, const dev_param *p) {
+ * the hash input (automatable subset, include_caps=false) and the full
+ * advertised array (include_caps=true) so the two cannot drift in shape — the
+ * 13 params are byte-identical in both EXCEPT the flag word (key 8), which the
+ * hash path emits WITHOUT the P2 capability bits (see param_flags). */
+static void encode_one_param(harp_cbuf *b, const dev_param *p, bool include_caps) {
     bool stepped = p->steps > 0;
     harp_cbor_map(b, stepped ? 5 : 3);
     harp_cbor_uint(b, 0);
@@ -282,7 +310,7 @@ static void encode_one_param(harp_cbuf *b, const dev_param *p) {
         harp_cbor_uint(b, p->steps);
     }
     harp_cbor_uint(b, 8);
-    harp_cbor_uint(b, 0x1); /* flags: automatable */
+    harp_cbor_uint(b, param_flags(p, include_caps)); /* automatable [+ P2 mod caps] */
     if (stepped) {
         harp_cbor_uint(b, 9);
         harp_cbor_array(b, p->steps);
@@ -296,7 +324,10 @@ static void encode_one_param(harp_cbuf *b, const dev_param *p) {
  * deliberately excluded so the hash is unchanged from pre-meter firmware. */
 void encode_param_array_automatable(harp_cbuf *b) {
     harp_cbor_array(b, NPARAMS);
-    for (size_t i = 0; i < NPARAMS; i++) encode_one_param(b, &g_params[i]);
+    /* include_caps=false: the P2 modulatable bits are MASKED OUT so this byte
+     * stream — the SOLE param-map-hash input — is identical to pre-P2 firmware.
+     * A capability-add must never invalidate stored automation (§9.3). */
+    for (size_t i = 0; i < NPARAMS; i++) encode_one_param(b, &g_params[i], false);
 }
 
 /* The FULL advertised array (§9.3 + §9.9): the 13 automatable params FOLLOWED
@@ -306,8 +337,11 @@ void encode_param_array_automatable(harp_cbuf *b) {
  * the collision-free id range METER_ID_BASE+ (slot*2 + {0 peak,1 rms}). */
 void encode_param_array(harp_cbuf *b) {
     harp_cbor_array(b, NPARAMS + METER_NPARAMS);
-    /* the automatable 13, byte-identical to encode_param_array_automatable */
-    for (size_t i = 0; i < NPARAMS; i++) encode_one_param(b, &g_params[i]);
+    /* the automatable 13. include_caps=true: the advertised descriptor carries
+     * the P2 modulatable bits (key 8) so hosts can target §9.4/§9.5 modulation;
+     * this is the ONLY byte-level difference from encode_param_array_automatable,
+     * and it lives outside the param-map-hash input by construction. */
+    for (size_t i = 0; i < NPARAMS; i++) encode_one_param(b, &g_params[i], true);
     /* the readonly meters: per part 0..15 then the main mix, peak then rms */
     for (int slot = 0; slot < METER_NSLOTS; slot++) {
         char name[24];

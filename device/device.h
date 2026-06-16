@@ -35,7 +35,14 @@
 #define PROTO_MAJOR 1
 #define PROTO_MINOR 0
 #define ENGINE_ID "refdev-null"
-#define ENGINE_VERSION "1.0.0"
+/* P2 (voice pool): bumped 1.0.0 -> 1.1.0. §6.4 names voice allocation as
+ * render-affecting — the per-part pool means overlapping notes now ring out on
+ * separate voices instead of retriggering one, so a render that contains note
+ * overlap (the golden melody's release tails) can differ from the pre-pool
+ * engine. The bump tells hosts the render contract moved. param-map-hash is
+ * deliberately UNCHANGED (the modulatable capability bits are masked out of the
+ * hash input, state.c), so stored automation and recall stay byte-identical. */
+#define ENGINE_VERSION "1.1.0"
 #define FW_VERSION "0.1.0"
 #define CREDIT_GRANT (16u << 20)
 #define LIVE_REF "live/project"
@@ -141,8 +148,8 @@ enum {
     DEV_EV_TRANSPORT, /* §9.7 anchor: (ts, ppq, tempo) defines musical time */
     DEV_EV_MOD        /* §9.4 non-destructive modulation (etype 6): an additive,
                          signed per-(param[,voice]) offset on the base value.
-                         DECODED here; the per-voice mod layer that APPLIES it is
-                         Phase 2 (voice pool) — until then the engine ignores it. */
+                         APPLIED (P2) on the per-voice mod[] layer — voice!=0
+                         addresses the matching voice, voice==0 is part-wide. */
 };
 
 typedef struct {

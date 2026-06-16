@@ -1,8 +1,10 @@
 /* engine.c — the refdev synth engine (split from harp-deviced.c; see device.h).
  *
- * Owns everything the render thread touches: the parameter bank, the mono
- * note voice, the timestamped event queue (§9.2), per-param ramps (§9.4),
- * and the audio thread itself (free-running and host-paced loops, §8).
+ * Owns everything the render thread touches: the parameter bank, the per-part
+ * VOICE POOL (P2: NVOICES of real polyphony, deterministically allocated), the
+ * timestamped event queue (§9.2), per-param ramps (§9.4) and per-voice
+ * modulation (§9.4/§9.5), and the audio thread itself (free-running and
+ * host-paced loops, §8).
  */
 #include <errno.h>
 #include <math.h>
@@ -79,8 +81,28 @@ typedef struct {
 
 /* A small stereo drone synth: blended sine/saw oscillator (R detuned for
  * width) through a Chamberlin state-variable lowpass. Every voice parameter
- * is one of the 8 recallable params — the point is recall you can hear. */
+ * is one of the 8 recallable params — the point is recall you can hear.
+ *
+ * P2 (voice pool): the NOTE IDENTITY moved INTO the voice (was per-part mono).
+ * Each part owns NVOICES of these and allocates one per sounding note for real
+ * polyphony. The DSP fields below the divider are VERBATIM from the mono voice
+ * — a single active voice rendered with accumulate=false is bit-for-bit the old
+ * mono kernel (only the storage of note/note_vel/note_seq moved here). */
 typedef struct {
+    /* ---- note identity (P2: was part::note/note_vel/note_seq, mono) ---- */
+    int note;          /* MIDI note, -1 = released (env decays / idle) */
+    float note_vel;    /* velocity / env target while gated */
+    uint32_t note_seq; /* retrig edge counter (a fresh note bumps it) */
+    uint32_t voice_id; /* §9.5 packed key of the allocating note-on (mod target) */
+    uint64_t alloc_seq; /* unique, monotone per part: the deterministic steal age */
+    bool active;       /* allocated (sounding or ringing); false = free slot */
+    /* §9.4 per-voice modulation offset layer: an additive signed offset on the
+     * base param, applied only when a mod event has addressed this voice. While
+     * has_mod is false (ALWAYS for the golden) the kernel reads the UNCHANGED
+     * base param_value() — identical codegen, identical bytes. */
+    float mod[NPARAMS];
+    bool has_mod;
+    /* ---- DSP state (VERBATIM from the pre-pool mono voice) ---- */
     float phase_l, phase_r;
     float low_l, band_l, low_r, band_r;
     /* control-rate-smoothed parameter values (§9.3: the device interpolates
@@ -124,30 +146,49 @@ typedef struct {
     uint64_t gate_off;   /* SSI to release `sounding` (0 = none pending) */
 } arp_state;
 
-/* One multitimbral part: a voice, its mono note state, its arp, AND (P3) its
- * own param values + ramps so each part is an independent timbre. The note
- * crosses threads (panic paths from session/panel); pval crosses threads too
+/* P2 voice pool: per-part polyphony. NVOICES sounding/ringing notes per part,
+ * allocated deterministically (index-first, steal-oldest by alloc_seq — see
+ * voice_alloc). Voice 0 is also the DRONE voice for part 0 (with_drone). */
+#define NVOICES 8
+
+/* One multitimbral part: a POOL of voices, a per-part allocation clock, its
+ * arp, AND (P3) its own param values + ramps so each part is an independent
+ * timbre. Note identity now lives in each voice (P2); the only cross-thread
+ * note field left is `panic_note`, a render-thread-consumed signal from the
+ * panic paths (engine_all_notes_off / engine_note_off_if cross threads and
+ * cannot touch the render-owned voice pool directly). pval crosses threads too
  * (render ramps, session loads, panel knobs) so it is _Atomic, exactly as the
- * old global dev_param.value was. vel/seq/ramps are render-thread-only (event
- * application happens on the render thread) and stay plain. */
+ * old global dev_param.value was. voices/arp/ramps/alloc_clock are
+ * render-thread-only (event application happens on the render thread). */
 typedef struct {
-    synth_voice voice;
-    _Atomic int note;
-    float note_vel;
-    uint32_t note_seq;
+    synth_voice voices[NVOICES];
+    uint64_t alloc_clock; /* next alloc_seq; monotone, render-thread-only */
+    /* panic signal (§ panic paths): another thread stores a value here and the
+     * render thread services it at the next segment. -2 = none, -1 = ALL notes
+     * off, >=0 = release that note number across the pool. _Atomic because the
+     * write crosses threads; the render's exchange is the single consumer. */
+    _Atomic int panic_note;
     arp_state arp;
     _Atomic float pval[NPARAMS]; /* per-part param values (P3) */
     dev_ramp ramps[NPARAMS];     /* per-part automation ramps (P3) */
 } part;
+#define PANIC_NONE (-2)
+#define PANIC_ALL (-1)
 /* NPARTS now lives in device.h (state.c stages all 16 parts on load). */
-/* every part starts idle: note -1 AND arp.sounding -1 (else part_active would
- * read the zero-init sounding==0 as "holding note 0" before the first stream
- * reset). pval starts at the factory defaults (PVAL_DEFAULTS == g_params[].def
- * in id order) so all 16 parts are IDENTICAL to the old globals at boot — part
- * 0 / channel 0 therefore renders byte-identically to P2.2. ramps zero-init
- * (inactive). GNU range designator (engine.c is gnu11). */
+/* every part starts idle: all voices note -1 / inactive (the zero-init voice
+ * has note 0 which would read as "holding note 0", so note is set to -1
+ * explicitly), panic_note PANIC_NONE, AND arp.sounding -1 (else part_active
+ * would read the zero-init sounding==0 as "holding note 0" before the first
+ * stream reset). pval starts at the factory defaults (PVAL_DEFAULTS ==
+ * g_params[].def in id order) so all 16 parts are IDENTICAL to the old globals
+ * at boot — part 0 / channel 0 with one note therefore renders byte-identically
+ * to P2.2. ramps zero-init (inactive). GNU range designators (engine.c is
+ * gnu11). */
 static part g_parts[NPARTS] = {[0 ... NPARTS - 1] = {
-    .note = -1, .arp = {.sounding = -1}, .pval = PVAL_DEFAULTS}};
+    .voices = {[0 ... NVOICES - 1] = {.note = -1}},
+    .panic_note = PANIC_NONE,
+    .arp = {.sounding = -1},
+    .pval = PVAL_DEFAULTS}};
 
 /* Per-part param value accessors (P3). Same cross-thread semantics as the old
  * global param_get/param_put: relaxed atomics, last-write-wins. Indexed by the
@@ -189,24 +230,99 @@ static float param_value(const part *p, uint32_t id) {
     return idx < 0 ? 0.0f : part_pget(p, (size_t)idx);
 }
 
-/* note state: p->note crosses threads (panic paths from session/panel) */
-static inline int note_get(part *p) {
-    return atomic_load_explicit(&p->note, memory_order_relaxed);
+/* §9.4 per-voice EFFECTIVE value: the part base plus this voice's mod offset,
+ * clamped to [0,1] (the modulation is signed; the SUM is what gets clamped, per
+ * §9.4 — the base alone is already in range). Called only when v->has_mod is
+ * set; the VP() hot-path macro routes the unmodulated case (always true for the
+ * golden) to the LITERAL param_value() above so that codegen — and therefore
+ * the rendered bytes — is unchanged when no voice has been modulated. */
+static float voice_param(const part *p, const synth_voice *v, uint32_t id) {
+    int idx = param_index(id);
+    if (idx < 0) return 0.0f;
+    float base = part_pget(p, (size_t)idx);
+    float r = base + v->mod[idx];
+    return r < 0.0f ? 0.0f : r > 1.0f ? 1.0f : r;
 }
-static inline void note_put(part *p, int n) {
-    atomic_store_explicit(&p->note, n, memory_order_relaxed);
-}
+#define VP(p, v, id) ((v)->has_mod ? voice_param((p), (v), (id)) : param_value((p), (id)))
 
+/* PANIC SIGNALLING (§ panic paths). engine_all_notes_off / engine_note_off_if
+ * run on the session/panel threads and must work even when the event queue is
+ * jammed. The voice pool is render-thread-owned, so these threads CANNOT poke
+ * voices directly without a data race. Instead they store a request into the
+ * per-part _Atomic panic_note; the render thread services it (panic_service)
+ * once per segment, atomically exchanging it back to PANIC_NONE. A second panic
+ * arriving before the render drains the first wins last-write — for ALL_OFF
+ * that is correct (a stronger panic), and a single-note off losing to a later
+ * one only means the earlier note also gets caught by part_active decay; in the
+ * pathological queue-jammed case a follow-up ALL_OFF (the escalation path's
+ * partner) clears everything. The store is release / the exchange acquire so
+ * the render sees a coherent value. */
 void engine_all_notes_off(void) {
-    for (size_t i = 0; i < NPARTS; i++) note_put(&g_parts[i], -1);
+    for (size_t i = 0; i < NPARTS; i++)
+        atomic_store_explicit(&g_parts[i].panic_note, PANIC_ALL, memory_order_release);
 }
 void engine_note_off_if(uint32_t note) {
-    for (size_t i = 0; i < NPARTS; i++) {
-        part *p = &g_parts[i];
-        if (note_get(p) == (int)note) note_put(p, -1); /* benign CAS-free: worst
-                                           case a racing note-on wins, which is
-                                           the musically correct outcome */
+    for (size_t i = 0; i < NPARTS; i++)
+        atomic_store_explicit(&g_parts[i].panic_note, (int)note, memory_order_release);
+}
+
+/* ---------------- deterministic voice allocation (§9.5) ----------------
+ *
+ * note-on allocates a voice; note-off releases it (env decays as the old mono
+ * voice did); the render frees a released voice once its env decays below the
+ * same threshold the old engine used. Allocation is a PURE INTEGER FUNCTION of
+ * the ordered event stream — index-first, steal-oldest-by-alloc_seq — so the
+ * render stays reproducible (no wall-clock, no float in the choice). All three
+ * helpers are render-thread-only (called from evq_apply_due / the arp / the
+ * panic service, all on the render thread). */
+
+/* Pick the voice a note-on takes: the first FREE slot in index order, else the
+ * active slot with the smallest alloc_seq (the oldest — deterministic since
+ * alloc_seq is unique and monotone per part). */
+static synth_voice *voice_alloc(part *p) {
+    for (int i = 0; i < NVOICES; i++)
+        if (!p->voices[i].active) return &p->voices[i];
+    int oldest = 0;
+    for (int i = 1; i < NVOICES; i++)
+        if (p->voices[i].alloc_seq < p->voices[oldest].alloc_seq) oldest = i;
+    return &p->voices[oldest];
+}
+
+/* Start a note on voice v. The DSP state is PRESERVED on a steal (phase/filter
+ * continue — no memset, so a steal does not click); only the envelope is
+ * re-armed via the seen_seq != note_seq retrig edge the kernel already honors.
+ * mod[] resets so a stolen voice does not inherit the previous note's offsets. */
+static void voice_note_on(part *p, int note, float vel, uint32_t voice_id) {
+    synth_voice *v = voice_alloc(p);
+    v->note = note;
+    v->note_vel = vel;
+    v->voice_id = voice_id;
+    v->alloc_seq = p->alloc_clock++;
+    v->active = true;
+    v->note_seq++; /* retrig edge: the kernel resets the env on seen_seq mismatch */
+    v->has_mod = false;
+    memset(v->mod, 0, sizeof v->mod);
+}
+
+/* Release every active voice currently sounding `note` (set note=-1 so its env
+ * decays into release exactly like the old mono voice; the render frees it when
+ * env falls below the idle threshold). A note can sound on at most one voice in
+ * normal play, but releasing all matches is the safe panic-consistent choice. */
+static void voice_note_off(part *p, int note) {
+    for (int i = 0; i < NVOICES; i++)
+        if (p->voices[i].active && p->voices[i].note == note) p->voices[i].note = -1;
+}
+
+/* Zero a part's whole voice pool to the cold-start idle state (T15: the voice
+ * starts from zero at audio.start). Each voice's DSP + identity is zeroed, note
+ * set to -1 (the zero value 0 would read as note 0), active cleared; the
+ * alloc_clock restarts so alloc_seq counting is deterministic per stream. */
+static void part_voices_cold(part *p) {
+    for (int i = 0; i < NVOICES; i++) {
+        p->voices[i] = (synth_voice){0};
+        p->voices[i].note = -1;
     }
+    p->alloc_clock = 0;
 }
 
 static dev_event g_evq[DEV_EVQ_CAP];
@@ -317,7 +433,13 @@ void evq_reset_for_new_stream(void) {
      * is NOT reset: it survives the stream restart, like the old globals. */
     for (size_t i = 0; i < NPARTS; i++) {
         part *p = &g_parts[i];
-        note_put(p, -1);
+        /* every voice idles (note -1, freed); a note held across a restart is
+         * a stuck note. The DSP state is zeroed by the audio thread at start. */
+        for (int vi = 0; vi < NVOICES; vi++) {
+            p->voices[vi].note = -1;
+            p->voices[vi].active = false;
+        }
+        atomic_store_explicit(&p->panic_note, PANIC_NONE, memory_order_relaxed);
         memset(p->ramps, 0, sizeof p->ramps);
         arp_stream_reset(p); /* defined with the arp block below */
     }
@@ -361,16 +483,21 @@ static void ramps_advance(part *p, uint64_t pos) {
  * parts(accumulate=true). The main-mix call pattern is byte-identical to P2.1
  * (which keyed write/+= off with_drone): part0 is the only with_drone caller
  * and is also the only accumulate=false caller there. */
-static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
-                          uint64_t pos, bool with_drone, bool accumulate) {
-    synth_voice *v = &p->voice; /* per-part voice; note state from p too */
+static void engine_render(part *p, synth_voice *v, float *interleaved, uint32_t n,
+                          float rate, uint64_t pos, bool with_drone, bool accumulate) {
+    /* P2: the note identity (note/note_vel/note_seq) reads from THIS VOICE now,
+     * not the part. param reads go through VP(p,v,id): when no mod has addressed
+     * the voice (has_mod==false, ALWAYS for the golden) VP collapses to the
+     * literal param_value(p,id) below — identical codegen, identical bytes — so
+     * a single isolated voice rendered with accumulate=false is bit-for-bit the
+     * pre-pool mono kernel. The DSP body is otherwise UNTOUCHED. */
     if (!v->s_init) { /* first block: land on targets, no glide-in from zero */
-        v->s_pitch = param_value(p, 1);
-        v->s_shape = param_value(p, 2);
-        v->s_cutoff = param_value(p, 3);
-        v->s_reso = param_value(p, 4);
-        v->s_master = param_value(p, 8);
-        v->s_drone = param_value(p, 7);
+        v->s_pitch = VP(p, v, 1);
+        v->s_shape = VP(p, v, 2);
+        v->s_cutoff = VP(p, v, 3);
+        v->s_reso = VP(p, v, 4);
+        v->s_master = VP(p, v, 8);
+        v->s_drone = VP(p, v, 7);
         v->n_freq = 220.0f;
         v->s_init = true;
     }
@@ -384,22 +511,22 @@ static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
         if (end > n) end = n;
 
         ramps_advance(p, pos + i);
-        v->s_pitch += alpha * (param_value(p, 1) - v->s_pitch);
-        v->s_shape += alpha * (param_value(p, 2) - v->s_shape);
-        v->s_cutoff += alpha * (param_value(p, 3) - v->s_cutoff);
-        v->s_reso += alpha * (param_value(p, 4) - v->s_reso);
-        v->s_master += alpha * (param_value(p, 8) - v->s_master);
-        v->s_drone += alpha * (param_value(p, 7) - v->s_drone);
+        v->s_pitch += alpha * (VP(p, v, 1) - v->s_pitch);
+        v->s_shape += alpha * (VP(p, v, 2) - v->s_shape);
+        v->s_cutoff += alpha * (VP(p, v, 3) - v->s_cutoff);
+        v->s_reso += alpha * (VP(p, v, 4) - v->s_reso);
+        v->s_master += alpha * (VP(p, v, 8) - v->s_master);
+        v->s_drone += alpha * (VP(p, v, 7) - v->s_drone);
 
         /* note voice control: gate + envelope. Pitch SNAPS on a fresh
          * attack and glides only when legato (env still high): a fixed-tau
          * glide on every note makes perceived onsets interval-dependent —
          * measured r=0.86 between grid deviation and leap size, ±23 ms of
          * musical slop on sequenced 16ths. Real monosynths snap too. */
-        int note = note_get(p);
-        bool retrig = v->seen_seq != p->note_seq;
+        int note = v->note;
+        bool retrig = v->seen_seq != v->note_seq;
         if (retrig) {
-            v->seen_seq = p->note_seq;
+            v->seen_seq = v->note_seq;
             /* Envelope RESETS per note: without this, articulation depends
              * on how far the previous release decayed (measured transient
              * depth 0.06..0.99 across one take — heard as timing slop).
@@ -410,7 +537,7 @@ static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
         bool gate = note >= 0;
         if (gate) {
             float target = 440.0f * exp2f(((float)note - 69.0f) / 12.0f);
-            float glide = param_value(p, 13);
+            float glide = VP(p, v, 13);
             if (glide <= 0.001f || (retrig && v->env < 0.2f)) {
                 v->n_freq = target; /* no portamento / fresh attack: arrive
                                        on time (off notes are worse than
@@ -423,13 +550,13 @@ static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
             }
         }
         /* attack 1 ms..1 s, release 5 ms..3 s (exp-mapped knobs) */
-        float atk_tau = 0.001f * exp2f(param_value(p, 5) * 10.0f);
-        float rel_tau = 0.005f * exp2f(param_value(p, 6) * 9.2f);
+        float atk_tau = 0.001f * exp2f(VP(p, v, 5) * 10.0f);
+        float rel_tau = 0.005f * exp2f(VP(p, v, 6) * 9.2f);
         if (v->env_reset) {
             v->env *= 0.25f; /* fast decay sub-block */
             v->env_reset--;
         } else {
-            float env_target = gate ? p->note_vel : 0.0f;
+            float env_target = gate ? v->note_vel : 0.0f;
             float env_alpha =
                 1.0f - expf(-(float)SMOOTH_SUBBLOCK / ((gate ? atk_tau : rel_tau) * rate));
             v->env += env_alpha * (env_target - v->env);
@@ -512,6 +639,83 @@ static void engine_render(part *p, float *interleaved, uint32_t n, float rate,
     }
 }
 
+/* idle threshold: a released voice (note==-1) whose env has decayed below this
+ * is freed (active=false). THE SAME constant part_active uses to decide a part
+ * still rings, so a voice keeps rendering its release tail until it crosses the
+ * threshold, then goes silent and is reclaimed — exactly the mono engine's tail
+ * lifetime, now per voice. */
+#define VOICE_IDLE_THRESH 1e-4f
+
+/* THE single render-summation helper (§ design 3). Renders a part's whole voice
+ * pool into `out` (interleaved stereo, n frames) at stream position `pos`,
+ * summing voices IN INDEX ORDER. Replaces the per-part engine_render call in
+ * BOTH render_with_events (main mix) and render_part_slots (per-part slot) so
+ * the two paths CANNOT drift — they share this exact summation.
+ *
+ * Drone: stays on VOICE 0 (rendered with with_drone). For part 0 voice 0 ALWAYS
+ * renders (it carries the continuous drone, env contributes ~0 when no note) so
+ * the buffer is initialised even with the whole pool idle — bit-identical to the
+ * pre-pool part-0 write. Other voices render only when active (a free note-only
+ * voice is silence; skipping it is the same as adding zero, AND it preserves the
+ * signed-zero write of the first writer).
+ *
+ * `accumulate` is the PART-LEVEL flag (false = this part is the first writer of
+ * `out`, so its first rendered voice WRITES with '='; subsequent voices and all
+ * voices of an accumulate=true part sum with '+='). For ONE active voice and
+ * accumulate=false this is a single engine_render(=) call — byte-identical to
+ * the mono engine.
+ *
+ * Voices released long enough to fall under VOICE_IDLE_THRESH are freed here
+ * (after rendering, so the final tail sample is still emitted). */
+static void render_part_voices(part *p, float *out, uint32_t n, float rate,
+                               uint64_t pos, bool with_drone, bool accumulate) {
+    bool wrote = false; /* has any voice written `out` yet this call? */
+    for (int vi = 0; vi < NVOICES; vi++) {
+        synth_voice *v = &p->voices[vi];
+        /* voice 0 of a drone part always renders (the drone never idles); every
+         * other voice renders only while allocated/ringing */
+        bool drone_v = with_drone && vi == 0;
+        if (!drone_v && !v->active) continue;
+        /* first writer uses the part-level accumulate; later voices always '+=' */
+        engine_render(p, v, out, n, rate, pos, drone_v, wrote ? true : accumulate);
+        wrote = true;
+        /* reclaim a released voice once its tail has decayed, freeing its slot
+         * for re-allocation. This applies to voice 0 too (the drone voice keeps
+         * rendering via drone_v even when its NOTE slot is free) — so a
+         * NON-OVERLAPPING note re-allocates voice 0 and retriggers it, exactly
+         * the pre-pool mono voice. active=false leaves the DSP state in place;
+         * a future allocation/steal preserves phase (no click). */
+        if (v->active && v->note < 0 && v->env <= VOICE_IDLE_THRESH)
+            v->active = false;
+    }
+    /* accumulate=false promises the buffer is fully written (it is the first
+     * writer). A note-only part with no active voice wrote nothing — define the
+     * buffer as silence so the consumer (render_part_slots' scratch, packed into
+     * a requested-but-idle part slot) never reads stale samples. With_drone part
+     * 0 always writes voice 0, and accumulate=true sums onto an already-written
+     * buffer, so neither needs this. */
+    if (!wrote && !accumulate) memset(out, 0, (size_t)2 * n * sizeof(float));
+}
+
+/* Service a pending panic for one part (render thread, once per segment). The
+ * panic threads cannot touch the render-owned pool, so they signalled via the
+ * _Atomic panic_note; we exchange it back to PANIC_NONE and act: PANIC_ALL
+ * releases AND frees every voice (a hard all-notes-off silences ringing tails
+ * too, like the old note_put(-1) on the single voice did), a note number
+ * releases matching voices into their normal decay. */
+static void panic_service(part *p) {
+    int req = atomic_exchange_explicit(&p->panic_note, PANIC_NONE, memory_order_acquire);
+    if (req == PANIC_NONE) return;
+    if (req == PANIC_ALL) {
+        for (int vi = 0; vi < NVOICES; vi++) {
+            p->voices[vi].note = -1;
+            p->voices[vi].active = false;
+        }
+    } else {
+        voice_note_off(p, req);
+    }
+}
+
 /* Free-running stream thread (§8.3 mode 0): the device clock owns the
  * stream; the MSC counts rendered samples; frames carry (epoch, msc). */
 
@@ -535,7 +739,7 @@ static void host_paced_loop(device *d) {
     audio_state *a = &d->audio;
     /* voice starts from zero at audio.start (T15); notes/arp are reset by
      * evq_reset_for_new_stream, so zero ONLY the per-part voices here */
-    for (size_t i = 0; i < NPARTS; i++) g_parts[i].voice = (synth_voice){0};
+    for (size_t i = 0; i < NPARTS; i++) part_voices_cold(&g_parts[i]);
     /* frame + sample buffers sized for the full 34-channel map (§P2.2); the
      * default stereo main mix uses only the first 2 channels */
     uint8_t frame[HARP_AUDIO_HDR_LEN + AUDIO_MAX_NSAMPLES * 34 * 4];
@@ -660,7 +864,7 @@ void *audio_thread(void *arg) {
     }
     /* voice starts from zero at audio.start (T15); notes/arp are reset by
      * evq_reset_for_new_stream, so zero ONLY the per-part voices here */
-    for (size_t i = 0; i < NPARTS; i++) g_parts[i].voice = (synth_voice){0};
+    for (size_t i = 0; i < NPARTS; i++) part_voices_cold(&g_parts[i]);
     /* frame + sample buffers sized for the full 34-channel map (§P2.2); the
      * default stereo main mix uses only the first 2 channels */
     uint8_t frame[HARP_AUDIO_HDR_LEN + AUDIO_MAX_NSAMPLES * 34 * 4];
@@ -719,11 +923,13 @@ void *audio_thread(void *arg) {
  * (pos, limit) for render segmentation, or 0 if none. Render thread only. */
 /* ---------------- the arpeggiator (§9.7 consumer) ----------------
  *
- * Per part now: every function takes 'part *p' and operates on p->arp and
- * p->note/note_seq/note_vel. The arp type + ARP_LATCH_MAX are defined up
- * top so 'part' can contain the state by value; the step/latch/anchor/gate
- * MATH is unchanged. P3: arp_active() reads THIS PART's Arp Mode param (the
- * arp params 9..12 are per part now), so it takes the part. */
+ * Per part now: every function takes 'part *p' and operates on p->arp. P2: the
+ * arp is monophonic, so it drives VOICE 0 of the part directly (arp_voice_on /
+ * arp_voice_off) — the same slot the pre-pool mono engine used — instead of the
+ * polyphonic allocator, keeping "one note at a time" byte-identical. The arp
+ * type + ARP_LATCH_MAX are defined up top so 'part' can contain the state by
+ * value; the step/latch/anchor/gate MATH is unchanged. P3: arp_active() reads
+ * THIS PART's Arp Mode param (the arp params 9..12 are per part now). */
 
 static bool arp_active(const part *p) { return param_step_index(p, 9) != 0; }
 
@@ -738,10 +944,31 @@ static void arp_stream_reset(part *p) {
     p->arp.tempo = 0;
 }
 
+/* The arp is MONOPHONIC by construction (§9.7: one sounding note, retriggered
+ * each step). It drives VOICE 0 of its part directly — the same slot the
+ * pre-pool mono engine used — rather than the polyphonic allocator, so a step
+ * RETRIGGERS the one voice (env reset, phase continuous) instead of ringing a
+ * fresh voice out. That keeps "one note at a time" byte-identical to the mono
+ * groove render: the arp never produces tail-overlap polyphony. (For part 0,
+ * voice 0 is also the drone voice — exactly as the mono engine carried drone +
+ * arp note on its single voice.) */
 static void arp_voice_off(part *p) {
-    if (p->arp.sounding >= 0 && note_get(p) == p->arp.sounding) note_put(p, -1);
+    synth_voice *v0 = &p->voices[0];
+    if (p->arp.sounding >= 0 && v0->note == p->arp.sounding) v0->note = -1;
     p->arp.sounding = -1;
     p->arp.gate_off = 0;
+}
+
+/* Retrigger voice 0 onto the arp's stepped note — the mono note_put + note_seq
+ * bump the pre-pool engine did, now on the voice. active=true so a note-only
+ * part (1..15) renders it; alloc_seq is left untouched (the arp owns voice 0,
+ * never steals). */
+static void arp_voice_on(part *p, int note, float vel) {
+    synth_voice *v0 = &p->voices[0];
+    v0->note_vel = vel;
+    v0->note = note;
+    v0->note_seq++;
+    v0->active = true;
 }
 
 static void arp_latch_add(part *p, uint8_t note, float vel) {
@@ -862,9 +1089,7 @@ static void arp_fire_due(part *p, uint64_t pos, double rate) {
     int note = p->arp.latch[order[idx]] + 12 * oct;
     if (note > 127) note = p->arp.latch[order[idx]];
 
-    p->note_vel = p->arp.vel[order[idx]];
-    note_put(p, note);
-    p->note_seq++;
+    arp_voice_on(p, note, p->arp.vel[order[idx]]); /* mono retrigger on voice 0 */
     p->arp.sounding = note;
     /* gate: release after gate-fraction of the step length */
     double div = ARP_DIV_PPQ[param_step_index(p, 10)];
@@ -899,28 +1124,39 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
             switch (ev->kind) {
                 case DEV_EV_NOTE_ON:
                     /* arp engaged: notes feed the latch; the step clock
-                     * owns the voice. Arp off (or transport stopped):
-                     * direct mono voice as ever — audition while stopped */
+                     * owns the voice. Arp off (or transport stopped): the
+                     * polyphonic allocator hands the note a voice (P2) — a
+                     * voice per overlapping note, vs the old single mono voice.
+                     * voice_id carries the §9.5 packed key for later mod. */
                     arp_latch_add(p, (uint8_t)ev->a, ev->v);
                     if (!arp_active(p) || !p->arp.playing || !p->arp.anchor_valid) {
-                        p->note_vel = ev->v;
-                        note_put(p, (int)ev->a);
-                        p->note_seq++;
+                        /* §9.5 packed voice key for later per-voice mod targeting:
+                         * (group<<12)|(channel<<8)|note. MIDI-1.0 note-ons carry no
+                         * voice (ev->voice==0), so derive the canonical key from the
+                         * part + note; honor an explicit voice if a future MIDI-2.0
+                         * note-on ever supplies one. */
+                        uint32_t vid = ev->voice ? ev->voice
+                                       : (((uint32_t)ev->channel << 8) | ((uint32_t)ev->a & 0x7f));
+                        voice_note_on(p, (int)ev->a, ev->v, vid);
                     }
                     break;
                 case DEV_EV_NOTE_OFF:
                     arp_latch_remove(p, (uint8_t)ev->a);
                     if (!arp_active(p) || !p->arp.playing || !p->arp.anchor_valid) {
-                        if (note_get(p) == (int)ev->a) note_put(p, -1);
+                        voice_note_off(p, (int)ev->a); /* release matching voices */
                     } else if (p->arp.nlatch == 0) {
                         arp_voice_off(p); /* all keys released = latch clears */
                     }
                     break;
                 case DEV_EV_ALL_OFF:
-                    /* global panic: reset arp + clear note on EVERY part */
+                    /* global panic: reset arp + release/free every voice on
+                     * EVERY part (a hard panic silences ringing tails too) */
                     for (size_t pi = 0; pi < NPARTS; pi++) {
                         arp_reset(&g_parts[pi]);
-                        note_put(&g_parts[pi], -1);
+                        for (int vi = 0; vi < NVOICES; vi++) {
+                            g_parts[pi].voices[vi].note = -1;
+                            g_parts[pi].voices[vi].active = false;
+                        }
                     }
                     break;
                 case DEV_EV_TRANSPORT: {
@@ -967,12 +1203,31 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                     atomic_store_explicit(&g_touch_pending, 1,
                                           memory_order_release);
                     break;
-                case DEV_EV_MOD:
-                    /* §9.4 non-destructive modulation: decoded + queued (Phase 1)
-                     * but NOT yet applied — the per-voice mod offset layer is
-                     * Phase 2 (voice pool). Ignored here so the render is
-                     * unchanged (golden byte-identical). */
+                case DEV_EV_MOD: {
+                    /* §9.4 non-destructive modulation (P2): an additive, signed
+                     * per-(param[,voice]) offset on the part BASE value. It does
+                     * NOT touch pval/ramps (the base) or the dirty flag — it
+                     * lives on the per-voice mod[] layer, clamped only after
+                     * summation in voice_param(). Addressing (§9.5):
+                     *   voice != 0 -> the ONE active voice whose voice_id matches
+                     *                 (a mod to a gone voice is ignored, §9.5);
+                     *   voice == 0 -> "whole-part" (no voice key): a part-wide
+                     *                 offset applied to EVERY active voice, the
+                     *                 reading consistent with the channel-level
+                     *                 §9.4 base — every sounding voice modulates.
+                     * Unknown param id: ignored. */
+                    int idx = param_index(ev->a); /* id -> g_params/mod[] slot */
+                    if (idx >= 0) {
+                        for (int vi = 0; vi < NVOICES; vi++) {
+                            synth_voice *mv = &p->voices[vi];
+                            if (!mv->active) continue;
+                            if (ev->voice != 0 && mv->voice_id != ev->voice) continue;
+                            mv->mod[idx] = ev->v;
+                            mv->has_mod = true;
+                        }
+                    }
                     break;
+                }
             }
             continue; /* consumed */
         }
@@ -985,14 +1240,20 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
 }
 
 /* A part is "active" (worth rendering) if it sounds now or still rings:
- * a held/arp note, a non-empty latch, an arp voice, or a decaying envelope.
- * The env>1e-4f term keeps release tails alive — env only decays WHILE the
- * part renders, so an active part keeps rendering until env<1e-4f, then goes
- * silent and terminates. For ch0-only input, parts 1..15 have note=-1, empty
- * latch, sounding=-1, env=0 -> inactive -> never rendered. */
+ * a non-empty latch, an arp voice, ANY allocated voice, a still-decaying
+ * release tail on any voice, or a pending panic the render must service. The
+ * env>1e-4f term keeps release tails alive — env only decays WHILE the part
+ * renders, so an active part keeps rendering until every voice falls under the
+ * threshold (and is freed), then goes silent and terminates. For ch0-only
+ * input, parts 1..15 have no active voice, empty latch, sounding=-1, env=0 ->
+ * inactive -> never rendered. */
 static bool part_active(const part *p) {
-    return atomic_load_explicit(&p->note, memory_order_relaxed) >= 0 ||
-           p->arp.nlatch > 0 || p->arp.sounding >= 0 || p->voice.env > 1e-4f;
+    if (p->arp.nlatch > 0 || p->arp.sounding >= 0) return true;
+    if (atomic_load_explicit(&p->panic_note, memory_order_relaxed) != PANIC_NONE)
+        return true;
+    for (int vi = 0; vi < NVOICES; vi++)
+        if (p->voices[vi].active || p->voices[vi].env > 1e-4f) return true;
+    return false;
 }
 
 /* Render n samples starting at stream position `pos`, splitting at event
@@ -1006,8 +1267,10 @@ static void render_with_events(float *interleaved, uint32_t n,
     uint32_t done = 0;
     while (done < n) {
         uint64_t next = evq_apply_due(pos + done, pos + n);
-        for (size_t pi = 0; pi < NPARTS; pi++)
+        for (size_t pi = 0; pi < NPARTS; pi++) {
+            panic_service(&g_parts[pi]);                  /* drain panic signals */
             arp_fire_due(&g_parts[pi], pos + done, rate); /* steps fire AT seg starts */
+        }
         for (size_t pi = 0; pi < NPARTS; pi++) {
             uint64_t anext = arp_next_deadline(&g_parts[pi], pos + done, rate);
             if (anext && (next == 0 || anext < next)) next = anext;
@@ -1015,18 +1278,19 @@ static void render_with_events(float *interleaved, uint32_t n,
         uint32_t seg = next ? (uint32_t)(next - (pos + done)) : n - done;
         if (seg == 0) seg = 1; /* paranoia: guarantee forward progress */
         if (seg > n - done) seg = n - done;
-        /* part 0 ALWAYS renders first with a direct write (no pre-zero needed —
-         * it initialises every sample of the segment, bit-identical to P2.0).
-         * accumulate=!is_part0: part0 WRITES (=), parts 1..15 sum (+=) — the
-         * P2.1 write/+= behaviour, now spelled via the decoupled `accumulate`
-         * param (§P2.2) so these bytes are unchanged. */
-        engine_render(&g_parts[0], interleaved + 2 * done, seg, rate, pos + done,
-                      true, false); /* part 0 ALWAYS: full voice (drone+note), WRITE */
+        /* part 0 ALWAYS renders first via the single voice-pool summation helper
+         * with a direct write (no pre-zero needed — voice 0 initialises every
+         * sample of the segment, bit-identical to P2.0). accumulate=!is_part0:
+         * part0 WRITES (=), parts 1..15 sum (+=) — the P2.1 write/+= behaviour,
+         * now applied across each part's POOL in index order (render_part_voices
+         * shared with render_part_slots so they cannot drift). */
+        render_part_voices(&g_parts[0], interleaved + 2 * done, seg, rate, pos + done,
+                           true, false); /* part 0 ALWAYS: drone voice + notes, WRITE */
         for (size_t pi = 1; pi < NPARTS; pi++)
             if (part_active(&g_parts[pi]))
-                engine_render(&g_parts[pi], interleaved + 2 * done, seg, rate,
-                              pos + done, false,
-                              true); /* parts 1..15: note-only, accumulate, when active */
+                render_part_voices(&g_parts[pi], interleaved + 2 * done, seg, rate,
+                                   pos + done, false,
+                                   true); /* parts 1..15: note-only voices, accumulate */
         done += seg;
     }
 }
@@ -1074,8 +1338,10 @@ static void render_part_slots(audio_state *a, float *out, uint32_t n, float rate
         /* SHARED event/arp application — IDENTICAL to render_with_events, run
          * EXACTLY ONCE per segment so each voice advances at most once */
         uint64_t next = evq_apply_due(pos + done, pos + n);
-        for (size_t pi = 0; pi < NPARTS; pi++)
+        for (size_t pi = 0; pi < NPARTS; pi++) {
+            panic_service(&g_parts[pi]);                  /* drain panic signals */
             arp_fire_due(&g_parts[pi], pos + done, rate); /* steps fire AT seg starts */
+        }
         for (size_t pi = 0; pi < NPARTS; pi++) {
             uint64_t anext = arp_next_deadline(&g_parts[pi], pos + done, rate);
             if (anext && (next == 0 || anext < next)) next = anext;
@@ -1091,8 +1357,11 @@ static void render_part_slots(audio_state *a, float *out, uint32_t n, float rate
             bool in_mix = need_main && (pi == 0 || part_active(&g_parts[pi]));
             if (!in_mix && !need_part[pi]) continue; /* this part isn't wanted */
             /* part 0 carries the drone; 1..15 are note-only. WRITE the scratch
-             * (accumulate=false) — signed-zero-preserving, like P2.1's part0 */
-            engine_render(&g_parts[pi], pscr, seg, rate, pos + done, pi == 0, false);
+             * (accumulate=false) — signed-zero-preserving, like P2.1's part0 —
+             * via the SHARED voice-pool summation helper (same as the main mix,
+             * so the two paths can't drift). An idle requested part renders to
+             * silence (render_part_voices zero-fills its unwritten scratch). */
+            render_part_voices(&g_parts[pi], pscr, seg, rate, pos + done, pi == 0, false);
             /* §9.9: fold this part's just-written stereo into its block meter.
              * A pure read of pscr — does not alter pscr, mix, or any slot. */
             meter_acc_fold(&pacc[pi], pscr, seg);
@@ -1197,8 +1466,16 @@ void audio_stop(device *d) {
     pthread_cancel(d->audio.thread);
     pthread_join(d->audio.thread, NULL);
     atomic_store_explicit(&d->audio.thread_live, false, memory_order_relaxed);
-    for (size_t i = 0; i < NPARTS; i++)
-        note_put(&g_parts[i], -1); /* never let a note outlive its stream */
+    /* render thread is joined: the pool is quiescent, so free every voice
+     * directly (never let a note outlive its stream). Also clear any pending
+     * panic signal so it cannot leak into the next stream. */
+    for (size_t i = 0; i < NPARTS; i++) {
+        for (int vi = 0; vi < NVOICES; vi++) {
+            g_parts[i].voices[vi].note = -1;
+            g_parts[i].voices[vi].active = false;
+        }
+        atomic_store_explicit(&g_parts[i].panic_note, PANIC_NONE, memory_order_relaxed);
+    }
     fprintf(stderr, "harp-deviced: audio stream stopped (%llu reanchors)\n",
             (unsigned long long)d->audio.reanchors);
 }
