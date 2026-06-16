@@ -267,29 +267,67 @@ fail:
     return -1;
 }
 
-/* Canonical parameter descriptor array (§9.3). param-map-hash is the
- * SHA-256 of this exact deterministic encoding — identity and evt.params
- * MUST agree. */
-void encode_param_array(harp_cbuf *b) {
+/* Encode ONE automatable device-param descriptor (§9.3) into `b`. Shared by
+ * the hash input (automatable subset) and the full advertised array so the two
+ * cannot drift in shape — the 13 params are byte-identical in both. */
+static void encode_one_param(harp_cbuf *b, const dev_param *p) {
+    bool stepped = p->steps > 0;
+    harp_cbor_map(b, stepped ? 5 : 3);
+    harp_cbor_uint(b, 0);
+    harp_cbor_uint(b, p->id);
+    harp_cbor_uint(b, 1);
+    harp_cbor_text(b, p->name);
+    if (stepped) { /* §9.3 keys 5 + 9: step count, enum labels */
+        harp_cbor_uint(b, 5);
+        harp_cbor_uint(b, p->steps);
+    }
+    harp_cbor_uint(b, 8);
+    harp_cbor_uint(b, 0x1); /* flags: automatable */
+    if (stepped) {
+        harp_cbor_uint(b, 9);
+        harp_cbor_array(b, p->steps);
+        for (int s = 0; s < p->steps; s++) harp_cbor_text(b, p->labels[s]);
+    }
+}
+
+/* The AUTOMATABLE subset (§9.3): the 13 device params, in id order, EXACTLY as
+ * before metering existed — byte-for-byte. This is the SOLE input to
+ * param-map-hash (see compute_param_map_hash): the readonly meter params are
+ * deliberately excluded so the hash is unchanged from pre-meter firmware. */
+void encode_param_array_automatable(harp_cbuf *b) {
     harp_cbor_array(b, NPARAMS);
-    for (size_t i = 0; i < NPARAMS; i++) {
-        const dev_param *p = &g_params[i];
-        bool stepped = p->steps > 0;
-        harp_cbor_map(b, stepped ? 5 : 3);
-        harp_cbor_uint(b, 0);
-        harp_cbor_uint(b, p->id);
-        harp_cbor_uint(b, 1);
-        harp_cbor_text(b, p->name);
-        if (stepped) { /* §9.3 keys 5 + 9: step count, enum labels */
-            harp_cbor_uint(b, 5);
-            harp_cbor_uint(b, p->steps);
-        }
-        harp_cbor_uint(b, 8);
-        harp_cbor_uint(b, 0x1); /* flags: automatable */
-        if (stepped) {
-            harp_cbor_uint(b, 9);
-            harp_cbor_array(b, p->steps);
-            for (int s = 0; s < p->steps; s++) harp_cbor_text(b, p->labels[s]);
+    for (size_t i = 0; i < NPARAMS; i++) encode_one_param(b, &g_params[i]);
+}
+
+/* The FULL advertised array (§9.3 + §9.9): the 13 automatable params FOLLOWED
+ * BY the readonly output meters. Emitted on identity / evt.params so hosts can
+ * present meters in their UI; NOT fed to param-map-hash. Each meter descriptor
+ * is readonly (key 8 flag bit 1 = output) with a meter-rate hint (key 11), in
+ * the collision-free id range METER_ID_BASE+ (slot*2 + {0 peak,1 rms}). */
+void encode_param_array(harp_cbuf *b) {
+    harp_cbor_array(b, NPARAMS + METER_NPARAMS);
+    /* the automatable 13, byte-identical to encode_param_array_automatable */
+    for (size_t i = 0; i < NPARAMS; i++) encode_one_param(b, &g_params[i]);
+    /* the readonly meters: per part 0..15 then the main mix, peak then rms */
+    for (int slot = 0; slot < METER_NSLOTS; slot++) {
+        char name[24];
+        bool main = (slot == METER_MAIN_IX);
+        for (int kind = 0; kind < 2; kind++) { /* 0 = peak, 1 = rms */
+            const char *what = kind ? "RMS" : "Peak";
+            if (main)
+                snprintf(name, sizeof name, "Main %s", what);
+            else
+                snprintf(name, sizeof name, "Part %d %s", slot + 1, what);
+            /* keys 0 (id), 1 (name), 8 (flags=readonly), 11 (meter rate Hz) */
+            harp_cbor_map(b, 4);
+            harp_cbor_uint(b, 0);
+            harp_cbor_uint(b, kind ? METER_ID_RMS(slot) : METER_ID_PEAK(slot));
+            harp_cbor_uint(b, 1);
+            harp_cbor_text(b, name);
+            harp_cbor_uint(b, 8);
+            harp_cbor_uint(b, 0x2); /* flags: bit 1 = readonly (output), §9.9 */
+            harp_cbor_uint(b, 11);
+            harp_cbor_uint(b, METER_RATE_HZ); /* §9.3 key 11 meter-rate hint */
         }
     }
 }
@@ -304,7 +342,13 @@ void compute_param_map_hash(device *d) {
         assert(engine_part_param_get(0, g_params[i].id) == g_params[i].def);
     harp_cbuf b;
     harp_cbuf_init(&b);
-    encode_param_array(&b);
+    /* §9.3/§9.9 DETERMINISM HINGE: hash the AUTOMATABLE subset ONLY. The hash
+     * protects stored automation lanes ("change iff invalidates stored
+     * automation"); readonly outputs are never automation targets, so adding /
+     * removing meters does NOT invalidate any lane and MUST NOT move the hash.
+     * Hashing the 13 automatable params keeps param-map-hash byte-identical to
+     * pre-meter firmware -> identity + recall stay byte-identical. */
+    encode_param_array_automatable(&b);
     d->param_map_hash = harp_hash_compute(b.buf, b.len);
     harp_cbuf_free(&b);
 }

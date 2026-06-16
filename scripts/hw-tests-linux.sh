@@ -84,6 +84,7 @@ run scripts/alias-group-e2e.sh
 run scripts/alias-part-audio-test.sh
 run scripts/late-sink-test.sh
 run scripts/part-param-iso-test.sh
+run scripts/meter-test.sh
 run scripts/replug-test.sh
 echo "════ hw-tests (linux): $PASS passed, $FAIL failed, $SKIP skipped"
 [ $FAIL -eq 0 ]

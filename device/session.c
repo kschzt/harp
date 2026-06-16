@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/statvfs.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "device.h"
@@ -55,6 +56,75 @@ void evt_echo_param(device *d, uint32_t id, float v, uint8_t channel) {
     if (d->io) harp_link_send(d->io, HARP_STREAM_EVT, m.buf, m.len);
     pthread_mutex_unlock(&d->send_mu);
     harp_cbuf_free(&m);
+}
+
+/* ---------------- §9.9 output-metering echo pump ----------------
+ *
+ * A dedicated CONTROL-PLANE thread (never the render thread) that streams the
+ * readonly meter params as 'param' echoes while a stream is running. It paces
+ * itself to METER_RATE_HZ (§9.9 "no more than the meter rate hint"), reads the
+ * render thread's relaxed meter atomics, and emits via evt_echo_param — the
+ * SAME path front-panel echoes use, so it inherits the hello gate + send_mu
+ * serialization. It NEVER calls live_ref_touch, NEVER dirties state, and NEVER
+ * touches engine render state: a meter is an output, not an edit (§9.9 — hosts
+ * MUST NOT record these as automation; they are readonly).
+ *
+ * Coalescing (§9.9 / §10.3 spirit): a meter id is re-emitted only when its
+ * value changed since the last tick, so a silent or steady part costs no wire
+ * traffic. The first tick after start emits every id once (last[] seeded NaN)
+ * so the host gets an initial reading. */
+static void *meter_pump_thread(void *arg) {
+    device *d = arg;
+    audio_state *a = &d->audio;
+    /* last value sent per meter id (peak,rms interleaved per slot). NaN forces
+     * the first emission; thereafter we only send on change. */
+    float last_peak[METER_NSLOTS], last_rms[METER_NSLOTS];
+    for (int i = 0; i < METER_NSLOTS; i++)
+        last_peak[i] = last_rms[i] = (float)NAN;
+
+    const long tick_ns = 1000000000L / (long)METER_RATE_HZ;
+    while (atomic_load_explicit(&a->meter_running, memory_order_relaxed)) {
+        struct timespec ts = {tick_ns / 1000000000L, tick_ns % 1000000000L};
+        nanosleep(&ts, NULL);
+        if (!atomic_load_explicit(&a->meter_running, memory_order_relaxed)) break;
+        for (int slot = 0; slot < METER_NSLOTS; slot++) {
+            float peak = atomic_load_explicit(&g_meter_peak[slot], memory_order_relaxed);
+            float rms = atomic_load_explicit(&g_meter_rms[slot], memory_order_relaxed);
+            /* coalesce unchanged values (a steady reading costs no traffic).
+             * The NaN-seeded first comparison always differs -> initial emit. */
+            if (!(peak == last_peak[slot])) {
+                evt_echo_param(d, METER_ID_PEAK(slot), peak, 0); /* device output:
+                                                        channel 0 wire shape */
+                last_peak[slot] = peak;
+            }
+            if (!(rms == last_rms[slot])) {
+                evt_echo_param(d, METER_ID_RMS(slot), rms, 0);
+                last_rms[slot] = rms;
+            }
+        }
+    }
+    return NULL;
+}
+
+void meter_pump_start(device *d) {
+    audio_state *a = &d->audio;
+    if (atomic_load_explicit(&a->meter_live, memory_order_relaxed)) return;
+    engine_meters_reset(); /* new stream = new meter timeline; no stale peaks */
+    atomic_store_explicit(&a->meter_running, true, memory_order_relaxed);
+    if (pthread_create(&a->meter_thread, NULL, meter_pump_thread, d) != 0) {
+        atomic_store_explicit(&a->meter_running, false, memory_order_relaxed);
+        return; /* metering is best-effort telemetry; a failed pump never
+                   blocks the audio stream from starting */
+    }
+    atomic_store_explicit(&a->meter_live, true, memory_order_relaxed);
+}
+
+void meter_pump_stop(device *d) {
+    audio_state *a = &d->audio;
+    if (!atomic_load_explicit(&a->meter_live, memory_order_relaxed)) return;
+    atomic_store_explicit(&a->meter_running, false, memory_order_relaxed);
+    pthread_join(a->meter_thread, NULL);
+    atomic_store_explicit(&a->meter_live, false, memory_order_relaxed);
 }
 
 void ntf_state_changed(device *d, const harp_ref *r) {
@@ -140,7 +210,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, PROTO_MAJOR);
     harp_cbor_uint(m, PROTO_MINOR);
     harp_cbor_uint(m, 6); /* capabilities */
-    harp_cbor_array(m, 13); /* P3: + "evt.multitimbral" */
+    harp_cbor_array(m, 14); /* P3: + "evt.multitimbral"; §9.9: + "evt.param.meter" */
     harp_cbor_text(m, "harp-core");
     harp_cbor_text(m, "harp-recall");
     harp_cbor_text(m, "harp-stream");
@@ -157,6 +227,10 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_text(m, "evt.multitimbral"); /* P3: 16 independent per-part timbres;
                                               params/notes/ramps route by §9.4 part
                                               (channel key 5). Part count = key 12 */
+    harp_cbor_text(m, "evt.param.meter"); /* §9.9 output metering: readonly meter
+                                             params (per-part + main peak/RMS)
+                                             streamed via evt.param.echo at the
+                                             descriptor's meter-rate hint */
     harp_cbor_text(m, "x.harp-refdev.sim");
     harp_cbor_uint(m, 7); /* channel map (§6.3): 34 slots, all D→H. §P2.2
                              exposes per-part outputs: slots 0/1 are the stereo
@@ -736,6 +810,7 @@ static void handle_audio_start(device *d, const harp_env *e) {
         return;
     }
     atomic_store_explicit(&d->audio.thread_live, true, memory_order_relaxed);
+    meter_pump_start(d); /* §9.9: stream the readonly meters while streaming */
     fprintf(stderr, "harp-deviced: audio stream started (%u Hz, %u-sample blocks, %s)\n",
             d->audio.rate, d->audio.nsamples,
             mode ? "host-paced" : "free-running");
@@ -971,6 +1046,28 @@ static void handle_dev_params(device *d, const harp_env *e) {
     harp_cbuf_free(&m);
 }
 
+/* x.harp-refdev.meters -> {0: [ [slot, peak, rms], ... ]} — a control-plane READ
+ * of the live §9.9 output meters (the same _Atomic floats the render thread folds
+ * and the 30 Hz pump echoes). slot 0..15 = parts, 16 = main mix. Pure read, no
+ * render/state effect (golden unaffected) — a diag + test convenience alongside
+ * the asynchronous meter echo. */
+static void handle_dev_meters(device *d, const harp_env *e) {
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, true);
+    harp_cbor_map(&m, 1);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_array(&m, METER_NSLOTS);
+    for (int s = 0; s < METER_NSLOTS; s++) {
+        harp_cbor_array(&m, 3);
+        harp_cbor_uint(&m, (uint64_t)s);
+        harp_cbor_float(&m, atomic_load_explicit(&g_meter_peak[s], memory_order_relaxed));
+        harp_cbor_float(&m, atomic_load_explicit(&g_meter_rms[s], memory_order_relaxed));
+    }
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+
 /* ---------------- dispatch ---------------- */
 
 static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
@@ -1075,6 +1172,8 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
         handle_knob(d, &e);
     else if (strcmp(e.method, "x.harp-refdev.params") == 0)
         handle_dev_params(d, &e);
+    else if (strcmp(e.method, "x.harp-refdev.meters") == 0)
+        handle_dev_meters(d, &e);
     else if (strcmp(e.method, "x.harp-refdev.restart") == 0) {
         /* dev-loop helper: exit cleanly so systemd (Restart=always) respawns
          * the daemon from the (possibly updated) binary on disk — the

@@ -83,6 +83,45 @@ int param_index(uint32_t id); /* slot in g_params, or -1 (engine.c) */
 float engine_part_param_get(int part_idx, uint32_t id);
 void engine_part_param_put(int part_idx, uint32_t id, float v);
 
+/* ---------------- per-part OUTPUT METERING (§9.9) ----------------
+ *
+ * Output parameters (§9.9): readonly meters streamed via echo. The render
+ * thread FOLDS peak+RMS for every rendered part AND the summed main mix into
+ * process-global atomics; a control-thread pump (session.c) reads them and
+ * emits 'param' echoes at the meter rate. These atomics are the ONLY thing the
+ * metering adds to the render path — it reads the already-written stereo
+ * scratch / main mix and writes here; it never feeds back into the render, so
+ * the golden render stays byte-identical (see engine.c engine_meter_fold).
+ *
+ * Layout: index 0..NPARTS-1 = parts 0..15, index NPARTS = the main mix. Peak is
+ * max|sample| over the block; RMS is sqrt(mean(square)) over the block. Both are
+ * flushed-to-zero on silence / non-finite input (no denormals or NaN escape).
+ *
+ * COVERAGE CONTRACT (§9.9): a part is metered for a block iff its output is
+ * actually produced that block — part 0 always (it carries the drone), parts
+ * 1..15 only while active (held/ringing); an unrendered part's meters decay to
+ * the silent floor (the pump emits 0 for it). The main-mix meter always covers
+ * the summed stereo mix that the host hears on slots 0/1. */
+#define METER_NSLOTS (NPARTS + 1) /* 16 parts + 1 main mix */
+#define METER_MAIN_IX NPARTS      /* the main-mix entry */
+
+/* Meter-rate hint (§9.3 key 11 / §9.9 "no more than the meter rate"): the
+ * descriptor advertises this and the pump paces itself to it. */
+#define METER_RATE_HZ 30u
+
+/* Stable, collision-free id range for the readonly meter params (§9.9). The 13
+ * device params use ids 1..13; meters live at 0x1000+ so they CANNOT collide.
+ * id = METER_ID_BASE + slot*2 + {0 peak, 1 rms}; slot 0..15 = parts, 16 = main. */
+#define METER_ID_BASE 0x1000u
+#define METER_ID_PEAK(slot) (METER_ID_BASE + (uint32_t)(slot) * 2u + 0u)
+#define METER_ID_RMS(slot) (METER_ID_BASE + (uint32_t)(slot) * 2u + 1u)
+#define METER_NPARAMS (METER_NSLOTS * 2) /* one peak + one rms per slot */
+
+/* Render thread writes (engine.c), pump reads (session.c). Relaxed: meters
+ * order nothing and a one-block-stale read is musically invisible. */
+extern _Atomic float g_meter_peak[METER_NSLOTS];
+extern _Atomic float g_meter_rms[METER_NSLOTS];
+
 /* Live performance note state is PRIVATE to engine.c (mono, last-note
  * priority; notes are events, not patch state — they never touch the
  * dirty flag). Other threads reach it only through the panic-grade
@@ -170,6 +209,15 @@ typedef struct {
      * map (34) so any subset/order fits; values are clamped 0..33 on parse. */
     uint8_t out_slots[34];
     uint8_t n_out_slots;
+
+    /* §9.9 meter echo pump: a control-thread emitter that streams readonly
+     * meter params via evt_echo_param at METER_RATE_HZ, ONLY while streaming.
+     * Owned/managed by session.c (meter_pump_start/stop); never the render
+     * thread. `meter_running` is the stop flag (session writes, pump polls);
+     * `meter_live` guards join (set true after a successful create). */
+    pthread_t meter_thread;
+    _Atomic bool meter_running;
+    _Atomic bool meter_live;
 } audio_state;
 
 typedef struct {
@@ -221,6 +269,7 @@ void evq_push(dev_event ev);
 void evq_reset_for_new_stream(void);
 void *audio_thread(void *arg);
 void audio_stop(device *d);
+void engine_meters_reset(void); /* §9.9: clear meters to the silent floor */
 
 /* ---------------- state.c ---------------- */
 
@@ -248,7 +297,15 @@ bool refdev_parse_params_blob(const uint8_t *payload, size_t len,
 int engine_snapshot_objects(device *d, const harp_hash *parent, const char *msg,
                             harp_hash *out);
 int engine_load_snapshot(device *d, const harp_hash *snap_h);
+/* The FULL descriptor array advertised on evt.params / identity: the 13
+ * automatable device params FOLLOWED BY the readonly meter params (§9.9). */
 void encode_param_array(harp_cbuf *b);
+/* The AUTOMATABLE subset only — the 13 device params, no meters. This is the
+ * SOLE input to param-map-hash (§9.3): the hash protects stored automation
+ * lanes, and readonly outputs (§9.9) can never be automation targets, so they
+ * MUST NOT perturb it. Keeping the hash over this subset is what makes the
+ * golden render + per-part recall + identity byte-identical to pre-meter. */
+void encode_param_array_automatable(harp_cbuf *b);
 void compute_param_map_hash(device *d);
 void live_ref_touch(device *d, bool dirty);
 void live_cache_flush(device *d);
@@ -270,6 +327,11 @@ int send_ctl(device *d, const harp_cbuf *msg);
 /* P3: echo carries the part (channel). channel 0 omits the §9.4 channel key
  * (key 5) so part-0 echoes are byte-identical to P2.2; non-zero emits it. */
 void evt_echo_param(device *d, uint32_t id, float v, uint8_t channel);
+/* §9.9 meter echo pump lifecycle (session.c): start at audio.start, stop at
+ * audio.stop / session teardown. start clears the meter atomics so a new
+ * stream begins from the silent floor. */
+void meter_pump_start(device *d);
+void meter_pump_stop(device *d);
 void ntf_state_changed(device *d, const harp_ref *r);
 void grant_credit(device *d);
 void send_error(device *d, uint64_t rid, const char *method, const char *code,

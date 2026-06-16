@@ -8,6 +8,7 @@
  * Remaining spec deviation, by design: no four-actions UI yet —
  * mismatches auto-resolve by Push-with-archive, which is loss-free.
  */
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -70,6 +71,32 @@ static constexpr int kNumParams = sizeof(kParams) / sizeof(kParams[0]);
 /* hidden parameter the DAW's panic (CC 120/123) maps onto via IMidiMapping
  * (VST3-only — the AU surfaces panic through MIDI CC directly, no param) */
 static constexpr uint32_t kPanicParamId = 99;
+
+/* §9.9 OUTPUT METERS. The device's readonly per-part + main-mix peak/RMS meters
+ * (id range 0x1000+, see shell_constants.h) are surfaced as READONLY host
+ * parameters: registered kIsReadOnly (which per the VST3 SDK implies NOT
+ * automatable), so a DAW shows live meters in its generic UI but cannot offer or
+ * record them as automation (§9.9). They are NEVER written by the shell — the
+ * device echoes their values through the SAME evt 'param' path the front-panel
+ * echo uses, and process() routes those echoes to outputParameterChanges exactly
+ * like a panel knob move (the id self-encodes the part/slot/metric). Because they
+ * are additive + readonly + never on the render/event path, the single-instance
+ * golden render is byte-identical (the determinism gate). */
+static_assert(kMeterIdBase == 0x1000u && kNumMeterParams == 34,
+              "meter id scheme must mirror device/device.h (METER_ID_BASE/NSLOTS)");
+
+/* Human-readable meter param name into `buf` (e.g. "Meter Part 3 Peak",
+ * "Meter Main RMS"). slot 0..15 = parts, slot 16 = the summed main mix; the low
+ * id bit picks peak (0) vs rms (1). */
+static void meterParamName(uint32_t id, char *buf, size_t n) {
+    uint32_t k = id - kMeterIdBase;
+    uint32_t slot = k / 2, metric = k & 1;
+    const char *mname = metric ? "RMS" : "Peak";
+    if (slot == kMeterMainSlot)
+        snprintf(buf, n, "Meter Main %s", mname);
+    else
+        snprintf(buf, n, "Meter Part %u %s", slot, mname);
+}
 
 /* ---------------- processor ---------------- */
 
@@ -660,6 +687,22 @@ public:
                                 ParameterInfo::kCanAutomate, kPartParamId);
         parameters.addParameter(STR16("Panic"), nullptr, 0, 0,
                                 ParameterInfo::kIsHidden, kPanicParamId);
+        /* §9.9 OUTPUT METERS: the device's readonly per-part + main-mix peak/RMS
+         * meters (ids 0x1000+). Registered kIsReadOnly so a DAW shows the live
+         * values its meter UI/generic editor but offers them as neither
+         * automation nor a writable target (kIsReadOnly implies NOT kCanAutomate
+         * per the SDK). The shell never writes them; their values arrive via the
+         * device echo -> outputParameterChanges path (see process()). */
+        for (uint32_t slot = 0; slot < kMeterSlots; slot++) {
+            for (uint32_t metric = 0; metric < 2; metric++) {
+                uint32_t id = kMeterIdBase + slot * 2 + metric;
+                char name[64];
+                meterParamName(id, name, sizeof name);
+                UString256 title(name);
+                parameters.addParameter(title, nullptr, 0, 0.0,
+                                        ParameterInfo::kIsReadOnly, id);
+            }
+        }
         return kResultOk;
     }
 

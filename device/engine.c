@@ -220,6 +220,66 @@ _Atomic uint32_t g_evt_consumed;
 _Atomic uint64_t g_fence_waits;
 _Atomic uint64_t g_fence_timeouts;
 
+/* §9.9 OUTPUT METERING atomics. Render thread folds (engine_meter_fold);
+ * the session.c pump reads. Relaxed: meters order nothing, and the worst case
+ * is a one-block-stale value the eye cannot see. */
+_Atomic float g_meter_peak[METER_NSLOTS];
+_Atomic float g_meter_rms[METER_NSLOTS];
+
+/* A meter accumulator spans a whole host block, which render_part_slots emits
+ * in event-aligned SEGMENTS reusing one scratch buffer. We therefore fold each
+ * segment into a stack accumulator (peak max, energy sum, count) and commit
+ * once per block, so peak/RMS cover all n frames the host receives — not just
+ * the last segment. */
+typedef struct {
+    float peak;
+    double sumsq;
+    uint64_t nsamp;
+} meter_acc;
+
+/* Fold one rendered stereo SEGMENT (interleaved L,R; `n` frames) into `acc`.
+ * This ONLY READS samples already written by engine_render and updates the
+ * stack accumulator — it touches no engine_render call, no render math, no slot
+ * write, no SSI. Removing every meter call leaves the rendered audio
+ * bit-for-bit unchanged, which is the golden-render guarantee.
+ *
+ * NaN/Inf guard (§9.9): a non-finite sample (it cannot occur in the
+ * finite-input synth, but the contract is guarded anyway) is dropped from both
+ * peak and energy, so no NaN/Inf can propagate to the stored meter. */
+static void meter_acc_fold(meter_acc *acc, const float *interleaved, uint32_t n) {
+    uint32_t ns = 2u * n;
+    for (uint32_t i = 0; i < ns; i++) {
+        float s = interleaved[i];
+        if (!isfinite(s)) continue;
+        float a = fabsf(s);
+        if (a > acc->peak) acc->peak = a;
+        acc->sumsq += (double)s * (double)s; /* double sum: a 1024-frame block of
+                                                |1.0| sums to 2048, no f32 bias */
+    }
+    acc->nsamp += ns;
+}
+
+/* Commit a block accumulator to meter slot `ix`. Flush-to-zero on silence: a
+ * denormal peak/rms (a lone tiny release-tail sample) reads as silence on a
+ * meter and would only cost the host denormal stalls, so it stores exact 0. */
+static void meter_acc_commit(int ix, const meter_acc *acc) {
+    float peak = acc->peak;
+    float rms = acc->nsamp ? (float)sqrt(acc->sumsq / (double)acc->nsamp) : 0.0f;
+    if (!(peak > 1e-20f)) peak = 0.0f;
+    if (!(rms > 1e-20f)) rms = 0.0f;
+    atomic_store_explicit(&g_meter_peak[ix], peak, memory_order_relaxed);
+    atomic_store_explicit(&g_meter_rms[ix], rms, memory_order_relaxed);
+}
+
+/* Reset every meter slot to the silent floor. Called by the pump at stream
+ * start (a new stream is a new meter timeline; stale peaks must not leak). */
+void engine_meters_reset(void) {
+    for (int i = 0; i < METER_NSLOTS; i++) {
+        atomic_store_explicit(&g_meter_peak[i], 0.0f, memory_order_relaxed);
+        atomic_store_explicit(&g_meter_rms[i], 0.0f, memory_order_relaxed);
+    }
+}
+
 void evq_push(dev_event ev) {
     pthread_mutex_lock(&g_evq_mu);
     if (g_evq_n < DEV_EVQ_CAP)
@@ -994,6 +1054,15 @@ static void render_part_slots(audio_state *a, float *out, uint32_t n, float rate
     float pscr[2 * AUDIO_MAX_NSAMPLES]; /* one part's stereo render */
     float mix[2 * AUDIO_MAX_NSAMPLES];  /* the reconstructed main mix */
 
+    /* §9.9 meter accumulators for THIS block. Per-part + main; `metered[pi]`
+     * records whether part pi produced output this block (the coverage
+     * contract). Folding reads pscr/mix AFTER they are written and never feeds
+     * back into the render, so the audio bytes are untouched. */
+    meter_acc pacc[NPARTS] = {{0}};
+    bool metered[NPARTS] = {false};
+    meter_acc macc = {0};
+    bool main_metered = false;
+
     uint32_t done = 0;
     while (done < n) {
         /* SHARED event/arp application — IDENTICAL to render_with_events, run
@@ -1018,6 +1087,10 @@ static void render_part_slots(audio_state *a, float *out, uint32_t n, float rate
             /* part 0 carries the drone; 1..15 are note-only. WRITE the scratch
              * (accumulate=false) — signed-zero-preserving, like P2.1's part0 */
             engine_render(&g_parts[pi], pscr, seg, rate, pos + done, pi == 0, false);
+            /* §9.9: fold this part's just-written stereo into its block meter.
+             * A pure read of pscr — does not alter pscr, mix, or any slot. */
+            meter_acc_fold(&pacc[pi], pscr, seg);
+            metered[pi] = true;
             if (in_mix) {
                 /* part0 WRITES mix, later active parts ACCUMULATE — same order
                  * and same float ops as render_with_events's main mix */
@@ -1045,6 +1118,12 @@ static void render_part_slots(audio_state *a, float *out, uint32_t n, float rate
         /* if main was requested but nothing fed `mix` (can't happen: part0 is
          * always in_mix when need_main), guard against reading uninitialised */
         if (need_main && !mix_written) memset(mix, 0, (size_t)2 * seg * sizeof(float));
+        /* §9.9: fold the just-assembled main-mix segment into its block meter.
+         * Read-only on `mix`; runs only when the mix was actually produced. */
+        if (need_main) {
+            meter_acc_fold(&macc, mix, seg);
+            main_metered = true;
+        }
         /* pack the main-mix columns (slots 0/1) from the accumulator */
         if (need_main)
             for (uint8_t s = 0; s < ns; s++) {
@@ -1055,6 +1134,21 @@ static void render_part_slots(audio_state *a, float *out, uint32_t n, float rate
             }
         done += seg;
     }
+
+    /* §9.9 commit the block's meters (coverage contract): a part that produced
+     * output this block gets its peak/RMS; a part that did NOT render (inactive,
+     * or not requested) decays to the silent floor so a stale peak never sticks.
+     * The main-mix slot updates only when the mix was assembled (need_main);
+     * otherwise it keeps its prior value (the host didn't ask for the mix). */
+    for (size_t pi = 0; pi < NPARTS; pi++) {
+        if (metered[pi])
+            meter_acc_commit((int)pi, &pacc[pi]);
+        else {
+            atomic_store_explicit(&g_meter_peak[pi], 0.0f, memory_order_relaxed);
+            atomic_store_explicit(&g_meter_rms[pi], 0.0f, memory_order_relaxed);
+        }
+    }
+    if (main_metered) meter_acc_commit(METER_MAIN_IX, &macc);
 }
 
 static uint16_t render_output(audio_state *a, float *out, uint32_t n, float rate,
@@ -1065,6 +1159,17 @@ static uint16_t render_output(audio_state *a, float *out, uint32_t n, float rate
      * output, golden hashes hold. The per-part branch is purely additive. */
     if (a->n_out_slots == 2 && a->out_slots[0] == 0 && a->out_slots[1] == 1) {
         render_with_events(out, n, rate, pos);
+        /* §9.9 main-mix meter on the golden path: fold the ALREADY-WRITTEN
+         * stereo output. This is a read of `out` AFTER render_with_events
+         * returned — it cannot change a single rendered byte, so the golden /
+         * groove hashes are untouched. Per-part meters are unavailable here (no
+         * per-part scratch exists on this fast path — by construction, to keep
+         * it byte-identical); the pump emits the silent floor for parts in this
+         * mode. The main mix is what the host hears on slots 0/1, so that is the
+         * meter that matters in the default streaming case. */
+        meter_acc macc = {0};
+        meter_acc_fold(&macc, out, n);
+        meter_acc_commit(METER_MAIN_IX, &macc);
         return 2;
     }
     /* PER-PART case: any requested slot >= 2, or a non-{0,1} arrangement */
@@ -1073,6 +1178,10 @@ static uint16_t render_output(audio_state *a, float *out, uint32_t n, float rate
 }
 
 void audio_stop(device *d) {
+    /* §9.9: stop the meter pump first (a no-op if none is live). Done BEFORE the
+     * thread_live early-return so an orphaned pump is always reaped, and before
+     * tearing down the render thread so no echo races a half-stopped stream. */
+    meter_pump_stop(d);
     if (!atomic_load_explicit(&d->audio.thread_live, memory_order_relaxed)) return;
     d->audio.running = false;
     /* The thread may be parked in a blocking endpoint read (mode 1 pacing,

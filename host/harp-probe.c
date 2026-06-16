@@ -702,6 +702,36 @@ static void cmd_params(probe *p) {
     harp_cbuf_free(&rsp);
 }
 
+/* §9.9 live output meters: x.harp-refdev.meters -> {0: [ [slot, peak, rms], ...]}
+ * slot 0..15 = parts, 16 = main mix. */
+static void cmd_meters(probe *p) {
+    do_hello(p);
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    req_head(p, &req, "x.harp-refdev.meters", false);
+    harp_env e = request(p, &req, &rsp);
+    harp_cdec b;
+    harp_cdec_init(&b, e.body, e.body_len);
+    uint64_t n, key, alen;
+    if (e.has_body && harp_cdec_map(&b, &n) && n >= 1 && harp_cdec_uint(&b, &key) &&
+        key == 0 && harp_cdec_array(&b, &alen)) {
+        for (uint64_t i = 0; i < alen; i++) {
+            uint64_t three, slot;
+            double peak, rms;
+            if (!harp_cdec_array(&b, &three) || three != 3 || !harp_cdec_uint(&b, &slot) ||
+                !harp_cdec_float(&b, &peak) || !harp_cdec_float(&b, &rms))
+                break;
+            if (slot == 16)
+                printf("  main     peak %.4f  rms %.4f\n", peak, rms);
+            else
+                printf("  part %-2llu  peak %.4f  rms %.4f\n", (unsigned long long)slot, peak, rms);
+        }
+    }
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+}
+
 static void cmd_knob(probe *p, uint64_t id, double v) {
     do_hello(p);
     harp_cbuf req, rsp;
@@ -871,7 +901,7 @@ int main(int argc, char **argv) {
     if (i >= argc) {
         fprintf(stderr,
                 "usage: harp-probe [-d HOST:PORT|usb|usb:SERIAL] [-s STOREDIR] "
-                "identify|refs|counters|params|knob ID V|save|restore|record SECS WAV|demo\n");
+                "identify|refs|counters|params|meters|knob ID V|save|restore|record SECS WAV|demo\n");
         return 2;
     }
     const char *cmd = argv[i];
@@ -917,6 +947,8 @@ int main(int argc, char **argv) {
         cmd_counters(&p);
     else if (strcmp(cmd, "params") == 0)
         cmd_params(&p);
+    else if (strcmp(cmd, "meters") == 0)
+        cmd_meters(&p);
     else if (strcmp(cmd, "knob") == 0 && i + 2 < argc) {
         cmd_knob(&p, strtoull(argv[i + 1], NULL, 10), strtod(argv[i + 2], NULL));
     } else if (strcmp(cmd, "save") == 0) {

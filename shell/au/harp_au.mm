@@ -51,6 +51,32 @@ static const AuParam kAuParams[] = {
 };
 static constexpr UInt32 kNumAuParams = sizeof(kAuParams) / sizeof(kAuParams[0]);
 
+/* §9.9 OUTPUT METERS. The device's readonly per-part + main-mix peak/RMS meters
+ * (id range 0x1000+, shared scheme in shell_constants.h, mirroring
+ * device/device.h) are surfaced as READONLY AudioUnitParameters: reported in the
+ * ParameterList AFTER the 13 device params and the Part router, with ParameterInfo
+ * flags that are READABLE but NOT WRITABLE (the AU read-only equivalent of VST3's
+ * kIsReadOnly), so a host shows live meters but cannot write/automate them (§9.9).
+ * The shell never sets them — their values arrive through the SAME device echo
+ * path the front-panel echo uses; au_GetParameter drains meter echoes into a
+ * meterShadow and returns them. Additive + readonly + never on the render/event
+ * path => the single-instance golden render is byte-identical (the determinism
+ * gate). The id self-encodes the part/slot/metric so the echo path is unchanged. */
+static_assert(kMeterIdBase == 0x1000u && kNumMeterParams == 34,
+              "meter id scheme must mirror device/device.h (METER_ID_BASE/NSLOTS)");
+
+/* Human-readable meter param name into `buf` (mirrors the VST3 shell's
+ * meterParamName so both formats show identical labels). */
+static void au_meter_name(AudioUnitParameterID id, char *buf, size_t n) {
+    uint32_t k = (uint32_t)id - kMeterIdBase;
+    uint32_t slot = k / 2, metric = k & 1;
+    const char *mname = metric ? "RMS" : "Peak";
+    if (slot == kMeterMainSlot)
+        snprintf(buf, n, "Meter Main %s", mname);
+    else
+        snprintf(buf, n, "Meter Part %u %s", slot, mname);
+}
+
 /* The "Part" routing parameter id (98), its step count, and the recall
  * component-state header (kStateHeaderMagic/kStateHeaderLen) are SHARED with the
  * VST3 shell via shell_constants.h — both formats must agree for a project's
@@ -114,6 +140,10 @@ struct HarpAU {
     /* controller-side shadow of the param values (the device owns truth;
      * echoes update this so hosts see front-panel moves) */
     float paramShadow[kNumAuParams];
+    /* §9.9 readonly meter shadow: latest echoed peak/RMS per slot+metric (the
+     * device owns truth; the meter echo updates this so hosts read live values).
+     * Indexed by (id - kMeterIdBase); silent floor (0) until the first echo. */
+    float meterShadow[kNumMeterParams];
 
     /* This instance's multitimbral PART (§9.4 channel, 0..15) — the per-instance
      * routing the "Part" param (id 98) drives, mirroring the VST3 shell. DEFAULT =
@@ -138,6 +168,7 @@ struct HarpAU {
 
     HarpAU() {
         for (UInt32 i = 0; i < kNumAuParams; i++) paramShadow[i] = 0.5f;
+        for (UInt32 i = 0; i < kNumMeterParams; i++) meterShadow[i] = 0.0f; /* silent floor */
         paramShadow[8] = 0.0f;  /* Arp Mode off */
         paramShadow[9] = 0.6f;  /* Division 1/16 */
         paramShadow[11] = 0.0f; /* Octaves 1 */
@@ -464,9 +495,10 @@ static OSStatus au_GetPropertyInfo(void *self, AudioUnitPropertyID prop,
             size = sizeof(AUChannelInfo);
             break;
         case kAudioUnitProperty_ParameterList:
-            /* 13 device params + the host-side "Part" router (id 98) */
+            /* 13 device params + the host-side "Part" router (id 98) + the §9.9
+             * readonly meter params (ids 0x1000+) */
             size = scope == kAudioUnitScope_Global
-                       ? (kNumAuParams + 1) * sizeof(AudioUnitParameterID)
+                       ? (kNumAuParams + 1 + kNumMeterParams) * sizeof(AudioUnitParameterID)
                        : 0;
             break;
         case kAudioUnitProperty_ParameterInfo:
@@ -557,13 +589,20 @@ static OSStatus au_GetProperty(void *self, AudioUnitPropertyID prop,
                 *ioSize = 0;
                 return noErr;
             }
-            /* 13 device params, then the host-side "Part" router (id 98) last */
-            const UInt32 total = kNumAuParams + 1;
+            /* 13 device params, then the host-side "Part" router (id 98), then the
+             * §9.9 readonly meter params (ids 0x1000+, peak/rms per slot) last */
+            const UInt32 total = kNumAuParams + 1 + kNumMeterParams;
             UInt32 n = *ioSize / sizeof(AudioUnitParameterID);
             if (n > total) n = total;
             auto *ids = (AudioUnitParameterID *)outData;
-            for (UInt32 i = 0; i < n; i++)
-                ids[i] = (i < kNumAuParams) ? kAuParams[i].id : kPartParamId;
+            for (UInt32 i = 0; i < n; i++) {
+                if (i < kNumAuParams)
+                    ids[i] = kAuParams[i].id;
+                else if (i == kNumAuParams)
+                    ids[i] = kPartParamId;
+                else
+                    ids[i] = kMeterIdBase + (i - kNumAuParams - 1); /* contiguous meter range */
+            }
             *ioSize = n * sizeof(AudioUnitParameterID);
             return noErr;
         }
@@ -587,6 +626,27 @@ static OSStatus au_GetProperty(void *self, AudioUnitPropertyID prop,
                 info->unit = kAudioUnitParameterUnit_Indexed;
                 info->minValue = 0;
                 info->maxValue = (Float32)kPartStepCount; /* 0..15 */
+                info->defaultValue = 0;
+                *ioSize = sizeof(AudioUnitParameterInfo);
+                return noErr;
+            }
+            if (isMeterId((uint32_t)elem)) {
+                /* §9.9 readonly meter: READABLE but NOT WRITABLE — the AU
+                 * read-only equivalent of VST3's kIsReadOnly. A host shows the
+                 * live value but cannot write or automate it. Generic 0..1 range
+                 * (peak/RMS are already normalized by the device); meterReadable. */
+                char nm[64];
+                au_meter_name((AudioUnitParameterID)elem, nm, sizeof nm);
+                info->flags = kAudioUnitParameterFlag_IsReadable |
+                              kAudioUnitParameterFlag_MeterReadOnly |
+                              kAudioUnitParameterFlag_HasCFNameString |
+                              kAudioUnitParameterFlag_CFNameRelease;
+                info->cfNameString =
+                    CFStringCreateWithCString(nullptr, nm, kCFStringEncodingUTF8);
+                strncpy(info->name, nm, sizeof info->name - 1);
+                info->unit = kAudioUnitParameterUnit_LinearGain;
+                info->minValue = 0;
+                info->maxValue = 1;
                 info->defaultValue = 0;
                 *ioSize = sizeof(AudioUnitParameterInfo);
                 return noErr;
@@ -739,18 +799,26 @@ static OSStatus au_GetParameter(void *self, AudioUnitParameterID param,
         *out = (Float32)au->part;
         return noErr;
     }
-    if (param < 1 || param > kNumAuParams) return kAudioUnitErr_InvalidParameter;
-    /* drain device echoes into the shadow so hosts see panel moves. The echo ring
-     * is single-consumer (OWNER-only, exactly like the VST3 shell's process()); an
-     * attached or unacquired instance must NOT pop it (it would steal the owner's
-     * echoes / corrupt the SPSC ring). */
+    if (param < 1 || (param > kNumAuParams && !isMeterId((uint32_t)param)))
+        return kAudioUnitErr_InvalidParameter;
+    /* drain device echoes into the shadows so hosts see panel moves AND live
+     * meters. ONE drain feeds both: device-param echoes (ids 1..13) -> paramShadow,
+     * §9.9 readonly meter echoes (ids 0x1000+, the SAME evt 'param' path) ->
+     * meterShadow, indexed by (id - kMeterIdBase). The echo ring is single-consumer
+     * (OWNER-only, like the VST3 shell's process()); an attached/unacquired instance
+     * must NOT pop it (it would steal the owner's echoes / corrupt the SPSC ring). */
     if (au->owner() && au->runtime()) {
         uint32_t id;
         float v;
-        while (au->runtime()->popEcho(id, v))
-            if (id >= 1 && id <= kNumAuParams) au->paramShadow[id - 1] = v;
+        while (au->runtime()->popEcho(id, v)) {
+            if (id >= 1 && id <= kNumAuParams)
+                au->paramShadow[id - 1] = v;
+            else if (isMeterId(id))
+                au->meterShadow[id - kMeterIdBase] = v;
+        }
     }
-    *out = au->paramShadow[param - 1];
+    *out = isMeterId((uint32_t)param) ? au->meterShadow[(uint32_t)param - kMeterIdBase]
+                                      : au->paramShadow[param - 1];
     return noErr;
 }
 
