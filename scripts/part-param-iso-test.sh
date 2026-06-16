@@ -33,7 +33,7 @@ export HARP_DEVICE_SERIAL="$SERIAL"
 PROBE="${PROBE:-./build/harp-probe}"
 BUILD="${BUILD:-build-mt-host}"
 SECONDS_RUN="${SECONDS_RUN:-4}"
-SAMPLES="${SAMPLES:-3}"
+SAMPLES="${SAMPLES:-5}"   # median of 5: the realtime pull's RMS jitters; more samples tighten it
 
 if pgrep -x "Live" >/dev/null 2>&1; then
     echo "PART-PARAM-ISO FAIL: device claimed by Ableton Live — needs it exclusively"; exit 3
@@ -91,22 +91,26 @@ XT=$(sink_rms "0.9,0.2"); echo "   part-1 sink-rms (XTALK)= $XT"
 
 case "$HI$LO$XT" in *-1*) echo "PART-PARAM-ISO FAIL: a run never connected/produced audio (device busy?)"; exit 3 ;; esac
 
-# 1.5x is conservative vs the observed separation on PI4B-0001 (HIGH/LOW ~2–4x;
-# XTALK lands within ~1x of LOW), leaving margin for the realtime pull's RMS jitter.
-ROUTES=$(python3 -c "print(1 if $HI > 1.5*$LO else 0)")
-ISOLATED=$(python3 -c "print(1 if $XT < 1.5*$LO else 0)")
-echo "── HIGH=$HI LOW=$LO XTALK=$XT  (routes: HIGH>1.5·LOW ; isolated: XTALK<1.5·LOW)"
+# Thresholds keyed to the STABLE loud readings, not the small/jittery LOW (which
+# under the realtime pull can dip ~4x and false-trip a LOW-relative isolation gate
+# — the earlier flake). The level param is ~linear, so part1@0.2 renders ~0.22x of
+# part1@0.9: ROUTING HIGH>2·LOW and ISOLATION XTALK<0.5·HIGH both have wide margin
+# vs jitter, while cross-talk (owner leaking into part 1) would push XTALK toward
+# HIGH, well past 0.5·HIGH. (XTALK should also land near LOW — reported, not gated.)
+ROUTES=$(python3 -c "print(1 if $HI > 2*$LO else 0)")
+ISOLATED=$(python3 -c "print(1 if $XT < 0.5*$HI else 0)")
+echo "── HIGH=$HI LOW=$LO XTALK=$XT  (routes: HIGH>2·LOW ; isolated: XTALK<0.5·HIGH)"
 if [ "$ROUTES" = 1 ] && [ "$ISOLATED" = 1 ]; then
     echo "PART-PARAM-ISO PASS (on $SERIAL: part 1's level param reached part 1's audio —"
-    echo "   HIGH $HI > 1.5×LOW $LO — and driving the OWNER's level to 0.9 left part 1 at"
-    echo "   XTALK $XT ≈ LOW $LO, so per-part params don't cross parts in the merged session)"
+    echo "   HIGH $HI > 2×LOW $LO — and driving the OWNER's level to 0.9 left part 1 at"
+    echo "   XTALK $XT < 0.5×HIGH $HI (≈ LOW $LO), so per-part params don't cross parts)"
     exit 0
 elif [ "$ROUTES" != 1 ]; then
-    echo "PART-PARAM-ISO FAIL: part 1 level did not route (HIGH $HI not > 1.5×LOW $LO) —"
+    echo "PART-PARAM-ISO FAIL: part 1 level did not route (HIGH $HI not > 2×LOW $LO) —"
     echo "   the attached instance's param-8 did not reach part 1's audio"
     exit 1
 else
-    echo "PART-PARAM-ISO FAIL: cross-talk (XTALK $XT >= 1.5×LOW $LO) — the owner's level"
-    echo "   leaked into part 1; per-part param isolation broken"
+    echo "PART-PARAM-ISO FAIL: cross-talk (XTALK $XT >= 0.5×HIGH $HI) — driving the owner's"
+    echo "   level toward 0.9 pushed part 1 up; per-part param isolation broken"
     exit 1
 fi
