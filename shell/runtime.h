@@ -226,6 +226,15 @@ public:
     void queueRamp(EventSource *src, uint32_t id, float target, uint64_t start,
                    uint64_t end);
     void queueNote(EventSource *src, uint32_t umpWord, uint64_t ts);
+    /* §9.4 non-destructive modulation (etype 6): an additive signed offset on
+     * one param's base value. `voice` is the §9.5 packed key of the target note
+     * ((channel<<8)|note for MIDI-1.0 note-ons, exactly what the device assigns
+     * at note-on); 0 means part-wide (every active voice). The part (key 5) is
+     * derived from the voice key, so a mod follows its note's channel even when
+     * one instance drives several. Maps a host's per-note expression (e.g. VST3
+     * Brightness -> Filter Cutoff) to one voice without touching base/recall. */
+    void queueMod(EventSource *src, uint32_t id, float offset, uint32_t voice,
+                  uint64_t ts);
     /* §9.7 transport anchor: (ts, ppq, tempo) defines musical time on the
      * device until superseded. ppq travels as bit-cast u64 (the ring's
      * fields are fixed); flags per spec key 0. Transport is GLOBAL (no part):
@@ -478,6 +487,8 @@ private:
     static void encodeRampEvent(harp_cbuf *out, uint32_t id, float target,
                                 uint64_t start, uint64_t end, uint8_t channel = 0);
     static void encodeUmpEvent(harp_cbuf *out, uint32_t word, uint64_t ts);
+    static void encodeModEvent(harp_cbuf *out, uint32_t id, float offset,
+                               uint64_t ts, uint32_t voice);
     static void encodeTransportEvent(harp_cbuf *out, uint32_t flags, double tempo,
                                      double ppq, uint64_t ts);
     void pollEcho(); /* drain incoming evt stream */

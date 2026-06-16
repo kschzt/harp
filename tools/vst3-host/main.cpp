@@ -385,7 +385,8 @@ int main(int argc, char **argv) {
                 "       [--seconds S] [--input sine[:HZ]|impulse|silence]\n"
                 "       [--set ID=NORMVALUE]... [--ramp ID=V0:V1]... [--notes N,N,..]\n"
                 "       [--lfo ID=HZ[:PTS_PER_BLOCK[:SHAPE]]]... [--flood]\n"
-                "       [--bpm B] [--chord N,N,..] [--channel N] [--loop STARTPPQ:ENDPPQ]\n"
+                "       [--bpm B] [--chord N,N,..] [--brightness V] [--brightness-idx K]\n"
+                "       [--channel N] [--loop STARTPPQ:ENDPPQ]\n"
                 "       [--part N] [--realtime] [--out FILE.wav] [--hash] [--json]\n"
                 "       [--expect-hash HEX] [--save-state FILE] [--load-state FILE]\n"
                 "       [--instances N | --aliases ch0,ch1,..] [--serial SERIAL]\n"
@@ -417,6 +418,14 @@ int main(int argc, char **argv) {
     std::vector<std::pair<uint32_t, double>> sets;
     std::vector<int> notes;    /* played sequentially at note_period spacing */
     std::vector<int> chord;    /* held from 0.1 s to the end (arp fodder) */
+    /* --brightness V: §9.4 per-voice demo. Sends a VST3 Brightness Note
+     * Expression (value V, 0..1) on the FIRST chord note only — the shell maps
+     * it to a signed Filter-Cutoff mod on that ONE voice (§9.5), so the chord's
+     * other voices are unmodulated. <0 = off (no expression emitted). */
+    double brightness = -1.0;
+    int brightness_idx = 0;    /* which chord note (index) gets the Brightness expression;
+                                  lets a test modulate voice 0 vs voice 1 of ONE arrangement
+                                  to prove the mod is per-voice, not part-wide (§9.5). */
     int channel = 0;           /* MIDI channel 0..15 for emitted notes -> device part (P2.1) */
     int part = -1;             /* -1 = main mix (default); 0..15 = pull that part's stereo pair (P2.2) */
     /* multi-instance (P6): >1 plugin instances in ONE process, one per channel,
@@ -473,6 +482,10 @@ int main(int argc, char **argv) {
                 if (pos == std::string::npos) break;
                 pos++;
             }
+        } else if (a == "--brightness") {
+            brightness = atof(argv[++i]);
+        } else if (a == "--brightness-idx") {
+            brightness_idx = atoi(argv[++i]);
         } else if (a == "--loop") {
             if (sscanf(argv[++i], "%lf:%lf", &loop_a, &loop_b) != 2)
                 die("--loop wants STARTPPQ:ENDPPQ");
@@ -858,6 +871,7 @@ int main(int argc, char **argv) {
         if (!chord.empty()) {
             size_t onAt = (size_t)(0.1 * rate);
             bool last = done + n >= total;
+            int32 nid = 0; /* a stable per-note id so a Note Expression can target one */
             for (int cn : chord) {
                 if (onAt >= done && onAt < done + n) {
                     Event ev{};
@@ -866,7 +880,20 @@ int main(int argc, char **argv) {
                     ev.noteOn.channel = (int16)channel;
                     ev.noteOn.pitch = (int16)cn;
                     ev.noteOn.velocity = 0.8f;
+                    ev.noteOn.noteId = nid;
                     evList.addEvent(ev);
+                    /* --brightness: one Brightness expression on chord note
+                     * `brightness_idx` (default 0), in the same block right after
+                     * its note-on, so the shell mods that ONE voice's cutoff (§9.5). */
+                    if (brightness >= 0.0 && nid == brightness_idx) {
+                        Event nx{};
+                        nx.type = Event::kNoteExpressionValueEvent;
+                        nx.sampleOffset = ev.sampleOffset;
+                        nx.noteExpressionValue.typeId = kBrightnessTypeID;
+                        nx.noteExpressionValue.noteId = nid;
+                        nx.noteExpressionValue.value = brightness;
+                        evList.addEvent(nx);
+                    }
                 }
                 if (last) {
                     Event ev{};
@@ -875,8 +902,10 @@ int main(int argc, char **argv) {
                     ev.noteOff.channel = (int16)channel;
                     ev.noteOff.pitch = (int16)cn;
                     ev.noteOff.velocity = 0;
+                    ev.noteOff.noteId = nid;
                     evList.addEvent(ev);
                 }
+                nid++;
             }
         }
         for (size_t ni = 0; ni < notes.size(); ni++) {

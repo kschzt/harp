@@ -70,6 +70,7 @@ run() {
     echo
 }
 run scripts/golden-test.sh
+run scripts/note-expr-test.sh
 run scripts/multitimbral-test.sh
 run scripts/recall-test.sh
 run scripts/recall-perpart-test.sh

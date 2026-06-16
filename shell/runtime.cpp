@@ -702,6 +702,18 @@ void HarpRuntime::queueNote(EventSource *src, uint32_t word, uint64_t ts) {
     }
 }
 
+void HarpRuntime::queueMod(EventSource *src, uint32_t id, float offset,
+                           uint32_t voice, uint64_t ts) {
+    if (!src) return noteDormant();
+    /* kind 4 = mod; the §9.5 voice key rides in `end` (it is a packed uint, not
+     * a timestamp). A dropped mod is benign — it leaves the base value as-is, no
+     * stuck state — so unlike a note we do not escalate to panic on overflow. */
+    if (src->ring.push({4, id, offset, ts, voice}))
+        evtQueuedSeq_.fetch_add(1, std::memory_order_release);
+    else
+        evDrops_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void HarpRuntime::queueTransport(EventSource *src, uint32_t flags, double tempo,
                                  double ppq, uint64_t ts) {
     /* Transport is GLOBAL (no part): force it onto the OWNER source whatever
@@ -906,6 +918,37 @@ void HarpRuntime::encodeUmpEvent(harp_cbuf *m, uint32_t word, uint64_t ts) {
     harp_cbor_uint(m, ts);
     harp_cbor_uint(m, 0); /* etype: ump */
     harp_cbor_bytes(m, bytes, 4);
+}
+
+/* Mod event (§9.4 non-destructive modulation): etype 6, body
+ * {0 param, 1 signed offset, 3 voice (§9.5 packed key), 5 channel/part}. The
+ * offset is NOT clamped here — it is signed and clamped only after summing onto
+ * the base, on the device (§9.4). The part (key 5) is the channel embedded in
+ * the voice key ((voice>>8)&0xf), so the mod lands on the SAME part the note's
+ * voice_id was minted under; key 5 is omitted for part 0 / part-wide (voice 0),
+ * matching the ramp/param convention (ascending keys, part-0 byte-economy). */
+void HarpRuntime::encodeModEvent(harp_cbuf *m, uint32_t id, float offset,
+                                 uint64_t ts, uint32_t voice) {
+    uint8_t channel = voice ? (uint8_t)((voice >> 8) & 0xf) : 0;
+    harp_cbor_array(m, 3);
+    harp_cbor_array(m, 2);
+    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, ts);
+    harp_cbor_uint(m, 6); /* etype: mod */
+    int n = 2 + (voice ? 1 : 0) + (channel ? 1 : 0);
+    harp_cbor_map(m, (uint64_t)n);
+    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, id);
+    harp_cbor_uint(m, 1);
+    harp_cbor_float(m, offset);
+    if (voice) { /* key 3 = §9.5 per-voice target; 0/absent = part-wide */
+        harp_cbor_uint(m, 3);
+        harp_cbor_uint(m, voice);
+    }
+    if (channel) { /* key 5 = multitimbral part; omitted for part 0 */
+        harp_cbor_uint(m, 5);
+        harp_cbor_uint(m, channel);
+    }
 }
 
 /* Ramp event (§9.4): etype 5, msg tstamp = start, body {param, target, end}. */
@@ -1229,7 +1272,11 @@ int HarpRuntime::drainSource(EventSource &src, harp_cbuf &batch, harp_cbuf &msgb
             double ppq;
             memcpy(&ppq, &te.end, sizeof ppq);
             encodeTransportEvent(&msgbuf, te.a, te.v, ppq, te.ts);
-        } else
+        } else if (te.kind == 4)
+            /* mod (§9.4): the voice key rides in `end`; the part is derived from
+             * it inside encodeModEvent, so a mod follows its note's channel. */
+            encodeModEvent(&msgbuf, te.a, te.v, te.ts, (uint32_t)te.end);
+        else
             encodeUmpEvent(&msgbuf, te.a, te.ts);
         harp_frame_hdr h = {HARP_FRAME_FVER, HARP_STREAM_EVT, HARP_FLAG_FIN,
                             (uint32_t)msgbuf.len};
