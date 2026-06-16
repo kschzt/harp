@@ -24,13 +24,22 @@
 #   nanosleep-paced audio thread racing the device's free-running stream), so the
 #   exact captured bytes jitter run-to-run — even two single-channel runs hash
 #   differently. RMS (energy integrated over the whole capture) is the
-#   jitter-robust metric: it lands in a tight band per configuration, and the
-#   single-channel band is cleanly, repeatably SEPARATED from the group band
-#   (measured ~8k vs ~3k, a >2x gap, no overlap across runs) because the merged
-#   multi-part stream the device renders is a genuinely different mix than one
-#   channel's. Separation — not its direction — is the proof: a single channel
-#   can never produce the group's mix, so a group mix that differs from every
-#   single-channel sample means the device engaged MORE THAN ONE part.
+#   jitter-robust metric, BUT it must be read carefully: the realtime pull pads
+#   underrun gaps with silence, and N contending instances underrun far more than
+#   one (measured ~67% vs ~26% of the capture padded), so the GROUP capture reads
+#   LOWER than the single even though it carries more parts. That inversion is
+#   fine — separation, NOT its direction, is the proof: a single channel can
+#   never produce the group's multi-part mix, so a group median that differs from
+#   the single median by a wide margin means MORE THAN ONE part engaged.
+#
+#   The one thing that must be stable is the SINGLE-channel baseline (the group's
+#   heavy-underrun band sits reproducibly near ~6k on every board measured). So
+#   each alias holds a SUSTAINED chord note (below) for the whole capture instead
+#   of tsan-host's default 80-note flood: a flood retriggers a voice 20x/s and
+#   its realtime-pulled RMS swung ~±40% (single dipped from ~12k to ~7.5k on a
+#   slower board), which once narrowed the gap under the threshold and flaked. A
+#   held note renders a steady tone, so the single band is tight (~12k) and the
+#   ~2x gap to the group band has wide, board-independent margin.
 #
 # tsan-host is the only harness that drives N channels into ONE device: each of
 # its --instances is an alias on its own channel (owner ch0, attached ch1.., the
@@ -51,7 +60,9 @@ PROBE="${PROBE:-./build/harp-probe}"
 BUILD="${BUILD:-build-mt-host}"      # the multi-instance harness, built WITHOUT TSan
 INSTANCES="${INSTANCES:-4}"          # owner ch0 + 3 siblings ch1..3 — a real group
 SECONDS_RUN="${SECONDS_RUN:-4}"
-SAMPLES="${SAMPLES:-3}"              # captures per configuration (median defeats jitter)
+SAMPLES="${SAMPLES:-5}"              # captures per configuration (median defeats jitter)
+CHORD="${CHORD:-57}"                 # a SUSTAINED note per alias (transposed by channel),
+                                     # NOT tsan-host's default 80-note flood — see below
 
 # claim guard: a DAW holding the device steals the claim and every render comes
 # back silence (single==group, a bogus pass) — a hard FAIL, never a silent skip.
@@ -85,8 +96,9 @@ cmake --build "$BUILD" --target tsan-host -j >/dev/null
 
 # Pin a known AUDIBLE voice on the device via the front panel (persists past the
 # session, like flood-stress.sh): drone on (7), level up (8), a tone (3), and a
-# FAST envelope (5/6) so each struck note's energy lands inside the capture
-# window. Without this the mix could be silent and single==group trivially.
+# FAST envelope (5/6). The drone (part 0, the panel's only part) gives a steady
+# energy floor so a capture is never silent. The CHORD note below is held for the
+# whole capture (sustained), not struck repeatedly.
 for kv in "7 0.5" "8 0.6" "3 0.7" "5 0.05" "6 0.1"; do
     "$PROBE" -d "usb:$SERIAL" knob $kv >/dev/null 2>&1 || true
 done
@@ -120,7 +132,7 @@ capture_rms() {
     n="$1"; wav="$2"; r=-1
     for try in 1 2 3; do
         err=$(mktemp /tmp/alias-play.XXXXXX)
-        "$BUILD/tsan-host" --instances "$n" --seconds "$SECONDS_RUN" --block 256 \
+        "$BUILD/tsan-host" --instances "$n" --chord "$CHORD" --seconds "$SECONDS_RUN" --block 256 \
             --out "$wav" >"$err" 2>&1 || true
         if grep -q "harp-shell: connected:.*serial $SERIAL" "$err"; then
             r=$(rms "$wav")
@@ -166,8 +178,9 @@ GMED=$(median $GROUP)
 # A single channel can NEVER produce the group's mix, so a group median that
 # differs from the single median by a wide margin (>25% relative) means the
 # device summed sibling parts into its main mix — MORE THAN ONE part engaged.
-# 25% is far below the ~2.5x separation measured on hardware, with margin for
-# the realtime pull's jitter, yet far above same-config run-to-run spread.
+# With sustained notes the measured gap is ~45-50% (single ~12k vs group ~6k, the
+# group's heavy-underrun band), so 25% has wide margin for the realtime pull's
+# residual jitter yet sits far above any same-config run-to-run spread.
 echo "── single-channel median RMS=$SMED ; group median RMS=$GMED"
 DIFF=$(python3 -c "s=$SMED; g=$GMED; print(0 if max(s,g)==0 else abs(s-g)/max(s,g))")
 OVER=$(python3 -c "print(1 if $DIFF > 0.25 else 0)")
