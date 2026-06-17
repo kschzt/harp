@@ -91,6 +91,26 @@ echo "   press .6 v0=$PR0 v1=$PR1 ; after=$AFTER"
 [ "$PR0" != "$PR1" ]           || fail "per-voice pressure not distinct (v0=$PR0 v1=$PR1)"
 [ "$AFTER" = "$PLAIN" ]        || fail "plain chord after MPE ($AFTER) != before — MPE altered the base (NOT non-destructive)"
 
+# CROSS-FORMAT pitch: the SAME pitch gesture via VST3 Note Expression (Tuning)
+# must render byte-identically to CLAP's per-note bend — one device, identical
+# §9.5 mod regardless of which shell sent it. (VST3 Tuning is normalized about
+# 0.5 over ±120 st; harp-vst3-host's --tuning takes semitones, so --tuning 4 ==
+# CLAP --bend 4.) Skipped only if the VST3 host/bundle is absent on this rig.
+V="${HOSTBIN:-build-vst/harp-vst3-host}"
+PLUG="${PLUG:-$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3}"
+if [ -x "$V" ] && [ -e "$PLUG" ]; then
+    rv() { "$V" "$PLUG" $S --chord 60,64,67 --seconds 2.0 "$@" --hash 2>/dev/null | grep output-hash | cut -d' ' -f2; }
+    "$V" "$PLUG" $S --seconds 0.5 >/dev/null 2>&1
+    VPLAIN=$(rv); VTUNE0=$(rv --tuning 0 --tuning-idx 0); VTUNE4=$(rv --tuning 4 --tuning-idx 0)
+    echo "   VST3: plain=$VPLAIN tuning0=$VTUNE0 tuning+4=$VTUNE4  (CLAP bend+4=$B0)"
+    [ -n "$VPLAIN" ] && [ -n "$VTUNE4" ] || fail "VST3 render produced no hash (device busy?)"
+    [ "$VPLAIN" = "$CHORD_HASH" ]  || fail "VST3 plain $VPLAIN != chord golden $CHORD_HASH"
+    [ "$VTUNE0" = "$PLAIN" ]       || fail "VST3 neutral Tuning ($VTUNE0) != plain — must be byte-identical"
+    [ "$VTUNE4" = "$B0" ]          || fail "VST3 Tuning +4 ($VTUNE4) != CLAP bend +4 ($B0) — MPE pitch not cross-format byte-identical"
+else
+    echo "   (VST3 cross-format pitch check skipped: harp-vst3-host / VST3 bundle absent)"
+fi
+
 echo "MPE PASS (on $SERIAL: CLAP note expressions drive §9.5 per-voice pitch/timbre/"
 echo "   pressure — neutral is byte-identical, three voices bend to three distinct mixes,"
 echo "   pitch and timbre are independent axes, and the base/recall is untouched)"

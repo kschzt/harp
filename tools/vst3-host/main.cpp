@@ -385,7 +385,7 @@ int main(int argc, char **argv) {
                 "       [--seconds S] [--input sine[:HZ]|impulse|silence]\n"
                 "       [--set ID=NORMVALUE]... [--ramp ID=V0:V1]... [--notes N,N,..]\n"
                 "       [--lfo ID=HZ[:PTS_PER_BLOCK[:SHAPE]]]... [--flood]\n"
-                "       [--bpm B] [--chord N,N,..] [--brightness V] [--brightness-idx K]\n"
+                "       [--bpm B] [--chord N,N,..] [--brightness V] [--brightness-idx K] [--tuning SEMIS] [--tuning-idx K]\n"
                 "       [--channel N] [--loop STARTPPQ:ENDPPQ]\n"
                 "       [--part N] [--realtime] [--out FILE.wav] [--hash] [--json]\n"
                 "       [--expect-hash HEX] [--save-state FILE] [--load-state FILE]\n"
@@ -423,6 +423,12 @@ int main(int argc, char **argv) {
      * it to a signed Filter-Cutoff mod on that ONE voice (§9.5), so the chord's
      * other voices are unmodulated. <0 = off (no expression emitted). */
     double brightness = -1.0;
+    /* --tuning SEMIS: a VST3 Tuning Note Expression (the MPE pitch axis) on chord
+     * note `tuning_idx` — the shell maps it to a per-voice pitch bend, so the same
+     * SEMIS as CLAP's --bend yields the byte-identical render (cross-format MPE). */
+    bool has_tuning = false;
+    double tuning_semis = 0.0;
+    int tuning_idx = 0;
     int brightness_idx = 0;    /* which chord note (index) gets the Brightness expression;
                                   lets a test modulate voice 0 vs voice 1 of ONE arrangement
                                   to prove the mod is per-voice, not part-wide (§9.5). */
@@ -486,6 +492,11 @@ int main(int argc, char **argv) {
             brightness = atof(argv[++i]);
         } else if (a == "--brightness-idx") {
             brightness_idx = atoi(argv[++i]);
+        } else if (a == "--tuning") {
+            tuning_semis = atof(argv[++i]);
+            has_tuning = true;
+        } else if (a == "--tuning-idx") {
+            tuning_idx = atoi(argv[++i]);
         } else if (a == "--loop") {
             if (sscanf(argv[++i], "%lf:%lf", &loop_a, &loop_b) != 2)
                 die("--loop wants STARTPPQ:ENDPPQ");
@@ -892,6 +903,19 @@ int main(int argc, char **argv) {
                         nx.noteExpressionValue.typeId = kBrightnessTypeID;
                         nx.noteExpressionValue.noteId = nid;
                         nx.noteExpressionValue.value = brightness;
+                        evList.addEvent(nx);
+                    }
+                    /* --tuning: a Tuning expression (MPE pitch) on chord note
+                     * `tuning_idx`. VST3 Tuning is normalized about 0.5 with a
+                     * ±120-semitone full range, so SEMIS -> value 0.5 + semis/240
+                     * (the shell inverts it back to semitones). */
+                    if (has_tuning && nid == tuning_idx) {
+                        Event nx{};
+                        nx.type = Event::kNoteExpressionValueEvent;
+                        nx.sampleOffset = ev.sampleOffset;
+                        nx.noteExpressionValue.typeId = kTuningTypeID;
+                        nx.noteExpressionValue.noteId = nid;
+                        nx.noteExpressionValue.value = 0.5 + tuning_semis / 240.0;
                         evList.addEvent(nx);
                     }
                 }

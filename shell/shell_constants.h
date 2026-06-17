@@ -23,6 +23,17 @@ static constexpr int kPartStepCount = 15; /* 16 parts (0..15); VST3 stepCount = 
 static const uint8_t kStateHeaderMagic[3] = {'H', 'P', '1'};
 static constexpr size_t kStateHeaderLen = sizeof kStateHeaderMagic + 1; /* magic + part byte */
 
+/* §9.5 per-voice EXPRESSION mod targets (the MPE pitch/pressure axes). A shell
+ * sends these via queueMod to drive a voice's pitch bend (SEMITONES) and
+ * loudness (gain); they are NOT §9.3 params — they route to the device's
+ * per-voice bend_semis / z_gain fields. The values MUST match device.h
+ * HARP_MOD_PITCH_BEND / HARP_MOD_PRESSURE (the id is what the wire carries),
+ * mirrored host-side exactly like kParams mirrors the 1..13 device params.
+ * Reserved at 0x2000+, clear of the params, the 98/99 host params, and the
+ * 0x1000 meter ids. */
+static constexpr uint32_t kHarpModPitchBend = 0x2001u;
+static constexpr uint32_t kHarpModPressure = 0x2002u;
+
 /* ---------------- §9.9 OUTPUT METERS (readonly host params) ----------------
  *
  * The device exposes per-part + main-mix peak/RMS meters as READONLY parameters

@@ -350,20 +350,25 @@ public:
                                  base + (uint64_t)ev.sampleOffset);
                     noteVoices_.noteOff((chan << 8) | note);
                 } else if (ev.type == Event::kNoteExpressionValueEvent) {
-                    /* §9.4 non-destructive per-voice modulation. We map VST3
-                     * Brightness (the standard "filter cutoff" expression,
-                     * normalized 0..1) to a SIGNED offset on Filter Cutoff
-                     * (device param id 3): 0.5 = no change, <0.5 darker, >0.5
-                     * brighter. The device sums offset onto the base and clamps,
-                     * never touching the stored base (so recall is unaffected).
+                    /* §9.4/§9.5 non-destructive per-voice modulation from VST3
+                     * Note Expression (Cubase MPE + the per-note expression UI),
+                     * mapped to the addressed voice (voiceFor(noteId); 0 =
+                     * part-wide). All neutral at rest -> golden-identical:
+                     *   kBrightnessTypeID (timbre, 0..1) -> Filter Cutoff offset
+                     *     (0.5 = no change; the device clamps the sum, never the
+                     *     stored base, so recall is unaffected).
+                     *   kTuningTypeID (pitch, normalized about 0.5; ±120 semis
+                     *     full range per the SDK) -> per-voice pitch bend, in
+                     *     semitones = (value-0.5)*240.
                      * Other expression types are ignored for now. */
                     const auto &nx = ev.noteExpressionValue;
-                    if (nx.typeId == kBrightnessTypeID) {
-                        float offset = (float)(nx.value - 0.5);
-                        rt.queueMod(source_, /*Filter Cutoff*/ 3, offset,
-                                    noteVoices_.voiceFor(nx.noteId),
-                                    base + (uint64_t)ev.sampleOffset);
-                    }
+                    uint32_t voice = noteVoices_.voiceFor(nx.noteId);
+                    uint64_t ts = base + (uint64_t)ev.sampleOffset;
+                    if (nx.typeId == kBrightnessTypeID)
+                        rt.queueMod(source_, /*Filter Cutoff*/ 3, (float)(nx.value - 0.5), voice, ts);
+                    else if (nx.typeId == kTuningTypeID)
+                        rt.queueMod(source_, kHarpModPitchBend, (float)((nx.value - 0.5) * 240.0),
+                                    voice, ts);
                 }
             }
         }

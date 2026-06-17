@@ -47,11 +47,8 @@ static const DevParam kParams[] = {
 };
 static constexpr uint32_t kNumParams = sizeof(kParams) / sizeof(kParams[0]);
 static constexpr uint32_t kCutoffId = 3; /* the per-voice-modulatable param (§9.5) */
-/* §9.5 per-voice EXPRESSION mod targets (the MPE pitch/pressure axes) — MUST
- * match device.h HARP_MOD_PITCH_BEND / HARP_MOD_PRESSURE (0x2001/0x2002), kept
- * in sync by hand exactly like the param ids. Pitch is semitones, pressure a gain. */
-static constexpr uint32_t kPitchBendId = 0x2001u;
-static constexpr uint32_t kPressureId = 0x2002u;
+/* per-voice expression mod targets (pitch bend / loudness) — shared with the VST3
+ * shell + mirrored from device.h, in shell_constants.h: kHarpModPitchBend/Pressure. */
 
 static uint8_t envChannelDefault() {
     if (const char *e = getenv("HARP_CHANNEL"); e && e[0]) {
@@ -279,10 +276,10 @@ static void applyEvent(HarpClap *h, const clap_event_header_t *hdr, uint64_t bas
             rt.queueMod(h->source, kCutoffId, (float)(e->value - 0.5), voice, ts);
             break;
         case CLAP_NOTE_EXPRESSION_TUNING:
-            rt.queueMod(h->source, kPitchBendId, (float)e->value, voice, ts);
+            rt.queueMod(h->source, kHarpModPitchBend, (float)e->value, voice, ts);
             break;
         case CLAP_NOTE_EXPRESSION_PRESSURE:
-            rt.queueMod(h->source, kPressureId, (float)e->value, voice, ts);
+            rt.queueMod(h->source, kHarpModPressure, (float)e->value, voice, ts);
             break;
         default: break;
         }
