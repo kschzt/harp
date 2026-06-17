@@ -1,11 +1,13 @@
 /* Unit tests for the HARP core library. */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "harp/audio.h"
 #include "harp/cbor.h"
 #include "harp/envelope.h"
 #include "harp/frame.h"
+#include "harp/link.h"
 #include "harp/object.h"
 #include "harp/sha256.h"
 #include "harp/store.h"
@@ -478,8 +480,71 @@ static void test_event_channel(void) {
     harp_cbuf_free(&evt);
 }
 
+/* An in-memory harp_io: send writes append to one growing buffer; recv reads it
+ * back from the start. Lets us round-trip harp_link_send -> harp_link_recv with
+ * no socket, so the multi-frame chunking (<=65536 payload per frame) and the
+ * exact-boundary cases are exercised in CI on every OS. */
+typedef struct {
+    harp_io io;
+    harp_cbuf wire;
+    size_t rpos;
+} mem_io;
+
+static bool mem_write(harp_io *io, const void *buf, size_t n) {
+    mem_io *m = (mem_io *)io;
+    harp_cbuf_put(&m->wire, buf, n);
+    return true;
+}
+static bool mem_read(harp_io *io, void *buf, size_t n) {
+    mem_io *m = (mem_io *)io;
+    if (m->rpos + n > m->wire.len) return false; /* EOF */
+    memcpy(buf, m->wire.buf + m->rpos, n);
+    m->rpos += n;
+    return true;
+}
+
+/* §4.2 framed link: a message of any size round-trips byte-exact through the
+ * <=65536-per-frame chunking — empty (one FIN frame, no payload), sub-frame,
+ * exactly one frame, and the multi-frame boundaries where an off-by-one in the
+ * FIN flag or the chunk loop would corrupt or truncate the reassembly. */
+static void test_link_fragmentation(void) {
+    const size_t lens[] = {0, 1, 100, 65535, 65536, 65537, 131072, 131073};
+    for (size_t k = 0; k < sizeof lens / sizeof lens[0]; k++) {
+        size_t len = lens[k];
+        uint8_t *payload = len ? (uint8_t *)malloc(len) : NULL;
+        for (size_t i = 0; i < len; i++) payload[i] = (uint8_t)(i * 131u + 7u);
+
+        mem_io m;
+        m.io.read_exact = mem_read;
+        m.io.write_all = mem_write;
+        harp_cbuf_init(&m.wire);
+        m.rpos = 0;
+
+        CHECK(harp_link_send(&m.io, HARP_STREAM_OBJ, payload, len) == 0);
+
+        harp_link l;
+        harp_link_init(&l);
+        uint8_t stream = 0xff;
+        harp_cbuf msg;
+        harp_cbuf_init(&msg);
+        int rc = harp_link_recv(&m.io, &l, &stream, &msg);
+        CHECK(rc == 0);
+        CHECK(stream == HARP_STREAM_OBJ);
+        CHECK(msg.len == len);
+        CHECK(len == 0 || memcmp(msg.buf, payload, len) == 0);
+        /* the wire held exactly the message + its frame headers, all consumed */
+        CHECK(m.rpos == m.wire.len);
+
+        harp_cbuf_free(&msg);
+        harp_link_free(&l);
+        harp_cbuf_free(&m.wire);
+        free(payload);
+    }
+}
+
 int main(void) {
     test_sha256();
+    test_link_fragmentation();
     test_event_channel();
     test_cbor_encode();
     test_cbor_roundtrip();
