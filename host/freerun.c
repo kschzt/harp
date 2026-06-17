@@ -1,35 +1,41 @@
 /* See freerun.h. Ring buffer + clock-recovery loop + libsamplerate ASRC.
  *
- * Recovery structure: a FEEDFORWARD rate estimate (a slow EMA of input frames
- * arrived per output frame — i.e. the device/host rate, measured directly and
- * robustly) sets the bulk of the resample ratio, and a slow PROPORTIONAL trim
- * on the smoothed buffer level re-centers the elastic buffer. Feedforward is
- * driven by the arrival rate, not by the buffer level, so it is immune to the
- * lumpy way libsamplerate pulls input (its internal SINC buffering makes raw
- * ring-fill a noisy thing to control on). The trim is deliberately weak: the
- * buffer absorbs jitter, the loop tracks only the slow crystal drift. */
+ * Recovery is FEEDFORWARD with a smoothed ratio:
+ *   target ratio  = total output / total input arrived   (cumulative)
+ *   applied ratio = one-pole low-pass of that target
+ *
+ * The cumulative output/arrival count is a bias-free estimate of host/device
+ * that converges to a CONSTANT for a constant crystal drift — no feedback loop,
+ * so libsamplerate's internal buffering (a dead-time that makes buffer-feedback
+ * loops ring) can't destabilize it. The one-pole low-pass is the airtight part:
+ * the raw cumulative ratio still steps by ~1 ppm per pull (integer division),
+ * and even 1-ppm ratio steps FM-modulate the output enough to cap SINAD ~40 dB;
+ * smoothing the applied ratio removes that, recovering the converter's full
+ * quality (>120 dB on a constant ratio). Rate-matching keeps the elastic buffer
+ * from drifting; the buffer absorbs per-packet jitter.
+ *
+ * Reported est_ppm is the EFFECTIVE ratio (total output / total input consumed)
+ * — the ratio actually realized. */
 #include "freerun.h"
 
 #include <samplerate.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define FR_BETA    0.02      /* arrival-rate EMA (feedforward) — carries the rate */
-#define FR_ALPHA   0.02      /* buffer-level EMA (for the centering trim)        */
-#define FR_KT      0.005     /* buffer-centering trim — gentle; FF does the work */
+#define FR_SMOOTH  0.002     /* one-pole LPF on the applied ratio (low FM)       */
 #define FR_MAXADJ  0.05      /* ratio may deviate +/- 5% from nominal            */
 
 struct harp_freerun {
     SRC_STATE *src;
     unsigned   ch;
     double     host_rate, dev_rate, nominal;   /* nominal = host/dev (out/in)  */
-    unsigned   cap, target;                    /* ring capacity / setpoint, fr */
+    unsigned   cap, target;
     float     *ring;
     unsigned   rd, wr, fill;
-    double     ipo_ema;                        /* input-per-output (1/rate)    */
-    double     fill_ema, ratio;
-    unsigned long long pushed_total, last_push;
-    int        primed;                         /* first pull seeds last_push   */
+    double     ratio;
+    unsigned long long pushed_total, last_push;   /* arrivals (prebuffer excl.) */
+    unsigned long long consumed_total, output_total;
+    int        primed;
     unsigned   underflow, overflow;
 };
 
@@ -41,6 +47,7 @@ static long fr_input_cb(void *cb_data, float **data) {
     *data = fr->ring + (size_t)fr->rd * fr->ch;
     fr->rd = (fr->rd + contig) % fr->cap;
     fr->fill -= contig;
+    fr->consumed_total += contig;
     return (long)contig;
 }
 
@@ -57,8 +64,6 @@ harp_freerun *harp_freerun_new(const harp_freerun_cfg *c) {
     fr->cap = c->capacity_frames;
     fr->target = c->target_frames;
     fr->ratio = fr->nominal;
-    fr->ipo_ema = c->dev_rate_hz / c->host_rate_hz;   /* 1/nominal (in per out) */
-    fr->fill_ema = (double)c->target_frames;
     fr->ring = malloc((size_t)c->capacity_frames * c->channels * sizeof(float));
     int err = 0;
     fr->src = src_callback_new(fr_input_cb, c->quality, (int)c->channels, &err, fr);
@@ -90,34 +95,21 @@ unsigned harp_freerun_push(harp_freerun *fr, const float *in, unsigned n) {
     return take;
 }
 
-/* Once per pulled block of n output frames: update the feedforward rate
- * estimate from how much input arrived since the last pull, then apply the
- * slow buffer-centering trim. */
-static void update_ratio(harp_freerun *fr, unsigned n) {
-    unsigned long long delta = fr->pushed_total - fr->last_push;
-    fr->last_push = fr->pushed_total;
-    if (!fr->primed) {
-        fr->primed = 1;            /* first delta spans the prebuffer -> discard */
-    } else {
-        double ipo = (double)delta / (double)n;      /* input arrived / output  */
-        fr->ipo_ema += FR_BETA * (ipo - fr->ipo_ema);
-    }
-    double ratio_ff = 1.0 / fr->ipo_ema;             /* out/in == host/dev       */
-
-    fr->fill_ema += FR_ALPHA * ((double)fr->fill - fr->fill_ema);
-    double trim = FR_KT * (fr->fill_ema - (double)fr->target) / (double)fr->target;
-
-    double corr = 1.0 - trim;                        /* fill high -> consume more */
-    double r = ratio_ff * corr;
+static void update_ratio(harp_freerun *fr) {
+    if (!fr->primed) { fr->primed = 1; fr->last_push = fr->pushed_total; return; }
+    unsigned long long pin = fr->pushed_total - fr->last_push;
+    if (pin == 0 || fr->output_total == 0) return;
+    double target = (double)fr->output_total / (double)pin;       /* host/dev */
     double lo = fr->nominal * (1.0 - FR_MAXADJ), hi = fr->nominal * (1.0 + FR_MAXADJ);
-    if (r < lo) r = lo; else if (r > hi) r = hi;
-    fr->ratio = r;
+    if (target < lo) target = lo; else if (target > hi) target = hi;
+    fr->ratio += FR_SMOOTH * (target - fr->ratio);                /* smooth -> low FM */
 }
 
 unsigned harp_freerun_pull(harp_freerun *fr, float *out, unsigned n) {
-    update_ratio(fr, n);
+    update_ratio(fr);
     long made = src_callback_read(fr->src, fr->ratio, (long)n, out);
     if (made < 0) made = 0;
+    fr->output_total += (unsigned)made;
     if ((unsigned)made < n) {
         memset(out + (size_t)made * fr->ch, 0,
                (size_t)(n - (unsigned)made) * fr->ch * sizeof(float));
@@ -128,7 +120,9 @@ unsigned harp_freerun_pull(harp_freerun *fr, float *out, unsigned n) {
 
 void harp_freerun_get_stats(const harp_freerun *fr, harp_freerun_stats *st) {
     st->ratio = fr->ratio;
-    st->est_ppm = (fr->nominal / fr->ratio - 1.0) * 1e6;
+    double eff = fr->consumed_total ? (double)fr->output_total / (double)fr->consumed_total
+                                    : fr->nominal;
+    st->est_ppm = (fr->nominal / eff - 1.0) * 1e6;
     st->fill_frames = fr->fill;
     st->underflow_frames = fr->underflow;
     st->overflow_frames = fr->overflow;
