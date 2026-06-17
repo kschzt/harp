@@ -126,6 +126,15 @@ add_executable(harp-tests tests/harp_tests.c)
 target_link_libraries(harp-tests harpcore ${HARP_MATH_LIB})
 add_test(NAME core COMMAND harp-tests)
 
+# harp-engine-logic-tests: the determinism-critical PURE policies factored out of
+# engine.c (device/voice_alloc.h §9.5 allocation, device/arp_select.h §9.7 arp
+# note selection) — header-only, no device.h/daemon deps, so they unit-test on
+# every OS without a board. engine.c calls these same functions, so this is the
+# real logic; the chord/groove golden hashes pin it byte-identical on hardware.
+add_executable(harp-engine-logic-tests tests/harp_engine_logic_tests.c)
+target_include_directories(harp-engine-logic-tests PRIVATE device)
+add_test(NAME engine_logic COMMAND harp-engine-logic-tests)
+
 # harp-device-tests: unit tests for the params-blob codec (§10 / P3 closer
 # step 3). Links the REAL pure codec from device/state.c — not a fork — so a
 # daemon serializer regression is caught. state.c shares its TU with engine/

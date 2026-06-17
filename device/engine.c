@@ -16,6 +16,9 @@
 
 #include "device.h"
 
+#include "arp_select.h"  /* pure §9.7 arp note-selection (host-unit-tested) */
+#include "voice_alloc.h" /* pure §9.5 voice-allocation policy (host-unit-tested) */
+
 static const char *const ARP_MODES[] = {"Off", "Up", "Down", "Up-Down", "As Played"};
 static const char *const ARP_DIVS[] = {"1/4", "1/8", "1/8T", "1/16", "1/16T", "1/32"};
 static const char *const ARP_OCTS[] = {"1", "2", "3", "4"};
@@ -286,14 +289,17 @@ void engine_note_off_if(uint32_t note) {
 
 /* Pick the voice a note-on takes: the first FREE slot in index order, else the
  * active slot with the smallest alloc_seq (the oldest — deterministic since
- * alloc_seq is unique and monotone per part). */
+ * alloc_seq is unique and monotone per part). The policy itself is the pure
+ * harp_voice_pick (device/voice_alloc.h) so it is unit-testable off-hardware;
+ * this just feeds it the pool state and returns the chosen slot. */
 static synth_voice *voice_alloc(part *p) {
-    for (int i = 0; i < NVOICES; i++)
-        if (!p->voices[i].active) return &p->voices[i];
-    int oldest = 0;
-    for (int i = 1; i < NVOICES; i++)
-        if (p->voices[i].alloc_seq < p->voices[oldest].alloc_seq) oldest = i;
-    return &p->voices[oldest];
+    bool active[NVOICES];
+    uint64_t seq[NVOICES];
+    for (int i = 0; i < NVOICES; i++) {
+        active[i] = p->voices[i].active;
+        seq[i] = p->voices[i].alloc_seq;
+    }
+    return &p->voices[harp_voice_pick(active, seq, NVOICES)];
 }
 
 /* Start a note on voice v. The DSP state is PRESERVED on a steal (phase/filter
@@ -1068,48 +1074,16 @@ static void arp_fire_due(part *p, uint64_t pos, double rate) {
         return;
     if (arp_next_step_ssi(p, pos - 1, rate) != pos) return; /* not a boundary */
 
-    /* which latched note does this step sound? */
-    int span = p->arp.nlatch * (param_step_index(p, 12) + 1); /* notes x octaves */
-    int s = p->arp.step % span;
-    int idx, oct;
-    switch (param_step_index(p, 9)) {
-        default:
-        case 1: /* up */
-            idx = s % p->arp.nlatch;
-            oct = s / p->arp.nlatch;
-            break;
-        case 2: /* down */
-            idx = (span - 1 - s) % p->arp.nlatch;
-            oct = (span - 1 - s) / p->arp.nlatch;
-            break;
-        case 3: { /* up-down (no repeated endpoints) */
-            int cycle = span > 1 ? 2 * span - 2 : 1;
-            int t = p->arp.step % cycle;
-            if (t >= span) t = cycle - t;
-            idx = t % p->arp.nlatch;
-            oct = t / p->arp.nlatch;
-            break;
-        }
-        case 4: /* as played */
-            idx = s % p->arp.nlatch;
-            oct = s / p->arp.nlatch;
-            break;
-    }
-    /* up/down sort by pitch; as-played keeps press order */
+    /* which latched note does this step sound? The mode/octave/sort/clamp logic
+     * is the pure harp_arp_select (device/arp_select.h) so all four modes are
+     * unit-testable off-hardware; `order` is its sort scratch. */
     int order[ARP_LATCH_MAX];
-    for (int i = 0; i < p->arp.nlatch; i++) order[i] = i;
-    if (param_step_index(p, 9) != 4)
-        for (int i = 0; i < p->arp.nlatch; i++)
-            for (int j = i + 1; j < p->arp.nlatch; j++)
-                if (p->arp.latch[order[j]] < p->arp.latch[order[i]]) {
-                    int t = order[i];
-                    order[i] = order[j];
-                    order[j] = t;
-                }
-    int note = p->arp.latch[order[idx]] + 12 * oct;
-    if (note > 127) note = p->arp.latch[order[idx]];
+    harp_arp_pick pick = harp_arp_select(param_step_index(p, 9), p->arp.step,
+                                         p->arp.latch, p->arp.nlatch,
+                                         param_step_index(p, 12), order);
+    int note = pick.note;
 
-    arp_voice_on(p, note, p->arp.vel[order[idx]]); /* mono retrigger on voice 0 */
+    arp_voice_on(p, note, p->arp.vel[pick.sel]); /* mono retrigger on voice 0 */
     p->arp.sounding = note;
     /* gate: release after gate-fraction of the step length */
     double div = ARP_DIV_PPQ[param_step_index(p, 10)];

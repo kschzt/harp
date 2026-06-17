@@ -79,7 +79,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true   # native nonzero exit => step fails
           cmake -B build -G "Visual Studio 17 2022" -A x64
-          cmake --build build --config RelWithDebInfo --target harp-tests harp-probe
+          cmake --build build --config RelWithDebInfo --target harp-tests harp-engine-logic-tests harp-probe
           ctest --test-dir build -C RelWithDebInfo --output-on-failure
       - name: shell + host build, ring tests
         shell: pwsh
