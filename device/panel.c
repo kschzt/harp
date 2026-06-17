@@ -7,6 +7,7 @@
  * device mutation takes the same locks as the session thread.
  */
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -194,71 +195,83 @@ static bool panel_revert(device *d, const char *refname) {
     return true;
 }
 
-/* One panel-API connection at a time (the sidecar holds one persistent
- * connection); line in, JSON line out. */
-static void panel_serve_conn(device *d, int fd) {
+/* Handle ONE panel command line; returns the response string (in `body`, or a
+ * heap buffer returned via *dyn that the caller frees). Pure per-line dispatch,
+ * so the poll() loop below can serve several frontends from this one thread. */
+static const char *panel_handle_line(device *d, const char *line, char *body,
+                                      size_t bodysz, char **dyn) {
+    *dyn = NULL;
+    const char *out = body;
+    if (strcmp(line, "params") == 0)
+        panel_json_params(d, body, bodysz);
+    else if (strcmp(line, "refs") == 0) {
+        *dyn = panel_json_refs(d);
+        if (*dyn) out = *dyn;
+        else snprintf(body, bodysz, "{\"error\":\"out of memory\"}");
+    } else if (strcmp(line, "counters") == 0)
+        panel_json_counters(d, body, bodysz);
+    else if (strcmp(line, "snapshot") == 0) {
+        /* the front-panel save button (§10.4 snapshot-on-demand) */
+        harp_hash snap;
+        uint64_t gen;
+        if (do_snapshot(d, "front panel", &snap, &gen) == 0) {
+            char hex[2 * HARP_HASH_LEN + 1];
+            harp_hash_hex(&snap, hex);
+            hex[12] = 0;
+            snprintf(body, bodysz, "{\"ok\":true,\"hash\":\"%s\",\"gen\":%llu}", hex,
+                     (unsigned long long)gen);
+        } else
+            snprintf(body, bodysz, "{\"ok\":false,\"error\":\"storage\"}");
+    } else if (strcmp(line, "panic") == 0) {
+        engine_all_notes_off(); /* same path the CC 120/123 handler takes */
+        snprintf(body, bodysz, "{\"ok\":true}");
+    } else if (strncmp(line, "revert ", 7) == 0) {
+        if (panel_revert(d, line + 7))
+            snprintf(body, bodysz, "{\"ok\":true}");
+        else
+            snprintf(body, bodysz, "{\"ok\":false,\"error\":\"unknown ref or load failed\"}");
+    } else if (strncmp(line, "knob ", 5) == 0) {
+        unsigned id = 0;
+        double v = -1;
+        if (sscanf(line + 5, "%u %lf", &id, &v) == 2 && v >= 0 && v <= 1 &&
+            front_panel_set(d, id, v))
+            snprintf(body, bodysz, "{\"ok\":true}");
+        else
+            snprintf(body, bodysz, "{\"ok\":false,\"error\":\"knob <id 1..8> <value 0..1>\"}");
+    } else
+        snprintf(body, bodysz, "{\"error\":\"unknown command\"}");
+    return out;
+}
+
+/* A connected frontend: its fd + the partial request line being accumulated. */
+#define PANEL_MAX_CLIENTS 8
+struct panel_client {
+    int fd;
     char buf[512];
-    size_t len = 0;
-    char body[4096];
-    for (;;) {
-        ssize_t r = read(fd, buf + len, sizeof buf - 1 - len);
-        if (r <= 0) return;
-        len += (size_t)r;
-        buf[len] = 0;
-        char *nl;
-        while ((nl = memchr(buf, '\n', len))) {
-            *nl = 0;
-            char *dyn = NULL;       /* heap response (refs); freed after send */
-            const char *out = body; /* what we send: fixed body, or dyn if set */
-            if (strcmp(buf, "params") == 0)
-                panel_json_params(d, body, sizeof body);
-            else if (strcmp(buf, "refs") == 0) {
-                dyn = panel_json_refs(d);
-                if (dyn) out = dyn;
-                else snprintf(body, sizeof body, "{\"error\":\"out of memory\"}");
-            } else if (strcmp(buf, "counters") == 0)
-                panel_json_counters(d, body, sizeof body);
-            else if (strcmp(buf, "snapshot") == 0) {
-                /* the front-panel save button (§10.4 snapshot-on-demand) */
-                harp_hash snap;
-                uint64_t gen;
-                if (do_snapshot(d, "front panel", &snap, &gen) == 0) {
-                    char hex[2 * HARP_HASH_LEN + 1];
-                    harp_hash_hex(&snap, hex);
-                    hex[12] = 0;
-                    snprintf(body, sizeof body, "{\"ok\":true,\"hash\":\"%s\",\"gen\":%llu}",
-                             hex, (unsigned long long)gen);
-                } else
-                    snprintf(body, sizeof body, "{\"ok\":false,\"error\":\"storage\"}");
-            } else if (strcmp(buf, "panic") == 0) {
-                engine_all_notes_off(); /* same path the CC 120/123 handler takes */
-                snprintf(body, sizeof body, "{\"ok\":true}");
-            } else if (strncmp(buf, "revert ", 7) == 0) {
-                if (panel_revert(d, buf + 7))
-                    snprintf(body, sizeof body, "{\"ok\":true}");
-                else
-                    snprintf(body, sizeof body,
-                             "{\"ok\":false,\"error\":\"unknown ref or load failed\"}");
-            } else if (strncmp(buf, "knob ", 5) == 0) {
-                unsigned id = 0;
-                double v = -1;
-                if (sscanf(buf + 5, "%u %lf", &id, &v) == 2 && v >= 0 && v <= 1 &&
-                    front_panel_set(d, id, v))
-                    snprintf(body, sizeof body, "{\"ok\":true}");
-                else
-                    snprintf(body, sizeof body,
-                             "{\"ok\":false,\"error\":\"knob <id 1..8> <value 0..1>\"}");
-            } else
-                snprintf(body, sizeof body, "{\"error\":\"unknown command\"}");
-            bool ok = harp_write_all(fd, out, strlen(out)) && harp_write_all(fd, "\n", 1);
-            free(dyn);
-            if (!ok) return;
-            size_t consumed = (size_t)(nl + 1 - buf);
-            memmove(buf, nl + 1, len - consumed);
-            len -= consumed;
-        }
-        if (len >= sizeof buf - 1) return; /* oversized request line */
+    size_t len;
+};
+
+/* Drain whatever just arrived on client `c`: split into lines, handle each, write
+ * its JSON response. false => the connection should close (EOF/error/oversize). */
+static bool panel_client_pump(device *d, struct panel_client *c) {
+    ssize_t r = read(c->fd, c->buf + c->len, sizeof c->buf - 1 - c->len);
+    if (r <= 0) return false;
+    c->len += (size_t)r;
+    c->buf[c->len] = 0;
+    char *nl;
+    while ((nl = memchr(c->buf, '\n', c->len))) {
+        *nl = 0;
+        char body[4096];
+        char *dyn = NULL;
+        const char *resp = panel_handle_line(d, c->buf, body, sizeof body, &dyn);
+        bool ok = harp_write_all(c->fd, resp, strlen(resp)) && harp_write_all(c->fd, "\n", 1);
+        free(dyn);
+        if (!ok) return false;
+        size_t consumed = (size_t)(nl + 1 - c->buf);
+        memmove(c->buf, nl + 1, c->len - consumed);
+        c->len -= consumed;
     }
+    return c->len < sizeof c->buf - 1; /* oversized request line => close */
 }
 
 void *panel_main(void *arg) {
@@ -274,14 +287,53 @@ void *panel_main(void *arg) {
     }
     chmod(a->path, 0666); /* sidecar runs unprivileged */
     fprintf(stderr, "harp-deviced: panel api on %s\n", a->path);
+
+    /* Single-threaded poll() multiplexing: several frontends (the web sidecar AND
+     * the Electra MIDI sidecar, say) connect at once, but every command is still
+     * handled on THIS one thread — front_panel_set/snapshot/revert keep their
+     * single-caller invariant with no new locks. */
+    struct panel_client cl[PANEL_MAX_CLIENTS];
+    for (int i = 0; i < PANEL_MAX_CLIENTS; i++) cl[i].fd = -1;
     for (;;) {
-        int cfd = accept(sfd, NULL, NULL);
-        if (cfd < 0) {
+        struct pollfd pfd[1 + PANEL_MAX_CLIENTS];
+        int slot_of[1 + PANEL_MAX_CLIENTS]; /* pfd index -> client slot */
+        pfd[0].fd = sfd;
+        pfd[0].events = POLLIN;
+        int n = 1;
+        for (int i = 0; i < PANEL_MAX_CLIENTS; i++) {
+            if (cl[i].fd < 0) continue;
+            pfd[n].fd = cl[i].fd;
+            pfd[n].events = POLLIN;
+            slot_of[n] = i;
+            n++;
+        }
+        if (poll(pfd, (nfds_t)n, -1) < 0) {
             if (errno == EINTR) continue;
             break;
         }
-        panel_serve_conn(a->d, cfd);
-        close(cfd);
+        /* service existing clients first, so a close frees a slot for the accept */
+        for (int k = 1; k < n; k++) {
+            if (!(pfd[k].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            struct panel_client *c = &cl[slot_of[k]];
+            if (!panel_client_pump(a->d, c)) {
+                close(c->fd);
+                c->fd = -1;
+            }
+        }
+        if (pfd[0].revents & POLLIN) {
+            int cfd = accept(sfd, NULL, NULL);
+            if (cfd >= 0) {
+                int slot = -1;
+                for (int i = 0; i < PANEL_MAX_CLIENTS; i++)
+                    if (cl[i].fd < 0) { slot = i; break; }
+                if (slot < 0) {
+                    close(cfd); /* table full (frontends are few) — refuse */
+                } else {
+                    cl[slot].fd = cfd;
+                    cl[slot].len = 0;
+                }
+            }
+        }
     }
     return NULL;
 }
