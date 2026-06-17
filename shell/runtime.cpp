@@ -1,5 +1,6 @@
 #include "runtime.h"
 #include "ump.h"
+#include "usb_transport.h" /* the concrete USB binding selectDevice() wraps */
 
 #ifdef __APPLE__
 #include <pthread/qos.h>
@@ -244,11 +245,11 @@ void HarpRuntime::audioRenegotiateLocked() {
      * arrive. Draining with no concurrent reader is what makes audio.start reliable
      * under the instrumented host (the device's session loop is never write-blocked). */
     audioStopLocked();
-    if (io_) {
+    if (transport_) {
         uint8_t junk[16384];
         int quiet = 0;
         while (quiet < 2) {
-            int r = harp_usb_audio_read(io_, junk, sizeof junk, 80);
+            int r = transport_->audioRead(junk, sizeof junk, 80);
             if (r < 0) break;
             quiet = (r == 0) ? quiet + 1 : 0;
         }
@@ -302,10 +303,10 @@ void HarpRuntime::encodeParamEvent(harp_cbuf *m, uint32_t id, float v, uint64_t 
 void HarpRuntime::pollEcho() {
     std::unique_lock<std::mutex> lk(ctlMutex_, std::try_to_lock);
     if (!lk.owns_lock()) return; /* a state op owns the link; echoes wait */
-    if (!harp_usb_link_poll(io_, 1)) return;
-    while (harp_usb_link_pending(io_) > 0) {
+    if (!transport_->linkPoll(1)) return;
+    while (transport_->linkPending() > 0) {
         uint8_t stream;
-        if (harp_link_recv(io_, &link_, &stream, &msg_) != 0) {
+        if (harp_link_recv(transport_->ctlIo(), &link_, &stream, &msg_) != 0) {
             log_msg("link receive failed; device gone?");
             connected_.store(false, std::memory_order_release);
             return;
@@ -382,12 +383,17 @@ void HarpRuntime::wgMaintain(WgState &st) {
  * USB claim inside harp_usb_open_match: a device owned by another plugin
  * instance fails the claim and the scan advances, so two fresh instances
  * land on different units without any coordination here. */
-harp_io *HarpRuntime::selectDevice() {
+/* Wrap a freshly claimed USB transport (or a failed claim) as a ShellTransport.
+ * Step 1 only ever builds UsbTransport here; the Ethernet binding is selected
+ * elsewhere (next step). nullptr in => nullptr out (no device was claimed). */
+static ShellTransport *wrapUsb(harp_io *io) { return io ? new UsbTransport(io) : nullptr; }
+
+ShellTransport *HarpRuntime::selectDevice() {
     /* reconnect: pinned to the exact unit this instance already owns — the
      * same-model fallback must NOT fire here, or a replug could let this
      * instance steal a sibling track's device. */
     if (!boundSerial_.empty())
-        return harp_usb_open_match_ctx(usbCtx_, boundSerial_.c_str(), false, 0, 0);
+        return wrapUsb(harp_usb_open_match_ctx(usbCtx_, boundSerial_.c_str(), false, 0, 0));
 
     /* first bind: what does the loaded project want? */
     std::string wantSerial;
@@ -413,24 +419,27 @@ harp_io *HarpRuntime::selectDevice() {
         harp_io *io = harp_usb_open_match_ctx(usbCtx_, wantSerial.c_str(), false, 0, 0); /* exact */
         if (!io && wantModel) /* serial gone: first unclaimed of the SAME model */
             io = harp_usb_open_match_ctx(usbCtx_, nullptr, true, wvid, wpid);
-        return io; /* a known model is never satisfied by a different model */
+        return wrapUsb(io); /* a known model is never satisfied by a different model */
     }
     /* fresh instance (or a bundle predating usb-identity): first unclaimed
      * HARP device of any model — it adopts whatever is there and records
      * it on first save. */
-    return harp_usb_open_match_ctx(usbCtx_, nullptr, false, 0, 0);
+    return wrapUsb(harp_usb_open_match_ctx(usbCtx_, nullptr, false, 0, 0));
 }
 
 /* One connection attempt: claim, hello, re-assert the project bundle,
  * start the stream, spawn the reader. Caller: start() or supervisor(). */
 bool HarpRuntime::sessionUp() {
-    io_ = selectDevice();
-    if (!io_) return false;
-    if (!harp_usb_has_audio(io_)) {
-        harp_usb_close(io_);
-        io_ = nullptr;
+    transport_ = selectDevice();
+    if (!transport_) return false;
+    if (!transport_->hasAudio()) {
+        delete transport_;
+        transport_ = nullptr;
         return false;
     }
+    /* cache the binding mode once, off the RT path (review m2). USB => false,
+     * so every host-paced branch below is reached exactly as before. */
+    freeRunning_ = transport_->isFreeRunning();
     {
         std::lock_guard<std::mutex> lk(ctlMutex_);
         /* capture the bound device's USB identity (vid:pid:serial) UNDER
@@ -438,7 +447,7 @@ bool HarpRuntime::sessionUp() {
          * an unlocked write here would be a cross-thread race on the
          * std::string (the project holds itself to zero benign races). */
         harp_usb_devinfo di;
-        if (harp_usb_devident(io_, &di)) {
+        if (transport_->identity(&di)) {
             usbVid_ = di.vendor_id;
             usbPid_ = di.product_id;
             usbSerial_ = di.serial;
@@ -450,13 +459,13 @@ bool HarpRuntime::sessionUp() {
         harp_link_free(&link_);
         harp_link_init(&link_);
         harp_client_free(&client_);
-        harp_client_init(&client_, io_, &link_, storeOk_ ? &store_ : nullptr, nullptr,
-                         nullptr);
+        harp_client_init(&client_, transport_->ctlIo(), &link_, storeOk_ ? &store_ : nullptr,
+                         nullptr, nullptr);
         if (!helloAndIdentity()) {
             log_msg("hello failed");
             harp_client_free(&client_);
-            harp_usb_close(io_);
-            io_ = nullptr;
+            delete transport_;
+            transport_ = nullptr;
             return false;
         }
         log_msg("connected: %s %s (serial %s, engine %s %s)", vendorName_.c_str(),
@@ -482,14 +491,14 @@ bool HarpRuntime::sessionUp() {
         if (!audioStart(rate_)) {
             log_msg("audio.start failed");
             harp_client_free(&client_);
-            harp_usb_close(io_);
-            io_ = nullptr;
+            delete transport_;
+            transport_ = nullptr;
             return false;
         }
     }
     /* drain any stale stream bytes before pacing */
     uint8_t junk[16384];
-    while (harp_usb_audio_read(io_, junk, sizeof junk, 30) > 0) {}
+    while (transport_->audioRead(junk, sizeof junk, 30) > 0) {}
 
     /* new session = new stream = new SSI time domain (§7.1). Events still
      * queued from the previous session carry STALE timestamps — drain EVERY
@@ -535,7 +544,7 @@ void HarpRuntime::sessionDown() {
     bool wasConnected = connected_.exchange(false, std::memory_order_acq_rel);
     if (readerThread_.joinable()) readerThread_.join();
     if (eventPumpThread_.joinable()) eventPumpThread_.join();
-    if (!io_) return;
+    if (!transport_) return;
     std::lock_guard<std::mutex> lk(ctlMutex_);
     if (wasConnected) {
         audioStopLocked();
@@ -543,14 +552,14 @@ void HarpRuntime::sessionDown() {
         uint8_t junk[16384];
         int quiet = 0;
         while (quiet < 2) {
-            int r = harp_usb_audio_read(io_, junk, sizeof junk, 80);
+            int r = transport_->audioRead(junk, sizeof junk, 80);
             if (r < 0) break;
             quiet = (r == 0) ? quiet + 1 : 0;
         }
     }
     harp_client_free(&client_);
-    harp_usb_close(io_);
-    io_ = nullptr;
+    delete transport_; /* UsbTransport::~ closes the claim; the libusb ctx survives */
+    transport_ = nullptr;
 }
 
 /* The supervisor owns the session for the plugin's whole active life:
@@ -1216,7 +1225,7 @@ void HarpRuntime::feeder() {
             ph[HARP_AUDIO_HDR_LEN + 1] = (uint8_t)(seq >> 8);
             ph[HARP_AUDIO_HDR_LEN + 2] = (uint8_t)(seq >> 16);
             ph[HARP_AUDIO_HDR_LEN + 3] = (uint8_t)(seq >> 24);
-            if (!harp_usb_audio_write(io_, ph, sizeof ph, 8)) break;
+            if (!transport_->audioWrite(ph, sizeof ph, 8)) break;
             ssi_ += kBlock;
             framesSent_++;
             inFlight++;
@@ -1316,7 +1325,7 @@ void HarpRuntime::eventPump() {
             harp_cbuf_init(&m);
             encodeUmpEvent(&m, ump_all_notes_off(), 0); /* CC 123, now */
             std::lock_guard<std::mutex> lk(ctlMutex_);
-            harp_link_send(io_, HARP_STREAM_EVT, m.buf, m.len);
+            harp_link_send(transport_->ctlIo(), HARP_STREAM_EVT, m.buf, m.len);
             harp_cbuf_free(&m);
             log_msg("WARNING: note-off lost to overflow; sent all-notes-off");
         }
@@ -1355,7 +1364,8 @@ void HarpRuntime::eventPump() {
              * fence. The device simply consumes them (a fence is a §8.3.1 minimum —
              * consuming MORE than required never wedges), so no batch needs dropping
              * and no event is lost. */
-            if (!io_->write_all(io_, batch.buf, batch.len)) {
+            harp_io *cio = transport_->ctlIo();
+            if (!cio->write_all(cio, batch.buf, batch.len)) {
                 log_msg("event write failed; device gone?");
                 connected_.store(false, std::memory_order_release);
             }
@@ -1396,7 +1406,7 @@ void HarpRuntime::reader() {
 #ifdef __APPLE__
         wgMaintain(wg);
 #endif
-        int r = harp_usb_audio_read(io_, acc + accLen, (int)(sizeof acc - accLen), 100);
+        int r = transport_->audioRead(acc + accLen, (int)(sizeof acc - accLen), 100);
         if (r < 0) {
             log_msg("audio stream read failed; device gone?");
             connected_.store(false, std::memory_order_release);

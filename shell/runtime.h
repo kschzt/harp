@@ -128,6 +128,8 @@ extern "C" {
 #include "usb_io.h"
 }
 
+#include "transport.h" /* ShellTransport: the USB/Ethernet binding behind the runtime */
+
 class HarpRuntime {
 public:
     /* Called from setupProcessing: the ring cushion must scale with the
@@ -406,7 +408,7 @@ private:
     /* multi-device selection: first bind picks by the project's wanted
      * identity (exact serial -> same model -> fresh-any); once bound,
      * reconnect targets that exact unit only. Claimed transport or null. */
-    harp_io *selectDevice();
+    ShellTransport *selectDevice();
     void sessionDown(); /* reap reader+pump, orderly stop if alive, close usb */
     void feeder();      /* runs on the supervisor thread while connected */
     void reader();
@@ -501,7 +503,11 @@ private:
     bool fetchClosureLocked(const harp_hash &root);
     bool pushStateLocked(const harp_hash &target);
 
-    harp_io *io_ = nullptr;
+    ShellTransport *transport_ = nullptr; /* the active binding (USB now; Ethernet next) */
+    bool freeRunning_ = false; /* cached transport_->isFreeRunning() (set at sessionUp,
+                                * read off the RT path): false on USB, so every existing
+                                * host-paced line is reached identically. The Ethernet
+                                * steps gate the free-running branches on this bool. */
     harp_link link_;   /* rx reassembly: shared by client_ and pollEcho */
     harp_cbuf msg_;    /* pollEcho rx scratch */
     harp_client client_{};
