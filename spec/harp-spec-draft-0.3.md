@@ -527,6 +527,8 @@ Mapping: the RTP **sequence number** supplies the loss/reorder detection the rel
 
 Real-time audio over this binding is **free-running** (§8.3 mode 0) only. Host-paced real-time is not offered: its latency floor (network RTT + pipeline depth) is inferior to receiver-side ASRC, and converter-bearing devices require free-running regardless — the inverse of the USB preference, deliberately. **Offline bounce is preserved**: a device declaring `audio.offline-rate` (§8.3) MAY be paced host-paced for *non-real-time* rendering, with SSI ranges and rendered audio carried over the **reliable framed link (TCP)**, not RTP — latency is irrelevant offline and reliability is what a bounce needs, so deterministic offline-bounce-through-hardware (T15) stays available without a second real-time media transport (capability `net.offline`).
 
+Added network-path latency — packet time, jitter-buffer depth (sized to the segment's packet-delay variation), and ASRC group delay — MUST be constant for the session and reported in DAW-domain samples for plugin delay compensation (§7, §8.3), as on USB. It is of the same character as networked-audio (AES67/Dante) latencies; this specification commits no normative figure pending measurement on a kernel-timestamped reference path.
+
 Admission control (§8.4) applies with the switch/segment as the transport path. The AES67/Dante interop bridge (§4.4 item 6, `net.aes67-bridge`) layers the AES67 PTPv2 media profile and SDP/SAP session description onto this RTP plane for fabric participation; it is reserved and optional.
 
 ---

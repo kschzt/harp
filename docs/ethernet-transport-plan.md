@@ -261,8 +261,22 @@ in the session via the plugin shell. Adjacent market, not core requirement.
    within a stated bound" (device↔device PTP + host recovery), never
    sample-exact — sample-exact stays host-paced/offline's job.
 5. RTP payload mapping for HARP's slot/interleave model and the `fmt` set
-   (float32 required; int24 for AES67-bridge compatibility) — detail for the
-   companion spec.
+   (float32 required; int24 for AES67-bridge compatibility) — detail for §8.7.
+6. **Receiver-side recovery (P2) — prototyped 2026-06-17** (KR260 → wired Mac;
+   see [[ethernet-ptp-prototyping]]). Tier-1: the device clock shows up as a
+   stable, near-constant ppm offset recoverable from the stream alone, 0% loss.
+   Tier-2: a jitter buffer + cubic async resampler produced a clean, glitch-free
+   tone (0 spikes / 2.88M samples) — receiver-side ASRC recovery works. Not yet
+   built: the closed-loop rate tracker + a production polyphase ASRC (the
+   unbuilt free-running core, shared with USB analog devices).
+7. **Network-path latency — framing only, no number committed.** Added latency
+   = packet time + jitter-buffer depth (sized to the segment's packet-delay
+   variation) + ASRC group delay; constant and reported via PDC, of the same
+   character as AES67/Dante. The Tier-2 prototype's 30 ms buffer reflected the
+   **Python harness's** scheduling jitter (userspace pacing + timestamping),
+   NOT the transport (the PTP-measured link PDV is tens of µs). A specific
+   figure awaits a kernel-timestamped rig (`SO_TIMESTAMPING` / small C receiver,
+   AES67-style ~1 ms or smaller packets); until then, quote no ms.
 
 ## What this touches when built (not now)
 
