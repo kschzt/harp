@@ -418,7 +418,10 @@ int main(int argc, char **argv) {
                      * right after its note-on (same ts; the voice is already
                      * minted, so the §9.5 mod lands on it). */
                     if (has_mpe_bend && (int)ci == mpe_bend_idx) {
-                        double r = mpe_range > 0 ? mpe_range : 48.0;
+                        /* scale by the SAME rounded range the RPN carried (not the
+                         * raw --mpe-range), so the host's encoding and the device's
+                         * reconstruction agree exactly even for a fractional range. */
+                        double r = (double)range;
                         int v14 = (int)(8192.0 + mpe_bend / r * 8192.0 + 0.5);
                         if (v14 < 0) v14 = 0;
                         if (v14 > 16383) v14 = 16383;

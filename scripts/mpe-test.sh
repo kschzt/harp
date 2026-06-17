@@ -140,10 +140,14 @@ if [ -x "$A" ] && [ -e "$AUCOMP" ]; then
     AUB1=$("$A" $S --mpe-chord 60,64,67 --mpe-bend -12 --mpe-bend-idx 1 --seconds 2.0 --hash 2>/dev/null | grep output-hash | cut -d' ' -f2)
     AUPR0=$("$A" $S --mpe-chord 60,64,67 --mpe-press 0.6 --mpe-press-idx 0 --seconds 2.0 --hash 2>/dev/null | grep output-hash | cut -d' ' -f2)
     AUTB0=$("$A" $S --mpe-chord 60,64,67 --mpe-timbre 1.0 --mpe-timbre-idx 0 --seconds 2.0 --hash 2>/dev/null | grep output-hash | cut -d' ' -f2)
+    # SAME -12 st gesture but encoded over a NON-default ±24 member range (RPN 0):
+    # the rendered semitones must be identical regardless of the range used to
+    # encode them on the wire — exercises RPN-0 range parsing end-to-end.
+    AUB0R=$("$A" $S --mpe-chord 60,64,67 --mpe-range 24 --mpe-bend -12 --mpe-bend-idx 0 --seconds 2.0 --hash 2>/dev/null | grep output-hash | cut -d' ' -f2)
     CLBM12=$(r --bend -12 --bend-idx 0)                 # CLAP reference: same -12 gesture
     echo "   AU raw-MPE: plain=$AUPLAIN neutral=$AUNEUT (collapse) bend-12 v0=$AUB0 v1=$AUB1"
-    echo "              press .6 v0=$AUPR0 timbre=$AUTB0  (CLAP bend-12=$CLBM12 cutoff=$CUT0)"
-    for n in AUPLAIN AUNEUT AUB0 AUB1 AUPR0 AUTB0 CLBM12; do
+    echo "              press .6 v0=$AUPR0 timbre=$AUTB0 bend-12@±24=$AUB0R  (CLAP bend-12=$CLBM12 cutoff=$CUT0)"
+    for n in AUPLAIN AUNEUT AUB0 AUB1 AUPR0 AUTB0 AUB0R CLBM12; do
         eval "v=\$$n"
         [ -n "$v" ] || { echo "MPE FAIL: AU $n produced no hash (device busy/absent?)"; exit 3; }
     done
@@ -153,6 +157,7 @@ if [ -x "$A" ] && [ -e "$AUCOMP" ]; then
     [ "$AUB0" != "$AUB1" ]         || fail "AU MPE pitch not per-voice (v0=$AUB0 v1=$AUB1) — the bend hit the part, not one voice"
     [ "$AUPR0" != "$AUNEUT" ]      || fail "AU MPE pressure did not change the render"
     [ "$AUB0" = "$CLBM12" ]        || fail "AU raw-MPE bend ($AUB0) != CLAP note-expr bend ($CLBM12) — raw 16-ch MPE pitch not cross-format byte-identical"
+    [ "$AUB0R" = "$AUB0" ]         || fail "AU raw-MPE bend over ±24 range ($AUB0R) != over ±48 ($AUB0) — the rendered semitones must not depend on the RPN-0 range used to encode them"
     [ "$AUTB0" = "$CUT0" ]         || fail "AU raw-MPE CC74 timbre ($AUTB0) != CLAP Brightness ($CUT0) — timbre axis not cross-format byte-identical"
 else
     echo "   (AU raw-MPE check skipped: au-host / AU component absent — macOS only)"

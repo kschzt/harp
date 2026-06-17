@@ -192,6 +192,7 @@ struct MpeZone {
      * marked accepted=false so the shell can apply its own policy. With the zone
      * inactive every note is accepted on the part (the non-MPE pass-through). */
     MpeNote noteOn(uint8_t chan, uint8_t note) {
+        chan &= 0x0f; /* a MIDI channel is a 4-bit nibble; keep chanVoice[] in range */
         if (!active()) return {chan, true}; /* pass-through on its OWN channel:
                                                HARP derives the device part from
                                                the note's MIDI channel; MPE off
@@ -203,12 +204,16 @@ struct MpeZone {
 
     /* A member-channel NOTE-OFF: clears the channel's voice binding so a stray
      * later expression on it falls back to part-wide (voice 0) instead of a dead
-     * voice. Idempotent; safe on any channel. (The note OFF itself still emits
-     * on the part, like noteOn — the caller uses the returned part.) */
+     * voice. (The note OFF itself still emits on the part, like noteOn — the
+     * caller uses the returned part.) The binding is cleared only when THIS note
+     * is the one bound to the channel: MPE is one note per member channel, but a
+     * mismatched off (degenerate) must not strand the sounding voice by dropping
+     * its expression route. */
     MpeNote noteOff(uint8_t chan, uint8_t note) {
-        (void)note; /* one note per member channel; the channel identifies it */
+        chan &= 0x0f;
         if (!active()) return {chan, true}; /* pass-through on its own channel */
-        if (isMember(chan)) chanVoice[chan] = 0;
+        if (isMember(chan) && chanVoice[chan] == (((uint32_t)part << 8) | (note & 0x7f)))
+            chanVoice[chan] = 0;
         if (!isMember(chan) && !isMaster(chan)) return {part, false};
         return {part, true};
     }
@@ -231,6 +236,7 @@ struct MpeZone {
      * out to each live member voice; deferred until a non-zero-part MPE rig
      * needs it.) */
     MpeMod pitchBend(uint8_t chan, uint16_t value14) const {
+        chan &= 0x0f;
         if (!active()) return {0, 0.0f, false};
         float norm = ((float)(int)value14 - 8192.0f) / 8192.0f; /* -1..+1 */
         if (isMaster(chan)) return {0, norm * masterPbRange, true}; /* part-wide */
@@ -247,6 +253,7 @@ struct MpeZone {
      * (harp_clap.cpp). A member channel addresses its voice; the master channel
      * is part-wide (voice 0) — a zone-wide swell. */
     MpeMod channelPressure(uint8_t chan, uint8_t val) const {
+        chan &= 0x0f;
         if (!active()) return {0, 0.0f, false};
         float gain = (float)(val & 0x7f) / 127.0f;
         if (isMaster(chan)) return {0, gain, true};
@@ -276,7 +283,7 @@ struct MpeZone {
      * this for EVERY CC; with the zone inactive, CC74 is ignored (valid=false)
      * but RPN/MCM are still parsed so an incoming MCM can auto-engage. */
     MpeMod cc(uint8_t chan, uint8_t num, uint8_t val) {
-        if (chan > 15) return {0, 0.0f, false};
+        chan &= 0x0f; /* a MIDI channel is a 4-bit nibble; keep rpn[]/chanVoice[] in range */
         switch (num) {
         case 101: rpn[chan].msb = val & 0x7f; return {0, 0.0f, false}; /* RPN MSB */
         case 100: rpn[chan].lsb = val & 0x7f; return {0, 0.0f, false}; /* RPN LSB */
@@ -286,10 +293,12 @@ struct MpeZone {
             if (r.msb == 0) {
                 if (r.lsb == 0) {          /* RPN 0: pitch-bend sensitivity */
                     float semis = (float)(val & 0x7f);
-                    if (isMaster(chan) || (!active() && chan == masterOf()))
-                        masterPbRange = semis;
-                    else
-                        memberPbRange = semis;
+                    /* the master channel sets the zone-wide (master) range; any
+                     * member sets the shared member range. isMaster depends only
+                     * on the zone side, so this routes correctly even before an
+                     * MCM has engaged the zone (lowerZone defaults to true). */
+                    if (isMaster(chan)) masterPbRange = semis;
+                    else memberPbRange = semis;
                 } else if (r.lsb == 6) {   /* RPN 6: MCM — configure the zone */
                     applyMcm(chan, val & 0x7f);
                 }
@@ -322,19 +331,19 @@ struct MpeZone {
         if (chan == 0) lowerZone = true;
         else if (chan == 15) lowerZone = false;
         else return; /* MCM only valid on a master channel (ch0 / ch15) */
-        members = count & 0x0f; /* MPE caps at 15 members (16th is the master) */
+        members = count > 15 ? 15 : count; /* MPE caps at 15 members (clamp, not wrap) */
         mcmActive = members > 0; /* count 0 DEACTIVATES the auto-detected zone */
+        /* The explicit toggle is a force-on that a zone-teardown MCM must not
+         * defeat: if MPE is forced on but this MCM dropped the zone (count 0),
+         * keep a usable default full lower zone (else active() stays true with
+         * members 0 and every member note would be rejected). */
+        if (members == 0 && enabled) { lowerZone = true; members = 15; }
         /* an MCM resets PB sensitivities to the MPE defaults */
         masterPbRange = HARP_MPE_DEFAULT_MASTER_PB_RANGE;
         memberPbRange = HARP_MPE_DEFAULT_MEMBER_PB_RANGE;
         /* dropping/resizing the zone invalidates stale channel->voice bindings */
         for (auto &v : chanVoice) v = 0;
     }
-
-    /* The master channel index of the currently selected zone (for an RPN 0 that
-     * arrives BEFORE the zone is active, so we still route it to the right
-     * range). */
-    uint8_t masterOf() const { return lowerZone ? 0 : 15; }
 
     /* ============================== reset =============================== */
 

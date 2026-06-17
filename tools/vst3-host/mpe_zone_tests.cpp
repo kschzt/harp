@@ -195,6 +195,93 @@ static void test_mod_ids() {
     CHECK(HARP_MPE_MOD_PRESSURE == 0x2002u);
 }
 
+/* The UPPER zone (master ch15, members descending) must collapse + express
+ * exactly like the lower zone — on a NON-zero instance part too (member binding
+ * is correct for any part; only the master path is part-0-limited). */
+static void test_upper_zone_expression() {
+    MpeZone z;
+    z.setPart(3);
+    z.cc(15, 101, 0);
+    z.cc(15, 100, 6);
+    z.cc(15, 6, 4); /* 4-member UPPER zone: members ch14..11, master ch15 */
+    CHECK(z.active() && !z.lowerZone && z.members == 4);
+    CHECK(z.isMaster(15) && z.isMember(14) && z.isMember(11) && !z.isMember(10));
+    CHECK(z.noteOn(14, 60).part == 3); /* collapses onto the instance part */
+    CHECK(z.noteOn(11, 67).part == 3);
+    /* bend on an upper member -> that voice, scaled by the (MCM-reseeded ±48) range */
+    MpeMod b = z.pitchBend(14, 6144);
+    CHECK(b.valid && b.value == -12.0f && b.voiceKey == ((3u << 8) | 60u));
+    /* pressure + CC74 on an upper member resolve to the same voice */
+    MpeMod pr = z.channelPressure(14, 127);
+    CHECK(pr.valid && approx(pr.value, 1.0f) && pr.voiceKey == ((3u << 8) | 60u));
+    MpeMod tb = z.cc(14, 74, 127);
+    CHECK(tb.valid && approx(tb.value, 0.5f) && tb.voiceKey == ((3u << 8) | 60u));
+    /* the upper master (ch15) is part-wide */
+    MpeMod m = z.pitchBend(15, 0);
+    CHECK(m.valid && m.voiceKey == 0);
+}
+
+/* RPN 0 routes by channel role BEFORE any MCM engages the zone (lowerZone
+ * defaults true): ch0 -> master range, a member channel -> member range. */
+static void test_rpn_before_active() {
+    MpeZone z; /* fresh: no MCM, inactive */
+    CHECK(!z.active());
+    z.cc(0, 101, 0);
+    z.cc(0, 100, 0);
+    z.cc(0, 6, 7); /* RPN 0 on ch0 (the lower master) -> master range 7 */
+    CHECK(approx(z.masterPbRange, 7.0f));
+    CHECK(approx(z.memberPbRange, HARP_MPE_DEFAULT_MEMBER_PB_RANGE)); /* untouched */
+    z.cc(1, 101, 0);
+    z.cc(1, 100, 0);
+    z.cc(1, 6, 24); /* RPN 0 on a member -> member range 24, even while inactive */
+    CHECK(approx(z.memberPbRange, 24.0f));
+    CHECK(approx(z.masterPbRange, 7.0f)); /* still the master value */
+}
+
+/* Symmetric with the note-on rejection: a NOTE-OFF outside the active zone is
+ * also accepted=false (the caller drops it); a MISMATCHED member note-off must
+ * NOT strand the sounding voice by clearing its binding. */
+static void test_out_of_zone_and_mismatch() {
+    MpeZone z;
+    z.cc(0, 101, 0);
+    z.cc(0, 100, 6);
+    z.cc(0, 6, 3); /* 3-member lower zone */
+    CHECK(z.noteOff(6, 72).accepted == false); /* ch6 outside a 3-member zone */
+    z.noteOn(1, 60);
+    z.noteOff(1, 62); /* WRONG note on ch1 -> must not clear the binding */
+    CHECK(z.pitchBend(1, 4096).valid); /* voice still bound, expression still routes */
+    z.noteOff(1, 60); /* the real off clears it */
+    CHECK(!z.pitchBend(1, 4096).valid);
+}
+
+/* The explicit toggle is a force-on a zone-teardown MCM cannot defeat: a count-0
+ * MCM while enabled re-seeds a usable default zone instead of dropping notes. */
+static void test_count0_mcm_with_toggle() {
+    MpeZone z;
+    z.setEnabled(true); /* force-on: seeds a full lower zone */
+    CHECK(z.active() && z.members == 15);
+    z.cc(0, 101, 0);
+    z.cc(0, 100, 6);
+    z.cc(0, 6, 0); /* count-0 MCM: would zero members, but the toggle is still on */
+    CHECK(z.active() && z.members == 15); /* re-seeded, not defeated */
+    CHECK(z.noteOn(3, 60).accepted); /* member notes still flow */
+}
+
+/* The DOCUMENTED part-0 master limitation, pinned so a future fix is a conscious
+ * test change: on a non-zero instance part a master (part-wide) message still
+ * returns voiceKey 0 (which the runtime encodes as part 0), while a member
+ * message correctly carries the instance part. */
+static void test_master_nonzero_part_limit() {
+    MpeZone z;
+    z.setPart(5);
+    z.cc(0, 101, 0);
+    z.cc(0, 100, 6);
+    z.cc(0, 6, 3);
+    z.noteOn(1, 60);
+    CHECK(z.pitchBend(1, 0).voiceKey == ((5u << 8) | 60u)); /* member: correct part */
+    CHECK(z.pitchBend(0, 0).voiceKey == 0);                 /* master: part-wide (part-0 limit) */
+}
+
 int main() {
     test_inactive_passthrough();
     test_mcm_engages_zone();
@@ -204,6 +291,11 @@ int main() {
     test_rpn_pb_range();
     test_explicit_toggle();
     test_mod_ids();
+    test_upper_zone_expression();
+    test_rpn_before_active();
+    test_out_of_zone_and_mismatch();
+    test_count0_mcm_with_toggle();
+    test_master_nonzero_part_limit();
     printf("mpe-zone-tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
