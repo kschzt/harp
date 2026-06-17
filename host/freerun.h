@@ -67,4 +67,10 @@ unsigned harp_freerun_pull(harp_freerun *fr, float *out, unsigned nframes);
 
 void harp_freerun_get_stats(const harp_freerun *fr, harp_freerun_stats *st);
 
+/* True once the elastic buffer has filled to target_frames at least once (the
+ * producer latches it). The consumer pulls silence until then. Lets the rx side
+ * mark a session "ready" off the audio thread — never spin/poll on warm-up from
+ * the audio callback. Observer-safe (atomic). */
+int harp_freerun_warm(const harp_freerun *fr);
+
 #endif /* HARP_FREERUN_H */

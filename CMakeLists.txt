@@ -192,6 +192,19 @@ if(SAMPLERATE_FOUND)
       target_link_directories(harp-rtp-demo PRIVATE ${SAMPLERATE_LIBRARY_DIRS})
     endif()
     target_link_libraries(harp-rtp-demo ${SAMPLERATE_LIBRARIES} ${HARP_MATH_LIB} Threads::Threads)
+
+    # harp-freerun-mt-tests: concurrent SPSC stress under ThreadSanitizer — proves
+    # freerun is race-free for the runtime's rx-thread-push / audio-thread-pull
+    # topology. TSan-instrumented (this target only) so it aborts on any data race.
+    add_executable(harp-freerun-mt-tests tests/harp_freerun_mt_tests.c host/freerun.c)
+    target_include_directories(harp-freerun-mt-tests PRIVATE host ${SAMPLERATE_INCLUDE_DIRS})
+    target_compile_options(harp-freerun-mt-tests PRIVATE -fsanitize=thread -g -O1)
+    target_link_options(harp-freerun-mt-tests PRIVATE -fsanitize=thread)
+    if(SAMPLERATE_LIBRARY_DIRS)
+      target_link_directories(harp-freerun-mt-tests PRIVATE ${SAMPLERATE_LIBRARY_DIRS})
+    endif()
+    target_link_libraries(harp-freerun-mt-tests ${SAMPLERATE_LIBRARIES} ${HARP_MATH_LIB} Threads::Threads)
+    add_test(NAME freerun_mt COMMAND harp-freerun-mt-tests)
   endif()
 else()
   message(STATUS "libsamplerate not found -> harp-freerun-tests skipped")
