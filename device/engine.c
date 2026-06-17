@@ -1178,31 +1178,31 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                     }
                     break;
                 }
-                case DEV_EV_PARAM_SET:
+                case DEV_EV_PARAM_SET: {
                     /* P3: apply to the ROUTED part's pval/ramps (was global) */
-                    for (size_t j = 0; j < NPARAMS; j++)
-                        if (g_params[j].id == ev->a) {
-                            part_pput(p, j, ev->v);
-                            p->ramps[j].active = false; /* set supersedes ramp (§9.4) */
-                            break; /* param ids are unique — stop scanning */
-                        }
+                    int j = param_index(ev->a);
+                    if (j >= 0) {
+                        part_pput(p, (size_t)j, ev->v);
+                        p->ramps[j].active = false; /* set supersedes ramp (§9.4) */
+                    }
                     atomic_store_explicit(&g_touch_pending, 1,
                                           memory_order_release);
                     break;
-                case DEV_EV_RAMP:
+                }
+                case DEV_EV_RAMP: {
                     /* P3: ramp the ROUTED part's value (was global) */
-                    for (size_t j = 0; j < NPARAMS; j++)
-                        if (g_params[j].id == ev->a) {
-                            p->ramps[j].active = true;
-                            p->ramps[j].start = pos;
-                            p->ramps[j].end = ev->end;
-                            p->ramps[j].start_val = part_pget(p, j);
-                            p->ramps[j].target = ev->v;
-                            break; /* param ids are unique — stop scanning */
-                        }
+                    int j = param_index(ev->a);
+                    if (j >= 0) {
+                        p->ramps[j].active = true;
+                        p->ramps[j].start = pos;
+                        p->ramps[j].end = ev->end;
+                        p->ramps[j].start_val = part_pget(p, (size_t)j);
+                        p->ramps[j].target = ev->v;
+                    }
                     atomic_store_explicit(&g_touch_pending, 1,
                                           memory_order_release);
                     break;
+                }
                 case DEV_EV_MOD: {
                     /* §9.4 non-destructive modulation (P2): an additive, signed
                      * per-(param[,voice]) offset on the part BASE value. It does
