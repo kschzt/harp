@@ -23,9 +23,9 @@ sync, and DAW compatibility from scratch.
 
 HARP is a complete, working implementation of that integration — with an open
 spec underneath, if you want to build a device on it. The reference device is
-a Raspberry Pi running a 16-part multitimbral synth (13 params per part);
-anything that speaks the protocol gets the same treatment from any conforming
-host:
+a Raspberry Pi running a 16-part multitimbral, 8-voice-polyphonic synth (13
+params per part); anything that speaks the protocol gets the same treatment from
+any conforming host:
 
 - **Total recall, Git-style** — device state is content-addressed and
   hash-verified; a saved project reopens with the hardware *provably* in
@@ -45,7 +45,14 @@ host:
   channel, params, recall state, and stereo output (16 parts, with a summed
   main mix alongside the per-part outputs). A recall-safe **Part** knob persists
   each track's part in the project, and that per-part state moves intact between
-  the VST3 and AU formats.
+  the VST3, AU, and CLAP formats.
+- **Polyphonic, with per-voice modulation** — each part is an 8-voice pool with
+  deterministic voice allocation, so overlapping notes ring out on their own
+  voices instead of stealing one. Modulation is *non-destructive* and *per
+  voice*: a VST3 Note Expression or a CLAP per-note parameter modulation bends a
+  single sounding note's filter cutoff without touching the stored patch — and
+  the two formats render byte-identically (the device applies the §9.5 mod the
+  same regardless of which shell sent it).
 - **Sample-accurate everything** — DAW automation becomes
   device-interpolated ramps applied within ±1 sample; notes travel as UMP;
   an event *fence* makes "applied late" structurally impossible rather
@@ -67,25 +74,26 @@ host:
 **What "works" means here:** the four protocol planes (control, state, events,
 audio) are implemented end-to-end and verified on real hardware — recall
 through Ableton's own save/reopen, a tempo-locked arpeggiator, sample-accurate
-automation, offline bounce through the box, and a 16-part multitimbral instrument
-driven by several plugin instances over one shared session. The plugin shell
-builds and is CI-validated on **macOS, Windows, and Linux** — a VST3 on all
-three (pluginval strictness 10) plus an Audio Unit on macOS (`auval`) at full
-parity, with a project's per-part recall state moving between the two formats —
-and the device has been driven from **Ableton Live** (macOS + Windows) and
+automation, offline bounce through the box, and a 16-part multitimbral,
+8-voice-polyphonic instrument — with per-voice modulation — driven by several
+plugin instances over one shared session. The plugin shell builds and is
+CI-validated on **macOS, Windows, and Linux** — a VST3 on all three (pluginval
+strictness 10), an Audio Unit on macOS (`auval`) at full parity, and a CLAP
+(macOS + Linux), all three rendering byte-identically and a project's per-part
+recall state moving between them — and the device has been driven from **Ableton
+Live** (macOS + Windows) and
 **Renoise** (Windows) by hand, plus a headless **REAPER** render-and-recall e2e
 on Linux that runs on every push.
 
 **What it is, and isn't, yet:** today HARP is a complete recall + audio system
-with one reference device — a Raspberry Pi synth, now 16-part multitimbral. It
-is *not* yet an ecosystem of instruments; building richer synths and shipping
-real devices on top of the protocol is the roadmap, not a claim about the
-present. The reference engine is also still monophonic *per part* — real
-polyphony, per-voice/MPE expression, and CLAP-style non-destructive modulation
-are the next big step toward a first-class modern instrument. The spec is an
-**editor's draft** (0.3.8): breaking changes are expected and negotiated at
-`hello`. The four-actions recall UI, a CLAP port, and the Ethernet binding are
-next — the [Status](#status) section is the full breakdown.
+with one reference device — a Raspberry Pi synth: 16-part multitimbral, 8-voice
+polyphonic per part, with non-destructive per-voice modulation reachable from
+VST3 Note Expression and CLAP per-note parameter modulation. It is *not* yet an
+ecosystem of instruments; building richer synths and shipping real devices on
+top of the protocol is the roadmap, not a claim about the present. The spec is
+an **editor's draft** (0.3.8): breaking changes are expected and negotiated at
+`hello`. The four-actions recall UI and the Ethernet binding are next — the
+[Status](#status) section is the full breakdown.
 
 ## Repository map
 
@@ -100,23 +108,25 @@ device/           harp-deviced — the reference device daemon: a 16-part
                   FunctionFS USB gadget (Linux)
 host/             harp-probe — host-side CLI: recall flows, audio capture,
                   offline render, determinism checks (libusb)
-shell/            the plugin shells over one embedded runtime:
-                  VST3 ("HARP RefDev") and Audio Unit (shell/au) — same
-                  params, same Recall Bundle, same "Part" routing param. The
-                  runtime registry lets several instances naming one device
-                  SHARE its session (each owns a part); the AU also joins the
-                  host's CoreAudio workgroup. Both render BYTE-IDENTICAL audio
-                  and a project's recall state moves between them (asserted by
-                  the conformance kit)
+shell/            the plugin shells over one embedded runtime: VST3 ("HARP
+                  RefDev"), Audio Unit (shell/au) and CLAP (shell/clap) — same
+                  params, same Recall Bundle, same "Part" routing param, same
+                  noteId->voice map (note_voice_map.h). The runtime registry lets
+                  several instances naming one device SHARE its session (each owns
+                  a part); the AU also joins the host's CoreAudio workgroup. All
+                  three render BYTE-IDENTICAL audio and a project's recall state
+                  moves between them (asserted by the conformance kit)
 tools/vst3-host/  CLI VST3 host for automated testing of any plugin —
                   params, block processing, WAV+hash, state round-trips,
                   multi-instance shared-session driving
 tools/au-host/    its Audio Unit twin (drives the AU shell; same hashes;
                   save/load-state for the cross-format recall e2e)
+tools/clap-host/  its CLAP twin (dlopens the .clap; drives notes/params and
+                  CLAP per-note PARAM_MOD; same golden hashes as the others)
 tests/            unit tests for the core (RFC 8949 vectors included)
 docs/             architecture one-pager, VST3 shell design plan
 scripts/          Raspberry Pi provisioning + operations runbook
-external/         VST3 SDK clone (gitignored; needed for shell/tools only)
+external/         VST3 SDK + CLAP SDK clones (gitignored; shell/tools only)
 ```
 
 ## Getting started
@@ -223,9 +233,18 @@ The shell can also be driven without any DAW, which is how it is tested:
   content-addressed object store), `harp-recall` (save / snapshot / restore),
   `harp-stream` (free-running and host-paced; `audio.deterministic` +
   `audio.offline-rate`), and the USB binding.
-- **The plugin shell** — VST3 on macOS/Windows/Linux and an Audio Unit on
-  macOS, driving the device in Ableton Live (macOS + Windows), Renoise
-  (Windows), and an automated headless REAPER render (Linux).
+- **The plugin shell** — VST3 on macOS/Windows/Linux, an Audio Unit on macOS,
+  and a CLAP on macOS/Linux (all three byte-identical), driving the device in
+  Ableton Live (macOS + Windows), Renoise (Windows), and an automated headless
+  REAPER render (Linux).
+- **Polyphony + per-voice modulation (§9.5)** — each part is an 8-voice pool
+  with deterministic allocation (overlapping notes ring out, never steal one
+  voice); a VST3 Note Expression or a CLAP per-note PARAM_MOD bends one voice's
+  filter cutoff non-destructively, byte-identically across the two formats. The
+  device's golden render is unchanged when no modulation is sent.
+- **Output metering (§9.9)** — per-part and main-mix peak/RMS, exposed as
+  readonly params streamed via echo and read back through `harp-probe meters`;
+  folded read-after-write in the render, so the golden render is unperturbed.
 - **The event plane (§9)** — parameter sets and ramps at exact sample
   timestamps (±1 sample on hardware), DAW automation synthesized into
   device-interpolated ramps, UMP note input (the refdev is a playable
@@ -277,11 +296,11 @@ The shell can also be driven without any DAW, which is how it is tested:
   T15/T17 (byte-identical renders), T16 (event timing).
 
 **Not yet:** the four-safe-actions UI (v0 auto-resolves by Push-with-archive),
-per-part **polyphony** + per-voice/MPE expression and non-destructive modulation
-(§9.5–§9.6), output metering (§9.9), the deeper diagnostics (`diag.bundle` /
-loopback, §14), runtime/shell process split (§15.1), firmware management (§13),
-class-audio coexistence (§8.5), free-running ASRC for analog devices, a CLAP
-port, the TCP companion spec (§4.4).
+full MPE channel-per-note input (§9.6; the §9.5 per-voice mod layer it rides on
+is in place), the deeper diagnostics (`diag.bundle` / loopback, §14),
+runtime/shell process split (§15.1), firmware management (§13), class-audio
+coexistence (§8.5), free-running ASRC for analog devices, the TCP companion spec
+(§4.4).
 
 The spec is an **editor's draft**: breaking changes expected, version
 negotiated at `core.hello`. Changes flow through HARP Enhancement Proposals
