@@ -191,6 +191,23 @@ def build_preset(params):
                         "message": {"deviceId": 1, "type": "cc7",
                                     "parameterNumber": p["id"], "min": 0, "max": 127}}],
         })
+    # Phase-2 Reconcile page (§11.4): the four safe actions on knobs 1-4. The Mini
+    # is non-touch, so a knob PRESS fires the action under it (caught as a CTRL pot
+    # event); these controls are bound to CCs the bridge ignores (>13), so turning
+    # one is harmless — only the press matters.
+    pages.append({"id": 3, "name": "Reconcile"})
+    actions = [("Push", "F49500"), ("Pull", "529DEC"),
+               ("Read-only", "9AA0A6"), ("Duplicate", "C44795")]
+    for j, (nm, color) in enumerate(actions):
+        controls.append({
+            "id": 200 + j, "type": "fader", "name": nm, "color": color,
+            "bounds": [j * COL_W + PADX, TOP_Y, COL_W - 2 * PADX, ROW_H],
+            "pageId": 3, "controlSetId": 1,
+            "inputs": [{"potId": j + 1, "valueId": "value"}],
+            "values": [{"id": "value", "min": 0, "max": 127,
+                        "message": {"deviceId": 1, "type": "cc7",
+                                    "parameterNumber": 110 + j, "min": 0, "max": 127}}],
+        })
     return {"version": 2, "name": "HARP RefDev", "pages": pages, "devices": devices,
             "controls": controls, "groups": [], "overlays": []}
 
@@ -250,10 +267,15 @@ def main():
     panel = Panel(PANEL_SOCK)
     params = json.loads(panel.cmd("params"))["params"]
 
-    ctrl = RawMidi(ctrl_name, want_in=True, want_out=True)
-    upload_preset(ctrl, build_preset(params))
+    # CTRL as TWO independent opens. Writing (upload, force_page) and reading
+    # (events) the SAME open made force_page writes silently vanish once a reader
+    # was live (a lock didn't help — it's the shared open, not a race); separate
+    # in/out opens decouple them.
+    ctrl_out = RawMidi(ctrl_name, want_in=False, want_out=True)
+    ctrl_in = RawMidi(ctrl_name, want_in=True, want_out=False)
+    upload_preset(ctrl_out, build_preset(params))
     # The Electra replies on the CTRL port: ACK = F0 00 21 45 7E 01 ..., NACK = ... 7E 00 ...
-    ack = ctrl.read_window(0.8)
+    ack = ctrl_in.read_window(0.8)
     if ELECTRA_SYSEX + b"\x7e\x00" in ack:
         sys.stderr.write("electra-panel: preset upload NACK [%s]\n" % ack.hex())
     elif ELECTRA_SYSEX + b"\x7e\x01" in ack:
@@ -262,18 +284,12 @@ def main():
         sys.stderr.write("electra-panel: no clear upload ACK [%s]\n" % (ack.hex() or "(silence)"))
     time.sleep(0.4)  # let the controller swap to the new preset
 
-    # Phase-2 note — firing actions from the Mini (non-touch):
-    # The 4 assignable buttons emit no MIDI by default, BUT the "Assign Buttons"
-    # feature (fw >= 4.1.0) binds a button to a preset Lua user function
-    # (preset.userFunctions) that can midi.sendControlChange/sendSysex — caught
-    # here. That binding is a one-time device-menu step (not storable in the preset
-    # or the uploadable config). The KNOBS are press/touch-sensitive and DO emit
-    # CTRL-port events, and ARE preset-automatable:
-    #   subscribe   F0 00 21 45 14 79 <flags> F7
-    #   press/rel   F0 00 21 45 7E 0A <potId> <ctrlId-lo> <ctrlId-hi> <pressed> F7
-    # So the four reconcile actions (Push/Pull/Read-only/Duplicate) will be knob
-    # PRESSES on a dedicated Reconcile page — no manual button-assign needed. Pages
-    # navigate via MENU -> press the knob matching the page in the screen list.
+    # Subscribe to controller events on the CTRL port. The Reconcile page fires on a
+    # knob PRESS/click — F0 00 21 45 7E 06 <potId> F7 — which is DISTINCT from the
+    # capacitive TOUCH (7E 0A <potId> <ctrlId-lo> <ctrlId-hi> <on/off> F7), so a mere
+    # brush never fires a consequential action.
+    ctrl_out.write(ELECTRA_SYSEX + bytes([0x14, 0x7B, 0x02, 0xF7]))  # route events -> CTRL
+    ctrl_out.write(ELECTRA_SYSEX + bytes([0x14, 0x79, 0x7F, 0xF7]))  # enable all event types
 
     port = RawMidi(port_name, want_in=True, want_out=True)
     by_cc = {p["id"] for p in params}
@@ -293,6 +309,57 @@ def main():
 
     threading.Thread(target=reader, daemon=True).start()
 
+    # Phase-2 reconcile: when the device parks a §11.4 offer (a shell found
+    # live/project != its saved bundle), force-open the Reconcile page; the user
+    # picks an action there, posted back for the shell. The knobs have no click
+    # event, only capacitive TOUCH (7E 0A) — and a brush fired actions by accident
+    # — so a choice requires a deliberate TOUCH-AND-HOLD. 7E 06 is the active-page
+    # change event (force_page emits it); we track it to return the user afterwards.
+    RECONCILE_PAGE = 3
+    HOLD_SECS = 0.4
+    ACTIONS = ["Push", "Pull", "Read-only", "Duplicate"]
+    recon = {"active": False, "page": 1, "return_to": 1}
+    out_lock = threading.Lock()  # two threads write ctrl_out (poll forces, reader returns)
+
+    def force(page):
+        with out_lock:
+            force_page(ctrl_out, page)
+
+    def ctrl_reader():
+        touch = ELECTRA_SYSEX + b"\x7e\x0a"  # <potId><ctrlLo><ctrlHi><on/off> capacitive
+        page = ELECTRA_SYSEX + b"\x7e\x06"   # <pageNo> active-page change
+        held_since = {}
+        acc = b""
+        while True:
+            chunk = ctrl_in.read()
+            if not chunk:
+                time.sleep(0.005)
+                continue
+            acc += chunk
+            while b"\xf7" in acc:
+                i = acc.index(b"\xf7")
+                msg, acc = acc[: i + 1], acc[i + 1:]
+                if msg[:6] == page and len(msg) >= 8:
+                    recon["page"] = msg[6]  # track where the user is, to return later
+                elif msg[:6] == touch and len(msg) >= 11 and recon["active"]:
+                    pot, on = msg[6], msg[9]
+                    if 0 <= pot <= 3:
+                        if on:
+                            held_since[pot] = time.monotonic()
+                        elif pot in held_since:
+                            held = time.monotonic() - held_since.pop(pot)
+                            if held >= HOLD_SECS:  # deliberate hold, not a brush
+                                r = panel.cmd("reconcile-choose %d" % pot)
+                                sys.stderr.write("electra-panel: reconcile -> %s (held %.2fs) %s\n"
+                                                 % (ACTIONS[pot], held, r))
+                                recon["active"] = False
+                                force(recon["return_to"] or 1)
+
+    ctrl_in.nonblock(True)  # poll, don't park a blocking read
+    while ctrl_in.read():    # discard stale buffered events (e.g. taps from before)
+        pass
+    threading.Thread(target=ctrl_reader, daemon=True).start()
+
     # display poll: the device's live param values -> CC out, so the Electra tracks
     # the device however it changed (web panel, a DAW, or a hardware front-panel move).
     period = 1.0 / POLL_HZ
@@ -308,6 +375,16 @@ def main():
             if out:
                 port.write(out)
         except (OSError, ValueError, KeyError):
+            pass
+        try:  # a parked §11.4 offer -> yank the screen onto the Reconcile page
+            rj = json.loads(panel.cmd("reconcile-get"))
+            if rj.get("pending") and not recon["active"]:
+                recon["return_to"] = recon["page"]  # capture where they are, pre-force
+                recon["active"] = True
+                force(RECONCILE_PAGE)
+                sys.stderr.write("electra-panel: reconcile offer expect=%s live=%s%s -> Reconcile\n"
+                                 % (rj.get("expect"), rj.get("live"), " dirty" if rj.get("dirty") else ""))
+        except (OSError, ValueError):
             pass
         time.sleep(period)
 

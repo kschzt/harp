@@ -195,6 +195,20 @@ static bool panel_revert(device *d, const char *refname) {
     return true;
 }
 
+/* Phase-2 recall-reconcile mailbox (§11.4 four safe actions, surfaced on the front
+ * panel). A shell that finds live/project differing from its saved Recall Bundle
+ * POSTs an offer here; a panel frontend (the Electra sidecar) reads it, force-opens
+ * its Reconcile screen, and POSTs the user's chosen action back for the shell to
+ * execute. Panel-thread-owned (the single poll() thread), so no lock needed; the
+ * shell-posts-over-the-protocol path (session.c) is the next step. */
+static struct {
+    int pending;     /* an offer awaits a choice */
+    char expect[16]; /* short hex: the project's expected live/project hash */
+    char live[16];   /* short hex: the device's current live/project hash */
+    int dirty;       /* is the live ref dirty (unsaved front-panel edits)? */
+    int choice;      /* -1 none; 0 push / 1 pull / 2 read-only / 3 duplicate */
+} g_reconcile = {0, "", "", 0, -1};
+
 /* Handle ONE panel command line; returns the response string (in `body`, or a
  * heap buffer returned via *dyn that the caller frees). Pure per-line dispatch,
  * so the poll() loop below can serve several frontends from this one thread. */
@@ -238,6 +252,34 @@ static const char *panel_handle_line(device *d, const char *line, char *body,
             snprintf(body, bodysz, "{\"ok\":true}");
         else
             snprintf(body, bodysz, "{\"ok\":false,\"error\":\"knob <id 1..8> <value 0..1>\"}");
+    } else if (strncmp(line, "reconcile-offer ", 16) == 0) {
+        /* a shell (or a test) posts a §11.4 conflict: expected vs live hash + dirty */
+        char e[16] = "", l[16] = "";
+        int dty = 0;
+        if (sscanf(line + 16, "%15s %15s %d", e, l, &dty) >= 2) {
+            snprintf(g_reconcile.expect, sizeof g_reconcile.expect, "%s", e);
+            snprintf(g_reconcile.live, sizeof g_reconcile.live, "%s", l);
+            g_reconcile.dirty = dty ? 1 : 0;
+            g_reconcile.choice = -1;
+            g_reconcile.pending = 1;
+            snprintf(body, bodysz, "{\"ok\":true}");
+        } else
+            snprintf(body, bodysz,
+                     "{\"ok\":false,\"error\":\"reconcile-offer <expect> <live> <dirty>\"}");
+    } else if (strcmp(line, "reconcile-get") == 0) {
+        snprintf(body, bodysz,
+                 "{\"pending\":%s,\"expect\":\"%s\",\"live\":\"%s\",\"dirty\":%s,\"choice\":%d}",
+                 g_reconcile.pending ? "true" : "false", g_reconcile.expect,
+                 g_reconcile.live, g_reconcile.dirty ? "true" : "false", g_reconcile.choice);
+    } else if (strncmp(line, "reconcile-choose ", 17) == 0) {
+        /* the front panel reports the user's pick; the shell reads it + executes */
+        int n = atoi(line + 17);
+        if (n >= 0 && n <= 3) {
+            g_reconcile.choice = n;
+            g_reconcile.pending = 0;
+            snprintf(body, bodysz, "{\"ok\":true,\"choice\":%d}", n);
+        } else
+            snprintf(body, bodysz, "{\"ok\":false,\"error\":\"reconcile-choose <0..3>\"}");
     } else
         snprintf(body, bodysz, "{\"error\":\"unknown command\"}");
     return out;
