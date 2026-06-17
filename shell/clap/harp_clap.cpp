@@ -482,15 +482,9 @@ static const void *entry_get_factory(const char *factory_id) {
  * dlsym/GetProcAddress finds it (else the plugin is silently skipped). NO
  * `extern "C"` here on purpose: clap/entry.h already declares clap_entry inside
  * its own `extern "C"` block as `CLAP_EXPORT extern const ...`, so this
- * definition inherits C linkage + EXTERNAL linkage + the export attribute from
- * that declaration (the upstream clap-entry.cc pattern). A second `extern "C"`
- * on the definition is what kept MSVC from exporting it (a const data symbol's
- * export is linkage-sensitive on MSVC). CLAP_EXPORT = visibility("default") on
- * mac/Linux (also future-proofs against -fvisibility=hidden / LTO); the MSVC
- * /EXPORT pragma is a belt-and-suspenders guarantee for the const-export corner
- * case. The §9.x entry contract is unchanged. */
-#if defined(_MSC_VER)
-#  pragma comment(linker, "/EXPORT:clap_entry")
-#endif
+ * definition inherits C linkage + EXTERNAL linkage from that declaration (the
+ * upstream clap-entry.cc pattern), and CLAP_EXPORT exports it: __declspec(
+ * dllexport) on MSVC, visibility("default") on mac/Linux (also future-proofs
+ * against -fvisibility=hidden / LTO). The §9.x entry contract is unchanged. */
 CLAP_EXPORT const clap_plugin_entry_t clap_entry = {
     CLAP_VERSION_INIT, entry_init, entry_deinit, entry_get_factory};

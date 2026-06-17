@@ -103,7 +103,12 @@ jobs:
           $clap = (Get-ChildItem build-vst -Recurse -Filter harp-clap.clap | Select-Object -First 1).FullName
           if (-not $clap) { throw "harp-clap.clap was not built" }
           $exports = & $dumpbin /EXPORTS $clap
-          if ($exports -notmatch 'clap_entry') { throw "clap_entry is NOT exported from harp-clap.clap (CLAP_EXPORT missing?)" }
+          # NOTE: $exports is a multi-line ARRAY; `-notmatch` on an array returns
+          # the non-matching elements (always non-empty), so use Select-String
+          # -Quiet for a real boolean "does any line name clap_entry".
+          if (-not ($exports | Select-String -Quiet -Pattern 'clap_entry')) {
+            throw "clap_entry is NOT exported from harp-clap.clap (CLAP_EXPORT missing?)"
+          }
           Write-Host "clap_entry exported from $clap"
       - name: pluginval (plugin-contract abuse, strictness 10)
         shell: pwsh
