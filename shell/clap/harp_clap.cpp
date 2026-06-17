@@ -22,6 +22,7 @@
 
 #include <clap/clap.h>
 
+#include "note_voice_map.h"
 #include "runtime.h"
 #include "runtime_registry.h"
 #include "shell_constants.h"
@@ -71,28 +72,11 @@ struct HarpClap {
     std::vector<float> interleaved;     /* pull scratch (stereo) */
 
     /* noteId -> §9.5 voice key, so a PARAM_MOD / Note Expression can target the
-     * exact ringing voice — identical bookkeeping to the VST3 shell (Phase 3). */
-    struct NoteVoice { int32_t noteId; uint32_t voiceKey; bool active; };
-    NoteVoice noteVoices[64] = {};
+     * exact ringing voice — the SAME bridge the VST3 shell uses (note_voice_map.h). */
+    NoteVoiceMap noteVoices;
 
     HarpRuntime *rt() const { return handle.rt; }
     bool owner() const { return handle.owner; }
-
-    void trackNoteOn(int32_t noteId, uint32_t voiceKey) {
-        if (noteId < 0) return; /* unaddressable without an id */
-        for (auto &nv : noteVoices)
-            if (!nv.active || nv.noteId == noteId) { nv = {noteId, voiceKey, true}; return; }
-    }
-    void trackNoteOff(uint32_t voiceKey) {
-        for (auto &nv : noteVoices)
-            if (nv.active && nv.voiceKey == voiceKey) nv.active = false;
-    }
-    uint32_t voiceForNote(int32_t noteId) const {
-        if (noteId < 0) return 0; /* part-wide */
-        for (auto &nv : noteVoices)
-            if (nv.active && nv.noteId == noteId) return nv.voiceKey;
-        return 0;
-    }
 
     void releaseSource() {
         if (source && rt()) rt()->unregisterSource(source);
@@ -247,7 +231,7 @@ static void applyEvent(HarpClap *h, const clap_event_header_t *hdr, uint64_t bas
         if (vel == 0) vel = 1;
         if (vel > 127) vel = 127;
         rt.queueNote(h->source, ump_note_on(note, vel, chan), ts);
-        h->trackNoteOn(e->note_id, (chan << 8) | note);
+        h->noteVoices.noteOn(e->note_id, (chan << 8) | note);
         break;
     }
     case CLAP_EVENT_NOTE_OFF:
@@ -256,7 +240,7 @@ static void applyEvent(HarpClap *h, const clap_event_header_t *hdr, uint64_t bas
         uint32_t note = (uint32_t)(e->key & 0x7f);
         uint32_t chan = (uint32_t)(e->channel & 0xf);
         rt.queueNote(h->source, ump_note_off(note, chan), ts);
-        h->trackNoteOff((chan << 8) | note);
+        h->noteVoices.noteOff((chan << 8) | note);
         break;
     }
     case CLAP_EVENT_PARAM_VALUE: {
@@ -272,7 +256,7 @@ static void applyEvent(HarpClap *h, const clap_event_header_t *hdr, uint64_t bas
          * offset on the param's base — exactly HARP's mod semantics. */
         auto *e = (const clap_event_param_mod *)hdr;
         rt.queueMod(h->source, (uint32_t)e->param_id, (float)e->amount,
-                    h->voiceForNote(e->note_id), ts);
+                    h->noteVoices.voiceFor(e->note_id), ts);
         break;
     }
     case CLAP_EVENT_NOTE_EXPRESSION: {
@@ -281,7 +265,7 @@ static void applyEvent(HarpClap *h, const clap_event_header_t *hdr, uint64_t bas
         auto *e = (const clap_event_note_expression *)hdr;
         if (e->expression_id == CLAP_NOTE_EXPRESSION_BRIGHTNESS)
             rt.queueMod(h->source, kCutoffId, (float)(e->value - 0.5),
-                        h->voiceForNote(e->note_id), ts);
+                        h->noteVoices.voiceFor(e->note_id), ts);
         break;
     }
     default: break; /* transport is handled in process() — it needs the block size */
@@ -375,7 +359,7 @@ static void pl_stop_processing(const clap_plugin_t *) {}
 
 static void pl_reset(const clap_plugin_t *p) {
     HarpClap *h = self(p);
-    for (auto &nv : h->noteVoices) nv.active = false;
+    h->noteVoices.reset();
 }
 
 static void writeSilence(const clap_process_t *pc) {

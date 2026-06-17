@@ -26,6 +26,7 @@
 #include "public.sdk/source/vst/vstaudioeffect.h"
 #include "public.sdk/source/vst/vsteditcontroller.h"
 
+#include "note_voice_map.h"
 #include "runtime.h"
 #include "runtime_registry.h"
 #include "shell_constants.h"
@@ -341,13 +342,13 @@ public:
                     /* remember the §9.5 voice key the device will mint for this
                      * note ((chan<<8)|note) so a later Note Expression can target
                      * this exact voice (Phase 3 per-voice modulation). */
-                    trackNoteOn(ev.noteOn.noteId, (chan << 8) | note);
+                    noteVoices_.noteOn(ev.noteOn.noteId, (chan << 8) | note);
                 } else if (ev.type == Event::kNoteOffEvent) {
                     uint32_t note = (uint32_t)(ev.noteOff.pitch & 0x7f);
                     uint32_t chan = (uint32_t)ev.noteOff.channel & 0xf;
                     rt.queueNote(source_, ump_note_off(note, chan),
                                  base + (uint64_t)ev.sampleOffset);
-                    trackNoteOff((chan << 8) | note);
+                    noteVoices_.noteOff((chan << 8) | note);
                 } else if (ev.type == Event::kNoteExpressionValueEvent) {
                     /* §9.4 non-destructive per-voice modulation. We map VST3
                      * Brightness (the standard "filter cutoff" expression,
@@ -360,7 +361,7 @@ public:
                     if (nx.typeId == kBrightnessTypeID) {
                         float offset = (float)(nx.value - 0.5);
                         rt.queueMod(source_, /*Filter Cutoff*/ 3, offset,
-                                    voiceForNote(nx.noteId),
+                                    noteVoices_.voiceFor(nx.noteId),
                                     base + (uint64_t)ev.sampleOffset);
                     }
                 }
@@ -651,29 +652,10 @@ private:
      * re-parts the source mid-session. Drives the instance's event-source channel
      * at activate and on change (see setActive / process). */
     uint8_t part_ = envChannelDefault();
-    /* Phase 3: VST3 Note Expression -> §9.5 per-voice modulation. An expression
-     * event names a host noteId; the device addresses a voice by its §9.5 packed
-     * key ((channel<<8)|note, which it mints at note-on). We remember that key
-     * per live noteId so an expression can target the exact ringing voice. The
-     * table is sparse (notes are few per instance); a note-on the host gave NO
-     * id (noteId < 0) is not tracked, so its expressions fall back to part-wide. */
-    struct NoteVoice { int32 noteId; uint32_t voiceKey; bool active; };
-    NoteVoice noteVoices_[64] = {};
-    void trackNoteOn(int32 noteId, uint32_t voiceKey) {
-        if (noteId < 0) return; /* unaddressable without an id */
-        for (auto &nv : noteVoices_) /* take a free slot, or refresh the same id */
-            if (!nv.active || nv.noteId == noteId) { nv = {noteId, voiceKey, true}; return; }
-    }
-    void trackNoteOff(uint32_t voiceKey) {
-        for (auto &nv : noteVoices_)
-            if (nv.active && nv.voiceKey == voiceKey) nv.active = false;
-    }
-    /* The §9.5 voice key for a live noteId, or 0 (part-wide) if we never saw it. */
-    uint32_t voiceForNote(int32 noteId) const {
-        for (auto &nv : noteVoices_)
-            if (nv.active && nv.noteId == noteId) return nv.voiceKey;
-        return 0;
-    }
+    /* Phase 3: VST3 Note Expression -> §9.5 per-voice modulation. A host noteId
+     * names the note; the device addresses a voice by its §9.5 key. The bridge
+     * (noteId -> voice key) is shared with the CLAP shell — note_voice_map.h. */
+    NoteVoiceMap noteVoices_;
     /* The Part default the env pins: HARP_CHANNEL (the headless --channel path)
      * clamped 0..15, else 0. Read once to seed part_ so the env path is unchanged
      * (start() ALSO reads HARP_CHANNEL into the owner source, so for the owner
