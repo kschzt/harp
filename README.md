@@ -45,7 +45,7 @@ any conforming host:
   channel, params, recall state, and stereo output (16 parts, with a summed
   main mix alongside the per-part outputs). A recall-safe **Part** knob persists
   each track's part in the project, and that per-part state moves intact between
-  the VST3, AU, and CLAP formats.
+  the VST3 and AU formats (the CLAP shell writes the same recall bundle).
 - **Polyphonic, with per-voice modulation** — each part is an 8-voice pool with
   deterministic voice allocation, so overlapping notes ring out on their own
   voices instead of stealing one. Modulation is *non-destructive* and *per
@@ -81,8 +81,9 @@ CI-validated on **macOS, Windows, and Linux** — a VST3 on all three (pluginval
 strictness 10), an Audio Unit on macOS (`auval`) at full parity, and a CLAP on
 all three (a macOS `.clap` bundle, Windows/Linux shared libraries — installable
 to the OS plugin dir via `install-clap`), all three formats rendering
-byte-identically and a project's per-part recall state moving between them — and
-the device has been driven from **Ableton
+byte-identically (the conformance kit asserts it), and a project's per-part
+recall state moving between VST3 and AU (CLAP writes the same recall bundle) —
+and the device has been driven from **Ableton
 Live** (macOS + Windows) and
 **Renoise** (Windows) by hand, plus a headless **REAPER** render-and-recall e2e
 on Linux that runs on every push.
@@ -126,7 +127,8 @@ tools/au-host/    its Audio Unit twin (drives the AU shell; same hashes;
 tools/clap-host/  its CLAP twin (dlopens the .clap; drives notes/params and
                   CLAP per-note PARAM_MOD; same golden hashes as the others)
 tests/            unit tests for the core (RFC 8949 vectors included)
-docs/             architecture one-pager, VST3 shell design plan
+docs/             architecture one-pager; VST3, multitimbral, and Ethernet-
+                  transport (§4.4, design-only) plans
 scripts/          Raspberry Pi provisioning + operations runbook
 external/         VST3 SDK + CLAP SDK clones (gitignored; shell/tools only)
 ```
@@ -175,26 +177,32 @@ hardware — plus audio:
 ./build/harp-probe -d usb t15 4                # determinism: render twice, byte-compare
 ```
 
-### Path 3 — the DAW (VST3 shell)
+### Path 3 — the DAW (VST3, AU, or CLAP)
 
-Builds on macOS, Windows, and Linux. Requires CMake ≥ 3.25, libusb (macOS:
-`brew install libusb`; Linux: `apt install libusb-1.0-0-dev` plus
+Builds on macOS, Windows, and Linux. Requires CMake ≥ 3.16 (3.20 for the
+plugin tools), libusb (macOS: `brew install libusb`; Linux:
+`apt install libusb-1.0-0-dev` plus
 `sudo cp scripts/99-harp.rules /etc/udev/rules.d/` for rootless device
 access; Windows: prebuilt MSVC binaries under `external/libusb-win`, built
-with the Visual Studio 2022 generator), and the VST3 SDK
-cloned to `external/vst3sdk` (`git clone --recursive
-https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk`).
+with the Visual Studio 2022 generator), and the VST3 + CLAP SDKs cloned under
+`external/`:
+
+```sh
+git clone --recursive https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
+git clone --branch 1.2.8 https://github.com/free-audio/clap.git external/clap
+```
 
 ```sh
 cmake -B build-vst -S tools/vst3-host
 cmake --build build-vst --target install-live   # macOS/Windows: install to the OS VST3 folder (+sign on macOS)
 cmake --build build-vst --target install-linux  # Linux: install to ~/.vst3
 cmake --build build-vst --target install-au     # macOS: the Audio Unit shell
+cmake --build build-vst --target install-clap   # CLAP: ~/Library/Audio/Plug-Ins/CLAP (mac, bundle+signed) | %CommonProgramFiles%\CLAP (win) | ~/.clap (linux)
 ```
 
 (The AU appears as **HARP Project: HARP RefDev**; `auval -v aumu rfdv
-HARP` is Apple's own validation and runs in this repo's CI. Both shells
-render byte-identically from the same drive — the conformance kit
+HARP` is Apple's own validation and runs in this repo's CI. All three
+shells render byte-identically from the same drive — the conformance kit
 asserts it.)
 
 Rescan plug-ins in your DAW and drop **HARP RefDev** on a track. The
@@ -224,6 +232,10 @@ The shell can also be driven without any DAW, which is how it is tested:
   — the per-part build (device parts → per-part params → session sharing →
   event merge → per-part audio → Part param), what each phase verified, and
   the deferred items.
+- **Ethernet/IP transport design**: [`docs/ethernet-transport-plan.md`](docs/ethernet-transport-plan.md)
+  — a design pass at the §4.4 network binding (RTP/UDP + PTP for audio, the
+  framed link over TCP for control, trusted-segment security, an AES67 bridge
+  reserved). Design only — nothing built yet.
 - **Pi runbook**: [`scripts/pi-bringup.md`](scripts/pi-bringup.md) —
   provisioning, the sudo-free deploy loop, USB debugging tricks.
 
@@ -268,7 +280,8 @@ The shell can also be driven without any DAW, which is how it is tested:
   (channel): its own params, its own recall, its own demuxed stereo output (16
   parts; a summed main mix alongside the per-part pairs). A recall-safe **Part**
   parameter persists each instance's part in the project, and per-part state
-  moves between the VST3 and AU formats. Verified on hardware: channel→part
+  moves between the VST3 and AU formats (CLAP writes the same recall bundle).
+  Verified on hardware: channel→part
   routing is exclusive (no bleed), per-part timbres restore losslessly across
   save/reopen, sibling parts engage in the summed mix, a part added mid-session
   re-negotiates its own audio, and a per-part param reaches only its own part.
@@ -284,16 +297,21 @@ The shell can also be driven without any DAW, which is how it is tested:
 **Gated in CI on every push:**
 
 - **Hardware suite** on a real Pi (`scripts/hw-tests-linux.sh`, the `hw`
-  badge): recall round-trips, ±1-sample note timing with zero late events, a
-  realtime soak flooding automation + notes + panel traffic across DAW buffers
-  64–1024 (zero silence gaps, zero drops, bounded padding), an automated
-  mid-stream replug, an IDM-flood determinism gate, the REAPER real-DAW
-  determinism + recall round-trip, and the **multitimbral matrix** — channel→part
-  routing, per-part recall, session sharing, an alias group playing, per-part
-  audio demux (incl. a mid-session re-negotiation), per-part param isolation,
-  and cross-format VST3↔AU recall (macOS) — with the daemon under test built on
-  the board from the commit being tested. The runtime threads are also
-  ThreadSanitizer-clean (incl. the multi-source event merge + demux) on the rig.
+  badge): 21 sub-tests — 19 pass / 2 skip on the one-board, no-AU CI rig (the
+  two-device and VST3↔AU-recall tests self-skip there). It gates the **golden
+  oracle across VST3 + AU + CLAP** (byte-identical), **8-voice polyphony with
+  deterministic voice-stealing**, **per-voice modulation** (VST3 Note Expression,
+  CLAP per-note PARAM_MOD, and **MPE** pitch/timbre/pressure), **§9.9 output
+  metering**, ±1-sample note timing with zero late events, a realtime soak
+  flooding automation + notes + panel traffic across DAW buffers 64–1024 (zero
+  silence gaps, zero drops, bounded padding), an automated mid-stream replug, an
+  IDM-flood determinism gate, the REAPER real-DAW determinism + recall
+  round-trip, and the **multitimbral matrix** — channel→part routing, per-part
+  recall, session sharing, an alias group playing, per-part audio demux (incl. a
+  mid-session re-negotiation), per-part param isolation, and cross-format VST3↔AU
+  recall (macOS) — with the daemon under test built on the board from the commit
+  being tested. The runtime threads are also ThreadSanitizer-clean (incl. the
+  multi-source event merge + demux) on the rig.
 - **Sandboxed suite**: builds + unit tests on three OSes, pluginval
   strictness 10 (macOS / Windows / Linux), `auval` (macOS), fuzzed parsers
   (libFuzzer + ASan), and a protocol-abuse test that slams a live daemon with
