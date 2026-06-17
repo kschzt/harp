@@ -215,7 +215,9 @@ if [ -x "$V" ] && [ -e "$PLUG" ]; then
     [ "$VRTB" = "$CUT0" ]         || fail "VST3 raw-MPE CC74 timbre ($VRTB) != CLAP Brightness ($CUT0) — timbre axis not cross-format byte-identical"
     [ "$VRLOAD" = "$VRB0" ]       || fail "VST3 MPE toggle did NOT persist: reloaded MPE-on project ($VRLOAD) != armed bend ($VRB0)"
     [ "$VRCTRL" != "$VRB0" ]      || fail "VST3 raw-MPE persistence control ($VRCTRL) == armed ($VRB0) — no-state + no-arm must NOT engage MPE"
-    [ -z "$AUB0" ] || [ "$VRB0" = "$AUB0" ] || fail "VST3 raw-MPE bend ($VRB0) != AU raw-MPE bend ($AUB0) — the two raw-MIDI paths must render identically"
+    # cross-check against the AU raw path ONLY where it ran (macOS); on Linux the
+    # AU section is skipped so AUB0 is unset — ${AUB0:-} keeps `set -u` happy.
+    [ -z "${AUB0:-}" ] || [ "$VRB0" = "$AUB0" ] || fail "VST3 raw-MPE bend ($VRB0) != AU raw-MPE bend ($AUB0) — the two raw-MIDI paths must render identically"
 else
     echo "   (VST3 raw-MPE check skipped: harp-vst3-host / VST3 bundle absent)"
 fi
