@@ -38,6 +38,10 @@ void         harp_rtp_rx_stats(const harp_rtp_rx *rx, harp_freerun_stats *st);
 void         harp_rtp_rx_counters(const harp_rtp_rx *rx, unsigned long *ok,
                                   unsigned long *lost, unsigned long *bad);
 
+/* Milliseconds since the last packet arrived (UINT_MAX if none yet). UDP has no
+ * EOF, so the runtime polls this to detect a dead device and trigger reconnect. */
+unsigned     harp_rtp_rx_silent_ms(const harp_rtp_rx *rx);
+
 /* ---- sender (device) ---- */
 typedef struct harp_rtp_tx harp_rtp_tx;
 

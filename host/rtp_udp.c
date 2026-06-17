@@ -5,6 +5,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,7 +30,11 @@ struct harp_rtp_rx {
     uint64_t      ts64;          /* unwrapped device timestamp        */
     int           have_ts, have_seq;
     uint16_t      last_seq;
-    unsigned long c_ok, c_lost, c_bad;
+    /* counters + liveness: written on the rx (poll) thread, read by any observer
+     * (UI / the runtime's reconnect logic) -> atomic. last_arr_ns lets a caller
+     * detect a dead UDP stream (UDP has no EOF) via harp_rtp_rx_silent_ms(). */
+    _Atomic unsigned long      c_ok, c_lost, c_bad;
+    _Atomic unsigned long long last_arr_ns;
 };
 
 harp_rtp_rx *harp_rtp_rx_open(int port, const harp_freerun_cfg *cfg) {
@@ -71,14 +76,18 @@ int harp_rtp_rx_poll(harp_rtp_rx *rx, int timeout_ms) {
         ssize_t n = recv(rx->fd, buf, sizeof buf, 0);
         if (n < 0) return -1;
         unsigned long long arr = now_ns();        /* arrival stamp = recovery clock */
+        atomic_store_explicit(&rx->last_arr_ns, arr, memory_order_relaxed); /* liveness */
 
         harp_rtp_hdr h; const uint8_t *pl; size_t pln;
         if (harp_rtp_unpack(buf, (size_t)n, &h, &pl, &pln) != 0 ||
-            pln % (rx->ch * sizeof(float)) != 0) { rx->c_bad++; continue; }
+            pln % (rx->ch * sizeof(float)) != 0) {
+            atomic_fetch_add_explicit(&rx->c_bad, 1, memory_order_relaxed); continue;
+        }
 
         if (rx->have_seq) {                        /* seq-gap loss accounting      */
             uint16_t gap = (uint16_t)(h.seq - rx->last_seq - 1);
-            if (gap && gap < 0x8000) rx->c_lost += gap;
+            if (gap && gap < 0x8000)
+                atomic_fetch_add_explicit(&rx->c_lost, gap, memory_order_relaxed);
         }
         rx->last_seq = h.seq; rx->have_seq = 1;
 
@@ -86,7 +95,7 @@ int harp_rtp_rx_poll(harp_rtp_rx *rx, int timeout_ms) {
         rx->have_ts = 1;
         harp_freerun_observe(rx->fr, rx->ts64, arr);
         harp_freerun_push(rx->fr, (const float *)pl, (unsigned)(pln / (rx->ch * sizeof(float))));
-        rx->c_ok++;
+        atomic_fetch_add_explicit(&rx->c_ok, 1, memory_order_relaxed);
         processed++;
     }
     return processed;
@@ -102,9 +111,19 @@ void harp_rtp_rx_stats(const harp_rtp_rx *rx, harp_freerun_stats *st) {
 
 void harp_rtp_rx_counters(const harp_rtp_rx *rx, unsigned long *ok,
                           unsigned long *lost, unsigned long *bad) {
-    if (ok) *ok = rx->c_ok;
-    if (lost) *lost = rx->c_lost;
-    if (bad) *bad = rx->c_bad;
+    if (ok) *ok = atomic_load_explicit(&rx->c_ok, memory_order_relaxed);
+    if (lost) *lost = atomic_load_explicit(&rx->c_lost, memory_order_relaxed);
+    if (bad) *bad = atomic_load_explicit(&rx->c_bad, memory_order_relaxed);
+}
+
+/* Milliseconds since the last packet arrived (any packet, even malformed — it
+ * proves the peer is alive). UINT_MAX before the first packet. The runtime polls
+ * this to declare an Ethernet session dead and reconnect, since UDP has no EOF. */
+unsigned harp_rtp_rx_silent_ms(const harp_rtp_rx *rx) {
+    unsigned long long last = atomic_load_explicit(&rx->last_arr_ns, memory_order_relaxed);
+    if (last == 0) return 0xFFFFFFFFu;
+    unsigned long long now = now_ns();
+    return now > last ? (unsigned)((now - last) / 1000000ull) : 0;
 }
 
 /* ---------------- sender ---------------- */
