@@ -2,7 +2,7 @@
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 
-Specification, Draft 0.3.8 — 16 June 2026
+Specification, Draft 0.4.0 — 17 June 2026
 
 | | |
 |---|---|
@@ -13,6 +13,8 @@ Specification, Draft 0.3.8 — 16 June 2026
 | **Schema & reference code license** | Apache-2.0 |
 | **Patent policy** | Royalty-free; contributors sign a non-assertion covenant (§19) |
 | **Feedback** | via HARP Enhancement Proposals (HEPs), see §18 |
+
+> **Changes in 0.4.0** — The network transport binding lands; §4.4 is no longer reserved. The **Ethernet/IP binding** carries the framed link over TCP and the audio plane over RTP/UDP (§8.7), discovered by `_harp._tcp` mDNS, on a dedicated trusted segment. The clock model is host-side **receiver-side recovery** for a single device — the host is not a PTP node — and optional device-side **PTPv2** for multi-device timeline alignment (§7.3); software timestamping is sufficient. Real-time network audio is **free-running only**; offline bounce rides the reliable link, preserving deterministic through-hardware rendering. **The placeholder mandatory-TLS language of the old §4.4 is withdrawn**: the binding relies on segment isolation, not transport encryption — consistent with AES67/Dante/AVB — with signed firmware unchanged (§16). Full AES67/Dante interop is reserved as an optional, firmware-deliverable capability (`net.aes67-bridge`); AVB/gPTP is out of scope. New capabilities `net.tcp`/`net.rtp`/`net.offline`/`net.ptp`/`net.ptp.hw`/`net.aes67-bridge`. Informed by clock-correlation prototyping on reference hardware (software-timestamped PTP over a commodity switch: ~22 µs idle, ~140 µs under prioritized CPU load — an order of magnitude inside the §7.2 USB bounds; it collapses only under simultaneous CPU and link saturation).
 
 > **Changes in 0.3.8** — Errata from implementing §9.9 output metering on the reference device. **`param-map-hash` excludes readonly/output params** (§9.3): the hash protects stored *automation* lanes, and §9.9 outputs are never automation targets, so a device MAY add per-part/main-mix meters (advertised in `evt.params`/identity) without moving the hash — recall of existing projects stays byte-identical. The literal "full param array" wording is narrowed to the automatable descriptors. Implementation: the reference device computes per-part + main-mix peak/RMS by reading the already-rendered buffers (zero effect on the rendered bytes — golden byte-identical) and echoes them at a 30 Hz meter-rate hint via the existing `param`-echo path; shells surface them as readonly host params (VST3 `kIsReadOnly` / AU non-writable), and `harp-probe meters` reads them live.
 >
@@ -100,7 +102,7 @@ The following principles are normative inputs to every design decision in this s
 
 ### 1.3 Non-goals
 
-HARP does not define: a sound engine; a plugin API (it *targets* existing ones); digital rights management for sample content; a control-surface/HUI replacement; networked multi-room audio distribution (a network transport binding is reserved, §4.4, but Dante/AVB-class routing is out of scope); or inter-host song synchronization (Ableton Link and MIDI Clock remain the tools for that).
+HARP does not define: a sound engine; a plugin API (it *targets* existing ones); digital rights management for sample content; a control-surface/HUI replacement; networked multi-room audio distribution (a network transport binding is defined (§4.4), but Dante/AVB-class routing is out of scope); or inter-host song synchronization (Ableton Link and MIDI Clock remain the tools for that).
 
 ### 1.4 Relationship to existing standards
 
@@ -187,7 +189,7 @@ A device claiming any class MUST implement `harp-core`. **HARP Certified** (§17
 │  └───────────┬──────────────┘  └─────┬──────────────────┘   │
 │                          (optional UAC2/3 coexists, §8.5)   │
 ├──────────────┴───────────────────────┴──────────────────────┤
-│  Transport binding: USB (normative, §4.3); TCP (reserved)   │
+│  Transport bindings: USB (§4.3); Ethernet/IP (§4.4)         │
 ├──────────────────────────────────────────────────────────────┤
 │  Device: HARP endpoint, state store, engine, front panel    │
 └──────────────────────────────────────────────────────────────┘
@@ -262,9 +264,18 @@ A HARP device on USB:
 
 Devices MUST tolerate the host claiming the HARP interface without claiming audio interfaces, and vice versa. Devices MUST enumerate at USB 2.0 High Speed as a floor and SHOULD support SuperSpeed where channel counts warrant it.
 
-### 4.4 TCP/IP binding (reserved)
+### 4.4 Ethernet/IP binding
 
-A network binding (`_harp._tcp` via mDNS/DNS-SD, TLS 1.3 mandatory, same framed link) is reserved for a companion specification. Implementations MUST NOT ship a network binding under the `harp` identifier until that specification is stable, to protect the meaning of conformance claims.
+A HARP device on Ethernet/IP carries the framed link (§4.2) over TCP and the audio plane (§8) over RTP/UDP, on a **dedicated, trusted network segment** — the instruments on their own switch, separated from the general-purpose LAN. This is the established deployment model for audio-over-IP and is assumed throughout. USB (§4.3) remains the floor; this binding is the upgrade path for the case USB scales poorly (many devices, hub chains, bandwidth admission §8.4), not "USB with a longer cable" — its distinct value is that a device becomes a citizen of ordinary IP networking and, optionally, of existing pro-audio fabrics (item 6).
+
+1. **Framed link** (`ctl`/`evt`/`obj`/`log`) travels over one **TCP connection** carrying the §4.2 frame format verbatim. TCP satisfies the §4.1 reliable-ordered requirement; the §4.2.1 bulk-pair deadlock does not arise (socket buffering decouples the directions), though `core.credit` (§5.5) still governs the `obj` stream and the `ctl`/`evt`-ahead-of-`obj` scheduling rule is unchanged. `core.hello` (§5.4) completes before any other method; a connection reset is a session reset (§12.4). Capability `net.tcp`.
+2. **Audio plane** travels over **RTP/UDP** (§8.7), free-running, separate from the TCP connection. Capability `net.rtp`.
+3. **Discovery** is by mDNS/DNS-SD service type `_harp._tcp`. The instance name is advisory and carries no trust; the TXT record gives `proto` (= `bcdHARP`) and the framed-link TCP port, and MUST NOT carry the serial (§16 privacy) — identity is fetched via `core.hello`. Detach (§12.3) is signalled by connection close, `core.ping` timeout, or the mDNS goodbye record, whichever is first; the session-resume model is otherwise unchanged, only the detach trigger differs from USB unplug.
+4. **Security posture.** On the trusted segment the link and audio travel in clear — there is **no mandatory transport encryption**, consistent with every comparable audio-over-IP standard (none encrypt the media path). Signed firmware (§13.2) remains mandatory and is the one security guarantee this binding does not relax. The threat model widens from one cabled host to any node on the segment, so the parsing and DoS requirements of §16 bind harder. A device on a shared, untrusted LAN is out of model; the answer there is USB.
+5. **Clock.** A single device's clock is recovered host-side from the audio stream itself (§7.3) — the host is not required to be a PTP node. Multi-device timeline alignment MAY use device-side PTP (§7.3, capability `net.ptp`).
+6. **AES67/Dante interop** — full participation in an AES67/Dante fabric (PTPv2 media profile, SDP/SAP) is **reserved as an optional, firmware-deliverable capability `net.aes67-bridge`** (§8.7), not part of the base binding; its purpose is the live/install/computer-less world that the plugin path does not serve. AVB (802.1AS gPTP, Layer 2) is out of scope.
+
+This binding adds no wire change to the framed link, control plane, state model, or event plane (§5–§12) — they are transport-agnostic and carry over unchanged.
 
 ---
 
@@ -415,6 +426,8 @@ On the HARP stream, frame headers carry the stream timestamp directly (§8.2), a
 
 Devices free-run their master clock unless synchronized externally — which means every free-running device attached to a host is its own clock domain, in addition to the DAW-interface domain the DAW is locked to. Runtimes MUST estimate drift between the DAW clock and each device's MSC continuously and expose it per device (`clock_drift_ppb`, §14.2). Reconciling the domains is the runtime's job under the clock-mode rules of §8.3; devices MUST NOT resample silently (a device MAY declare `audio.src` for explicit, host-enabled device-side conversion). Coexisting class-compliant audio (§8.5) inherits ordinary UAC clocking semantics and sits outside the plugin path.
 
+Over the **Ethernet/IP binding (§4.4)** the same model holds with a network front-end. A *single* device's clock is recovered host-side from the delivered RTP stream (§8.7) measured against the host audio clock — the host is **not** a PTP node — exactly as a USB free-running device is recovered from its frame timestamps. To align *several* independent network devices on one host timeline to better than per-stream recovery yields (§8.4), devices MAY share IEEE 1588 PTPv2 on the segment (capability `net.ptp`), participating as slaves to the segment grandmaster (a single device needs no PTP at all). Software timestamping is sufficient for correlation comparable to §7.2 and MUST be supported; hardware timestamping is OPTIONAL (`net.ptp.hw`) and, where present, tightens correlation and immunizes it against host CPU load — a device MUST NOT advertise `net.ptp.hw` unless its receive timestamps actually arrive (advertised ≠ delivered timestamping has been observed on commodity SoC MACs). A software-timestamped device MUST give its clock/timestamping path scheduling priority over engine work, and the segment SHOULD carry PTP with QoS/headroom; absent both, correlation degrades without bound under simultaneous CPU and link saturation. Multi-device sample-accuracy under this model is "aligned within a stated bound," never sample-exact; sample-exact remains the province of host-paced/offline operation (§8.3).
+
 ---
 
 ## 8. Audio plane
@@ -505,6 +518,16 @@ Nothing in a HARP session may alter standalone class-audio behavior except as de
 ### 8.6 Sample-rate changes
 
 All rate changes pass through `audio.stop` → `time.epoch` notification → `audio.start`. In free-running mode the device clock changes and a new epoch begins; in host-paced mode the rate is simply the host's new pacing rate. Devices MUST preserve all state across rate changes; certification stresses the transition under load (T4).
+
+### 8.7 Network binding audio plane (RTP/UDP)
+
+Over the Ethernet/IP binding (§4.4) the audio plane is **RTP (RFC 3550) over UDP**, separate from the framed-link TCP connection. RTP is used rather than a HARP-native UDP frame because the §8.2 audio frame already carries epoch/timestamp/format and lacks only a sequence number — which UDP delivery requires for loss detection — and because RTP is the lingua franca of embedded audio endpoints and the cheap path to the §4.4 interop bridge.
+
+Mapping: the RTP **sequence number** supplies the loss/reorder detection the reliable bulk endpoint made unnecessary on USB; the RTP **timestamp** is the device stream position (device MSC, free-running, §8.3); one **SSRC** per (device, direction, stream-slot group); payload is interleaved by stream slot (§6.3), `nsamples × slots`. `float32` MUST be supported; `int24` (L24) SHOULD be offered for AES67-bridge compatibility (§4.4). A lost or reordered frame is detected via the sequence number and surfaced through the existing discontinuity accounting (`audio_late_frames`, §8.2); loss MUST be counted, never silently concealed. Epoch/rate changes follow §8.6 (the SSRC MAY change at restart).
+
+Real-time audio over this binding is **free-running** (§8.3 mode 0) only. Host-paced real-time is not offered: its latency floor (network RTT + pipeline depth) is inferior to receiver-side ASRC, and converter-bearing devices require free-running regardless — the inverse of the USB preference, deliberately. **Offline bounce is preserved**: a device declaring `audio.offline-rate` (§8.3) MAY be paced host-paced for *non-real-time* rendering, with SSI ranges and rendered audio carried over the **reliable framed link (TCP)**, not RTP — latency is irrelevant offline and reliability is what a bounce needs, so deterministic offline-bounce-through-hardware (T15) stays available without a second real-time media transport (capability `net.offline`).
+
+Admission control (§8.4) applies with the switch/segment as the transport path. The AES67/Dante interop bridge (§4.4 item 6, `net.aes67-bridge`) layers the AES67 PTPv2 media profile and SDP/SAP session description onto this RTP plane for fabric participation; it is reserved and optional.
 
 ---
 
@@ -959,7 +982,9 @@ OPTIONAL capability `host.offline-edit`: a shell MAY allow editing the bundle's 
 
 **No code execution**: nothing in HARP delivers executable content to a device except signed firmware; devices MUST NOT interpret state objects as code.
 
-**Denial of service**: credit (§4.2.1) bounds memory; devices SHOULD rate-limit `state.snapshot` and `diag.bundle`.
+**Denial of service**: credit (§4.2.1) bounds memory; devices SHOULD rate-limit `state.snapshot` and `diag.bundle`. On the Ethernet/IP binding (§4.4) a device MUST additionally bound half-open connections and rate-limit connection attempts, since any node on the segment can reach it.
+
+**Network binding (§4.4)**: the Ethernet/IP binding is specified for a dedicated, trusted segment and carries the link and audio in clear, relying on segment isolation rather than transport encryption — as AES67/Dante/AVB do, none of which encrypt the media path — with signed firmware (§13.2) the unchanged constant. The threat model widens from one cabled host to any node on the segment, so parsing MUST stay bounds-checked and fuzz-tested against that wider surface. Deployments placing HARP on a shared, untrusted LAN are out of model; the answer there is USB.
 
 ---
 

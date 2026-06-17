@@ -129,7 +129,7 @@ tools/clap-host/  its CLAP twin (dlopens the .clap; drives notes/params and
                   CLAP per-note PARAM_MOD; same golden hashes as the others)
 tests/            unit tests for the core (RFC 8949 vectors included)
 docs/             architecture one-pager; VST3, multitimbral, and Ethernet-
-                  transport (§4.4, design-only) plans
+                  transport (§4.4) design notes
 scripts/          Raspberry Pi provisioning + operations runbook
 external/         VST3 SDK + CLAP SDK clones (gitignored; shell/tools only)
 ```
@@ -236,7 +236,8 @@ The shell can also be driven without any DAW, which is how it is tested:
 - **Ethernet/IP transport design**: [`docs/ethernet-transport-plan.md`](docs/ethernet-transport-plan.md)
   — a design pass at the §4.4 network binding (RTP/UDP + PTP for audio, the
   framed link over TCP for control, trusted-segment security, an AES67 bridge
-  reserved). Design only — nothing built yet.
+  reserved). Now folded into the spec (§4.4, §7.3, §8.7) and clock-correlation
+  prototyped on hardware (PTP ~22 µs idle); no runtime implementation yet.
 - **Pi runbook**: [`scripts/pi-bringup.md`](scripts/pi-bringup.md) —
   provisioning, the sudo-free deploy loop, USB debugging tricks.
 
@@ -333,7 +334,8 @@ The shell can also be driven without any DAW, which is how it is tested:
 **Not yet:** the four-safe-actions UI (v0 auto-resolves by Push-with-archive),
 the deeper diagnostics (`diag.bundle` / loopback, §14), runtime/shell process split
 (§15.1), firmware management (§13), class-audio coexistence (§8.5), free-running
-ASRC for analog devices, the TCP companion spec (§4.4).
+ASRC for analog devices, the Ethernet/IP binding implementation (§4.4 — specced
++ clock-prototyped, no runtime yet).
 
 The spec is an **editor's draft**: breaking changes expected, version
 negotiated at `core.hello`. Changes flow through HARP Enhancement Proposals
