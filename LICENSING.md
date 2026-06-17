@@ -7,12 +7,13 @@ This repository contains two kinds of work under two licenses:
 - **Everything else** — CDDL schemas, the reference implementation
   (`core/`, `device/`, `host/`, `shell/`, `tools/`, `tests/`, `scripts/`),
   and build files — is licensed under the
-  [Apache License 2.0](LICENSE-APACHE) (chosen for its explicit patent
+  [Apache License 2.0](LICENSE) (chosen for its explicit patent
   grant).
 
 Patent posture: royalty-free. Contributors and working-group members
 sign a non-assertion covenant covering implementations of the
 specification (see spec §19).
 
-`external/` is not part of this repository (gitignored); the VST3 SDK
-cloned there carries Steinberg's own licensing.
+`external/` is not part of this repository (gitignored); the SDKs cloned
+there carry their own licensing — the VST3 SDK (Steinberg) and the CLAP
+SDK (MIT).

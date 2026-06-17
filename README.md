@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/kschzt/harp/actions/workflows/ci.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/ci.yml)
 [![hw — real device](https://github.com/kschzt/harp/actions/workflows/hw.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/hw.yml)
-[![license: Apache-2.0 | CC-BY-4.0](https://img.shields.io/badge/license-Apache--2.0%20%7C%20CC--BY--4.0-blue)](LICENSE.md)
+[![license: Apache-2.0 | CC-BY-4.0](https://img.shields.io/badge/license-Apache--2.0%20%7C%20CC--BY--4.0-blue)](LICENSING.md)
 
 **Make hardware instruments behave like plugins.** A Raspberry Pi 4B plays as
 an instrument track in Ableton Live today — Git-style total recall through the
