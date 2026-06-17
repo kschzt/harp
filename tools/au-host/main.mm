@@ -177,6 +177,8 @@ int main(int argc, char **argv) {
     bool has_mpe_bend = false, has_mpe_press = false, has_mpe_timbre = false;
     double mpe_bend = 0, mpe_press = 0, mpe_timbre = 0;
     int mpe_bend_idx = 0, mpe_press_idx = 0, mpe_timbre_idx = 0;
+    bool has_mpe_master_bend = false; /* a MASTER-channel (zone-wide) pitch bend */
+    double mpe_master_bend = 0;       /* semitones, scaled by the master PB range */
     double seconds = 2, bpm = 0, loop_a = -1, loop_b = -1, note_period = 0.6;
     uint32_t block = 256, rate = 48000;
     std::string out_path, save_state_path, load_state_path;
@@ -219,6 +221,7 @@ int main(int argc, char **argv) {
         else if (a == "--mpe-timbre") { mpe_timbre = atof(need("--mpe-timbre").c_str()); has_mpe_timbre = true; }
         else if (a == "--mpe-timbre-idx")
             mpe_timbre_idx = atoi(need("--mpe-timbre-idx").c_str());
+        else if (a == "--mpe-master-bend") { mpe_master_bend = atof(need("--mpe-master-bend").c_str()); has_mpe_master_bend = true; }
         else if (a == "--bpm")
             bpm = atof(need("--bpm").c_str());
         else if (a == "--loop") {
@@ -390,9 +393,13 @@ int main(int argc, char **argv) {
          * the zone is live by the time the notes arrive regardless of when the
          * device claim settles. A neutral --mpe-chord collapses onto part_ and
          * therefore hashes IDENTICALLY to the same notes via plain --chord. */
-        if (!mpe_chord.empty()) {
+        if (!mpe_chord.empty() || has_mpe_master_bend) {
             size_t onAt = (size_t)(0.1 * rate);
-            int members = mpe_members > 0 ? mpe_members : (int)mpe_chord.size();
+            /* members from --mpe-members, else one per chord note; a master-bend-only
+             * render (no chord) still needs an engaged zone, so default to a full
+             * lower zone there. */
+            int members = mpe_members > 0 ? mpe_members
+                          : (mpe_chord.empty() ? 15 : (int)mpe_chord.size());
             if (members < 1) members = 1;
             if (members > 15) members = 15;
             if (onAt >= done && onAt < done + n) {
@@ -410,6 +417,13 @@ int main(int argc, char **argv) {
                 MusicDeviceMIDIEvent(au, 0xB1, 101, 0, off);   /* RPN MSB = 0 */
                 MusicDeviceMIDIEvent(au, 0xB1, 100, 0, off);   /* RPN LSB = 0 (PB range) */
                 MusicDeviceMIDIEvent(au, 0xB1, 6, (UInt32)range, off);
+                /* master PB range (RPN 0 on the lower master ch0) — only when a
+                 * master bend follows, so a zone-wide bend has a usable range. */
+                if (has_mpe_master_bend) {
+                    MusicDeviceMIDIEvent(au, 0xB0, 101, 0, off);
+                    MusicDeviceMIDIEvent(au, 0xB0, 100, 0, off);
+                    MusicDeviceMIDIEvent(au, 0xB0, 6, (UInt32)range, off);
+                }
                 for (size_t ci = 0; ci < mpe_chord.size(); ci++) {
                     UInt32 ch = (UInt32)((ci + 1) & 0x0f); /* lower-zone member ch1.. */
                     MusicDeviceMIDIEvent(au, 0x90 | ch, (UInt32)mpe_chord[ci],
@@ -440,6 +454,18 @@ int main(int argc, char **argv) {
                         if (v > 127) v = 127;
                         MusicDeviceMIDIEvent(au, 0xB0 | ch, 74, (UInt32)v, off);
                     }
+                }
+                /* a MASTER-channel (ch0) pitch bend AFTER the note-ons: zone-wide,
+                 * applied to EVERY sounding voice on the part (voiceKey 0 =
+                 * part-wide). Proves a part-wide mod reaches THIS instance's part,
+                 * not always part 0 (the old limitation). */
+                if (has_mpe_master_bend) {
+                    double r = (double)range;
+                    int v14 = (int)(8192.0 + mpe_master_bend / r * 8192.0 + 0.5);
+                    if (v14 < 0) v14 = 0;
+                    if (v14 > 16383) v14 = 16383;
+                    MusicDeviceMIDIEvent(au, 0xE0 | 0, (UInt32)(v14 & 0x7f),
+                                         (UInt32)((v14 >> 7) & 0x7f), off);
                 }
             }
             if (done + n >= total)

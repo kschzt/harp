@@ -488,7 +488,7 @@ private:
                                 uint64_t start, uint64_t end, uint8_t channel = 0);
     static void encodeUmpEvent(harp_cbuf *out, uint32_t word, uint64_t ts);
     static void encodeModEvent(harp_cbuf *out, uint32_t id, float offset,
-                               uint64_t ts, uint32_t voice);
+                               uint64_t ts, uint32_t voice, uint8_t srcChan = 0);
     static void encodeTransportEvent(harp_cbuf *out, uint32_t flags, double tempo,
                                      double ppq, uint64_t ts);
     void pollEcho(); /* drain incoming evt stream */

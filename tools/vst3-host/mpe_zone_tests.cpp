@@ -267,11 +267,11 @@ static void test_count0_mcm_with_toggle() {
     CHECK(z.noteOn(3, 60).accepted); /* member notes still flow */
 }
 
-/* The DOCUMENTED part-0 master limitation, pinned so a future fix is a conscious
- * test change: on a non-zero instance part a master (part-wide) message still
- * returns voiceKey 0 (which the runtime encodes as part 0), while a member
- * message correctly carries the instance part. */
-static void test_master_nonzero_part_limit() {
+/* A master (part-wide) message returns voiceKey 0; a member message carries the
+ * instance part in the voice key. (The runtime routes a part-wide voiceKey-0 mod
+ * to the emitting source's part — see encodeModEvent srcChan — so this reaches a
+ * non-zero part correctly; that routing is covered by the hardware mpe-test.) */
+static void test_master_voicekey_partwide() {
     MpeZone z;
     z.setPart(5);
     z.cc(0, 101, 0);
@@ -295,7 +295,7 @@ int main() {
     test_rpn_before_active();
     test_out_of_zone_and_mismatch();
     test_count0_mcm_with_toggle();
-    test_master_nonzero_part_limit();
+    test_master_voicekey_partwide();
     printf("mpe-zone-tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

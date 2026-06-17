@@ -923,13 +923,16 @@ void HarpRuntime::encodeUmpEvent(harp_cbuf *m, uint32_t word, uint64_t ts) {
 /* Mod event (§9.4 non-destructive modulation): etype 6, body
  * {0 param, 1 signed offset, 3 voice (§9.5 packed key), 5 channel/part}. The
  * offset is NOT clamped here — it is signed and clamped only after summing onto
- * the base, on the device (§9.4). The part (key 5) is the channel embedded in
- * the voice key ((voice>>8)&0xf), so the mod lands on the SAME part the note's
- * voice_id was minted under; key 5 is omitted for part 0 / part-wide (voice 0),
- * matching the ramp/param convention (ascending keys, part-0 byte-economy). */
+ * the base, on the device (§9.4). The part (key 5) for a PER-VOICE mod is the
+ * channel embedded in the voice key ((voice>>8)&0xf), so the mod lands on the
+ * SAME part the note's voice_id was minted under; for a PART-WIDE mod (voice 0)
+ * it is `srcChan` — the part the emitting source drives — so a zone-wide MPE
+ * master bend/pressure reaches THIS instance's part, not always part 0. Key 5 is
+ * omitted when the part is 0 (part-0 byte-economy; the device defaults absent to
+ * part 0), so a part-0 source is byte-identical to before. */
 void HarpRuntime::encodeModEvent(harp_cbuf *m, uint32_t id, float offset,
-                                 uint64_t ts, uint32_t voice) {
-    uint8_t channel = voice ? (uint8_t)((voice >> 8) & 0xf) : 0;
+                                 uint64_t ts, uint32_t voice, uint8_t srcChan) {
+    uint8_t channel = voice ? (uint8_t)((voice >> 8) & 0xf) : (uint8_t)(srcChan & 0xf);
     harp_cbor_array(m, 3);
     harp_cbor_array(m, 2);
     harp_cbor_uint(m, 0);
@@ -1273,9 +1276,10 @@ int HarpRuntime::drainSource(EventSource &src, harp_cbuf &batch, harp_cbuf &msgb
             memcpy(&ppq, &te.end, sizeof ppq);
             encodeTransportEvent(&msgbuf, te.a, te.v, ppq, te.ts);
         } else if (te.kind == 4)
-            /* mod (§9.4): the voice key rides in `end`; the part is derived from
-             * it inside encodeModEvent, so a mod follows its note's channel. */
-            encodeModEvent(&msgbuf, te.a, te.v, te.ts, (uint32_t)te.end);
+            /* mod (§9.4): the voice key rides in `end`; a per-voice mod takes its
+             * part from the voice key, a part-wide mod (voice 0) from this source's
+             * channel — so a zone-wide MPE master bend reaches this part, not 0. */
+            encodeModEvent(&msgbuf, te.a, te.v, te.ts, (uint32_t)te.end, chan);
         else
             encodeUmpEvent(&msgbuf, te.a, te.ts);
         harp_frame_hdr h = {HARP_FRAME_FVER, HARP_STREAM_EVT, HARP_FLAG_FIN,

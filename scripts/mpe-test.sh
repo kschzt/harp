@@ -159,6 +159,25 @@ if [ -x "$A" ] && [ -e "$AUCOMP" ]; then
     [ "$AUB0" = "$CLBM12" ]        || fail "AU raw-MPE bend ($AUB0) != CLAP note-expr bend ($CLBM12) — raw 16-ch MPE pitch not cross-format byte-identical"
     [ "$AUB0R" = "$AUB0" ]         || fail "AU raw-MPE bend over ±24 range ($AUB0R) != over ±48 ($AUB0) — the rendered semitones must not depend on the RPN-0 range used to encode them"
     [ "$AUTB0" = "$CUT0" ]         || fail "AU raw-MPE CC74 timbre ($AUTB0) != CLAP Brightness ($CUT0) — timbre axis not cross-format byte-identical"
+
+    # MASTER-channel (zone-wide) bend reaches the INSTANCE's part, not a hardcoded
+    # part 0. A master bend is a part-wide mod (voiceKey 0) the runtime routes to
+    # the emitting source's part; it bends EVERY active voice on that part. Proof
+    # is per-part — a chord + master bend bends the whole chord:
+    #   p0: chord on part 0 + master bend -> != neutral chord on part 0.
+    #   p3: chord on part 3 + master bend -> != neutral chord on part 3. With the
+    #       old part-0-only bug the bend was lost to part 0 (whose only voice, the
+    #       drone, is unallocated and immune), leaving part 3's chord unbent == p3.
+    AUNEUT3=$("$A" $S --part 3 --mpe-chord 60,64,67 --seconds 2.0 --hash 2>/dev/null | grep output-hash | cut -d' ' -f2)
+    AUMB0=$("$A" $S --mpe-chord 60,64,67 --mpe-master-bend -12 --seconds 2.0 --hash 2>/dev/null | grep output-hash | cut -d' ' -f2)
+    AUMB3=$("$A" $S --part 3 --mpe-chord 60,64,67 --mpe-master-bend -12 --seconds 2.0 --hash 2>/dev/null | grep output-hash | cut -d' ' -f2)
+    echo "              master-bend: neutral-p3=$AUNEUT3 bend-p0=$AUMB0 bend-p3=$AUMB3"
+    for n in AUNEUT3 AUMB0 AUMB3; do
+        eval "v=\$$n"
+        [ -n "$v" ] || { echo "MPE FAIL: AU $n produced no hash (device busy/absent?)"; exit 3; }
+    done
+    [ "$AUMB0" != "$AUNEUT" ]       || fail "AU master (zone-wide) bend on part 0 did not change the render — the master path is dead"
+    [ "$AUMB3" != "$AUNEUT3" ]      || fail "AU master bend on a part-3 instance left the chord unbent ($AUMB3 == $AUNEUT3) — a part-wide mod must reach the instance's part, not always part 0"
 else
     echo "   (AU raw-MPE check skipped: au-host / AU component absent — macOS only)"
 fi
