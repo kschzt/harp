@@ -1,21 +1,21 @@
-/* See freerun.h. Ring buffer + clock-recovery loop + libsamplerate ASRC.
+/* See freerun.h. Ring buffer + clock-recovery + libsamplerate ASRC.
  *
- * Recovery is FEEDFORWARD with a smoothed ratio:
- *   target ratio  = total output / total input arrived   (cumulative)
- *   applied ratio = one-pole low-pass of that target
+ * Clock recovery is TIMESTAMP-based: harp_freerun_observe() feeds (device sample
+ * index, host arrival time) pairs, and the device rate is the slope of a linear
+ * regression of dev_ts against host_ns. This is the airtight part — a frame
+ * COUNT is quantized to whole frames, capping SINAD ~40 dB no matter how it is
+ * smoothed, whereas host arrival time is continuous, so regressing against it
+ * averages out packet-delay jitter to a sub-frame-precise rate. ratio =
+ * host_rate / device_rate, one-pole-smoothed onto the applied ratio so it moves
+ * without per-update steps (even ~1 ppm steps FM-modulate the tone). With the
+ * ratio steady the resampler is pristine (>120 dB); the recovery's job is to
+ * keep it steady and correct. No feedback loop on the buffer (libsamplerate's
+ * internal dead-time makes those ring); the buffer just absorbs jitter.
  *
- * The cumulative output/arrival count is a bias-free estimate of host/device
- * that converges to a CONSTANT for a constant crystal drift — no feedback loop,
- * so libsamplerate's internal buffering (a dead-time that makes buffer-feedback
- * loops ring) can't destabilize it. The one-pole low-pass is the airtight part:
- * the raw cumulative ratio still steps by ~1 ppm per pull (integer division),
- * and even 1-ppm ratio steps FM-modulate the output enough to cap SINAD ~40 dB;
- * smoothing the applied ratio removes that, recovering the converter's full
- * quality (>120 dB on a constant ratio). Rate-matching keeps the elastic buffer
- * from drifting; the buffer absorbs per-packet jitter.
- *
- * Reported est_ppm is the EFFECTIVE ratio (total output / total input consumed)
- * — the ratio actually realized. */
+ * The regression here is cumulative (whole-stream) — simplest, and precision
+ * improves over the run; it is well-conditioned for runs up to minutes. A
+ * windowed/re-centred variant (for hours, or a clock that itself drifts) is a
+ * later refinement. est_ppm reports the recovered device drift. */
 #include "freerun.h"
 
 #include <samplerate.h>
@@ -32,10 +32,11 @@ struct harp_freerun {
     unsigned   cap, target;
     float     *ring;
     unsigned   rd, wr, fill;
-    double     ratio;
-    unsigned long long pushed_total, last_push;   /* arrivals (prebuffer excl.) */
-    unsigned long long consumed_total, output_total;
-    int        primed;
+    double     ratio, ratio_target;
+    /* timestamp regression (centred on the first observation) */
+    int        obs_primed;
+    unsigned long long ts0, host0;
+    double     Sw, Sx, Sy, Sxx, Sxy;
     unsigned   underflow, overflow;
 };
 
@@ -47,7 +48,6 @@ static long fr_input_cb(void *cb_data, float **data) {
     *data = fr->ring + (size_t)fr->rd * fr->ch;
     fr->rd = (fr->rd + contig) % fr->cap;
     fr->fill -= contig;
-    fr->consumed_total += contig;
     return (long)contig;
 }
 
@@ -63,7 +63,7 @@ harp_freerun *harp_freerun_new(const harp_freerun_cfg *c) {
     fr->nominal = c->host_rate_hz / c->dev_rate_hz;
     fr->cap = c->capacity_frames;
     fr->target = c->target_frames;
-    fr->ratio = fr->nominal;
+    fr->ratio = fr->ratio_target = fr->nominal;
     fr->ring = malloc((size_t)c->capacity_frames * c->channels * sizeof(float));
     int err = 0;
     fr->src = src_callback_new(fr_input_cb, c->quality, (int)c->channels, &err, fr);
@@ -76,6 +76,22 @@ void harp_freerun_free(harp_freerun *fr) {
     if (fr->src) src_delete(fr->src);
     free(fr->ring);
     free(fr);
+}
+
+void harp_freerun_observe(harp_freerun *fr, unsigned long long dev_ts,
+                          unsigned long long host_ns) {
+    if (!fr->obs_primed) { fr->obs_primed = 1; fr->ts0 = dev_ts; fr->host0 = host_ns; return; }
+    double x = (double)(host_ns - fr->host0) / 1e9;       /* host seconds since anchor */
+    double y = (double)(dev_ts - fr->ts0);                /* device samples since anchor */
+    fr->Sw += 1; fr->Sx += x; fr->Sy += y; fr->Sxx += x*x; fr->Sxy += x*y;
+    double denom = fr->Sw * fr->Sxx - fr->Sx * fr->Sx;
+    if (denom <= 0) return;
+    double slope = (fr->Sw * fr->Sxy - fr->Sx * fr->Sy) / denom;   /* dev samples/sec */
+    if (slope <= 0) return;
+    double t = fr->host_rate / slope;                     /* out/in == host/dev */
+    double lo = fr->nominal * (1.0 - FR_MAXADJ), hi = fr->nominal * (1.0 + FR_MAXADJ);
+    if (t < lo) t = lo; else if (t > hi) t = hi;
+    fr->ratio_target = t;
 }
 
 unsigned harp_freerun_push(harp_freerun *fr, const float *in, unsigned n) {
@@ -91,25 +107,13 @@ unsigned harp_freerun_push(harp_freerun *fr, const float *in, unsigned n) {
                (size_t)(take - first) * fr->ch * sizeof(float));
     fr->wr = (fr->wr + take) % fr->cap;
     fr->fill += take;
-    fr->pushed_total += take;
     return take;
 }
 
-static void update_ratio(harp_freerun *fr) {
-    if (!fr->primed) { fr->primed = 1; fr->last_push = fr->pushed_total; return; }
-    unsigned long long pin = fr->pushed_total - fr->last_push;
-    if (pin == 0 || fr->output_total == 0) return;
-    double target = (double)fr->output_total / (double)pin;       /* host/dev */
-    double lo = fr->nominal * (1.0 - FR_MAXADJ), hi = fr->nominal * (1.0 + FR_MAXADJ);
-    if (target < lo) target = lo; else if (target > hi) target = hi;
-    fr->ratio += FR_SMOOTH * (target - fr->ratio);                /* smooth -> low FM */
-}
-
 unsigned harp_freerun_pull(harp_freerun *fr, float *out, unsigned n) {
-    update_ratio(fr);
+    fr->ratio += FR_SMOOTH * (fr->ratio_target - fr->ratio);   /* smooth -> low FM */
     long made = src_callback_read(fr->src, fr->ratio, (long)n, out);
     if (made < 0) made = 0;
-    fr->output_total += (unsigned)made;
     if ((unsigned)made < n) {
         memset(out + (size_t)made * fr->ch, 0,
                (size_t)(n - (unsigned)made) * fr->ch * sizeof(float));
@@ -120,9 +124,7 @@ unsigned harp_freerun_pull(harp_freerun *fr, float *out, unsigned n) {
 
 void harp_freerun_get_stats(const harp_freerun *fr, harp_freerun_stats *st) {
     st->ratio = fr->ratio;
-    double eff = fr->consumed_total ? (double)fr->output_total / (double)fr->consumed_total
-                                    : fr->nominal;
-    st->est_ppm = (fr->nominal / eff - 1.0) * 1e6;
+    st->est_ppm = (fr->nominal / fr->ratio_target - 1.0) * 1e6;   /* recovered drift */
     st->fill_frames = fr->fill;
     st->underflow_frames = fr->underflow;
     st->overflow_frames = fr->overflow;

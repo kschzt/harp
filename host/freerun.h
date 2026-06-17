@@ -46,6 +46,16 @@ typedef struct {
 harp_freerun *harp_freerun_new(const harp_freerun_cfg *cfg);
 void          harp_freerun_free(harp_freerun *fr);
 
+/* Feed a timing observation for clock recovery: dev_ts is the device sample
+ * index of an arriving packet (its RTP/stream timestamp), host_ns the host
+ * monotonic time it arrived. The device rate is recovered from the regression
+ * of dev_ts against host_ns — sub-frame precise, unlike a frame count, which is
+ * what lifts SINAD to the resampler's ceiling. Call once per arriving packet,
+ * before/with the matching push(). (Optional: with no observations the ratio
+ * stays nominal.) */
+void harp_freerun_observe(harp_freerun *fr, unsigned long long dev_ts,
+                          unsigned long long host_ns);
+
 /* Producer: enqueue nframes of interleaved input just arrived from the device.
  * Returns frames accepted (< nframes iff the ring overflowed; the rest drop). */
 unsigned harp_freerun_push(harp_freerun *fr, const float *in, unsigned nframes);
