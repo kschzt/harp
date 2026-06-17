@@ -38,13 +38,23 @@ jobs:
               https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
           fi
 
+      - name: CLAP SDK (header-only; cached on the runner at ~/clap)
+        run: |
+          mkdir -p external
+          if [ -d "$HOME/clap/.git" ]; then
+            ln -sfn "$HOME/clap" external/clap
+          else
+            git clone --depth 1 --branch 1.2.8 \
+              https://github.com/free-audio/clap.git external/clap
+          fi
+
       - name: build core + device tools (harp-probe, harp-tests)
         run: cmake -B build && cmake --build build -j
 
-      - name: build + install the Linux VST3 shell (~/.vst3)
+      - name: build + install the Linux VST3 shell (~/.vst3) + the CLAP shell/host
         run: |
           cmake -B build-vst -S tools/vst3-host
-          cmake --build build-vst --target harp-vst3-host harp-shell -j
+          cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host -j
           cmake --build build-vst --target install-linux
 
       - name: deploy harp-deviced under test to PI4B-0002 (the daemon runs THIS commit)

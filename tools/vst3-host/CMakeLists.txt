@@ -117,6 +117,47 @@ if(LIBUSB_FOUND)
   endif()
   message(STATUS "harp-shell: building VST3 shell with libusb")
 
+  # ---- the HARP CLAP shell (shell/clap) — the SAME runtime core, CLAP-only ----
+  # A third shell over HarpRuntime (no VST3 SDK; CLAP is a header-only ABI). Built
+  # as a MODULE named harp-clap.clap that the host dlopen()s. CLAP's per-note
+  # PARAM_MOD maps straight to §9.5 per-voice modulation (shell/clap/harp_clap.cpp).
+  add_library(harp-clap MODULE
+    ${HARP_ROOT}/shell/clap/harp_clap.cpp
+    ${HARP_ROOT}/shell/runtime.cpp
+    ${HARP_ROOT}/shell/runtime_registry.cpp
+    ${HARP_ROOT}/host/usb_io.c
+    ${HARP_ROOT}/host/client.c
+    ${HARP_ROOT}/core/src/cbor.c
+    ${HARP_ROOT}/core/src/sha256.c
+    ${HARP_ROOT}/core/src/frame.c
+    ${HARP_ROOT}/core/src/object.c
+    ${HARP_ROOT}/core/src/store.c
+    ${HARP_ROOT}/core/src/envelope.c
+    ${HARP_ROOT}/core/src/link.c
+    ${HARP_ROOT}/core/src/audio.c
+    ${HARP_PLAT_SRC})
+  target_include_directories(harp-clap PRIVATE
+    ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
+    ${HARP_ROOT}/external/clap/include ${LIBUSB_INCLUDE_DIRS})
+  target_compile_definitions(harp-clap PRIVATE HAVE_LIBUSB)
+  target_link_directories(harp-clap PRIVATE ${LIBUSB_LIBRARY_DIRS})
+  target_link_libraries(harp-clap PRIVATE ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS})
+  set_target_properties(harp-clap PROPERTIES PREFIX "" OUTPUT_NAME "harp-clap" SUFFIX ".clap")
+  if(APPLE) # libusb on macOS pulls these; the VST3/AU shells get them via their SDKs
+    target_link_libraries(harp-clap PRIVATE "-framework CoreFoundation" "-framework IOKit")
+  endif()
+  message(STATUS "harp-clap: building CLAP shell with libusb")
+
+  # ---- clap-host: minimal CLI CLAP host (the CLAP analogue of harp-vst3-host) ----
+  # dlopen()s the .clap, drives notes/params/per-note PARAM_MOD, hashes the owner
+  # main mix — the byte-exact golden gate for the CLAP shell. No runtime link
+  # (the runtime lives inside the .clap); just the CLAP headers + dlopen.
+  add_executable(clap-host ${CMAKE_CURRENT_SOURCE_DIR}/../clap-host/main.cpp)
+  target_include_directories(clap-host PRIVATE
+    ${HARP_ROOT}/external/clap/include ${HARP_ROOT}/core/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/..) # tools/ -> render_check.h (shared harp_fnv1a)
+  target_link_libraries(clap-host PRIVATE ${CMAKE_DL_LIBS})
+
   # tsan-host (debt #17): the shell runtime, statically linked into a TSan
   # main image and driven directly (no plugin boundary — TSan must be in
   # the main image, not a dlopen'd bundle). Built only with -DHARP_TSAN=ON;
