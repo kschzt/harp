@@ -79,21 +79,39 @@ static void run_recv(int port, double secs) {
     harp_freerun_stats st; harp_rtp_rx_stats(rx, &st);
     unsigned long ok, lost, bad; harp_rtp_rx_counters(rx, &ok, &lost, &bad);
 
-    /* SINAD at the recovered frequency (search +/-300 ppm). */
-    double f0 = FREQ * (1.0 + st.est_ppm * 1e-6), sinad = -1e9;
-    for (int kf = -300; kf <= 300 && na > 1000; kf++) {
-        double fo = f0 * (1.0 + kf * 1e-6), Sss=0,Scc=0,Ssc=0,Sys=0,Syc=0,Syy=0;
-        for (long j = 0; j < na; j++) {
-            double ph = 2*M_PI*fo*j/RATE, s=sin(ph), c=cos(ph), y=ya[j];
-            Sss+=s*s; Scc+=c*c; Ssc+=s*c; Sys+=y*s; Syc+=y*c; Syy+=y*y;
+    /* RMS over all captured output — is there signal at all? */
+    double sumsq = 0; for (long j = 0; j < na; j++) sumsq += (double)ya[j] * ya[j];
+    double rms = na ? sqrt(sumsq / na) : 0;
+
+    /* Find the dominant tone (the drone sits at its own pitch, not 1 kHz):
+     * coarse scan then refine by fitted amplitude, then SINAD at that tone over
+     * a 1 s window. Harmonics count as distortion, so a rich drone reads
+     * conservatively; RMS + zero glitches confirm real, clean audio regardless. */
+    long wn = na < 48000 ? na : 48000;
+    const float *yw = ya + (na - wn);
+    double bestf = 0, sinad = -1e9;
+    for (int pass = 0; pass < 2 && wn > 2000; pass++) {
+        double lo = pass ? bestf - 2 : 40, hi = pass ? bestf + 2 : 4000;
+        double step = pass ? 0.05 : 2.0, bestamp = -1;
+        for (double fo = lo; fo <= hi; fo += step) {
+            double Sss=0,Scc=0,Ssc=0,Sys=0,Syc=0;
+            for (long j = 0; j < wn; j++) { double ph=2*M_PI*fo*j/RATE,s=sin(ph),c=cos(ph),y=yw[j];
+                Sss+=s*s;Scc+=c*c;Ssc+=s*c;Sys+=y*s;Syc+=y*c; }
+            double det=Sss*Scc-Ssc*Ssc; if (det<=0) continue;
+            double A=(Sys*Scc-Syc*Ssc)/det,B=(Syc*Sss-Sys*Ssc)/det, amp=A*A+B*B;
+            if (amp>bestamp) { bestamp=amp; bestf=fo; }
         }
-        double det=Sss*Scc-Ssc*Ssc, A=(Sys*Scc-Syc*Ssc)/det, B=(Syc*Sss-Sys*Ssc)/det;
-        double v=10*log10((A*A*Sss+2*A*B*Ssc+B*B*Scc)/na/((Syy-(A*Sys+B*Syc))/na));
-        if (v>sinad) sinad=v;
+    }
+    if (bestf > 0) {
+        double Sss=0,Scc=0,Ssc=0,Sys=0,Syc=0,Syy=0;
+        for (long j = 0; j < wn; j++) { double ph=2*M_PI*bestf*j/RATE,s=sin(ph),c=cos(ph),y=yw[j];
+            Sss+=s*s;Scc+=c*c;Ssc+=s*c;Sys+=y*s;Syc+=y*c;Syy+=y*y; }
+        double det=Sss*Scc-Ssc*Ssc,A=(Sys*Scc-Syc*Ssc)/det,B=(Syc*Sss-Sys*Ssc)/det;
+        sinad=10*log10((A*A*Sss+2*A*B*Ssc+B*B*Scc)/wn/((Syy-(A*Sys+B*Syc))/wn));
     }
     free(ya);
-    printf("recv: drift %.2f ppm  fill %u  SINAD %.1f dB  pkts ok=%lu lost=%lu bad=%lu  under=%u over=%u\n",
-           st.est_ppm, st.fill_frames, sinad, ok, lost, bad, st.underflow_frames, st.overflow_frames);
+    printf("recv: drift %.2f ppm  fill %u  RMS %.4f  tone %.1f Hz  SINAD %.1f dB  pkts ok=%lu lost=%lu bad=%lu under=%u over=%u\n",
+           st.est_ppm, st.fill_frames, rms, bestf, sinad, ok, lost, bad, st.underflow_frames, st.overflow_frames);
     harp_rtp_rx_close(rx);
 }
 
