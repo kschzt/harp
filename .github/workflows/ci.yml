@@ -9,8 +9,8 @@ jobs:
       - name: clone VST3 SDK
         run: git clone --depth 1 --recursive
              https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
-      - name: install libusb
-        run: brew install libusb
+      - name: install libusb + libsamplerate
+        run: brew install libusb libsamplerate
       - name: clone CLAP SDK (header-only)
         run: git clone --depth 1 --branch 1.2.8
              https://github.com/free-audio/clap.git external/clap
@@ -141,8 +141,8 @@ jobs:
       - name: clone VST3 SDK
         run: git clone --depth 1 --recursive
              https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
-      - name: install libusb + xvfb
-        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev xvfb
+      - name: install libusb + libsamplerate + xvfb
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libsamplerate0-dev xvfb
       - name: clone CLAP SDK (header-only)
         run: git clone --depth 1 --branch 1.2.8
              https://github.com/free-audio/clap.git external/clap

@@ -81,6 +81,7 @@ endif()
 find_package(PkgConfig QUIET)
 if(PKG_CONFIG_FOUND)
   pkg_check_modules(LIBUSB libusb-1.0)
+  pkg_check_modules(SAMPLERATE samplerate)
 endif()
 if(NOT LIBUSB_FOUND)
   # No pkg-config (typical on Windows/MSVC): try a vendored prebuilt drop under
@@ -156,6 +157,21 @@ if(NOT WIN32)
   target_include_directories(harp-device-tests PRIVATE device)
   target_link_libraries(harp-device-tests harpcore ${HARP_MATH_LIB} Threads::Threads)
   add_test(NAME device_codec COMMAND harp-device-tests)
+endif()
+
+# harp-freerun-tests: the §7.3/§8.7 free-running receiver — clock recovery +
+# libsamplerate ASRC (host/freerun.c). Needs libsamplerate; skipped (with a
+# notice) where it is absent so a bare build still configures.
+if(SAMPLERATE_FOUND)
+  add_executable(harp-freerun-tests tests/harp_freerun_tests.c host/freerun.c)
+  target_include_directories(harp-freerun-tests PRIVATE host ${SAMPLERATE_INCLUDE_DIRS})
+  if(SAMPLERATE_LIBRARY_DIRS)
+    target_link_directories(harp-freerun-tests PRIVATE ${SAMPLERATE_LIBRARY_DIRS})
+  endif()
+  target_link_libraries(harp-freerun-tests ${SAMPLERATE_LIBRARIES} ${HARP_MATH_LIB})
+  add_test(NAME freerun COMMAND harp-freerun-tests)
+else()
+  message(STATUS "libsamplerate not found -> harp-freerun-tests skipped")
 endif()
 
 # Fuzz targets. Apple clang ships no libFuzzer runtime -> a standalone
