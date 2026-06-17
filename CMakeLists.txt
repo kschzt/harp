@@ -170,6 +170,16 @@ if(SAMPLERATE_FOUND)
   endif()
   target_link_libraries(harp-freerun-tests ${SAMPLERATE_LIBRARIES} ${HARP_MATH_LIB})
   add_test(NAME freerun COMMAND harp-freerun-tests)
+
+  # harp-rtp-tests: the §8.7 RTP codec (host/rtp.c) + end-to-end through the
+  # free-running receiver (pack -> unpack -> recover -> resample).
+  add_executable(harp-rtp-tests tests/harp_rtp_tests.c host/rtp.c host/freerun.c)
+  target_include_directories(harp-rtp-tests PRIVATE host ${SAMPLERATE_INCLUDE_DIRS})
+  if(SAMPLERATE_LIBRARY_DIRS)
+    target_link_directories(harp-rtp-tests PRIVATE ${SAMPLERATE_LIBRARY_DIRS})
+  endif()
+  target_link_libraries(harp-rtp-tests ${SAMPLERATE_LIBRARIES} ${HARP_MATH_LIB})
+  add_test(NAME rtp COMMAND harp-rtp-tests)
 else()
   message(STATUS "libsamplerate not found -> harp-freerun-tests skipped")
 endif()
