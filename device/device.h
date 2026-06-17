@@ -263,6 +263,10 @@ typedef struct {
     bool closing;            /* session thread only */
     uint64_t peer_credit;   /* bytes we may still send on obj */
     uint64_t granted;       /* unconsumed credit we granted the peer */
+    uint32_t rtp_peer_ip;   /* §8.7: the TCP peer's IPv4 (network order), or 0 when
+                               the session is not over TCP (USB gadget). It is the
+                               RTP audio destination when audio.start negotiates a
+                               port (key 6); set once at accept, never on USB. */
 
     audio_state audio;
 
@@ -300,6 +304,11 @@ void audio_stop(device *d);
 /* §8.7 RTP/UDP emit of one rendered block; no-op unless a->rtp_fd >= 0.
  * Defined in harp-deviced.c so engine.c stays free of socket code. */
 void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, uint64_t msc);
+/* §8.7: open a UDP socket connect()'d to peer_ip_net:port (the negotiated RTP
+ * audio destination); returns the fd or -1. Close one with audio_rtp_close
+ * (no-op if a->rtp_fd < 0). Both keep socket code out of engine.c/session.c. */
+int  audio_open_rtp_dest(uint32_t peer_ip_net, int port);
+void audio_rtp_close(audio_state *a);
 void engine_meters_reset(void); /* §9.9: clear meters to the silent floor */
 
 /* ---------------- state.c ---------------- */

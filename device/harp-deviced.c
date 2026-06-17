@@ -82,6 +82,34 @@ void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, 
     (void)sendmsg(a->rtp_fd, &m, 0);
 }
 
+/* §8.7: open the negotiated RTP audio destination — a UDP socket connect()'d to
+ * the TCP peer's IP (peer_ip_net, network order) on the host-chosen `port`
+ * (audio.start key 6). connect() lets the render loop sendmsg() with no per-call
+ * address. Returns the fd, or -1 on bad args / socket failure. */
+int audio_open_rtp_dest(uint32_t peer_ip_net, int port) {
+    if (peer_ip_net == 0 || port <= 0 || port > 65535) return -1;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    a.sin_addr.s_addr = peer_ip_net;
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Close a negotiated RTP destination (no-op if none / on USB). Called from
+ * audio_stop once the render thread is joined, so the fd outlives no sender. */
+void audio_rtp_close(audio_state *a) {
+    if (a->rtp_fd >= 0) {
+        close(a->rtp_fd);
+        a->rtp_fd = -1;
+    }
+}
+
 /* Standalone §8.7 emit mode (--rtp-out HOST:PORT): free-running mono main-mix
  * over RTP/UDP, paced by the device clock. The real engine, no host needed —
  * the device side of the network audio plane. Blocks until killed. */
@@ -228,9 +256,18 @@ int main(int argc, char **argv) {
             break;
         }
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        /* §8.7: remember the peer's IP so a TCP-session audio.start can negotiate
+         * an RTP audio destination (its host:port = peer-IP + key-6 port). */
+        struct sockaddr_in peer;
+        socklen_t plen = sizeof peer;
+        d->rtp_peer_ip = (getpeername(cfd, (struct sockaddr *)&peer, &plen) == 0 &&
+                          peer.sin_family == AF_INET)
+                             ? peer.sin_addr.s_addr
+                             : 0;
         harp_io_fd tio;
         harp_io_fd_init(&tio, cfd, cfd);
         harp_deviced_run_session(d, &tio.io);
+        d->rtp_peer_ip = 0; /* session over — forget the peer */
         close(cfd);
         fprintf(stderr, "harp-deviced: session ended; awaiting reattach\n");
     }

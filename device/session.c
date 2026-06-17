@@ -729,6 +729,7 @@ int harp_ffs_audio_out_fd(void); /* device/ffs.c */
 /* audio.start (§8.2): free-running mode only, stereo D→H, USB transport only */
 static void handle_audio_start(device *d, const harp_env *e) {
     uint64_t rate = 48000, nsamples = 256, mode = 0;
+    uint64_t rtp_port = 0; /* §8.7 key 6: host's RTP audio port; 0 => USB transport */
     /* active-slots-out (§6.3, key 4): the output slots the host wants, in
      * request order. Parsed into a local array first; an absent or empty key
      * defaults to the stereo main mix {0,1} (the P2.1 byte-identical path). */
@@ -760,6 +761,8 @@ static void handle_audio_start(device *d, const harp_env *e) {
                     }
                 } else if (key == 5) {
                     if (!harp_cdec_uint(&b, &mode)) break;
+                } else if (key == 6) { /* §8.7: RTP audio destination port (Ethernet) */
+                    if (!harp_cdec_uint(&b, &rtp_port)) break;
                 } else if (!harp_cdec_skip(&b))
                     break;
             }
@@ -783,12 +786,22 @@ static void handle_audio_start(device *d, const harp_env *e) {
         send_error(d, e->rid, e->method, "unsupported", "nsamples");
         return;
     }
+    /* §8.7 Ethernet/RTP: a host-negotiated audio port (key 6) selects the RTP
+     * transport — free-running only, no USB endpoints. Absent key 6 (every USB
+     * audio.start) this whole branch is skipped and the path stays byte-identical
+     * to before, so the golden render is unaffected. */
+    if (rtp_port && mode != 0) {
+        send_error(d, e->rid, e->method, "unsupported", "RTP audio is free-running only");
+        return;
+    }
     int fd = -1, out_fd = -1;
 #ifdef __linux__
-    fd = harp_ffs_audio_in_fd();
-    out_fd = harp_ffs_audio_out_fd();
+    if (!rtp_port) { /* USB transport: the FFS audio endpoints */
+        fd = harp_ffs_audio_in_fd();
+        out_fd = harp_ffs_audio_out_fd();
+    }
 #endif
-    if (fd < 0 || (mode == 1 && out_fd < 0)) {
+    if (!rtp_port && (fd < 0 || (mode == 1 && out_fd < 0))) {
         send_error(d, e->rid, e->method, "unsupported",
                    "HARP stream requires the USB transport");
         return;
@@ -797,10 +810,24 @@ static void handle_audio_start(device *d, const harp_env *e) {
         send_error(d, e->rid, e->method, "busy", "stream already running");
         return;
     }
+    /* Open the RTP dest AFTER the busy gate so a rejected start leaks no socket.
+     * The peer IP was captured at accept; key 6 is the host's chosen port. */
+    int rtp_fd = -1;
+    if (rtp_port) {
+        rtp_fd = audio_open_rtp_dest(d->rtp_peer_ip, (int)rtp_port);
+        if (rtp_fd < 0) {
+            send_error(d, e->rid, e->method, "unsupported", "cannot open RTP destination");
+            return;
+        }
+    }
     evq_reset_for_new_stream();
     d->audio.fd = fd;
     d->audio.out_fd = out_fd;
-    d->audio.rtp_fd = -1;   /* USB/host-paced path never RTP-emits (rtp_fd<0 => no-op) */
+    d->audio.rtp_fd = rtp_fd;   /* >=0 only for RTP; USB stays <0 => emit is a no-op */
+    if (rtp_fd >= 0) {          /* fresh RTP stream identity */
+        d->audio.rtp_ssrc = 0x48415250u; /* "HARP" */
+        d->audio.rtp_seq = 0;
+    }
     d->audio.mode = (uint32_t)mode;
     d->audio.rate = (uint32_t)rate;
     d->audio.nsamples = (uint32_t)nsamples;
@@ -811,14 +838,15 @@ static void handle_audio_start(device *d, const harp_env *e) {
     atomic_store_explicit(&d->audio.running, true, memory_order_relaxed);
     if (pthread_create(&d->audio.thread, NULL, audio_thread, d) != 0) {
         atomic_store_explicit(&d->audio.running, false, memory_order_relaxed);
+        audio_rtp_close(&d->audio); /* don't leak the RTP socket on a failed start */
         send_error(d, e->rid, e->method, "internal", "thread");
         return;
     }
     atomic_store_explicit(&d->audio.thread_live, true, memory_order_relaxed);
     meter_pump_start(d); /* §9.9: stream the readonly meters while streaming */
-    fprintf(stderr, "harp-deviced: audio stream started (%u Hz, %u-sample blocks, %s)\n",
-            d->audio.rate, d->audio.nsamples,
-            mode ? "host-paced" : "free-running");
+    fprintf(stderr, "harp-deviced: audio stream started (%u Hz, %u-sample blocks, %s%s)\n",
+            d->audio.rate, d->audio.nsamples, mode ? "host-paced" : "free-running",
+            d->audio.rtp_fd >= 0 ? ", RTP/UDP" : "");
 
     harp_cbuf m;
     harp_cbuf_init(&m);

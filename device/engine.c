@@ -1467,6 +1467,7 @@ void audio_stop(device *d) {
     pthread_cancel(d->audio.thread);
     pthread_join(d->audio.thread, NULL);
     atomic_store_explicit(&d->audio.thread_live, false, memory_order_relaxed);
+    audio_rtp_close(&d->audio); /* §8.7: thread joined -> the RTP dest outlives no sender */
     /* render thread is joined: the pool is quiescent, so free every voice
      * directly (never let a note outlive its stream). Also clear any pending
      * panic signal so it cannot leak into the next stream. */
