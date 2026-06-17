@@ -478,11 +478,19 @@ static const void *entry_get_factory(const char *factory_id) {
 
 } // namespace
 
-/* CLAP_EXPORT is load-bearing on Windows (MSVC won't export clap_entry from the
- * DLL otherwise — every host's GetProcAddress("clap_entry") returns NULL and the
- * plugin is silently skipped). It is visibility("default") on mac/Linux clang/gcc
- * (a no-op today since nothing sets -fvisibility=hidden, but it also hardens
- * against anyone adding that flag or LTO later). The §9.x entry contract is
- * unchanged. */
-extern "C" CLAP_EXPORT const clap_plugin_entry_t clap_entry = {
+/* clap_entry must land in the DLL/dylib export table so the host's
+ * dlsym/GetProcAddress finds it (else the plugin is silently skipped). NO
+ * `extern "C"` here on purpose: clap/entry.h already declares clap_entry inside
+ * its own `extern "C"` block as `CLAP_EXPORT extern const ...`, so this
+ * definition inherits C linkage + EXTERNAL linkage + the export attribute from
+ * that declaration (the upstream clap-entry.cc pattern). A second `extern "C"`
+ * on the definition is what kept MSVC from exporting it (a const data symbol's
+ * export is linkage-sensitive on MSVC). CLAP_EXPORT = visibility("default") on
+ * mac/Linux (also future-proofs against -fvisibility=hidden / LTO); the MSVC
+ * /EXPORT pragma is a belt-and-suspenders guarantee for the const-export corner
+ * case. The §9.x entry contract is unchanged. */
+#if defined(_MSC_VER)
+#  pragma comment(linker, "/EXPORT:clap_entry")
+#endif
+CLAP_EXPORT const clap_plugin_entry_t clap_entry = {
     CLAP_VERSION_INIT, entry_init, entry_deinit, entry_get_factory};
