@@ -26,11 +26,18 @@
 #include "public.sdk/source/vst/vstaudioeffect.h"
 #include "public.sdk/source/vst/vsteditcontroller.h"
 
+#include "mpe_zone.h"
 #include "note_voice_map.h"
 #include "runtime.h"
 #include "runtime_registry.h"
 #include "shell_constants.h"
 #include "ump.h"
+
+/* mpe_zone.h carries its own §9.5 expression mod-target ids; pin them to the
+ * shared shell constants here (drift = compile error), exactly as harp_au.mm does. */
+static_assert(HARP_MPE_MOD_PITCH_BEND == kHarpModPitchBend, "MPE pitch-bend id drift");
+static_assert(HARP_MPE_MOD_PRESSURE == kHarpModPressure, "MPE pressure id drift");
+static_assert(HARP_MPE_MOD_TIMBRE == 3u, "MPE timbre must be Filter Cutoff (param 3)");
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
@@ -337,18 +344,27 @@ public:
                     uint32_t chan = (uint32_t)ev.noteOn.channel & 0xf; /* -> device part (P2.1) */
                     if (vel == 0) vel = 1;
                     if (vel > 127) vel = 127;
-                    rt.queueNote(source_, ump_note_on(note, vel, chan),
-                                 base + (uint64_t)ev.sampleOffset);
-                    /* remember the §9.5 voice key the device will mint for this
-                     * note ((chan<<8)|note) so a later Note Expression can target
-                     * this exact voice (Phase 3 per-voice modulation). */
-                    noteVoices_.noteOn(ev.noteOn.noteId, (chan << 8) | note);
+                    /* funnel through the MPE zone: inactive => its OWN channel
+                     * (byte-identical non-MPE path); a live zone (MPE toggle) =>
+                     * the note collapses onto the instance part (§9.4). */
+                    MpeNote r = mpe_.noteOn((uint8_t)chan, (uint8_t)note);
+                    if (r.accepted) {
+                        rt.queueNote(source_, ump_note_on(note, vel, r.part),
+                                     base + (uint64_t)ev.sampleOffset);
+                        /* remember the §9.5 voice key the device will mint
+                         * ((part<<8)|note) so a later Note Expression OR a member-
+                         * channel raw-MPE expression can target this exact voice. */
+                        noteVoices_.noteOn(ev.noteOn.noteId, ((uint32_t)r.part << 8) | note);
+                    }
                 } else if (ev.type == Event::kNoteOffEvent) {
                     uint32_t note = (uint32_t)(ev.noteOff.pitch & 0x7f);
                     uint32_t chan = (uint32_t)ev.noteOff.channel & 0xf;
-                    rt.queueNote(source_, ump_note_off(note, chan),
-                                 base + (uint64_t)ev.sampleOffset);
-                    noteVoices_.noteOff((chan << 8) | note);
+                    MpeNote r = mpe_.noteOff((uint8_t)chan, (uint8_t)note);
+                    if (r.accepted) {
+                        rt.queueNote(source_, ump_note_off(note, r.part),
+                                     base + (uint64_t)ev.sampleOffset);
+                        noteVoices_.noteOff(((uint32_t)r.part << 8) | note);
+                    }
                 } else if (ev.type == Event::kNoteExpressionValueEvent) {
                     /* §9.4/§9.5 non-destructive per-voice modulation from VST3
                      * Note Expression (Cubase MPE + the per-note expression UI),
@@ -420,6 +436,46 @@ public:
                          * change applies from the next event with no restart. */
                         part_ = (uint8_t)(v * (double)kPartStepCount + 0.5);
                         applyPart();
+                        continue;
+                    }
+                    if (id == kMpeEnableParamId) {
+                        /* HOST-SIDE: the raw-MIDI MPE engage toggle. Off =>
+                         * mpe_zone inactive (the non-MPE path); persisted via the
+                         * recall part byte. NOT a device param. (Set it before the
+                         * notes you want collapsed — a host arms MPE ahead of play,
+                         * and setState restores it before the first process.) */
+                        bool en = v >= 0.5;
+                        if (en != mpeEnabled_) { mpeEnabled_ = en; mpe_.setEnabled(en); }
+                        continue;
+                    }
+                    if (isMpeMidiId(id)) {
+                        /* a member-channel MPE expression the host routed here via
+                         * IMidiMapping: decode id -> (channel, axis), reconstruct
+                         * the MIDI value, feed mpe_zone -> a §9.5 per-voice mod (the
+                         * SAME wire the AU raw-MPE / CLAP note-expression paths emit).
+                         * NOT a device param. */
+                        uint32_t rel = id - kMpeMidiBase;
+                        uint8_t ch = (uint8_t)(rel / kMpeMidiAxes);
+                        switch (rel % kMpeMidiAxes) {
+                        case kMpeAxisBend: {
+                            MpeMod m = mpe_.pitchBend(ch, (uint16_t)(v * 16383.0 + 0.5));
+                            if (m.valid)
+                                rt.queueMod(source_, HARP_MPE_MOD_PITCH_BEND, m.value, m.voiceKey, ts);
+                            break;
+                        }
+                        case kMpeAxisTimbre: {
+                            MpeMod m = mpe_.cc(ch, 74, (uint8_t)(v * 127.0 + 0.5));
+                            if (m.valid)
+                                rt.queueMod(source_, HARP_MPE_MOD_TIMBRE, m.value, m.voiceKey, ts);
+                            break;
+                        }
+                        case kMpeAxisPressure: {
+                            MpeMod m = mpe_.channelPressure(ch, (uint8_t)(v * 127.0 + 0.5));
+                            if (m.valid)
+                                rt.queueMod(source_, HARP_MPE_MOD_PRESSURE, m.value, m.voiceKey, ts);
+                            break;
+                        }
+                        }
                         continue;
                     }
                     if (idx == SIZE_MAX) {
@@ -537,7 +593,11 @@ public:
          * header just carries this instance's per-project Part. */
         uint8_t header[kStateHeaderLen];
         memcpy(header, kStateHeaderMagic, sizeof kStateHeaderMagic);
-        header[sizeof kStateHeaderMagic] = (uint8_t)(part_ & 0xf);
+        /* part byte: low nibble = part, high bit 7 = the MPE toggle (see
+         * shell_constants.h). An MPE-off instance writes part byte = part exactly
+         * as before, so the cross-format-recall oracle is byte-identical. */
+        header[sizeof kStateHeaderMagic] =
+            (uint8_t)((part_ & kStatePartMask) | (mpeEnabled_ ? kStateMpeBit : 0));
         int32 written = 0;
         if (state->write(header, (int32)sizeof header, &written) != kResultOk)
             return kResultFalse;
@@ -563,7 +623,10 @@ public:
         std::vector<uint8_t> bundle;
         if (raw.size() >= kStateHeaderLen &&
             memcmp(raw.data(), kStateHeaderMagic, sizeof kStateHeaderMagic) == 0) {
-            part_ = (uint8_t)(raw[sizeof kStateHeaderMagic] & 0xf);
+            uint8_t pb = raw[sizeof kStateHeaderMagic];
+            part_ = (uint8_t)(pb & kStatePartMask);
+            mpeEnabled_ = (pb & kStateMpeBit) != 0; /* old 'HP1' projects: bit clear => MPE off */
+            mpe_.setEnabled(mpeEnabled_);
             applyPart(); /* live restore (usually a no-op pre-activate; setActive re-applies) */
             bundle.assign(raw.begin() + kStateHeaderLen, raw.end());
         } else {
@@ -661,6 +724,13 @@ private:
      * names the note; the device addresses a voice by its §9.5 key. The bridge
      * (noteId -> voice key) is shared with the CLAP shell — note_voice_map.h. */
     NoteVoiceMap noteVoices_;
+    /* Raw-MIDI MPE (Ableton Live on VST3): per-channel pitch-bend / CC74 / channel
+     * pressure arrive as IMidiMapping param changes; this collapses the zone onto
+     * part_ and turns each into a §9.5 per-voice mod, exactly like the AU shell.
+     * Engaged by the "MPE" toggle (mpeEnabled_), persisted in the recall part byte.
+     * Inactive by default => every note keeps its own channel (non-MPE path). */
+    MpeZone mpe_;
+    bool mpeEnabled_ = false;
     /* The Part default the env pins: HARP_CHANNEL (the headless --channel path)
      * clamped 0..15, else 0. Read once to seed part_ so the env path is unchanged
      * (start() ALSO reads HARP_CHANNEL into the owner source, so for the owner
@@ -680,6 +750,7 @@ private:
      * restart. nullptr source (unacquired / event-dormant 17th alias) = no-op. */
     void applyPart() {
         if (source_) source_->chan.store(part_ & 0xf, std::memory_order_relaxed);
+        mpe_.setPart(part_); /* the zone collapses every MPE note + mod onto this part */
     }
     bool offline_ = false;
     /* per-param ramp-synthesis state: last emitted point + pending folded
@@ -718,6 +789,28 @@ public:
                                 ParameterInfo::kCanAutomate, kPartParamId);
         parameters.addParameter(STR16("Panic"), nullptr, 0, 0,
                                 ParameterInfo::kIsHidden, kPanicParamId);
+        /* "MPE" (id 97): the raw-MIDI MPE engage toggle. Visible + automatable so
+         * a host/user can arm it; persisted via the recall part byte's high bit.
+         * Off by default => mpe_zone inactive => every note keeps its own channel
+         * (the byte-identical non-MPE path). Classic-MPE MCM/RPN auto-detect does
+         * not survive VST3's per-param automation model, so VST3 engages by this
+         * toggle (the AU still auto-detects from ordered raw MIDI). */
+        parameters.addParameter(STR16("MPE"), nullptr, 1, 0,
+                                ParameterInfo::kCanAutomate, kMpeEnableParamId);
+        /* The per-channel MPE expression params (hidden, NOT automatable): the
+         * host writes them from member-channel MIDI via the IMidiMapping below,
+         * and the processor decodes id -> (channel, axis) -> mpe_zone. */
+        {
+            static const char *axn[3] = {"bend", "timbre", "press"};
+            for (uint32_t ch = 0; ch < 16; ch++)
+                for (uint32_t ax = 0; ax < 3; ax++) {
+                    char nm[32];
+                    snprintf(nm, sizeof nm, "MPE.ch%u.%s", ch, axn[ax]);
+                    UString256 title(nm);
+                    parameters.addParameter(title, nullptr, 0, 0,
+                                            ParameterInfo::kIsHidden, mpeMidiId(ch, ax));
+                }
+        }
         /* §9.9 OUTPUT METERS: the device's readonly per-part + main-mix peak/RMS
          * meters (ids 0x1000+). Registered kIsReadOnly so a DAW shows the live
          * values its meter UI/generic editor but offers them as neither
@@ -737,15 +830,24 @@ public:
         return kResultOk;
     }
 
-    /* DAW panic reaches plugins as CC 120/123 through the MIDI mapping —
-     * route both onto the hidden Panic param */
-    tresult PLUGIN_API getMidiControllerAssignment(int32 busIndex, int16 /*channel*/,
+    /* MIDI controllers routed to params (the host turns member-channel MIDI into
+     * these). DAW panic (CC 120/123, any channel) -> the hidden Panic param. For
+     * raw-MIDI MPE, each member channel's pitch-bend / CC74-timbre / channel-
+     * pressure -> a per-(channel,axis) hidden param the processor decodes back
+     * into an mpe_zone expression. (CC74 is the SDK's kCtrlFilterResonance == 74,
+     * the MPE timbre/brightness axis.) */
+    tresult PLUGIN_API getMidiControllerAssignment(int32 busIndex, int16 channel,
                                                    CtrlNumber cc,
                                                    ParamID &id) override {
-        if (busIndex == 0 && (cc == kCtrlAllSoundsOff || cc == kCtrlAllNotesOff)) {
+        if (busIndex != 0) return kResultFalse;
+        if (cc == kCtrlAllSoundsOff || cc == kCtrlAllNotesOff) {
             id = kPanicParamId;
             return kResultTrue;
         }
+        if (channel < 0 || channel > 15) return kResultFalse;
+        if (cc == kPitchBend) { id = mpeMidiId((uint32_t)channel, kMpeAxisBend); return kResultTrue; }
+        if (cc == kAfterTouch) { id = mpeMidiId((uint32_t)channel, kMpeAxisPressure); return kResultTrue; }
+        if (cc == 74) { id = mpeMidiId((uint32_t)channel, kMpeAxisTimbre); return kResultTrue; }
         return kResultFalse;
     }
 
@@ -774,8 +876,9 @@ public:
         size_t blen = raw.size();
         if (raw.size() >= kStateHeaderLen &&
             memcmp(raw.data(), kStateHeaderMagic, sizeof kStateHeaderMagic) == 0) {
-            uint8_t part = (uint8_t)(raw[sizeof kStateHeaderMagic] & 0xf);
-            setParamNormalized(kPartParamId, (double)part / (double)kPartStepCount);
+            uint8_t pb = raw[sizeof kStateHeaderMagic];
+            setParamNormalized(kPartParamId, (double)(pb & kStatePartMask) / (double)kPartStepCount);
+            setParamNormalized(kMpeEnableParamId, (pb & kStateMpeBit) ? 1.0 : 0.0);
             bundle += kStateHeaderLen;
             blen -= kStateHeaderLen;
         }

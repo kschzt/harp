@@ -182,6 +182,44 @@ else
     echo "   (AU raw-MPE check skipped: au-host / AU component absent — macOS only)"
 fi
 
+# VST3 RAW-MIDI MPE (Ableton Live on VST3 -> IMidiMapping). The "MPE" toggle
+# engages the zone; per-channel pitch-bend / CC74 arrive as mapped param changes
+# the shell reconstructs into the SAME §9.5 per-voice mods. Cross-format: VST3 raw
+# == CLAP note-expression (== AU raw, where the AU ran), one device. And the
+# toggle PERSISTS in the recall part byte (bit 7): a reloaded MPE-on project
+# engages MPE with no re-arming. Uses the VST3 host/bundle resolved above.
+if [ -x "$V" ] && [ -e "$PLUG" ]; then
+    vrm() { "$V" "$PLUG" $S --seconds 2.0 "$@" --hash 2>/dev/null | grep output-hash | cut -d' ' -f2; }
+    CLM12=$(r --bend -12 --bend-idx 0)                  # CLAP reference: -12 st
+    VRNEUT=$(vrm --mpe-chord 60,64,67)
+    VRB0=$(vrm --mpe-chord 60,64,67 --mpe-bend -12 --mpe-bend-idx 0)
+    VRB1=$(vrm --mpe-chord 60,64,67 --mpe-bend -12 --mpe-bend-idx 1)
+    VRTB=$(vrm --mpe-chord 60,64,67 --mpe-timbre 1.0 --mpe-timbre-idx 0)
+    # persistence: save an MPE-armed project, reload it WITHOUT re-arming
+    # (--mpe-no-arm) — MPE must engage solely from the persisted toggle (bit 7 of
+    # the recall part byte). The control (no state, no arm) must NOT engage.
+    VST=$(mktemp -t harp-mpe.XXXXXX)
+    vrm --mpe-chord 60,64,67 --mpe-bend -12 --mpe-bend-idx 0 --save-state "$VST" >/dev/null 2>&1
+    VRLOAD=$(vrm --load-state "$VST" --mpe-chord 60,64,67 --mpe-bend -12 --mpe-bend-idx 0 --mpe-no-arm)
+    VRCTRL=$(vrm --mpe-chord 60,64,67 --mpe-bend -12 --mpe-bend-idx 0 --mpe-no-arm)
+    rm -f "$VST"
+    echo "   VST3 raw-MPE: neutral=$VRNEUT bend-12 v0=$VRB0 v1=$VRB1 timbre=$VRTB"
+    echo "                persist reload=$VRLOAD control=$VRCTRL  (CLAP-12=$CLM12 cutoff=$CUT0 AU-12=${AUB0:-n/a})"
+    for nm in CLM12 VRNEUT VRB0 VRB1 VRTB VRLOAD VRCTRL; do
+        eval "v=\$$nm"
+        [ -n "$v" ] || { echo "MPE FAIL: VST3 raw-MPE $nm produced no hash (device busy/absent?)"; exit 3; }
+    done
+    [ "$VRNEUT" = "$CHORD_HASH" ] || fail "VST3 raw-MPE zone collapse ($VRNEUT) != plain chord $CHORD_HASH — a member-channel chord MUST collapse onto ONE part (§9.4)"
+    [ "$VRB0" = "$CLM12" ]        || fail "VST3 raw-MPE bend -12 ($VRB0) != CLAP note-expr bend -12 ($CLM12) — raw MPE not cross-format byte-identical"
+    [ "$VRB0" != "$VRB1" ]        || fail "VST3 raw-MPE pitch not per-voice (v0=$VRB0 v1=$VRB1) — the bend hit the part, not one voice"
+    [ "$VRTB" = "$CUT0" ]         || fail "VST3 raw-MPE CC74 timbre ($VRTB) != CLAP Brightness ($CUT0) — timbre axis not cross-format byte-identical"
+    [ "$VRLOAD" = "$VRB0" ]       || fail "VST3 MPE toggle did NOT persist: reloaded MPE-on project ($VRLOAD) != armed bend ($VRB0)"
+    [ "$VRCTRL" != "$VRB0" ]      || fail "VST3 raw-MPE persistence control ($VRCTRL) == armed ($VRB0) — no-state + no-arm must NOT engage MPE"
+    [ -z "$AUB0" ] || [ "$VRB0" = "$AUB0" ] || fail "VST3 raw-MPE bend ($VRB0) != AU raw-MPE bend ($AUB0) — the two raw-MIDI paths must render identically"
+else
+    echo "   (VST3 raw-MPE check skipped: harp-vst3-host / VST3 bundle absent)"
+fi
+
 echo "MPE PASS (on $SERIAL: CLAP/VST3/AU all drive §9.5 per-voice pitch/timbre/"
 echo "   pressure — neutral is byte-identical, voices bend to distinct mixes, pitch"
 echo "   and timbre are independent axes, the base/recall is untouched, and the same"

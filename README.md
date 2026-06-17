@@ -261,13 +261,15 @@ The shell can also be driven without any DAW, which is how it is tested:
   per-note axes drive per-voice modulation: pitch-bend (semitones), timbre
   (CC74/brightness → filter cutoff), and pressure (→ loudness). They arrive as
   CLAP note expressions, VST3 Note Expression (Cubase + the per-note UI), or —
-  for Logic and Ableton Live, which send MPE to an AU as **raw 16-channel
-  MIDI** — a member-channel-per-note stream that `shell/mpe_zone.h` collapses
-  onto one device part (a member channel must never become the multitimbral part,
-  §9.4). However it arrives, the shell maps each axis to the SAME §9.5 per-voice
-  mod, so a chord bends every note independently and the *same gesture renders
-  byte-identically across all three shells* (a neutral MPE chord across member
-  channels == the plain chord; raw bend −12 == CLAP note-expression bend −12).
+  for the DAWs that send MPE as **raw 16-channel MIDI** (a member-channel-per-note
+  stream): Logic and Ableton Live into the AU, and Ableton Live into the VST3 (via
+  `IMidiMapping`, engaged by the plugin's "MPE" toggle, which persists with the
+  project). `shell/mpe_zone.h` collapses the zone onto one device part — a member
+  channel must never become the multitimbral part (§9.4). However it arrives, the
+  shell maps each axis to the SAME §9.5 per-voice mod, so a chord bends every note
+  independently and the *same gesture renders byte-identically across all three
+  shells* (a neutral MPE chord across member channels == the plain chord; raw bend
+  −12 == VST3 Note-Expression == CLAP note-expression bend −12).
   Neutral expression is byte-identical to no MPE.
 - **Output metering (§9.9)** — per-part and main-mix peak/RMS, exposed as
   readonly params streamed via echo and read back through `harp-probe meters`;
@@ -329,11 +331,7 @@ The shell can also be driven without any DAW, which is how it is tested:
   T15/T17 (byte-identical renders), T16 (event timing).
 
 **Not yet:** the four-safe-actions UI (v0 auto-resolves by Push-with-archive),
-raw 16-channel MPE-MIDI input for the **VST3** shell (Ableton Live on Windows
-sends MPE as raw member-channel MIDI, which VST3 surfaces only via `IMidiMapping`
-→ params; the AU raw-MPE bridge and the CLAP/VST3 note-expression paths are in,
-and Cubase-VST3 is covered by Note Expression, so this is the one remaining host
-path), the deeper diagnostics (`diag.bundle` / loopback, §14), runtime/shell process split
+the deeper diagnostics (`diag.bundle` / loopback, §14), runtime/shell process split
 (§15.1), firmware management (§13), class-audio coexistence (§8.5), free-running
 ASRC for analog devices, the TCP companion spec (§4.4).
 

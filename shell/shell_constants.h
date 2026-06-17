@@ -23,6 +23,38 @@ static constexpr int kPartStepCount = 15; /* 16 parts (0..15); VST3 stepCount = 
 static const uint8_t kStateHeaderMagic[3] = {'H', 'P', '1'};
 static constexpr size_t kStateHeaderLen = sizeof kStateHeaderMagic + 1; /* magic + part byte */
 
+/* The part byte is 0..15 (4 bits); its high bit 7 persists the VST3 MPE-enable
+ * toggle (raw-MIDI MPE engage — see below). Packed here, NOT as a new header byte,
+ * so the header length + magic are unchanged and the cross-format-recall oracle
+ * stays byte-identical: an MPE-off instance writes part byte = part (bit 7 clear),
+ * exactly as before; old 'HP1' projects (bit 7 clear) migrate to MPE-off; and the
+ * AU reads the part with `& 0xf`, harmlessly ignoring the bit. */
+static constexpr uint8_t kStatePartMask = 0x0fu;
+static constexpr uint8_t kStateMpeBit = 0x80u;
+
+/* §9.5 raw-MIDI MPE (VST3): per-channel pitch-bend / CC74-timbre / channel-
+ * pressure arrive in VST3 only as IMidiMapping-routed PARAM changes (the host
+ * turns the member-channel MIDI into them). The controller maps each
+ * (channel, axis) to one hidden param id here; the processor decodes the id back
+ * to (channel, axis) and feeds the value through shell/mpe_zone.h. Reserved at
+ * 0x3000+, stride 4 per channel (axes 0 pitch / 1 timbre / 2 pressure; 3 spare),
+ * clear of the 1..13 device params, the 97/98/99 host params, and the 0x1000
+ * meter ids — and special-cased out of the device param-set path like Part. The
+ * "MPE" toggle (id 97) engages the zone: classic-MPE auto-detect (MCM/RPN) does
+ * not survive VST3's per-param automation model, so VST3 uses an explicit toggle
+ * (the AU still auto-detects from ordered raw MIDI). */
+static constexpr uint32_t kMpeEnableParamId = 97;
+static constexpr uint32_t kMpeMidiBase = 0x3000u;
+static constexpr uint32_t kMpeMidiAxes = 4u; /* stride per channel (3 used + 1 spare) */
+static constexpr uint32_t kMpeMidiCount = 16u * kMpeMidiAxes; /* 16 channels */
+enum { kMpeAxisBend = 0, kMpeAxisTimbre = 1, kMpeAxisPressure = 2 };
+static constexpr uint32_t mpeMidiId(uint32_t chan, uint32_t axis) {
+    return kMpeMidiBase + (chan & 0xf) * kMpeMidiAxes + axis;
+}
+static constexpr bool isMpeMidiId(uint32_t id) {
+    return id >= kMpeMidiBase && id < kMpeMidiBase + kMpeMidiCount;
+}
+
 /* §9.5 per-voice EXPRESSION mod targets (the MPE pitch/pressure axes). A shell
  * sends these via queueMod to drive a voice's pitch bend (SEMITONES) and
  * loudness (gain); they are NOT §9.3 params — they route to the device's
