@@ -91,7 +91,8 @@ on Linux that runs on every push.
 **What it is, and isn't, yet:** today HARP is a complete recall + audio system
 with one reference device — a Raspberry Pi synth: 16-part multitimbral, 8-voice
 polyphonic per part, with non-destructive per-voice modulation reachable from
-VST3 Note Expression and CLAP per-note parameter modulation. It is *not* yet an
+VST3 Note Expression, CLAP per-note parameter modulation, and MPE (CLAP, VST3,
+and raw 16-channel MIDI into the AU — Logic / Ableton Live). It is *not* yet an
 ecosystem of instruments; building richer synths and shipping real devices on
 top of the protocol is the roadmap, not a claim about the present. The spec is
 an **editor's draft** (0.3.8): breaking changes are expected and negotiated at
@@ -256,11 +257,18 @@ The shell can also be driven without any DAW, which is how it is tested:
   voice); a VST3 Note Expression or a CLAP per-note PARAM_MOD bends one voice's
   filter cutoff non-destructively, byte-identically across the two formats. The
   device's golden render is unchanged when no modulation is sent.
-- **MPE input (§9.5/§9.10)** — an MPE controller's three per-note axes drive
-  per-voice modulation: pitch-bend (semitones), timbre (CC74/brightness → filter
-  cutoff), and pressure (→ loudness). In CLAP these arrive as native note
-  expressions; the shell maps each to a §9.5 per-voice mod, so a chord can bend
-  every note independently. Neutral expression is byte-identical to no MPE.
+- **MPE input (§9.5/§9.10), all three shells** — an MPE controller's three
+  per-note axes drive per-voice modulation: pitch-bend (semitones), timbre
+  (CC74/brightness → filter cutoff), and pressure (→ loudness). They arrive as
+  CLAP note expressions, VST3 Note Expression (Cubase + the per-note UI), or —
+  for Logic and Ableton Live, which send MPE to an AU as **raw 16-channel
+  MIDI** — a member-channel-per-note stream that `shell/mpe_zone.h` collapses
+  onto one device part (a member channel must never become the multitimbral part,
+  §9.4). However it arrives, the shell maps each axis to the SAME §9.5 per-voice
+  mod, so a chord bends every note independently and the *same gesture renders
+  byte-identically across all three shells* (a neutral MPE chord across member
+  channels == the plain chord; raw bend −12 == CLAP note-expression bend −12).
+  Neutral expression is byte-identical to no MPE.
 - **Output metering (§9.9)** — per-part and main-mix peak/RMS, exposed as
   readonly params streamed via echo and read back through `harp-probe meters`;
   folded read-after-write in the render, so the golden render is unperturbed.
@@ -321,10 +329,11 @@ The shell can also be driven without any DAW, which is how it is tested:
   T15/T17 (byte-identical renders), T16 (event timing).
 
 **Not yet:** the four-safe-actions UI (v0 auto-resolves by Push-with-archive),
-raw 16-channel MPE-MIDI input for the VST3/AU shells (the §9.5 per-voice path +
-CLAP note-expression MPE are in; Ableton-Live-on-VST3 sends MPE as raw member-
-channel MIDI, whose zone-collapse + RPN tracking is the remaining bridge), the
-deeper diagnostics (`diag.bundle` / loopback, §14), runtime/shell process split
+raw 16-channel MPE-MIDI input for the **VST3** shell (Ableton Live on Windows
+sends MPE as raw member-channel MIDI, which VST3 surfaces only via `IMidiMapping`
+→ params; the AU raw-MPE bridge and the CLAP/VST3 note-expression paths are in,
+and Cubase-VST3 is covered by Note Expression, so this is the one remaining host
+path), the deeper diagnostics (`diag.bundle` / loopback, §14), runtime/shell process split
 (§15.1), firmware management (§13), class-audio coexistence (§8.5), free-running
 ASRC for analog devices, the TCP companion spec (§4.4).
 

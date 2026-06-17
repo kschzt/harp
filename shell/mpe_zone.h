@@ -220,7 +220,16 @@ struct MpeZone {
      * §9.5 key. The MASTER channel bends the whole zone: semis via masterPbRange
      * with voiceKey 0 (part-wide), so it shifts every sounding voice on the part
      * — the device's voice==0 mod path (engine.c:1250). Returns valid=false off
-     * the active zone or when a member channel has no live note. */
+     * the active zone or when a member channel has no live note.
+     *
+     * KNOWN LIMIT — master-channel (part-wide, voiceKey 0) messages are correct
+     * only when the instance part is 0: the runtime derives a mod's part from
+     * (voiceKey>>8)&0xf (runtime.cpp), so voiceKey 0 always encodes part 0. On a
+     * non-zero instance part a zone-wide master bend/pressure would land on part
+     * 0, not this part. The per-note (member-channel) path — the primary MPE
+     * dimension — is correct for ANY part. (A fix would fan the master message
+     * out to each live member voice; deferred until a non-zero-part MPE rig
+     * needs it.) */
     MpeMod pitchBend(uint8_t chan, uint16_t value14) const {
         if (!active()) return {0, 0.0f, false};
         float norm = ((float)(int)value14 - 8192.0f) / 8192.0f; /* -1..+1 */
