@@ -1,6 +1,11 @@
 #!/bin/sh
-# mpe-test — MPE input (CLAP first): the three MPE expression axes drive §9.5
-# per-voice modulation, deterministically and non-destructively.
+# mpe-test — MPE input across ALL THREE shells: the three MPE expression axes
+# drive §9.5 per-voice modulation, deterministically and non-destructively, and
+# the SAME gesture renders byte-identically no matter which shell decoded it.
+#   CLAP  note expressions (TUNING/BRIGHTNESS/PRESSURE) — the per-note path.
+#   VST3  Note Expression (kTuning/kBrightness) — Cubase + the per-note UI.
+#   AU    classic MPE as RAW 16-channel MIDI (MCM + member channels) — Logic and
+#         Ableton Live, collapsed onto one part by shell/mpe_zone.h.
 #
 # An MPE controller's per-note expression arrives in CLAP as note expressions
 # (TUNING = pitch X, BRIGHTNESS = timbre Y, PRESSURE = Z) keyed by note_id; the
@@ -111,6 +116,50 @@ else
     echo "   (VST3 cross-format pitch check skipped: harp-vst3-host / VST3 bundle absent)"
 fi
 
-echo "MPE PASS (on $SERIAL: CLAP note expressions drive §9.5 per-voice pitch/timbre/"
-echo "   pressure — neutral is byte-identical, three voices bend to three distinct mixes,"
-echo "   pitch and timbre are independent axes, and the base/recall is untouched)"
+# CLASSIC-MPE over RAW 16-channel MIDI — what Logic / Ableton Live send to an AU
+# (they do NOT emit VST3/CLAP note expressions). au-host injects an MPE Config
+# Message + each chord note on its OWN member channel with per-note pitch /
+# pressure / CC74; the shell's mpe_zone COLLAPSES the zone onto one part and
+# carries each axis as the SAME §9.5 per-voice mod the note-expression path uses.
+# Two byte-identity proofs make this airtight (no baked MPE magic numbers):
+#   COLLAPSE   a neutral --mpe-chord (3 notes across 3 member channels) renders
+#              IDENTICALLY to those notes via plain --chord — a member channel
+#              never becomes the device part (§9.4), the whole zone is one part.
+#   X-FORMAT   the SAME pitch gesture via raw MIDI (value14 6144 over the ±48
+#              member range == -12 st exactly) == CLAP's per-note bend -12, and
+#              raw CC74=127 == CLAP Brightness 1.0 (CUT0) — one device, identical
+#              §9.5 mod regardless of which shell decoded the wire.
+# macOS only (no AU on Linux): self-skips if au-host / the component are absent.
+A="${HOSTBIN_AU:-build-vst/au-host}"
+AUCOMP="${AUCOMP:-$HOME/Library/Audio/Plug-Ins/Components/harp-au.component}"
+if [ -x "$A" ] && [ -e "$AUCOMP" ]; then
+    "$A" $S --seconds 0.5 >/dev/null 2>&1               # AU settle
+    AUPLAIN=$("$A" $S --chord 60,64,67 --seconds 2.0 --hash 2>/dev/null | grep output-hash | cut -d' ' -f2)
+    AUNEUT=$("$A" $S --mpe-chord 60,64,67 --seconds 2.0 --hash 2>/dev/null | grep output-hash | cut -d' ' -f2)
+    AUB0=$("$A" $S --mpe-chord 60,64,67 --mpe-bend -12 --mpe-bend-idx 0 --seconds 2.0 --hash 2>/dev/null | grep output-hash | cut -d' ' -f2)
+    AUB1=$("$A" $S --mpe-chord 60,64,67 --mpe-bend -12 --mpe-bend-idx 1 --seconds 2.0 --hash 2>/dev/null | grep output-hash | cut -d' ' -f2)
+    AUPR0=$("$A" $S --mpe-chord 60,64,67 --mpe-press 0.6 --mpe-press-idx 0 --seconds 2.0 --hash 2>/dev/null | grep output-hash | cut -d' ' -f2)
+    AUTB0=$("$A" $S --mpe-chord 60,64,67 --mpe-timbre 1.0 --mpe-timbre-idx 0 --seconds 2.0 --hash 2>/dev/null | grep output-hash | cut -d' ' -f2)
+    CLBM12=$(r --bend -12 --bend-idx 0)                 # CLAP reference: same -12 gesture
+    echo "   AU raw-MPE: plain=$AUPLAIN neutral=$AUNEUT (collapse) bend-12 v0=$AUB0 v1=$AUB1"
+    echo "              press .6 v0=$AUPR0 timbre=$AUTB0  (CLAP bend-12=$CLBM12 cutoff=$CUT0)"
+    for n in AUPLAIN AUNEUT AUB0 AUB1 AUPR0 AUTB0 CLBM12; do
+        eval "v=\$$n"
+        [ -n "$v" ] || { echo "MPE FAIL: AU $n produced no hash (device busy/absent?)"; exit 3; }
+    done
+    [ "$AUPLAIN" = "$CHORD_HASH" ] || fail "AU plain $AUPLAIN != chord golden $CHORD_HASH"
+    [ "$AUNEUT" = "$AUPLAIN" ]     || fail "AU MPE zone collapse ($AUNEUT) != plain chord — a member-channel chord MUST collapse onto ONE part byte-identically (§9.4)"
+    [ "$AUB0" != "$AUNEUT" ]       || fail "AU MPE pitch bend did not change the render"
+    [ "$AUB0" != "$AUB1" ]         || fail "AU MPE pitch not per-voice (v0=$AUB0 v1=$AUB1) — the bend hit the part, not one voice"
+    [ "$AUPR0" != "$AUNEUT" ]      || fail "AU MPE pressure did not change the render"
+    [ "$AUB0" = "$CLBM12" ]        || fail "AU raw-MPE bend ($AUB0) != CLAP note-expr bend ($CLBM12) — raw 16-ch MPE pitch not cross-format byte-identical"
+    [ "$AUTB0" = "$CUT0" ]         || fail "AU raw-MPE CC74 timbre ($AUTB0) != CLAP Brightness ($CUT0) — timbre axis not cross-format byte-identical"
+else
+    echo "   (AU raw-MPE check skipped: au-host / AU component absent — macOS only)"
+fi
+
+echo "MPE PASS (on $SERIAL: CLAP/VST3/AU all drive §9.5 per-voice pitch/timbre/"
+echo "   pressure — neutral is byte-identical, voices bend to distinct mixes, pitch"
+echo "   and timbre are independent axes, the base/recall is untouched, and the same"
+echo "   gesture renders identically across shells: VST3 Tuning == CLAP bend, and raw"
+echo "   16-channel MPE (AU) collapses onto one part == the plain chord + == CLAP bend)"

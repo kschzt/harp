@@ -9,6 +9,15 @@
  *           [--set ID=V]... [--notes N,..] [--chord N,..] [--bpm B]
  *           [--loop A:B] [--block N] [--seconds S] [--out f.wav] [--hash]
  *           [--part N] [--save-state FILE] [--load-state FILE]
+ *           [--mpe-chord N,..] [--mpe-members N] [--mpe-range SEMIS]
+ *           [--mpe-bend SEMIS --mpe-bend-idx K] [--mpe-press 0..1 --mpe-press-idx K]
+ *           [--mpe-timbre 0..1 --mpe-timbre-idx K]
+ *
+ * --mpe-* inject classic MPE as raw 16-channel MIDI (what Logic / Ableton Live
+ * send to an AU): an MPE Configuration Message + each note on its own member
+ * channel, so the shell's mpe_zone collapses the zone onto the instance part and
+ * carries the per-note pitch/pressure/timbre as §9.5 per-voice mods. A neutral
+ * --mpe-chord therefore hashes identically to the same notes via plain --chord.
  *
  * --part/--save-state/--load-state mirror tools/vst3-host so a project can be
  * MOVED across formats: the on-disk state file uses the exact same layout
@@ -156,7 +165,18 @@ int main(int argc, char **argv) {
     desc.componentSubType = 'rfdv';
     desc.componentManufacturer = 'HARP';
     std::vector<std::pair<uint32_t, float>> sets;
-    std::vector<int> notes, chord;
+    std::vector<int> notes, chord, mpe_chord;
+    /* classic-MPE injection (raw 16-channel MIDI — what Logic / Ableton Live send
+     * to an AU): --mpe-chord plays each note on its own LOWER-zone member channel
+     * (ch1, ch2, …) after an MPE Configuration Message, so the shell's mpe_zone
+     * collapses the zone onto the instance part. Per-note expression rides the
+     * member channel: --mpe-bend SEMIS (14-bit pitch bend scaled by the member PB
+     * range), --mpe-press 0..1 (channel pressure), --mpe-timbre 0..1 (CC74). */
+    int mpe_members = 0;       /* MCM member count; 0 = derive from --mpe-chord size */
+    double mpe_range = 48.0;   /* member PB range (semitones) sent via RPN 0 */
+    bool has_mpe_bend = false, has_mpe_press = false, has_mpe_timbre = false;
+    double mpe_bend = 0, mpe_press = 0, mpe_timbre = 0;
+    int mpe_bend_idx = 0, mpe_press_idx = 0, mpe_timbre_idx = 0;
     double seconds = 2, bpm = 0, loop_a = -1, loop_b = -1, note_period = 0.6;
     uint32_t block = 256, rate = 48000;
     std::string out_path, save_state_path, load_state_path;
@@ -176,9 +196,9 @@ int main(int argc, char **argv) {
             float val;
             if (sscanf(v.c_str(), "%u=%f", &id, &val) != 2) die("--set wants ID=V");
             sets.push_back({id, val});
-        } else if (a == "--notes" || a == "--chord") {
+        } else if (a == "--notes" || a == "--chord" || a == "--mpe-chord") {
             std::string list = need(a.c_str());
-            auto &dst = a == "--notes" ? notes : chord;
+            auto &dst = a == "--notes" ? notes : (a == "--chord" ? chord : mpe_chord);
             size_t pos = 0;
             while (pos < list.size()) {
                 dst.push_back(atoi(list.c_str() + pos));
@@ -186,7 +206,20 @@ int main(int argc, char **argv) {
                 if (pos == std::string::npos) break;
                 pos++;
             }
-        } else if (a == "--bpm")
+        } else if (a == "--mpe-members")
+            mpe_members = atoi(need("--mpe-members").c_str());
+        else if (a == "--mpe-range")
+            mpe_range = atof(need("--mpe-range").c_str());
+        else if (a == "--mpe-bend") { mpe_bend = atof(need("--mpe-bend").c_str()); has_mpe_bend = true; }
+        else if (a == "--mpe-bend-idx")
+            mpe_bend_idx = atoi(need("--mpe-bend-idx").c_str());
+        else if (a == "--mpe-press") { mpe_press = atof(need("--mpe-press").c_str()); has_mpe_press = true; }
+        else if (a == "--mpe-press-idx")
+            mpe_press_idx = atoi(need("--mpe-press-idx").c_str());
+        else if (a == "--mpe-timbre") { mpe_timbre = atof(need("--mpe-timbre").c_str()); has_mpe_timbre = true; }
+        else if (a == "--mpe-timbre-idx")
+            mpe_timbre_idx = atoi(need("--mpe-timbre-idx").c_str());
+        else if (a == "--bpm")
             bpm = atof(need("--bpm").c_str());
         else if (a == "--loop") {
             if (sscanf(need("--loop").c_str(), "%lf:%lf", &loop_a, &loop_b) != 2)
@@ -349,6 +382,67 @@ int main(int argc, char **argv) {
                                      (UInt32)(onAt - done));
             if (done + n >= total)
                 MusicDeviceMIDIEvent(au, 0x80, (UInt32)cn, 0, (UInt32)(n - 1));
+        }
+        /* classic-MPE chord: configure the zone (MCM + member PB range) then play
+         * the chord ACROSS member channels with optional per-note expression. The
+         * setup CCs are injected in this SAME block right before the note-ons; the
+         * shell's mpe_zone state updates synchronously in MIDIEvent call order, so
+         * the zone is live by the time the notes arrive regardless of when the
+         * device claim settles. A neutral --mpe-chord collapses onto part_ and
+         * therefore hashes IDENTICALLY to the same notes via plain --chord. */
+        if (!mpe_chord.empty()) {
+            size_t onAt = (size_t)(0.1 * rate);
+            int members = mpe_members > 0 ? mpe_members : (int)mpe_chord.size();
+            if (members < 1) members = 1;
+            if (members > 15) members = 15;
+            if (onAt >= done && onAt < done + n) {
+                UInt32 off = (UInt32)(onAt - done);
+                /* MPE Configuration Message on the lower-zone master (ch0): RPN 6,
+                 * data = member count — engages the shell's auto-detect. */
+                MusicDeviceMIDIEvent(au, 0xB0, 101, 0, off);   /* RPN MSB = 0 */
+                MusicDeviceMIDIEvent(au, 0xB0, 100, 6, off);   /* RPN LSB = 6 (MCM) */
+                MusicDeviceMIDIEvent(au, 0xB0, 6, (UInt32)members, off);
+                /* RPN 0 (member PB range, semitones) on member ch1 — AFTER the MCM,
+                 * which re-seeds the ±48 default; the host scales --mpe-bend by it. */
+                int range = (int)(mpe_range + 0.5);
+                if (range < 1) range = 1;
+                if (range > 96) range = 96;
+                MusicDeviceMIDIEvent(au, 0xB1, 101, 0, off);   /* RPN MSB = 0 */
+                MusicDeviceMIDIEvent(au, 0xB1, 100, 0, off);   /* RPN LSB = 0 (PB range) */
+                MusicDeviceMIDIEvent(au, 0xB1, 6, (UInt32)range, off);
+                for (size_t ci = 0; ci < mpe_chord.size(); ci++) {
+                    UInt32 ch = (UInt32)((ci + 1) & 0x0f); /* lower-zone member ch1.. */
+                    MusicDeviceMIDIEvent(au, 0x90 | ch, (UInt32)mpe_chord[ci],
+                                         (UInt32)(0.8f * 127.f + 0.5f) /* == --chord */, off);
+                    /* per-note expression on THIS note's member channel, queued
+                     * right after its note-on (same ts; the voice is already
+                     * minted, so the §9.5 mod lands on it). */
+                    if (has_mpe_bend && (int)ci == mpe_bend_idx) {
+                        double r = mpe_range > 0 ? mpe_range : 48.0;
+                        int v14 = (int)(8192.0 + mpe_bend / r * 8192.0 + 0.5);
+                        if (v14 < 0) v14 = 0;
+                        if (v14 > 16383) v14 = 16383;
+                        MusicDeviceMIDIEvent(au, 0xE0 | ch, (UInt32)(v14 & 0x7f),
+                                             (UInt32)((v14 >> 7) & 0x7f), off);
+                    }
+                    if (has_mpe_press && (int)ci == mpe_press_idx) {
+                        int v = (int)(mpe_press * 127.0 + 0.5);
+                        if (v < 0) v = 0;
+                        if (v > 127) v = 127;
+                        MusicDeviceMIDIEvent(au, 0xD0 | ch, (UInt32)v, 0, off);
+                    }
+                    if (has_mpe_timbre && (int)ci == mpe_timbre_idx) {
+                        int v = (int)(mpe_timbre * 127.0 + 0.5);
+                        if (v < 0) v = 0;
+                        if (v > 127) v = 127;
+                        MusicDeviceMIDIEvent(au, 0xB0 | ch, 74, (UInt32)v, off);
+                    }
+                }
+            }
+            if (done + n >= total)
+                for (size_t ci = 0; ci < mpe_chord.size(); ci++)
+                    MusicDeviceMIDIEvent(au, 0x80 | (UInt32)((ci + 1) & 0x0f),
+                                         (UInt32)mpe_chord[ci], 0, (UInt32)(n - 1));
         }
 
         AudioUnitRenderActionFlags flags = 0;
