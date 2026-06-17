@@ -65,7 +65,9 @@ if(NOT WIN32)
     device/state.c        # engine <-> content-addressed objects
     device/session.c      # protocol handlers + session loop
     device/panel.c        # front-panel unix-socket API
+    host/rtp.c            # §8.7 RTP packetization (--rtp-out emit)
   )
+  target_include_directories(harp-deviced PRIVATE host)
   target_link_libraries(harp-deviced harpcore ${HARP_MATH_LIB} Threads::Threads)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_sources(harp-deviced PRIVATE device/ffs.c) # USB gadget transport (§4.3)

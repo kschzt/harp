@@ -911,8 +911,9 @@ void *audio_thread(void *arg) {
         harp_audio_hdr_encode(&h, frame);
         size_t payload = (size_t)a->nsamples * slots * 4;
         memcpy(frame + HARP_AUDIO_HDR_LEN, samples, payload);
-        if (!harp_write_all(a->fd, frame, HARP_AUDIO_HDR_LEN + payload))
+        if (a->fd >= 0 && !harp_write_all(a->fd, frame, HARP_AUDIO_HDR_LEN + payload))
             break; /* endpoint died (stop/unplug) */
+        audio_rtp_emit(a, samples, payload, msc);  /* §8.7: no-op unless rtp_fd set */
         msc += a->nsamples;
 
         next.tv_nsec += (long)(period_ns % 1000000000ull);

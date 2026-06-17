@@ -219,8 +219,13 @@ typedef struct {
     pthread_t thread;
     _Atomic bool running;    /* session stores false to stop; render polls */
     _Atomic bool thread_live; /* session writes; panel reads for display */
-    int fd;     /* audio IN endpoint: device -> host */
+    int fd;     /* audio IN endpoint: device -> host (-1 = none, RTP-only) */
     int out_fd; /* audio OUT endpoint: host -> device (pacing, mode 1) */
+    /* §8.7 Ethernet emit: when rtp_fd >= 0 the free-running render loop also
+     * sends each rendered block as RTP/UDP (connected socket); ts = MSC. */
+    int rtp_fd;
+    uint16_t rtp_seq;
+    uint32_t rtp_ssrc;
     uint32_t mode, rate, nsamples, epoch;
     uint64_t reanchors;
     /* requested OUTPUT slots (§6.3 active-slots-out, audio.start key 4): the
@@ -292,6 +297,9 @@ void evq_push(dev_event ev);
 void evq_reset_for_new_stream(void);
 void *audio_thread(void *arg);
 void audio_stop(device *d);
+/* §8.7 RTP/UDP emit of one rendered block; no-op unless a->rtp_fd >= 0.
+ * Defined in harp-deviced.c so engine.c stays free of socket code. */
+void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, uint64_t msc);
 void engine_meters_reset(void); /* §9.9: clear meters to the silent floor */
 
 /* ---------------- state.c ---------------- */

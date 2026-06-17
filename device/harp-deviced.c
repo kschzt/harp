@@ -19,16 +19,20 @@
  */
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include "device.h"
+#include "rtp.h"
 
 /* THE device. One per daemon; modules share it via device.h. */
 device g_dev;
@@ -63,6 +67,60 @@ static uint64_t bump_boot_count(const char *dir) {
 }
 
 
+/* §8.7: send one rendered block as an RTP/UDP datagram (header + samples via
+ * iovec, no copy). No-op unless --rtp-out armed this socket. Called from the
+ * engine's free-running render loop; sockets live here, not in engine.c. */
+void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, uint64_t msc) {
+    if (a->rtp_fd < 0) return;
+    uint8_t hdr[HARP_RTP_HDR_BYTES];
+    harp_rtp_hdr h = {96, 0, a->rtp_seq++, (uint32_t)msc, a->rtp_ssrc};
+    harp_rtp_pack(hdr, sizeof hdr, &h, NULL, 0);
+    struct iovec iov[2] = {{hdr, HARP_RTP_HDR_BYTES}, {(void *)samples, payload_bytes}};
+    struct msghdr m = {0};
+    m.msg_iov = iov;
+    m.msg_iovlen = 2;
+    (void)sendmsg(a->rtp_fd, &m, 0);
+}
+
+/* Standalone §8.7 emit mode (--rtp-out HOST:PORT): free-running mono main-mix
+ * over RTP/UDP, paced by the device clock. The real engine, no host needed —
+ * the device side of the network audio plane. Blocks until killed. */
+static int run_rtp_out(device *d, const char *hostport) {
+    const char *colon = strrchr(hostport, ':');
+    if (!colon || colon == hostport) { fprintf(stderr, "--rtp-out needs HOST:PORT\n"); return 2; }
+    char host[256];
+    size_t hl = (size_t)(colon - hostport);
+    if (hl >= sizeof host) return 2;
+    memcpy(host, hostport, hl); host[hl] = 0;
+    int rport = atoi(colon + 1);
+
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 1;
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)rport);
+    if (inet_pton(AF_INET, host, &a.sin_addr) != 1) {
+        struct addrinfo hints = {0}, *res = NULL;
+        hints.ai_family = AF_INET; hints.ai_socktype = SOCK_DGRAM;
+        if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+            fprintf(stderr, "--rtp-out: cannot resolve %s\n", host); return 1;
+        }
+        a.sin_addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+        freeaddrinfo(res);
+    }
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) { fprintf(stderr, "--rtp-out: connect failed\n"); return 1; }
+
+    audio_state *au = &d->audio;
+    au->fd = au->out_fd = -1;             /* no framed transport — RTP only       */
+    au->rtp_fd = fd; au->rtp_ssrc = 0x48415250u /* "HARP" */; au->rtp_seq = 0;
+    au->mode = 0; au->rate = 48000; au->nsamples = 256; au->epoch = 1;
+    au->out_slots[0] = 0; au->n_out_slots = 1;   /* mono: main-mix slot 0         */
+    atomic_store_explicit(&au->running, true, memory_order_relaxed);
+    fprintf(stderr, "harp-deviced: §8.7 RTP emit -> %s:%d (48k mono, free-running)\n", host, rport);
+    audio_thread(d);                       /* render+emit in this thread until killed */
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *state_dir = "./refdev-state";
     const char *serial = "SIM-0001";
@@ -70,6 +128,7 @@ int main(int argc, char **argv) {
     const char *gadget = "/sys/kernel/config/usb_gadget/harp";
     int port = 47800;
     const char *panel_sock = "/tmp/harp-panel.sock"; /* "" disables */
+    const char *rtp_out = NULL;                       /* §8.7 emit dest HOST:PORT */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc)
             state_dir = argv[++i];
@@ -83,6 +142,8 @@ int main(int argc, char **argv) {
             gadget = argv[++i];
         else if (strcmp(argv[i], "--panel-sock") == 0 && i + 1 < argc)
             panel_sock = argv[++i];
+        else if (strcmp(argv[i], "--rtp-out") == 0 && i + 1 < argc)
+            rtp_out = argv[++i];
         else {
             fprintf(stderr,
                     "usage: harp-deviced [--state-dir DIR] [--serial S] "
@@ -129,6 +190,9 @@ int main(int argc, char **argv) {
                         (unsigned long long)live.generation);
         }
     }
+
+    if (rtp_out)
+        return run_rtp_out(d, rtp_out);
 
     if (ffs_dir) {
 #ifdef __linux__

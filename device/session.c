@@ -800,6 +800,7 @@ static void handle_audio_start(device *d, const harp_env *e) {
     evq_reset_for_new_stream();
     d->audio.fd = fd;
     d->audio.out_fd = out_fd;
+    d->audio.rtp_fd = -1;   /* USB/host-paced path never RTP-emits (rtp_fd<0 => no-op) */
     d->audio.mode = (uint32_t)mode;
     d->audio.rate = (uint32_t)rate;
     d->audio.nsamples = (uint32_t)nsamples;
