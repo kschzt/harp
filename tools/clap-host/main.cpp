@@ -24,7 +24,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <fstream>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 
 #include <clap/clap.h>
@@ -34,6 +36,42 @@
 static void die(const std::string &m) {
     fprintf(stderr, "clap-host: %s\n", m.c_str());
     exit(2);
+}
+
+/* Resolve the dlopen-able binary inside a .clap. On Linux/Windows a .clap is a
+ * bare shared library — dlopen the path directly. On macOS it is a CFBundle
+ * DIRECTORY (Contents/MacOS/<CFBundleExecutable>); dlopen of the directory
+ * fails, so we read CFBundleExecutable from Contents/Info.plist (basename-minus-
+ * .clap fallback) and dlopen the inner Mach-O. This makes the gate load EXACTLY
+ * the artifact a DAW loads — the bundle — not a side dylib. The bundle path is
+ * still what we hand to clap_entry->init() (the CLAP contract: init gets the
+ * bundle so the plugin can find Contents/Resources). */
+static std::string clap_binary_path(const std::string &clapPath) {
+    struct stat st;
+    if (stat(clapPath.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
+        return clapPath; /* bare lib (Linux/Windows) — dlopen directly */
+    std::string exe;
+    std::ifstream plist(clapPath + "/Contents/Info.plist");
+    std::string line;
+    while (std::getline(plist, line)) {
+        auto k = line.find("CFBundleExecutable");
+        if (k == std::string::npos) continue;
+        /* value is the next <string>…</string>, on this line or the following */
+        std::string scan = line;
+        for (int i = 0; i < 2 && scan.find("<string>") == std::string::npos; i++)
+            std::getline(plist, scan);
+        auto a = scan.find("<string>"), b = scan.find("</string>");
+        if (a != std::string::npos && b != std::string::npos)
+            exe = scan.substr(a + 8, b - (a + 8));
+        break;
+    }
+    if (exe.empty()) { /* fallback: bundle basename without the .clap extension */
+        auto slash = clapPath.find_last_of('/');
+        std::string base = slash == std::string::npos ? clapPath : clapPath.substr(slash + 1);
+        auto dot = base.rfind(".clap");
+        exe = dot == std::string::npos ? base : base.substr(0, dot);
+    }
+    return clapPath + "/Contents/MacOS/" + exe;
 }
 
 /* ---- minimal host (the plugin asks for almost nothing in this harness) ---- */
@@ -107,12 +145,13 @@ int main(int argc, char **argv) {
     }
     if (note_period == 0.0) note_period = 0.6; /* --notes spacing; matches harp-vst3-host's default */
 
-    /* ---- load the .clap (a plain MODULE dylib) ---- */
-    void *dso = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    /* ---- load the .clap (bare lib on Linux/Windows, CFBundle on macOS) ---- */
+    std::string binary = clap_binary_path(path); /* inner Mach-O if a bundle */
+    void *dso = dlopen(binary.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!dso) die("dlopen failed: " + std::string(dlerror() ? dlerror() : "?"));
     auto *entry = (const clap_plugin_entry_t *)dlsym(dso, "clap_entry");
     if (!entry) die("no clap_entry symbol");
-    if (!entry->init(path.c_str())) die("entry init failed");
+    if (!entry->init(path.c_str())) die("entry init failed"); /* init() gets the bundle path */
     auto *factory = (const clap_plugin_factory_t *)entry->get_factory(CLAP_PLUGIN_FACTORY_ID);
     if (!factory || factory->get_plugin_count(factory) < 1) die("no plugin factory");
     const clap_plugin_descriptor_t *desc = factory->get_plugin_descriptor(factory, 0);

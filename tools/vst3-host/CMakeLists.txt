@@ -142,11 +142,60 @@ if(LIBUSB_FOUND)
   target_compile_definitions(harp-clap PRIVATE HAVE_LIBUSB)
   target_link_directories(harp-clap PRIVATE ${LIBUSB_LIBRARY_DIRS})
   target_link_libraries(harp-clap PRIVATE ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS})
-  set_target_properties(harp-clap PROPERTIES PREFIX "" OUTPUT_NAME "harp-clap" SUFFIX ".clap")
-  if(APPLE) # libusb on macOS pulls these; the VST3/AU shells get them via their SDKs
-    target_link_libraries(harp-clap PRIVATE "-framework CoreFoundation" "-framework IOKit")
+  if(APPLE)
+    # macOS DAWs load a .clap as a CFBundle (Contents/MacOS/<exe> + Info.plist),
+    # exactly like the AU .component below — NOT a flat dylib. Mirror harp-au.
+    set_target_properties(harp-clap PROPERTIES
+      BUNDLE TRUE
+      BUNDLE_EXTENSION "clap"
+      OUTPUT_NAME "harp-clap"
+      MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/../clap-host/clap-info.plist.in)
+    target_link_libraries(harp-clap PRIVATE # libusb on macOS pulls these in
+      "-framework CoreFoundation" "-framework IOKit")
+    # re-seal the bundle (like harp-shell.vst3 / harp-au): a broken/absent seal
+    # makes the hardened loader / some DAWs refuse it.
+    add_custom_command(TARGET harp-clap POST_BUILD
+      COMMAND codesign --force -s - "$<TARGET_BUNDLE_DIR:harp-clap>"
+      COMMENT "Ad-hoc signing harp-clap.clap")
+  else()
+    # Linux/Windows: a .clap is a plain shared library (no bundle).
+    set_target_properties(harp-clap PROPERTIES PREFIX "" OUTPUT_NAME "harp-clap" SUFFIX ".clap")
+  endif()
+  if(WIN32) # static libusb pulls in the Win device-enum + COM GUID APIs (as harp-shell)
+    target_link_libraries(harp-clap PRIVATE setupapi ole32)
   endif()
   message(STATUS "harp-clap: building CLAP shell with libusb")
+
+  # ---- install-clap: stage the .clap in the OS plugin dir for a real DAW ----
+  # (the clap-test gate runs against the build tree, not this; this is for DAWs.)
+  if(APPLE)
+    set(HARP_CLAP_DEST "$ENV{HOME}/Library/Audio/Plug-Ins/CLAP")
+  elseif(WIN32)
+    set(HARP_CLAP_DEST "$ENV{CommonProgramW6432}/CLAP")
+  else()
+    set(HARP_CLAP_DEST "$ENV{HOME}/.clap")
+  endif()
+  if(NOT HARP_CLAP_DEST OR HARP_CLAP_DEST MATCHES "^/+CLAP$" OR HARP_CLAP_DEST STREQUAL "/.clap")
+    set(HARP_CLAP_DEST "${CMAKE_BINARY_DIR}/dist/CLAP") # env unset — never write to root
+  endif()
+  if(APPLE) # the bundle is a directory: copy it whole, then re-sign (copy can break the seal)
+    add_custom_target(install-clap
+      COMMAND ${CMAKE_COMMAND} -E rm -rf "${HARP_CLAP_DEST}/harp-clap.clap"
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${HARP_CLAP_DEST}"
+      COMMAND ${CMAKE_COMMAND} -E copy_directory "$<TARGET_BUNDLE_DIR:harp-clap>"
+              "${HARP_CLAP_DEST}/harp-clap.clap"
+      COMMAND codesign --force -s - "${HARP_CLAP_DEST}/harp-clap.clap"
+      DEPENDS harp-clap
+      COMMENT "Installing harp-clap.clap -> ${HARP_CLAP_DEST}")
+  else() # bare shared library: a single file (rm the FILE, never rm -rf the shared dir)
+    add_custom_target(install-clap
+      COMMAND ${CMAKE_COMMAND} -E rm -f "${HARP_CLAP_DEST}/harp-clap.clap"
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${HARP_CLAP_DEST}"
+      COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:harp-clap>"
+              "${HARP_CLAP_DEST}/harp-clap.clap"
+      DEPENDS harp-clap
+      COMMENT "Installing harp-clap.clap -> ${HARP_CLAP_DEST}")
+  endif()
 
   # ---- clap-host: minimal CLI CLAP host (the CLAP analogue of harp-vst3-host) ----
   # dlopen()s the .clap, drives notes/params/per-note PARAM_MOD, hashes the owner

@@ -478,5 +478,11 @@ static const void *entry_get_factory(const char *factory_id) {
 
 } // namespace
 
-extern "C" const clap_plugin_entry_t clap_entry = {CLAP_VERSION_INIT, entry_init, entry_deinit,
-                                                   entry_get_factory};
+/* CLAP_EXPORT is load-bearing on Windows (MSVC won't export clap_entry from the
+ * DLL otherwise — every host's GetProcAddress("clap_entry") returns NULL and the
+ * plugin is silently skipped). It is visibility("default") on mac/Linux clang/gcc
+ * (a no-op today since nothing sets -fvisibility=hidden, but it also hardens
+ * against anyone adding that flag or LTO later). The §9.x entry contract is
+ * unchanged. */
+extern "C" CLAP_EXPORT const clap_plugin_entry_t clap_entry = {
+    CLAP_VERSION_INIT, entry_init, entry_deinit, entry_get_factory};

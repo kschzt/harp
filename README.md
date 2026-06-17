@@ -78,9 +78,11 @@ automation, offline bounce through the box, and a 16-part multitimbral,
 8-voice-polyphonic instrument — with per-voice modulation — driven by several
 plugin instances over one shared session. The plugin shell builds and is
 CI-validated on **macOS, Windows, and Linux** — a VST3 on all three (pluginval
-strictness 10), an Audio Unit on macOS (`auval`) at full parity, and a CLAP
-(macOS + Linux), all three rendering byte-identically and a project's per-part
-recall state moving between them — and the device has been driven from **Ableton
+strictness 10), an Audio Unit on macOS (`auval`) at full parity, and a CLAP on
+all three (a macOS `.clap` bundle, Windows/Linux shared libraries — installable
+to the OS plugin dir via `install-clap`), all three formats rendering
+byte-identically and a project's per-part recall state moving between them — and
+the device has been driven from **Ableton
 Live** (macOS + Windows) and
 **Renoise** (Windows) by hand, plus a headless **REAPER** render-and-recall e2e
 on Linux that runs on every push.
@@ -234,7 +236,7 @@ The shell can also be driven without any DAW, which is how it is tested:
   `harp-stream` (free-running and host-paced; `audio.deterministic` +
   `audio.offline-rate`), and the USB binding.
 - **The plugin shell** — VST3 on macOS/Windows/Linux, an Audio Unit on macOS,
-  and a CLAP on macOS/Linux (all three byte-identical), driving the device in
+  and a CLAP on macOS/Windows/Linux (all three byte-identical), driving the device in
   Ableton Live (macOS + Windows), Renoise (Windows), and an automated headless
   REAPER render (Linux).
 - **Polyphony + per-voice modulation (§9.5)** — each part is an 8-voice pool

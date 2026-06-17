@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key><string>English</string>
+    <!-- MUST equal the inner Mach-O name (Contents/MacOS/harp-clap); the host
+         reads this to find the binary, then resolves the clap_entry symbol.
+         A mismatch makes the plugin silently un-loadable. -->
+    <key>CFBundleExecutable</key><string>harp-clap</string>
+    <key>CFBundleIdentifier</key><string>org.harp.refdev.clap</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleName</key><string>HARP RefDev</string>
+    <!-- A loadable bundle (NOT an app): BNDL. CLAP discovery is by the
+         clap_entry symbol + the plugin factory, so — unlike the AU plist —
+         there is deliberately NO AudioComponents array here. -->
+    <key>CFBundlePackageType</key><string>BNDL</string>
+    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+    <key>CFBundleVersion</key><string>0.1.0</string>
+</dict>
+</plist>

@@ -56,6 +56,9 @@ jobs:
       - name: clone VST3 SDK
         run: git clone --depth 1 --recursive
              https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
+      - name: clone CLAP SDK (header-only)
+        run: git clone --depth 1 --branch 1.2.8
+             https://github.com/free-audio/clap.git external/clap
       - name: fetch libusb (prebuilt MSVC binaries — no pkg-config on Windows)
         shell: pwsh
         run: |
@@ -88,8 +91,20 @@ jobs:
           # load). Full instantiate + process + audio is covered by the hw runner
           # (real Pi over USB) and local Windows runs; hosted runners have no device.
           cmake -B build-vst -S tools/vst3-host -G "Visual Studio 17 2022" -A x64
-          cmake --build build-vst --config Release --target harp-vst3-host harp-shell ring-tests
+          cmake --build build-vst --config Release --target harp-vst3-host harp-shell harp-clap ring-tests
           ctest --test-dir build-vst -C Release --output-on-failure
+          # CLAP: a green build + LoadLibrary does NOT prove clap_entry is in the
+          # DLL export table (MSVC needs __declspec(dllexport) via CLAP_EXPORT) —
+          # GetProcAddress would return NULL and every DAW would silently skip the
+          # plugin. There is no Windows clap-host, so verify the export directly.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vc = & $vswhere -latest -property installationPath
+          $dumpbin = (Get-ChildItem "$vc\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1).FullName
+          $clap = (Get-ChildItem build-vst -Recurse -Filter harp-clap.clap | Select-Object -First 1).FullName
+          if (-not $clap) { throw "harp-clap.clap was not built" }
+          $exports = & $dumpbin /EXPORTS $clap
+          if ($exports -notmatch 'clap_entry') { throw "clap_entry is NOT exported from harp-clap.clap (CLAP_EXPORT missing?)" }
+          Write-Host "clap_entry exported from $clap"
       - name: pluginval (plugin-contract abuse, strictness 10)
         shell: pwsh
         run: |
