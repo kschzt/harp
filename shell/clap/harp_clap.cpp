@@ -47,6 +47,11 @@ static const DevParam kParams[] = {
 };
 static constexpr uint32_t kNumParams = sizeof(kParams) / sizeof(kParams[0]);
 static constexpr uint32_t kCutoffId = 3; /* the per-voice-modulatable param (§9.5) */
+/* §9.5 per-voice EXPRESSION mod targets (the MPE pitch/pressure axes) — MUST
+ * match device.h HARP_MOD_PITCH_BEND / HARP_MOD_PRESSURE (0x2001/0x2002), kept
+ * in sync by hand exactly like the param ids. Pitch is semitones, pressure a gain. */
+static constexpr uint32_t kPitchBendId = 0x2001u;
+static constexpr uint32_t kPressureId = 0x2002u;
 
 static uint8_t envChannelDefault() {
     if (const char *e = getenv("HARP_CHANNEL"); e && e[0]) {
@@ -260,12 +265,27 @@ static void applyEvent(HarpClap *h, const clap_event_header_t *hdr, uint64_t bas
         break;
     }
     case CLAP_EVENT_NOTE_EXPRESSION: {
-        /* Brightness -> per-voice Filter Cutoff, identical mapping to the VST3
-         * shell (value 0..1, 0.5 = no change). Other expressions ignored. */
+        /* CLAP note expressions ARE the per-note (MPE) dimension in CLAP — no
+         * channel zone to collapse. Map the three MPE axes to §9.5 per-voice
+         * mods on the addressed voice (voiceFor(note_id); 0 = part-wide):
+         *   BRIGHTNESS (Y, timbre, 0..1)  -> Filter Cutoff offset (0.5 = none)
+         *   TUNING     (X, pitch, ±120 st) -> per-voice pitch bend (semitones)
+         *   PRESSURE   (Z, 0..1)          -> per-voice loudness gain
+         * All neutral at rest (0 offset / 0 semis / 0 gain) -> golden-identical. */
         auto *e = (const clap_event_note_expression *)hdr;
-        if (e->expression_id == CLAP_NOTE_EXPRESSION_BRIGHTNESS)
-            rt.queueMod(h->source, kCutoffId, (float)(e->value - 0.5),
-                        h->noteVoices.voiceFor(e->note_id), ts);
+        uint32_t voice = h->noteVoices.voiceFor(e->note_id);
+        switch (e->expression_id) {
+        case CLAP_NOTE_EXPRESSION_BRIGHTNESS:
+            rt.queueMod(h->source, kCutoffId, (float)(e->value - 0.5), voice, ts);
+            break;
+        case CLAP_NOTE_EXPRESSION_TUNING:
+            rt.queueMod(h->source, kPitchBendId, (float)e->value, voice, ts);
+            break;
+        case CLAP_NOTE_EXPRESSION_PRESSURE:
+            rt.queueMod(h->source, kPressureId, (float)e->value, voice, ts);
+            break;
+        default: break;
+        }
         break;
     }
     default: break; /* transport is handled in process() — it needs the block size */

@@ -102,6 +102,14 @@ typedef struct {
      * base param_value() — identical codegen, identical bytes. */
     float mod[NPARAMS];
     bool has_mod;
+    /* §9.5 per-voice EXPRESSION (MPE): a pitch bend in SEMITONES on the note
+     * frequency (X axis) and a loudness gain folded into the envelope (Z axis).
+     * SEPARATE from mod[] because neither is a normalized §9.3 param — pitch is
+     * semitones (unclamped), loudness is a multiplicative gain. Both gated at
+     * their use site on != 0, so a voice with no expression renders the LITERAL
+     * golden path bit-for-bit, even when has_mod is set by a (cutoff) param mod. */
+    float bend_semis;
+    float z_gain;
     /* ---- DSP state (VERBATIM from the pre-pool mono voice) ---- */
     float phase_l, phase_r;
     float low_l, band_l, low_r, band_r;
@@ -302,6 +310,8 @@ static void voice_note_on(part *p, int note, float vel, uint32_t voice_id) {
     v->note_seq++; /* retrig edge: the kernel resets the env on seen_seq mismatch */
     v->has_mod = false;
     memset(v->mod, 0, sizeof v->mod);
+    v->bend_semis = 0.0f; /* a fresh/stolen voice starts unbent + unpressured */
+    v->z_gain = 0.0f;
 }
 
 /* Release every active voice currently sounding `note` (set note=-1 so its env
@@ -536,7 +546,13 @@ static void engine_render(part *p, synth_voice *v, float *interleaved, uint32_t 
         }
         bool gate = note >= 0;
         if (gate) {
-            float target = 440.0f * exp2f(((float)note - 69.0f) / 12.0f);
+            /* §9.5 per-voice pitch bend (MPE X): a semitone offset on the note.
+             * Gated on bend_semis != 0 so an unbent voice — including a voice
+             * carrying only a cutoff mod (has_mod set) — keeps the LITERAL
+             * original expression, byte-identical to the golden render. */
+            float target = v->bend_semis != 0.0f
+                ? 440.0f * exp2f(((float)note + v->bend_semis - 69.0f) / 12.0f)
+                : 440.0f * exp2f(((float)note - 69.0f) / 12.0f);
             float glide = VP(p, v, 13);
             if (glide <= 0.001f || (retrig && v->env < 0.2f)) {
                 v->n_freq = target; /* no portamento / fresh attack: arrive
@@ -557,6 +573,10 @@ static void engine_render(part *p, synth_voice *v, float *interleaved, uint32_t 
             v->env_reset--;
         } else {
             float env_target = gate ? v->note_vel : 0.0f;
+            /* §9.5 per-voice loudness (MPE Z / pressure): scale the gated target
+             * by (1 + z_gain). Gated on z_gain != 0 so an unpressured voice keeps
+             * v->note_vel exactly (byte-identical golden). */
+            if (gate && v->z_gain != 0.0f) env_target = v->note_vel * (1.0f + v->z_gain);
             float env_alpha =
                 1.0f - expf(-(float)SMOOTH_SUBBLOCK / ((gate ? atk_tau : rel_tau) * rate));
             v->env += env_alpha * (env_target - v->env);
@@ -1215,16 +1235,22 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                      *                 offset applied to EVERY active voice, the
                      *                 reading consistent with the channel-level
                      *                 §9.4 base — every sounding voice modulates.
-                     * Unknown param id: ignored. */
-                    int idx = param_index(ev->a); /* id -> g_params/mod[] slot */
-                    if (idx >= 0) {
-                        for (int vi = 0; vi < NVOICES; vi++) {
-                            synth_voice *mv = &p->voices[vi];
-                            if (!mv->active) continue;
-                            if (ev->voice != 0 && mv->voice_id != ev->voice) continue;
-                            mv->mod[idx] = ev->v;
-                            mv->has_mod = true;
-                        }
+                     * §9.5 per-voice EXPRESSION (MPE) targets route to dedicated
+                     * voice fields instead of mod[]: HARP_MOD_PITCH_BEND ->
+                     * bend_semis (semitones, unclamped), HARP_MOD_PRESSURE ->
+                     * z_gain (loudness). A normalized param id -> the mod[] layer.
+                     * Unknown id: ignored. */
+                    int idx = param_index(ev->a); /* >=0 = real param; <0 = expr/unknown */
+                    bool is_bend = ev->a == HARP_MOD_PITCH_BEND;
+                    bool is_press = ev->a == HARP_MOD_PRESSURE;
+                    if (idx < 0 && !is_bend && !is_press) break; /* unknown id: ignore */
+                    for (int vi = 0; vi < NVOICES; vi++) {
+                        synth_voice *mv = &p->voices[vi];
+                        if (!mv->active) continue;
+                        if (ev->voice != 0 && mv->voice_id != ev->voice) continue;
+                        if (is_bend) mv->bend_semis = (float)ev->v;     /* X: semitones */
+                        else if (is_press) mv->z_gain = (float)ev->v;   /* Z: loudness gain */
+                        else { mv->mod[idx] = ev->v; mv->has_mod = true; } /* §9.4 param mod */
                     }
                     break;
                 }

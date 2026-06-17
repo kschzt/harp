@@ -124,6 +124,16 @@ void engine_part_param_put(int part_idx, uint32_t id, float v);
 #define METER_ID_RMS(slot) (METER_ID_BASE + (uint32_t)(slot) * 2u + 1u)
 #define METER_NPARAMS (METER_NSLOTS * 2) /* one peak + one rms per slot */
 
+/* §9.5 per-voice EXPRESSION mod targets (the MPE pitch/pressure axes). These are
+ * mod-event ids — NOT §9.3 params (1..13) and NOT meters (0x1000+) — that a shell
+ * sends via a §9.4 mod event (etype 6) to drive a voice's pitch bend (semitones)
+ * and loudness (gain). The device routes them to the voice's bend_semis / z_gain
+ * fields (engine.c); a normalized param id still routes to the mod[] layer. The
+ * SHELLS use these same values (kept in sync by hand, like the §9.3 param ids).
+ * Reserved at 0x2000+ so they cannot collide with params or meters. */
+#define HARP_MOD_PITCH_BEND 0x2001u /* per-voice pitch, SEMITONES (signed) */
+#define HARP_MOD_PRESSURE 0x2002u   /* per-voice loudness, gain (signed, ~0..1) */
+
 /* Render thread writes (engine.c), pump reads (session.c). Relaxed: meters
  * order nothing and a one-block-stale read is musically invisible. */
 extern _Atomic float g_meter_peak[METER_NSLOTS];

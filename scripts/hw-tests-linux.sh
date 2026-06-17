@@ -73,6 +73,7 @@ run scripts/golden-test.sh
 run scripts/note-expr-test.sh
 run scripts/voice-steal-test.sh
 run scripts/clap-test.sh
+run scripts/mpe-test.sh
 run scripts/multitimbral-test.sh
 run scripts/recall-test.sh
 run scripts/recall-perpart-test.sh

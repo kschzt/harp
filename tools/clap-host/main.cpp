@@ -16,7 +16,7 @@
  *
  * usage: clap-host PLUGIN.clap [--rate N] [--block N] [--seconds S] [--channel N]
  *        [--serial S] [--set ID=V]... [--notes N,N,..] [--chord N,N,..]
- *        [--brightness V] [--brightness-idx K] [--out FILE.wav] [--hash]
+ *        [--brightness V] [--brightness-idx K] [--bend SEMIS] [--bend-idx K] [--press V] [--press-idx K] [--out FILE.wav] [--hash]
  */
 #include <cmath>
 #include <cstdint>
@@ -87,6 +87,7 @@ union AnyEvent {
     clap_event_note_t note;
     clap_event_param_value_t pval;
     clap_event_param_mod_t pmod;
+    clap_event_note_expression_t nexp;
 };
 struct InEvents {
     std::vector<AnyEvent> evs;
@@ -106,6 +107,12 @@ int main(int argc, char **argv) {
     uint32_t rate = 48000, block = 256;
     double seconds = 2.0, brightness = -1.0;
     int channel = 0, brightness_idx = 0;
+    /* MPE note expressions, injected on a chosen chord note (per-voice proof):
+     * TUNING (semitones, can be 0/negative) and PRESSURE (0..1). bool flags
+     * because 0 is a meaningful value (neutral). */
+    bool has_bend = false, has_press = false;
+    double bend = 0.0, pressure = 0.0;
+    int bend_idx = 0, press_idx = 0;
     std::vector<std::pair<uint32_t, double>> sets;
     std::vector<int> notes, chord;
     std::string out_path;
@@ -125,6 +132,10 @@ int main(int argc, char **argv) {
         else if (a == "--serial") setenv("HARP_DEVICE_SERIAL", next(i).c_str(), 1);
         else if (a == "--brightness") brightness = atof(next(i).c_str());
         else if (a == "--brightness-idx") brightness_idx = atoi(next(i).c_str());
+        else if (a == "--bend") { bend = atof(next(i).c_str()); has_bend = true; }
+        else if (a == "--bend-idx") bend_idx = atoi(next(i).c_str());
+        else if (a == "--press") { pressure = atof(next(i).c_str()); has_press = true; }
+        else if (a == "--press-idx") press_idx = atoi(next(i).c_str());
         else if (a == "--out") out_path = next(i);
         else if (a == "--hash") do_hash = true;
         else if (a == "--set") {
@@ -228,6 +239,22 @@ int main(int argc, char **argv) {
                     m.pmod.amount = brightness - 0.5;
                     in.evs.push_back(m);
                 }
+                /* MPE note expressions on this note (the §9.5 per-voice path): a
+                 * TUNING (pitch bend, semitones) and/or PRESSURE (loudness, 0..1)
+                 * on chord note `bend_idx`/`press_idx`. */
+                auto nexpr = [&](uint16_t exprId, double value) {
+                    AnyEvent x{};
+                    hdr(x, CLAP_EVENT_NOTE_EXPRESSION, sizeof x.nexp, (uint32_t)(onAt - done));
+                    x.nexp.expression_id = exprId;
+                    x.nexp.note_id = nid;
+                    x.nexp.port_index = 0;
+                    x.nexp.channel = (int16_t)channel;
+                    x.nexp.key = (int16_t)cn;
+                    x.nexp.value = value;
+                    in.evs.push_back(x);
+                };
+                if (has_bend && nid == bend_idx) nexpr(CLAP_NOTE_EXPRESSION_TUNING, bend);
+                if (has_press && nid == press_idx) nexpr(CLAP_NOTE_EXPRESSION_PRESSURE, pressure);
             }
             if (last) {
                 AnyEvent e{};
