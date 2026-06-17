@@ -228,11 +228,39 @@ in the session via the plugin shell. Adjacent market, not core requirement.
 2. Whether to **reserve** the AES67-full bridge in the spec now or leave it
    wholly future — *resolved: reserve* (one sentence, idiomatic to §4.4/
    §1.3, backed by the already-chosen RTP path).
-3. PTP profile specifics (default profile vs. a HARP profile; software vs.
-   hardware timestamping floor; what correlation bound to *require* over
-   Ethernet vs. the §7.2 USB numbers) — genuinely open, needs measurement on
-   a real dedicated segment before the companion spec commits a MUST.
-4. RTP payload mapping for HARP's slot/interleave model and the `fmt` set
+3. PTP correlation bound — **prototyped 2026-06-17** (KR260 ↔ NUC, linuxptp,
+   over a cheap D-Link on the house LAN; see [[ethernet-ptp-prototyping]]).
+   Results, all *software*-timestamped on the device end (the KR260's Cadence
+   GEM advertises HW receive timestamping but doesn't deliver it — only
+   `none`/`all` RX filters; a real device-side finding):
+   - **idle: ~22 µs RMS** (worst ~34 µs) — ~10× better than USB's <250 µs
+     SHOULD, ~45× inside the <1 ms MUST.
+   - **full CPU load + ptp4l at RT priority, no net flood: ~140 µs RMS**,
+     clean ~10 µs path delay — degrades but still beats USB SHOULD and sits
+     well inside the MUST. Converges.
+   - **full CPU load + saturated link, no priority: collapses** (offset →
+     seconds, delay → ~1 s) — pathological; the lesson, not the bound.
+   Takeaways for the spec: (a) software timestamping is *sufficient* — do not
+   mandate hardware TS; (b) a device doing SW-timestamped free-running MUST
+   give its clock/network path scheduling priority and the segment needs
+   headroom/QoS (the trusted-segment posture already provides the latter);
+   (c) HW timestamping, where it works, immunizes against the CPU-load
+   degradation and is the path to sub-µs. Still TODO before a normative
+   MUST: a longer soak, the *isolated*-switch variant (expected ≤ the
+   house-LAN number), and a device with working HW RX timestamping for the
+   ceiling. Profile that worked: default IEEE-1588 / PTPv2 over UDP/IPv4,
+   domain 0 (L2 / gPTP only needed for the AVB-interop bridge).
+4. **Host-side PTP (was #3d) — resolved: P2.** The host does *receiver-side
+   clock recovery* (measure the RTP stream against the DAW audio clock and
+   ASRC — exactly what USB free-running already does, what Dante Virtual
+   Soundcard does), so it is **not** a PTP node. The Mac's lack of linuxptp
+   (only in-kernel gPTP via `IOAVBFamily`) therefore doesn't matter. PTP
+   lives device-side only, used for §8.4.3 *multi-device* timeline alignment
+   (the ~22 µs above is that device↔device case); a single free-running
+   device needs no PTP at all. Multi-box sample-accuracy is then "aligned
+   within a stated bound" (device↔device PTP + host recovery), never
+   sample-exact — sample-exact stays host-paced/offline's job.
+5. RTP payload mapping for HARP's slot/interleave model and the `fmt` set
    (float32 required; int24 for AES67-bridge compatibility) — detail for the
    companion spec.
 
