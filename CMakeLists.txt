@@ -193,6 +193,19 @@ if(SAMPLERATE_FOUND)
     endif()
     target_link_libraries(harp-rtp-demo ${SAMPLERATE_LIBRARIES} ${HARP_MATH_LIB} Threads::Threads)
 
+    # harp-eth-rtp-test: end-to-end §8.7 Ethernet audio plane — dial the device's
+    # TCP framed link, hello, audio.start(key 6 = our RTP port), recover the
+    # device's RTP stream + report SINAD. The Ethernet analog of golden-test.sh
+    # (drive it against a TCP-serving harp-deviced).
+    add_executable(harp-eth-rtp-test tools/eth-rtp-test.c
+      host/client.c host/sock_io.c host/rtp_udp.c host/rtp.c host/freerun.c ${HARP_PLAT_SRC})
+    target_include_directories(harp-eth-rtp-test PRIVATE host ${SAMPLERATE_INCLUDE_DIRS})
+    if(SAMPLERATE_LIBRARY_DIRS)
+      target_link_directories(harp-eth-rtp-test PRIVATE ${SAMPLERATE_LIBRARY_DIRS})
+    endif()
+    target_link_libraries(harp-eth-rtp-test harpcore ${SAMPLERATE_LIBRARIES}
+      ${HARP_MATH_LIB} ${HARP_PLAT_LIBS} Threads::Threads)
+
     # harp-freerun-mt-tests: concurrent SPSC stress under ThreadSanitizer — proves
     # freerun is race-free for the runtime's rx-thread-push / audio-thread-pull
     # topology. TSan-instrumented (this target only) so it aborts on any data race.

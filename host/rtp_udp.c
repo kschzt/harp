@@ -13,7 +13,12 @@
 #include <time.h>
 #include <unistd.h>
 
-#define RX_BUF 2048
+/* Big enough for the largest §8.7 datagram without truncation: the stereo main
+ * mix at AUDIO_MAX_NSAMPLES (1024) is 12 + 1024*2*4 = 8204 bytes. A short recv
+ * buffer truncates the UDP datagram, and the leftover payload then fails the
+ * channel-multiple check — every packet reads as malformed. 16 KB leaves 2x
+ * headroom (a transient stack buffer, negligible). */
+#define RX_BUF 16384
 
 static unsigned long long now_ns(void) {
     struct timespec t;
