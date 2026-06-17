@@ -505,12 +505,17 @@ out:
 }
 
 int harp_client_refset(harp_client *c, const char *name, const harp_hash *expect,
-                       const harp_hash *target, bool create, uint64_t *new_gen) {
+                       const harp_hash *target, bool create, bool force,
+                       uint64_t *new_gen) {
     harp_cbuf req, rsp;
     harp_cbuf_init(&req);
     harp_cbuf_init(&rsp);
     harp_client_req_head(c, &req, "state.refset", true);
-    harp_cbor_map(&req, create ? 4 : 3);
+    /* flags (key 3): bit 0 create-if-unborn, bit 1 force (§11.3 CAS override).
+     * Omitted when 0, so a plain CAS is byte-identical to before (the device
+     * defaults the absent key to 0). */
+    int flags = (create ? 1 : 0) | (force ? 2 : 0);
+    harp_cbor_map(&req, flags ? 4 : 3);
     harp_cbor_uint(&req, 0);
     harp_cbor_text(&req, name);
     harp_cbor_uint(&req, 1);
@@ -520,9 +525,9 @@ int harp_client_refset(harp_client *c, const char *name, const harp_hash *expect
         harp_cbor_null(&req);
     harp_cbor_uint(&req, 2);
     harp_cbor_bytes(&req, target->b, HARP_HASH_LEN);
-    if (create) {
+    if (flags) {
         harp_cbor_uint(&req, 3);
-        harp_cbor_uint(&req, 1); /* create-if-unborn */
+        harp_cbor_uint(&req, (uint64_t)flags);
     }
     harp_env e;
     int rc = harp_client_request(c, &req, &rsp, &e);

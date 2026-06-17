@@ -104,9 +104,11 @@ int harp_client_fetch_closure(harp_client *c, const harp_hash *root, size_t *fet
  * sent/already (may be NULL) report the transfer split for narration. */
 int harp_client_push_closure(harp_client *c, const harp_hash *root, size_t *sent,
                              size_t *already);
-/* CAS: expect NULL = expect-unborn. create adds create-if-unborn. new_gen
+/* CAS: expect NULL = expect-unborn. create adds create-if-unborn; force (§11.3/
+ * §11.4 action 1) overrides BOTH an expect mismatch and a dirty live ref. new_gen
  * (may be NULL) receives the post-CAS generation. */
 int harp_client_refset(harp_client *c, const char *name, const harp_hash *expect,
-                       const harp_hash *target, bool create, uint64_t *new_gen);
+                       const harp_hash *target, bool create, bool force,
+                       uint64_t *new_gen);
 
 #endif /* HARP_CLIENT_H */

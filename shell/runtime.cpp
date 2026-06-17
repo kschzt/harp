@@ -1549,7 +1549,7 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
         snprintf(archive, sizeof archive, "archive/%04d-%02d-%02dT%02d:%02d:%02dZ",
                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
                  tm.tm_sec);
-        if (harp_client_refset(&client_, archive, nullptr, &deviceHead, true, nullptr) !=
+        if (harp_client_refset(&client_, archive, nullptr, &deviceHead, true, false, nullptr) !=
             0)
             return false;
     }
@@ -1564,7 +1564,7 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
 
     /* CAS the live ref */
     bool ok = harp_client_refset(&client_, LIVE_REF, live.unborn ? nullptr : &deviceHead,
-                                 &target, live.unborn, nullptr) == 0;
+                                 &target, live.unborn, false, nullptr) == 0;
     if (ok) log_msg("recall: live/project restored");
     /* The bundle reference is PERSISTENT, not consumed: the DAW project's
      * notion of state re-asserts on every reconnect ("Live wins") — with

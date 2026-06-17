@@ -254,7 +254,7 @@ static void fetch_closure(probe *p, const harp_hash *root) {
 static uint64_t refset(probe *p, const char *name, const harp_hash *expect /* NULL = unborn */,
                        const harp_hash *newh, bool create) {
     uint64_t gen = 0;
-    ck(p, harp_client_refset(&p->client, name, expect, newh, create, &gen));
+    ck(p, harp_client_refset(&p->client, name, expect, newh, create, false, &gen));
     return gen;
 }
 
@@ -825,6 +825,66 @@ static void do_restore(probe *p) {
            (unsigned long long)gen);
 }
 
+/* cas-test (§11.3): exercises the recall negotiation's REJECTION + override paths
+ * that demo/restore (the happy path) never hit — a CAS conflict, the force
+ * override, and an incomplete-closure target. Needs an existing live/project ref
+ * (run after `demo`). Exits 0 on all-pass, 1 on any mismatch. */
+static void cmd_cas_test(probe *p) {
+    do_hello(p);
+    harp_ref refs[MAX_REFS];
+    size_t n = get_refs(p, refs);
+    harp_ref live;
+    if (!find_ref(refs, n, LIVE_REF, &live) || live.unborn)
+        die("cas-test needs an existing live/project ref (run `demo` first)");
+    harp_hash head = live.hash;                       /* the real, pushed current head */
+    if (live.dirty) head = remote_snapshot(p, "cas-test baseline"); /* clean it first */
+    printf("── cas-test: recall CAS conflict / force / not-found (§11.3)\n");
+
+    int fails = 0;
+    uint64_t gen = 0;
+
+    /* (a) CONFLICT: a wrong `expect` (head with a flipped bit) against a valid,
+     * already-pushed target must be REJECTED with code "conflict". */
+    harp_hash bogus = head;
+    bogus.b[0] ^= 0xff;
+    int rc = harp_client_refset(&p->client, LIVE_REF, &bogus, &head, false, false, &gen);
+    if (rc == 0 || strcmp(p->client.err_code, "conflict") != 0) {
+        fprintf(stderr, "   FAIL (a): expected 'conflict', got rc=%d code='%s'\n", rc,
+                rc ? p->client.err_code : "ok (accepted!)");
+        fails++;
+    } else
+        printf("   (a) wrong expect -> conflict: OK\n");
+
+    /* (b) FORCE overrides the mismatch: the SAME wrong expect with force succeeds
+     * (the §11.4 "DAW wins, archive-before-push" override). */
+    rc = harp_client_refset(&p->client, LIVE_REF, &bogus, &head, false, true, &gen);
+    if (rc != 0) {
+        fprintf(stderr, "   FAIL (b): force refset rejected rc=%d code='%s'\n", rc,
+                p->client.err_code);
+        fails++;
+    } else
+        printf("   (b) force overrides the mismatch: OK (gen %llu)\n",
+               (unsigned long long)gen);
+
+    /* (c) NOT-FOUND: a refset (force, to bypass the CAS) to a hash whose object
+     * closure was never pushed must be REJECTED with code "not-found". */
+    harp_hash absent;
+    memset(absent.b, 0xab, sizeof absent.b);
+    rc = harp_client_refset(&p->client, LIVE_REF, &head, &absent, false, true, &gen);
+    if (rc == 0 || strcmp(p->client.err_code, "not-found") != 0) {
+        fprintf(stderr, "   FAIL (c): expected 'not-found', got rc=%d code='%s'\n", rc,
+                rc ? p->client.err_code : "ok (accepted!)");
+        fails++;
+    } else
+        printf("   (c) unpushed closure -> not-found: OK\n");
+
+    if (fails) {
+        fprintf(stderr, "CAS-TEST FAIL (%d of 3)\n", fails);
+        exit(1);
+    }
+    printf("CAS-TEST PASS: conflict rejected, force overrides, unpushed -> not-found\n");
+}
+
 static void cmd_demo(probe *p, const char *addr) {
     (void)addr;
     p->verbose_ntf = true;
@@ -985,7 +1045,9 @@ int main(int argc, char **argv) {
 #else
         die("built without libusb");
 #endif
-    } else if (strcmp(cmd, "demo") == 0)
+    } else if (strcmp(cmd, "cas-test") == 0)
+        cmd_cas_test(&p);
+    else if (strcmp(cmd, "demo") == 0)
         cmd_demo(&p, addr);
     else {
         fprintf(stderr, "harp-probe: unknown command '%s'\n", cmd);

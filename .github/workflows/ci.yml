@@ -183,6 +183,11 @@ jobs:
           grep -q "recall complete" demo.out
           ./build/harp-probe -d 127.0.0.1:47800 -s /tmp/host restore | tee restore.out
           grep -q "SYNCED silently" restore.out
+          # the §11.3 CAS rejection + override paths (demo/restore only hit the
+          # happy path): a wrong expect -> conflict, force overrides it, and an
+          # unpushed-closure target -> not-found.
+          ./build/harp-probe -d 127.0.0.1:47800 -s /tmp/host cas-test | tee cas.out
+          grep -q "CAS-TEST PASS" cas.out
 
   fuzz:
     runs-on: ubuntu-latest
