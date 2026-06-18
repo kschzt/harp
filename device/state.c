@@ -427,14 +427,19 @@ void live_cache_flush(device *d) {
  * front panel operates on PART 0 for now (echo carries channel 0). A full
  * per-part panel dimension — a part selector on the panel API — is a
  * follow-up; see panel.c. */
-bool front_panel_set(device *d, uint32_t id, double v) {
+bool front_panel_set_part(device *d, int part, uint32_t id, double v) {
     if (v < 0) v = 0;
     if (v > 1) v = 1;
-    if (param_index(id) < 0) return false; /* no such param */
-    engine_part_param_put(0, id, (float)v);
-    live_ref_touch(d, true);
-    evt_echo_param(d, id, (float)v, 0); /* part 0 */
+    if (part < 0 || part >= NPARTS) return false; /* no such part */
+    if (param_index(id) < 0) return false;        /* no such param */
+    engine_part_param_put(part, id, (float)v);
+    live_ref_touch(d, true);                        /* any part's edit dirties live */
+    evt_echo_param(d, id, (float)v, (uint8_t)part); /* echo on the part's channel */
     return true;
+}
+
+bool front_panel_set(device *d, uint32_t id, double v) {
+    return front_panel_set_part(d, 0, id, v); /* back-compat: the panel's part 0 */
 }
 
 int do_snapshot(device *d, const char *msg, harp_hash *out, uint64_t *out_gen) {

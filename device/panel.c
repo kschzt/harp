@@ -39,7 +39,7 @@
  * is a solved problem there; this stays dependency-free C.
  */
 
-static void panel_json_params(device *d, char *body, size_t sz) {
+static void panel_json_params(device *d, int part, char *body, size_t sz) {
     size_t off = 0;
     pthread_mutex_lock(&d->state_mu);
     bool dirty = d->live_cache_valid ? d->live_cache.dirty : false;
@@ -48,19 +48,19 @@ static void panel_json_params(device *d, char *body, size_t sz) {
         if (harp_store_ref_read(&d->store, LIVE_REF, &r) == 0) dirty = r.dirty;
     }
     pthread_mutex_unlock(&d->state_mu);
+    if (part < 0 || part >= NPARTS) part = 0;
+    /* Values are PER PART (engine.c); `part` selects which (a frontend's part
+     * selector). `dirty` is the live ref's, shared across parts. The param NAMES
+     * and ids are the same for every part — only the values differ. */
     off += (size_t)snprintf(body + off, sz - off,
-                            "{\"product\":\"harp-refdev\",\"serial\":\"%s\","
+                            "{\"product\":\"harp-refdev\",\"serial\":\"%s\",\"part\":%d,"
                             "\"dirty\":%s,\"params\":[",
-                            d->serial, dirty ? "true" : "false");
-    /* P3: g_params no longer carries a per-instance value — the values are
-     * PER PART now (engine.c). The web panel shows/edits PART 0 for this scope;
-     * a full per-part panel dimension (a part selector in the panel API) is a
-     * follow-up. front_panel_set likewise targets part 0. */
+                            d->serial, part, dirty ? "true" : "false");
     for (size_t i = 0; i < NPARAMS; i++)
         off += (size_t)snprintf(body + off, sz - off,
                                 "%s{\"id\":%u,\"name\":\"%s\",\"value\":%.4f}",
                                 i ? "," : "", g_params[i].id, g_params[i].name,
-                                engine_part_param_get(0, g_params[i].id));
+                                engine_part_param_get(part, g_params[i].id));
     snprintf(body + off, sz - off, "]}");
 }
 
@@ -217,7 +217,11 @@ static const char *panel_handle_line(device *d, const char *line, char *body,
     *dyn = NULL;
     const char *out = body;
     if (strcmp(line, "params") == 0)
-        panel_json_params(d, body, bodysz);
+        panel_json_params(d, 0, body, bodysz);          /* part 0 (back-compat) */
+    else if (strncmp(line, "params ", 7) == 0)
+        panel_json_params(d, atoi(line + 7), body, bodysz); /* "params <part>" */
+    else if (strcmp(line, "parts") == 0)
+        snprintf(body, bodysz, "{\"parts\":%d}", NPARTS);
     else if (strcmp(line, "refs") == 0) {
         *dyn = panel_json_refs(d);
         if (*dyn) out = *dyn;
@@ -245,13 +249,18 @@ static const char *panel_handle_line(device *d, const char *line, char *body,
         else
             snprintf(body, bodysz, "{\"ok\":false,\"error\":\"unknown ref or load failed\"}");
     } else if (strncmp(line, "knob ", 5) == 0) {
-        unsigned id = 0;
-        double v = -1;
-        if (sscanf(line + 5, "%u %lf", &id, &v) == 2 && v >= 0 && v <= 1 &&
-            front_panel_set(d, id, v))
-            snprintf(body, bodysz, "{\"ok\":true}");
-        else
-            snprintf(body, bodysz, "{\"ok\":false,\"error\":\"knob <id 1..8> <value 0..1>\"}");
+        /* "knob <id> <v>" -> part 0 (back-compat); "knob <part> <id> <v>" -> part.
+         * Parse as doubles so the float <v> isn't mis-split (counting matched
+         * fields disambiguates 2 vs 3 cleanly). */
+        double a = -1, b = -1, c = -1;
+        int n = sscanf(line + 5, "%lf %lf %lf", &a, &b, &c);
+        int ok = 0;
+        if (n == 3 && c >= 0 && c <= 1)
+            ok = front_panel_set_part(d, (int)a, (uint32_t)b, c);
+        else if (n == 2 && b >= 0 && b <= 1)
+            ok = front_panel_set(d, (uint32_t)a, b);
+        snprintf(body, bodysz, ok ? "{\"ok\":true}"
+                 : "{\"ok\":false,\"error\":\"knob [part] <id 1..8> <value 0..1>\"}");
     } else if (strncmp(line, "reconcile-offer ", 16) == 0) {
         /* a shell (or a test) posts a §11.4 conflict: expected vs live hash + dirty */
         char e[16] = "", l[16] = "";

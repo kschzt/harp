@@ -228,6 +228,14 @@ typedef struct {
     uint32_t rtp_ssrc;
     uint32_t mode, rate, nsamples, epoch;
     uint64_t reanchors;
+    _Atomic int rate_trim_ppb; /* §8.7 bit-exact (host-locked): the host's rate
+                                * correction in parts-per-billion, set by the
+                                * audio.trim ctl and applied to the free-running
+                                * emit period each block. The host drives this to
+                                * hold its buffer at setpoint, so the device emits
+                                * at exactly the host's consumption rate and the
+                                * host plays 1:1 (no resampling = bit-exact). 0 =
+                                * nominal (the byte-identical free-running path). */
     double tone_hz; /* test/measurement: when >0, render_output emits a pure
                        stereo sine at this Hz INSTEAD of the synth — a clean
                        reference for SINAD over the free-running RTP path (the
@@ -354,7 +362,8 @@ void encode_param_array_automatable(harp_cbuf *b);
 void compute_param_map_hash(device *d);
 void live_ref_touch(device *d, bool dirty);
 void live_cache_flush(device *d);
-bool front_panel_set(device *d, uint32_t id, double v);
+bool front_panel_set(device *d, uint32_t id, double v);          /* the panel's part 0 */
+bool front_panel_set_part(device *d, int part, uint32_t id, double v); /* part 0..NPARTS-1 */
 int do_snapshot(device *d, const char *msg, harp_hash *out, uint64_t *out_gen);
 
 /* Closure check for refset (§11.3): root snapshot -> tree -> children
