@@ -15,6 +15,10 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 if(MSVC)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS) # harp C sources use getenv/snprintf
+  # MSVC gates C11 <stdatomic.h> (host/freerun.c) behind this flag even under /std:c11;
+  # C-only (the genexp) so the C++ SDK/shell sources are untouched. Harmless for C
+  # files that don't use atomics. Without it: "C atomic support is not enabled".
+  add_compile_options($<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
 endif()
 
 set(SMTG_ENABLE_VST3_HOSTING_EXAMPLES OFF CACHE BOOL "" FORCE)
