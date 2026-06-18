@@ -14,6 +14,12 @@
  * touches transport_, so reaping this transport on a reconnect can't race the
  * audio thread (sessionDown joins the reader before delete, like USB). This
  * object therefore owns NO threads of its own — just the two sockets.
+ *
+ * PORTABILITY: a DAW host may be Windows, so the UDP audio socket uses the same
+ * Winsock-portable handle type (harp_sockhandle) and close (harp_sock_close) as
+ * the TCP control plane (sock_io), recv() not read(), and WSAPoll()/poll() behind
+ * one helper. winsock2.h arrives via sock_io.h; WSAStartup is the runtime's job
+ * (done once at construction, before any dial()).
  */
 #ifndef HARP_SHELL_ETH_TRANSPORT_H
 #define HARP_SHELL_ETH_TRANSPORT_H
@@ -22,18 +28,23 @@
 
 extern "C" {
 #include "rtp.h"
-#include "sock_io.h"
+#include "sock_io.h" /* harp_sockhandle, HARP_SOCK_INVALID; pulls winsock2.h on _WIN32 */
 }
 
-#include <arpa/inet.h>
+#ifdef _WIN32
+#  include <ws2tcpip.h> /* inet_ntop, socklen_t (winsock2.h already in via sock_io.h) */
+#else
+#  include <arpa/inet.h>
+#  include <netinet/in.h>
+#  include <poll.h>
+#  include <sys/socket.h>
+#  include <unistd.h>
+#endif
+
 #include <atomic>
 #include <cstdio>
 #include <cstring>
-#include <netinet/in.h>
-#include <poll.h>
 #include <string>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include "harp/plat.h" /* monotonic clock for silentMs liveness */
 
@@ -43,14 +54,14 @@ struct EthTransport final : ShellTransport {
     static EthTransport *dial(const char *hostport) {
         harp_sockhandle ctl = harp_sock_dial(hostport);
         if (ctl == HARP_SOCK_INVALID) return nullptr;
-        int rx = ::socket(AF_INET, SOCK_DGRAM, 0);
-        if (rx < 0) { harp_sock_close(ctl); return nullptr; }
+        harp_sockhandle rx = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (rx == HARP_SOCK_INVALID) { harp_sock_close(ctl); return nullptr; }
         struct sockaddr_in a = {};
         a.sin_family = AF_INET;
         a.sin_addr.s_addr = htonl(INADDR_ANY);
         a.sin_port = 0; /* ephemeral */
-        if (::bind(rx, (struct sockaddr *)&a, sizeof a) != 0) {
-            ::close(rx); harp_sock_close(ctl); return nullptr;
+        if (::bind(rx, (struct sockaddr *)&a, (socklen_t)sizeof a) != 0) {
+            harp_sock_close(rx); harp_sock_close(ctl); return nullptr;
         }
         socklen_t al = sizeof a;
         int port = (::getsockname(rx, (struct sockaddr *)&a, &al) == 0) ? ntohs(a.sin_port) : 0;
@@ -58,7 +69,7 @@ struct EthTransport final : ShellTransport {
     }
 
     ~EthTransport() override {
-        if (rxsock_ >= 0) ::close(rxsock_);
+        if (rxsock_ != HARP_SOCK_INVALID) harp_sock_close(rxsock_);
         harp_sock_close(ctl_.s);
     }
 
@@ -67,14 +78,8 @@ struct EthTransport final : ShellTransport {
 
     /* ---- control plane (TCP framed link) ---- */
     harp_io *ctlIo() override { return &ctl_.io; }
-    bool linkPoll(unsigned ms) override {
-        struct pollfd p = {ctl_.s, POLLIN, 0};
-        return ::poll(&p, 1, (int)ms) > 0 && (p.revents & POLLIN);
-    }
-    size_t linkPending() override {
-        struct pollfd p = {ctl_.s, POLLIN, 0};
-        return (::poll(&p, 1, 0) > 0 && (p.revents & POLLIN)) ? 1 : 0;
-    }
+    bool linkPoll(unsigned ms) override { return readable(ctl_.s, (int)ms); }
+    size_t linkPending() override { return readable(ctl_.s, 0) ? 1 : 0; }
 
     /* ---- audio: free-running (RTP), not the host-paced endpoint ---- */
     bool hasAudio() override { return true; }
@@ -95,10 +100,9 @@ struct EthTransport final : ShellTransport {
      * maxFrames), waiting up to timeout_ms. Returns frames received (0 = none /
      * timeout / malformed). The caller (reader) writes them into audioRing_. */
     unsigned recvAudio(float *out, unsigned maxFrames, int timeout_ms) override {
-        struct pollfd p = {rxsock_, POLLIN, 0};
-        if (::poll(&p, 1, timeout_ms) <= 0) return 0;
+        if (!readable(rxsock_, timeout_ms)) return 0;
         uint8_t buf[16384];
-        ssize_t n = ::recv(rxsock_, buf, sizeof buf, 0);
+        int n = (int)::recv(rxsock_, (char *)buf, (int)sizeof buf, 0);
         if (n < 0) return 0;
         harp_rtp_hdr h;
         const uint8_t *pl;
@@ -119,7 +123,7 @@ struct EthTransport final : ShellTransport {
     }
 
 private:
-    EthTransport(harp_sockhandle ctl, int rx, int port) : rxsock_(rx), rxport_(port) {
+    EthTransport(harp_sockhandle ctl, harp_sockhandle rx, int port) : rxsock_(rx), rxport_(port) {
         harp_sock_io_init(&ctl_, ctl);
         struct sockaddr_in pa = {};
         socklen_t pl = sizeof pa;
@@ -129,10 +133,24 @@ private:
         }
     }
 
-    harp_sock_io ctl_;
-    int          rxsock_ = -1;
-    int          rxport_ = 0;
-    std::string  peer_;
+    /* one-fd readability poll, portable across POSIX poll() and Winsock WSAPoll() */
+    static bool readable(harp_sockhandle s, int timeout_ms) {
+#ifdef _WIN32
+        WSAPOLLFD p;
+        p.fd = s;
+        p.events = POLLRDNORM;
+        p.revents = 0;
+        return WSAPoll(&p, 1, timeout_ms) > 0 && (p.revents & POLLRDNORM);
+#else
+        struct pollfd p = {s, POLLIN, 0};
+        return ::poll(&p, 1, timeout_ms) > 0 && (p.revents & POLLIN);
+#endif
+    }
+
+    harp_sock_io    ctl_;
+    harp_sockhandle rxsock_ = HARP_SOCK_INVALID;
+    int             rxport_ = 0;
+    std::string     peer_;
     std::atomic<unsigned long long> lastArr_{0};
 };
 

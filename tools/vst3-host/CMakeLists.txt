@@ -121,8 +121,10 @@ if(LIBUSB_FOUND)
   target_link_directories(harp-shell PRIVATE ${LIBUSB_LIBRARY_DIRS})
   target_link_libraries(harp-shell PRIVATE sdk ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS})
   if(WIN32)
-    # static libusb pulls in the Win device-enumeration + COM GUID APIs
-    target_link_libraries(harp-shell PRIVATE setupapi ole32)
+    # static libusb pulls in the Win device-enumeration + COM GUID APIs; ws2_32 is
+    # Winsock for the §8.7 Ethernet control + RTP sockets (host/sock_io.c +
+    # shell/eth_transport.h — added with the EthTransport binding).
+    target_link_libraries(harp-shell PRIVATE setupapi ole32 ws2_32)
   endif()
   message(STATUS "harp-shell: building VST3 shell with libusb")
 
@@ -172,8 +174,8 @@ if(LIBUSB_FOUND)
     # Linux/Windows: a .clap is a plain shared library (no bundle).
     set_target_properties(harp-clap PROPERTIES PREFIX "" OUTPUT_NAME "harp-clap" SUFFIX ".clap")
   endif()
-  if(WIN32) # static libusb pulls in the Win device-enum + COM GUID APIs (as harp-shell)
-    target_link_libraries(harp-clap PRIVATE setupapi ole32)
+  if(WIN32) # libusb -> Win device-enum + COM GUID APIs; ws2_32 -> §8.7 Ethernet sockets (as harp-shell)
+    target_link_libraries(harp-clap PRIVATE setupapi ole32 ws2_32)
   endif()
   message(STATUS "harp-clap: building CLAP shell with libusb")
 
