@@ -57,14 +57,19 @@ fi
 
 # need the pinned board; without it nothing connects and per-part audio is
 # unobservable — legitimately N/A on this rig.
-if [ -x "$PROBE" ]; then
-    if ! "$PROBE" list 2>/dev/null | grep -q "serial $SERIAL"; then
-        echo "ALIAS-PART-AUDIO SKIP: board $SERIAL not on the bus"; exit 2
+# USB: confirm the pinned board is on the bus. Over Ethernet (HARP_ETH_DEVICE set,
+# e.g. eth.yml's localhost fake hardware) the device is a TCP endpoint, not a bus
+# board — skip the bus check and dial it directly.
+if [ -z "${HARP_ETH_DEVICE:-}" ]; then
+    if [ -x "$PROBE" ]; then
+        if ! "$PROBE" list 2>/dev/null | grep -q "serial $SERIAL"; then
+            echo "ALIAS-PART-AUDIO SKIP: board $SERIAL not on the bus"; exit 2
+        fi
+    else
+        echo "ALIAS-PART-AUDIO SKIP: $PROBE not built (need it to confirm the board)"; exit 2
     fi
-else
-    echo "ALIAS-PART-AUDIO SKIP: $PROBE not built (need it to confirm the board)"; exit 2
 fi
-echo "── alias-part-audio: owner part 0 + attached part 1 on $SERIAL — the alias hears its part"
+echo "── alias-part-audio: owner part 0 + attached part 1 on ${HARP_ETH_DEVICE:-$SERIAL} — the alias hears its part"
 
 # Build the multi-instance harness WITHOUT ThreadSanitizer (same reasoning as
 # alias-play-test: this asserts per-part AUDIO, not race-freedom — tsan-shell.sh's

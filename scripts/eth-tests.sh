@@ -71,5 +71,25 @@ else
     bad "bit-exact: conn=$conn rms=${rms:-none} (want connected + rms>0.30)"
 fi
 
+# ── multi-output demux + per-part routing over RTP ──────────────────────────────
+# The §8.7 coverage the USB rig can't run reliably (it wedges on the repeated
+# multi-instance --part-audio re-claims): the device streams the slot UNION over RTP
+# and the owner's reader() demuxes each part into its sink. Reuse the conformance
+# tests verbatim — they detect HARP_ETH_DEVICE and dial the localhost fake hardware:
+#   alias-part-audio = the main mix is RICHER than a demuxed part (a strict subset),
+#   part-param-iso   = a part's level routes to ITS audio and stays out of the others.
+# A normal-synth device (no --tone) so the aliases' injected per-part notes render.
+echo "──── multi-output: per-part demux + routing over RTP"
+start_dev
+export HARP_ETH_DEVICE="127.0.0.1:$PORT"
+export HARP_DEVICE_SERIAL="SIM-0001"   # the --port daemon's serial (the connect-check matches it)
+for t in scripts/alias-part-audio-test.sh scripts/part-param-iso-test.sh; do
+    echo "──── $t (over §8.7 Ethernet)"
+    if sh "$t"; then ok "$(basename "$t" .sh): per-part over RTP"
+    else bad "$(basename "$t" .sh) over RTP (exit $?)"; fi
+done
+unset HARP_ETH_DEVICE
+stop_dev
+
 echo "════ eth-tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

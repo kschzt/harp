@@ -44,14 +44,19 @@ SAMPLES="${SAMPLES:-5}"   # median of 5: the realtime pull's RMS jitters; more s
 if pgrep -x "Live" >/dev/null 2>&1; then
     echo "PART-PARAM-ISO FAIL: device claimed by Ableton Live — needs it exclusively"; exit 3
 fi
-if [ -x "$PROBE" ]; then
-    if ! "$PROBE" list 2>/dev/null | grep -q "serial $SERIAL"; then
-        echo "PART-PARAM-ISO SKIP: board $SERIAL not on the bus"; exit 2
+# USB: confirm the pinned board is on the bus. Over Ethernet (HARP_ETH_DEVICE set,
+# e.g. eth.yml's localhost fake hardware) there is no USB bus — the device is a TCP
+# endpoint the shell dials, so skip the bus check and run against it directly.
+if [ -z "${HARP_ETH_DEVICE:-}" ]; then
+    if [ -x "$PROBE" ]; then
+        if ! "$PROBE" list 2>/dev/null | grep -q "serial $SERIAL"; then
+            echo "PART-PARAM-ISO SKIP: board $SERIAL not on the bus"; exit 2
+        fi
+    else
+        echo "PART-PARAM-ISO SKIP: $PROBE not built"; exit 2
     fi
-else
-    echo "PART-PARAM-ISO SKIP: $PROBE not built"; exit 2
 fi
-echo "── part-param-iso: per-part level routing + isolation on $SERIAL (owner part 0 + attached part 1)"
+echo "── part-param-iso: per-part level routing + isolation on ${HARP_ETH_DEVICE:-$SERIAL} (owner part 0 + attached part 1)"
 
 echo "── building multi-instance harness (-DHARP_TSAN=ON -DHARP_TSAN_SANITIZE=OFF)"
 cmake -B "$BUILD" -S tools/vst3-host -DHARP_TSAN=ON -DHARP_TSAN_SANITIZE=OFF >/dev/null
