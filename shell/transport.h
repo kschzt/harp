@@ -58,6 +58,15 @@ struct ShellTransport {
     virtual int      pollFree(int timeout_ms) { (void)timeout_ms; return 0; }
     virtual unsigned pullFree(float *out, unsigned nframes) { (void)out; (void)nframes; return 0; }
     virtual unsigned silentMs() const { return 0; }
+
+    /* ---- bit-exact (host-locked) hooks (§8.7), used only when isFreeRunning().
+     * audioPort() is the bound RTP rx port the device must stream to (carried in
+     * audio.start key 6). fillFrames() is the current jitter-buffer occupancy,
+     * which the feeder's control loop reads to compute the rate trim it sends
+     * back (audio.trim) — keeping the device's emit rate locked to the host so
+     * pullFree() plays 1:1, no resampling = bit-exact. USB stubs both. */
+    virtual int      audioPort() const { return 0; }
+    virtual unsigned fillFrames() const { return 0; }
 };
 
 #endif /* HARP_SHELL_TRANSPORT_H */

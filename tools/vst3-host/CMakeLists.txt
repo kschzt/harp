@@ -101,6 +101,8 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/shell/runtime.cpp
     ${HARP_ROOT}/shell/runtime_registry.cpp
     ${HARP_ROOT}/host/usb_io.c
+    ${HARP_ROOT}/host/sock_io.c
+    ${HARP_ROOT}/host/rtp.c
     ${HARP_ROOT}/host/client.c
     ${HARP_ROOT}/core/src/cbor.c
     ${HARP_ROOT}/core/src/sha256.c
@@ -133,6 +135,8 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/shell/runtime.cpp
     ${HARP_ROOT}/shell/runtime_registry.cpp
     ${HARP_ROOT}/host/usb_io.c
+    ${HARP_ROOT}/host/sock_io.c
+    ${HARP_ROOT}/host/rtp.c
     ${HARP_ROOT}/host/client.c
     ${HARP_ROOT}/core/src/cbor.c
     ${HARP_ROOT}/core/src/sha256.c
@@ -232,6 +236,8 @@ if(LIBUSB_FOUND)
       ${HARP_ROOT}/shell/runtime.cpp
       ${HARP_ROOT}/shell/runtime_registry.cpp
       ${HARP_ROOT}/host/usb_io.c
+      ${HARP_ROOT}/host/sock_io.c
+      ${HARP_ROOT}/host/rtp.c
       ${HARP_ROOT}/host/client.c
       ${HARP_ROOT}/core/src/cbor.c
       ${HARP_ROOT}/core/src/sha256.c
@@ -279,6 +285,8 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/shell/runtime.cpp
     ${HARP_ROOT}/shell/runtime_registry.cpp
     ${HARP_ROOT}/host/usb_io.c
+    ${HARP_ROOT}/host/sock_io.c
+    ${HARP_ROOT}/host/rtp.c
     ${HARP_ROOT}/host/client.c
     ${HARP_ROOT}/core/src/cbor.c
     ${HARP_ROOT}/core/src/sha256.c
@@ -348,6 +356,8 @@ if(LIBUSB_FOUND)
       ${HARP_ROOT}/shell/runtime.cpp
       ${HARP_ROOT}/shell/runtime_registry.cpp
       ${HARP_ROOT}/host/usb_io.c
+      ${HARP_ROOT}/host/sock_io.c
+      ${HARP_ROOT}/host/rtp.c
       ${HARP_ROOT}/host/client.c
       ${HARP_ROOT}/core/src/cbor.c
       ${HARP_ROOT}/core/src/sha256.c

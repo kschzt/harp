@@ -1,6 +1,7 @@
 #include "runtime.h"
 #include "ump.h"
 #include "usb_transport.h" /* the concrete USB binding selectDevice() wraps */
+#include "eth_transport.h" /* the §8.7 Ethernet binding (bit-exact host-locked) */
 
 #ifdef __APPLE__
 #include <pthread/qos.h>
@@ -389,6 +390,12 @@ void HarpRuntime::wgMaintain(WgState &st) {
 static ShellTransport *wrapUsb(harp_io *io) { return io ? new UsbTransport(io) : nullptr; }
 
 ShellTransport *HarpRuntime::selectDevice() {
+    /* Ethernet binding (§8.7): HARP_ETH_DEVICE=HOST:PORT routes to the RTP/TCP
+     * transport instead of USB. Unset (the default, and every golden run) falls
+     * straight through to the USB path below — byte-identical. */
+    if (const char *eth = getenv("HARP_ETH_DEVICE"))
+        if (eth[0]) return EthTransport::dial(eth);
+
     /* reconnect: pinned to the exact unit this instance already owns — the
      * same-model fallback must NOT fire here, or a replug could let this
      * instance steal a sibling track's device. */
