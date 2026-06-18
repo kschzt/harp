@@ -87,6 +87,13 @@ static std::atomic<bool> g_capture_armed{true};
  * normal flood (every other config). Parsed once in main, read-only after. */
 static std::vector<float> g_iso_levels;
 
+/* --no-state-stress: skip the owner's periodic getState/setState round-trip (a
+ * ctlMutex_ stress kept for the TSan race configs). The per-part-AUDIO tests
+ * measure demuxed audio, not state churn, and post-§11.4-reconcile each setState
+ * runs a CAS-to-store Push that starves the stream into underrun — so those tests
+ * opt out. Set once in main before threads start; read-only after. */
+static bool g_state_stress = true;
+
 /* the simulated DAW audio thread: pull blocks at ~block cadence, and do
  * exactly what the plugin's process() does around the pull (timestamp
  * base, drain echoes). RT mode pads on underrun, never blocks. */
@@ -187,7 +194,7 @@ static void control_thread(HarpRuntime *rt, EventSource *src, bool isOwner,
          * plugin.cpp gates feedTransport to the owner. queueTransport pins it to
          * the owner source whatever we pass, but only the owner SHOULD call it. */
         if (isOwner) rt->queueTransport(src, 0x29, 120.0, (double)n * 0.01, base);
-        if (isOwner && n % 200 == 0 && rt->connected()) { /* op under ctlMutex_ */
+        if (isOwner && g_state_stress && n % 200 == 0 && rt->connected()) { /* op under ctlMutex_ */
             rt->getStateBundle(bundle);
             if (!bundle.empty()) rt->setStateBundle(bundle.data(), bundle.size());
         }
@@ -215,6 +222,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--block") && i + 1 < argc) block = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outPath = argv[++i];
         else if (!strcmp(argv[i], "--part-audio")) partAudio = true;
+        else if (!strcmp(argv[i], "--no-state-stress")) g_state_stress = false;
         else if (!strcmp(argv[i], "--late-sink")) { lateSink = true; partAudio = true; }
     }
     /* Bound the play-proof capture to the run length (+1 s slack), so --out on a

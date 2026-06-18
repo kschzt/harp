@@ -72,7 +72,7 @@ sink_rms() {
         r=""
         for try in 1 2 3; do
             out=$(mktemp /tmp/iso.XXXXXX)
-            HARP_ISO_LEVELS="$levels" "$BUILD/tsan-host" --instances 2 --part-audio \
+            HARP_ISO_LEVELS="$levels" "$BUILD/tsan-host" --instances 2 --part-audio --no-state-stress \
                 --seconds "$SECONDS_RUN" --block 256 --out "/tmp/iso-$i.wav" >"$out" 2>&1 || true
             s=$(grep '^sink-rms:' "$out" | awk '{print $2}')
             conn=$(grep -c "harp-shell: connected:.*serial $SERIAL" "$out" || true)

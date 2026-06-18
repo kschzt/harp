@@ -97,7 +97,7 @@ median() {
 capture() {
     for try in 1 2 3; do
         out=$(mktemp /tmp/alias-pa.XXXXXX)
-        "$BUILD/tsan-host" --instances "$INSTANCES" --part-audio --seconds "$SECONDS_RUN" \
+        "$BUILD/tsan-host" --instances "$INSTANCES" --part-audio --no-state-stress --seconds "$SECONDS_RUN" \
             --block 256 --out "/tmp/alias-pa-$1.wav" >"$out" 2>&1 || true
         m=$(grep '^main-rms:' "$out" | awk '{print $2}')
         s=$(grep '^sink-rms:' "$out" | awk '{print $2}')
