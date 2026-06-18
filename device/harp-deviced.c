@@ -157,6 +157,7 @@ int main(int argc, char **argv) {
     int port = 47800;
     const char *panel_sock = "/tmp/harp-panel.sock"; /* "" disables */
     const char *rtp_out = NULL;                       /* §8.7 emit dest HOST:PORT */
+    double tone_hz = 0.0;                             /* --tone HZ: SINAD test tone, 0=engine */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc)
             state_dir = argv[++i];
@@ -172,10 +173,12 @@ int main(int argc, char **argv) {
             panel_sock = argv[++i];
         else if (strcmp(argv[i], "--rtp-out") == 0 && i + 1 < argc)
             rtp_out = argv[++i];
+        else if (strcmp(argv[i], "--tone") == 0 && i + 1 < argc)
+            tone_hz = atof(argv[++i]);
         else {
             fprintf(stderr,
                     "usage: harp-deviced [--state-dir DIR] [--serial S] "
-                    "[--panel-sock PATH] "
+                    "[--panel-sock PATH] [--tone HZ] "
                     "[--port P | --ffs FFS_DIR [--gadget CONFIGFS_PATH]]\n");
             return 2;
         }
@@ -185,6 +188,7 @@ int main(int argc, char **argv) {
     device *d = &g_dev;
     memset(d, 0, sizeof *d);
     d->io = NULL;
+    d->audio.tone_hz = tone_hz; /* test/measurement tone (render_output); 0 = engine */
     snprintf(d->serial, sizeof d->serial, "%s", serial);
     if (harp_store_open(&d->store, state_dir) != 0) {
         fprintf(stderr, "harp-deviced: cannot open state dir %s\n", state_dir);

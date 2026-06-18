@@ -228,6 +228,11 @@ typedef struct {
     uint32_t rtp_ssrc;
     uint32_t mode, rate, nsamples, epoch;
     uint64_t reanchors;
+    double tone_hz; /* test/measurement: when >0, render_output emits a pure
+                       stereo sine at this Hz INSTEAD of the synth — a clean
+                       reference for SINAD over the free-running RTP path (the
+                       drone is too rich to measure). 0 = normal engine (golden
+                       path untouched; set only by harp-deviced --tone). */
     /* requested OUTPUT slots (§6.3 active-slots-out, audio.start key 4): the
      * channel map exposes 34 slots (2 main-mix + 16 stereo per-part pairs,
      * §P2.2). out_slots[0..n_out_slots-1] holds the host-requested slot

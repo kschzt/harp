@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h> /* struct timeval for SCM_TIMESTAMP */
 #include <time.h>
 #include <unistd.h>
 
@@ -51,6 +52,13 @@ harp_rtp_rx *harp_rtp_rx_open(int port, const harp_freerun_cfg *cfg) {
     if (!rx->fr || rx->fd < 0) { harp_rtp_rx_close(rx); return NULL; }
     int one = 1;
     setsockopt(rx->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    /* §7.3: ask the kernel to stamp each datagram at reception (SCM_TIMESTAMP).
+     * The arrival time drives clock recovery; a userspace stamp taken after
+     * recv() returns folds in OS scheduling latency (ms-scale on a non-RT host
+     * under load/Wi-Fi), which is the jitter wall between ~40 dB and the
+     * recovery's true SINAD. Best-effort — poll() falls back to a userspace
+     * monotonic stamp if the OS delivers no control message. */
+    setsockopt(rx->fd, SOL_SOCKET, SO_TIMESTAMP, &one, sizeof one);
     struct sockaddr_in a = {0};
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -78,10 +86,33 @@ int harp_rtp_rx_poll(harp_rtp_rx *rx, int timeout_ms) {
         if (pr < 0) return -1;
         if (pr == 0) break;                      /* nothing (more) available     */
         uint8_t buf[RX_BUF];
-        ssize_t n = recv(rx->fd, buf, sizeof buf, 0);
+        union { /* control buffer for the SCM_TIMESTAMP cmsg */
+            struct cmsghdr align;
+            char space[CMSG_SPACE(sizeof(struct timeval))];
+        } cbuf;
+        struct iovec iov = {buf, sizeof buf};
+        struct msghdr mh = {0};
+        mh.msg_iov = &iov;
+        mh.msg_iovlen = 1;
+        mh.msg_control = cbuf.space;
+        mh.msg_controllen = sizeof cbuf.space;
+        ssize_t n = recvmsg(rx->fd, &mh, 0);
         if (n < 0) return -1;
-        unsigned long long arr = now_ns();        /* arrival stamp = recovery clock */
-        atomic_store_explicit(&rx->last_arr_ns, arr, memory_order_relaxed); /* liveness */
+        unsigned long long mono = now_ns();
+        atomic_store_explicit(&rx->last_arr_ns, mono, memory_order_relaxed); /* liveness (monotonic) */
+        /* kernel RX timestamp drives recovery (sub-scheduling-jitter); fall back
+         * to the userspace monotonic stamp if the OS delivered no SCM_TIMESTAMP. */
+        unsigned long long arr = 0;
+        for (struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm)) {
+            if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_TIMESTAMP) {
+                struct timeval tv;
+                memcpy(&tv, CMSG_DATA(cm), sizeof tv);
+                arr = (unsigned long long)tv.tv_sec * 1000000000ull +
+                      (unsigned long long)tv.tv_usec * 1000ull;
+                break;
+            }
+        }
+        if (!arr) arr = mono;
 
         harp_rtp_hdr h; const uint8_t *pl; size_t pln;
         if (harp_rtp_unpack(buf, (size_t)n, &h, &pl, &pln) != 0 ||

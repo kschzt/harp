@@ -1429,6 +1429,20 @@ static void render_part_slots(audio_state *a, float *out, uint32_t n, float rate
 
 static uint16_t render_output(audio_state *a, float *out, uint32_t n, float rate,
                               uint64_t pos) {
+    /* TEST/MEASUREMENT tone (harp-deviced --tone HZ): a pure stereo sine,
+     * phase-continuous across blocks (pos is the absolute sample index), at
+     * -6 dBFS so it can't clip. A clean SINAD reference for the free-running
+     * RTP path, where the rich drone reads conservatively. Gated on tone_hz>0,
+     * which is 0 on every production/golden run — the path below is untouched. */
+    if (a->tone_hz > 0.0) {
+        double w = 2.0 * M_PI * a->tone_hz / (double)rate;
+        for (uint32_t i = 0; i < n; i++) {
+            float s = (float)sin(w * (double)(pos + i)) * 0.5f;
+            out[2 * i] = s;
+            out[2 * i + 1] = s;
+        }
+        return 2; /* stereo */
+    }
     /* DEFAULT / main-mix fast path: the host wants exactly the stereo main mix
      * in slot order {0,1}. Route straight through the UNCHANGED P2.1
      * render_with_events into the 2-channel `out` buffer — byte-identical
