@@ -77,6 +77,37 @@ if(NOT LIBUSB_FOUND)
     set(LIBUSB_FOUND TRUE)
   endif()
 endif()
+
+# ---- libsamplerate (host/freerun.c — §8.7 ASRC for a device that can't rate-lock) ----
+# System lib via pkg-config where present (macOS/Linux); else build it from source
+# (pinned 0.2.2), so Windows and a bare runner work with no host package. The harp_asrc
+# INTERFACE target carries the include dir + the lib so each runtime target just links
+# it. Unconditional: the ASRC fallback path is compiled into every shell.
+find_package(PkgConfig QUIET) # idempotent; Linux/macOS have it, Windows does not
+if(PKG_CONFIG_FOUND)
+  pkg_check_modules(SAMPLERATE samplerate)
+endif()
+if(NOT SAMPLERATE_FOUND)
+  include(FetchContent)
+  set(LIBSAMPLERATE_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(LIBSAMPLERATE_INSTALL OFF CACHE BOOL "" FORCE)
+  set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  set(CMAKE_POLICY_VERSION_MINIMUM 3.5) # libsamplerate 0.2.2 ships a pre-3.5 cmake_minimum_required
+  FetchContent_Declare(libsamplerate
+    GIT_REPOSITORY https://github.com/libsndfile/libsamplerate.git
+    GIT_TAG 0.2.2 GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(libsamplerate)
+  set(SAMPLERATE_LIBRARIES SampleRate::samplerate)
+endif()
+add_library(harp_asrc INTERFACE)
+target_link_libraries(harp_asrc INTERFACE ${SAMPLERATE_LIBRARIES})
+if(SAMPLERATE_INCLUDE_DIRS)
+  target_include_directories(harp_asrc INTERFACE ${SAMPLERATE_INCLUDE_DIRS})
+endif()
+if(SAMPLERATE_LIBRARY_DIRS)
+  target_link_directories(harp_asrc INTERFACE ${SAMPLERATE_LIBRARY_DIRS})
+endif()
+
 if(LIBUSB_FOUND)
   set(HARP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
   # Platform shim (harp/plat.h) compiled into the shell/AU like the core .c files.
@@ -103,6 +134,7 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/host/usb_io.c
     ${HARP_ROOT}/host/sock_io.c
     ${HARP_ROOT}/host/rtp.c
+    ${HARP_ROOT}/host/freerun.c
     ${HARP_ROOT}/host/client.c
     ${HARP_ROOT}/core/src/cbor.c
     ${HARP_ROOT}/core/src/sha256.c
@@ -119,7 +151,7 @@ if(LIBUSB_FOUND)
     ${LIBUSB_INCLUDE_DIRS})
   target_compile_definitions(harp-shell PRIVATE HAVE_LIBUSB)
   target_link_directories(harp-shell PRIVATE ${LIBUSB_LIBRARY_DIRS})
-  target_link_libraries(harp-shell PRIVATE sdk ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS})
+  target_link_libraries(harp-shell PRIVATE sdk ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc)
   if(WIN32)
     # static libusb pulls in the Win device-enumeration + COM GUID APIs; ws2_32 is
     # Winsock for the §8.7 Ethernet control + RTP sockets (host/sock_io.c +
@@ -139,6 +171,7 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/host/usb_io.c
     ${HARP_ROOT}/host/sock_io.c
     ${HARP_ROOT}/host/rtp.c
+    ${HARP_ROOT}/host/freerun.c
     ${HARP_ROOT}/host/client.c
     ${HARP_ROOT}/core/src/cbor.c
     ${HARP_ROOT}/core/src/sha256.c
@@ -154,7 +187,7 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/external/clap/include ${LIBUSB_INCLUDE_DIRS})
   target_compile_definitions(harp-clap PRIVATE HAVE_LIBUSB)
   target_link_directories(harp-clap PRIVATE ${LIBUSB_LIBRARY_DIRS})
-  target_link_libraries(harp-clap PRIVATE ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS})
+  target_link_libraries(harp-clap PRIVATE ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc)
   if(APPLE)
     # macOS DAWs load a .clap as a CFBundle (Contents/MacOS/<exe> + Info.plist),
     # exactly like the AU .component below — NOT a flat dylib. Mirror harp-au.
@@ -240,6 +273,7 @@ if(LIBUSB_FOUND)
       ${HARP_ROOT}/host/usb_io.c
       ${HARP_ROOT}/host/sock_io.c
       ${HARP_ROOT}/host/rtp.c
+      ${HARP_ROOT}/host/freerun.c
       ${HARP_ROOT}/host/client.c
       ${HARP_ROOT}/core/src/cbor.c
       ${HARP_ROOT}/core/src/sha256.c
@@ -263,7 +297,7 @@ if(LIBUSB_FOUND)
     if(LIBUSB_LIBRARY_DIRS)
       target_link_directories(tsan-host PRIVATE ${LIBUSB_LIBRARY_DIRS})
     endif()
-    target_link_libraries(tsan-host ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS})
+    target_link_libraries(tsan-host ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc)
     message(STATUS "tsan-host: multi-instance shell-runtime harness (TSan: ${HARP_TSAN_SANITIZE})")
   endif()
 
@@ -289,6 +323,7 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/host/usb_io.c
     ${HARP_ROOT}/host/sock_io.c
     ${HARP_ROOT}/host/rtp.c
+    ${HARP_ROOT}/host/freerun.c
     ${HARP_ROOT}/host/client.c
     ${HARP_ROOT}/core/src/cbor.c
     ${HARP_ROOT}/core/src/sha256.c
@@ -304,7 +339,7 @@ if(LIBUSB_FOUND)
     ${LIBUSB_INCLUDE_DIRS})
   target_compile_definitions(registry-tests PRIVATE HAVE_LIBUSB)
   target_link_directories(registry-tests PRIVATE ${LIBUSB_LIBRARY_DIRS})
-  target_link_libraries(registry-tests ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS})
+  target_link_libraries(registry-tests ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc)
   add_test(NAME registry COMMAND registry-tests)
   message(STATUS "registry-tests: runtime registry keying/refcount unit test")
   endif() # NOT WIN32
@@ -360,6 +395,7 @@ if(LIBUSB_FOUND)
       ${HARP_ROOT}/host/usb_io.c
       ${HARP_ROOT}/host/sock_io.c
       ${HARP_ROOT}/host/rtp.c
+      ${HARP_ROOT}/host/freerun.c
       ${HARP_ROOT}/host/client.c
       ${HARP_ROOT}/core/src/cbor.c
       ${HARP_ROOT}/core/src/sha256.c
@@ -377,7 +413,7 @@ if(LIBUSB_FOUND)
     # harp_au.mm (ObjC++): force the C-struct flavor of OS objects
     target_compile_definitions(harp-au PRIVATE HAVE_LIBUSB OS_OBJECT_USE_OBJC=0)
     target_link_directories(harp-au PRIVATE ${LIBUSB_LIBRARY_DIRS})
-    target_link_libraries(harp-au PRIVATE ${LIBUSB_LIBRARIES}
+    target_link_libraries(harp-au PRIVATE ${LIBUSB_LIBRARIES} harp_asrc
       "-framework AudioToolbox" "-framework CoreFoundation" "-framework Foundation")
     set_target_properties(harp-au PROPERTIES
       BUNDLE TRUE

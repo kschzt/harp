@@ -158,6 +158,7 @@ int main(int argc, char **argv) {
     const char *panel_sock = "/tmp/harp-panel.sock"; /* "" disables */
     const char *rtp_out = NULL;                       /* §8.7 emit dest HOST:PORT */
     double tone_hz = 0.0;                             /* --tone HZ: SINAD test tone, 0=engine */
+    bool no_rate_lock = false;                        /* --no-rate-lock: force host ASRC fallback */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc)
             state_dir = argv[++i];
@@ -175,10 +176,12 @@ int main(int argc, char **argv) {
             rtp_out = argv[++i];
         else if (strcmp(argv[i], "--tone") == 0 && i + 1 < argc)
             tone_hz = atof(argv[++i]);
+        else if (strcmp(argv[i], "--no-rate-lock") == 0)
+            no_rate_lock = true; /* §8.7: drop audio.rate-lock from hello → host ASRC path */
         else {
             fprintf(stderr,
                     "usage: harp-deviced [--state-dir DIR] [--serial S] "
-                    "[--panel-sock PATH] [--tone HZ] "
+                    "[--panel-sock PATH] [--tone HZ] [--no-rate-lock] "
                     "[--port P | --ffs FFS_DIR [--gadget CONFIGFS_PATH]]\n");
             return 2;
         }
@@ -189,6 +192,7 @@ int main(int argc, char **argv) {
     memset(d, 0, sizeof *d);
     d->io = NULL;
     d->audio.tone_hz = tone_hz; /* test/measurement tone (render_output); 0 = engine */
+    d->no_rate_lock = no_rate_lock; /* §8.7 ASRC fallback test hook (hello capability gate) */
     snprintf(d->serial, sizeof d->serial, "%s", serial);
     if (harp_store_open(&d->store, state_dir) != 0) {
         fprintf(stderr, "harp-deviced: cannot open state dir %s\n", state_dir);

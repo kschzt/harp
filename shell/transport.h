@@ -64,8 +64,8 @@ struct ShellTransport {
      * declare a dead RTP stream (no EOF) and trigger reconnect. USB stubs all three
      * (it never free-runs; its audio is the host-paced endpoint via audioRead). The
      * bit-exact RATE LOOP lives in the feeder and reads audioRing_ occupancy. */
-    virtual unsigned recvAudio(float *out, unsigned maxFloats, int timeout_ms) {
-        (void)out; (void)maxFloats; (void)timeout_ms; return 0;
+    virtual unsigned recvAudio(float *out, unsigned maxFloats, int timeout_ms, unsigned *dev_ts) {
+        (void)out; (void)maxFloats; (void)timeout_ms; (void)dev_ts; return 0;
     }
     virtual int      audioPort() const { return 0; }
     virtual unsigned silentMs() const { return 0; }

@@ -422,6 +422,12 @@ private:
      * mix {0,1} -> audioRing_, each per-part sink's columns -> its ring. Shared by
      * the USB framed reader and the §8.7 RTP reader. */
     void demuxUnionFrame(const float *pl, size_t ns, uint16_t S);
+    /* reader-thread: smallest occupancy (stereo frames) across the owner main ring
+     * AND every per-part sink. The §8.7 ASRC reader pulls until THIS reaches the
+     * buffer setpoint, not just the main ring — so the FASTEST-draining consumer is
+     * kept fed; a slower over-full ring harmlessly drops the surplus (FloatRing.write
+     * caps at capacity). On the bit-exact path the device rate-trim makes this moot. */
+    unsigned minRingFillFrames();
     void eventPump();   /* dedicated event->wire thread: an event's deadline
                            budget is ~one DAW block (5.3 ms at 256), while a
                            pacing write can stall 8 ms in drain-on-stall —

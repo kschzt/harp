@@ -270,6 +270,10 @@ typedef struct {
     char serial[64];
     harp_hash param_map_hash;
     uint64_t boot_count;
+    bool no_rate_lock; /* §8.7 ASRC fallback test hook (harp-deviced --no-rate-lock):
+                          drop the audio.rate-lock capability from hello so the host
+                          can't host-lock and must resample (host/freerun) instead.
+                          Models a real converter whose clock the host can't trim. */
 
     harp_io *io; /* NULL when no session transport is attached. Written by
                     the session loop and read by panel-thread echo paths:

@@ -2,6 +2,10 @@
 #include "ump.h"
 #include "usb_transport.h" /* the concrete USB binding selectDevice() wraps */
 #include "eth_transport.h" /* the §8.7 Ethernet binding (bit-exact host-locked) */
+extern "C" {
+#include "freerun.h" /* §8.7 ASRC: host-side clock recovery + resample (libsamplerate) */
+}
+#include <samplerate.h> /* SRC_* converter-quality enum for the freerun cfg */
 
 #ifdef __APPLE__
 #include <pthread/qos.h>
@@ -1559,6 +1563,18 @@ void HarpRuntime::demuxUnionFrame(const float *pl, size_t ns, uint16_t S) {
     }
 }
 
+unsigned HarpRuntime::minRingFillFrames() {
+    size_t m = audioRing_.readAvailable() / 2; /* owner main mix (interleaved L/R) */
+    if (haveSinks_.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lk(sinksMutex_);
+        for (size_t si = 0; si < nSinks_; si++) {
+            size_t f = sinks_[si]->ring.readAvailable() / 2;
+            if (f < m) m = f;
+        }
+    }
+    return (unsigned)m;
+}
+
 void HarpRuntime::reader() {
 #ifdef __APPLE__
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -1581,21 +1597,84 @@ void HarpRuntime::reader() {
          * USB reader does, so per-part audio lands in the same sinks. */
         static constexpr unsigned kRtpBufFloats = kBlock * 34;
         float buf[kRtpBufFloats];
-        while (running_.load(std::memory_order_relaxed) &&
-               !readerStop_.load(std::memory_order_acquire)) {
+        if (bitExact_) {
+            /* rate-lock device: write the union 1:1 to audioRing_ + per-part sinks
+             * (no resampling — the device's emit rate is slaved to us via audio.trim). */
+            while (running_.load(std::memory_order_relaxed) &&
+                   !readerStop_.load(std::memory_order_acquire)) {
 #ifdef __APPLE__
-            wgMaintain(wgf);
+                wgMaintain(wgf);
 #endif
-            unsigned floats = transport_->recvAudio(buf, kRtpBufFloats, 100);
+                unsigned floats = transport_->recvAudio(buf, kRtpBufFloats, 100, nullptr);
+                unsigned width = unionWidth_.load(std::memory_order_relaxed);
+                if (!width) width = 2;
+                if (floats >= width)
+                    demuxUnionFrame(buf, floats / width, (uint16_t)width);
+                else if (floats == 0 && transport_->silentMs() > 1000) {
+                    log_msg("RTP stream silent >1s; device gone?");
+                    connected_.store(false, std::memory_order_release);
+                    break;
+                }
+            }
+        } else {
+            /* ASRC (device can't rate-lock): the device free-runs on its own crystal,
+             * so recover its rate from the RTP timestamps and RESAMPLE the whole union
+             * to the host clock — HERE on the reader thread, into the SAME stable
+             * audioRing_ + per-part sinks the bit-exact path uses (demuxUnionFrame). So
+             * pullAudio is unchanged and there is NO resampler on the audio thread to
+             * race a reconnect: the freerun is reader-LOCAL, freed when this loop exits
+             * (which sessionDown joins before reaping transport_). MULTICHANNEL — the
+             * resampled union is demuxed exactly like bit-exact, so per-part audio works
+             * over ASRC too. The steady audioRing_ drain (pullAudio) paces our pull, so
+             * the freerun sees a steady ~host-rate consumer. */
             unsigned width = unionWidth_.load(std::memory_order_relaxed);
             if (!width) width = 2;
-            if (floats >= width)
-                demuxUnionFrame(buf, floats / width, (uint16_t)width);
-            else if (floats == 0 && transport_->silentMs() > 1000) {
-                log_msg("RTP stream silent >1s; device gone?");
+            harp_freerun_cfg cfg = {};
+            cfg.channels = width;
+            cfg.host_rate_hz = (double)rate_;
+            cfg.dev_rate_hz = (double)rate_; /* nominal seed; recovered from RTP timestamps */
+            cfg.target_frames = kEthTargetFrames;
+            cfg.capacity_frames = kEthTargetFrames * 4;
+            cfg.quality = SRC_SINC_FASTEST; /* still exceeds the §8.3 stopband floor */
+            harp_freerun *fr = harp_freerun_new(&cfg);
+            if (!fr) {
+                log_msg("ASRC: resampler init failed (libsamplerate?) — no audio");
                 connected_.store(false, std::memory_order_release);
-                break;
+                return;
             }
+            uint64_t prevTs = 0;
+            float resamp[kRtpBufFloats];
+            const unsigned target = kEthTargetFrames; /* keep audioRing_ near here */
+            while (running_.load(std::memory_order_relaxed) &&
+                   !readerStop_.load(std::memory_order_acquire)) {
+#ifdef __APPLE__
+                wgMaintain(wgf);
+#endif
+                unsigned ts32 = 0;
+                unsigned floats = transport_->recvAudio(buf, kRtpBufFloats, 100, &ts32);
+                if (floats >= width) {
+                    unsigned ns = floats / width;
+                    uint64_t dev = harp_rtp_unwrap_ts((uint32_t)ts32, prevTs);
+                    prevTs = dev;
+                    harp_freerun_observe(fr, dev, harp_now_ns());
+                    harp_freerun_push(fr, buf, ns); /* raw union (channels = width) */
+                    /* drain the resampler into audioRing_/sinks until EVERY consumer
+                     * ring nears target or the resampler runs dry; the consumers'
+                     * steady drains set the pace. Gating on the MIN across main + sinks
+                     * (not just main) keeps the fastest-draining part fed when consumer
+                     * rates skew — a slower over-full ring just drops the surplus. */
+                    while (harp_freerun_warm(fr) && minRingFillFrames() < target) {
+                        unsigned got = harp_freerun_pull(fr, resamp, kBlock);
+                        if (got) demuxUnionFrame(resamp, got, (uint16_t)width);
+                        if (got < kBlock) break; /* dry — don't spin on silence */
+                    }
+                } else if (floats == 0 && transport_->silentMs() > 1000) {
+                    log_msg("RTP stream silent >1s; device gone?");
+                    connected_.store(false, std::memory_order_release);
+                    break;
+                }
+            }
+            harp_freerun_free(fr);
         }
         return;
     }

@@ -99,8 +99,10 @@ struct EthTransport final : ShellTransport {
     /* Reader thread: receive ONE RTP packet's slot-interleaved samples into `out`
      * (up to maxFloats), waiting up to timeout_ms. Returns FLOATS received (0 = none
      * / timeout / malformed). The payload is nsamples x slots (the negotiated union);
-     * the caller splits it by the union width and demuxes per part. */
-    unsigned recvAudio(float *out, unsigned maxFloats, int timeout_ms) override {
+     * the caller splits it by the union width and demuxes per part. dev_ts (if
+     * non-null) gets the packet's 32-bit RTP timestamp = the device sample index,
+     * which the ASRC clock-recovery (host/freerun) regresses against arrival time. */
+    unsigned recvAudio(float *out, unsigned maxFloats, int timeout_ms, unsigned *dev_ts) override {
         if (!readable(rxsock_, timeout_ms)) return 0;
         int n = (int)::recv(rxsock_, (char *)rxpkt_, (int)sizeof rxpkt_, 0);
         if (n < 0) return 0;
@@ -108,6 +110,7 @@ struct EthTransport final : ShellTransport {
         const uint8_t *pl;
         size_t pln;
         if (harp_rtp_unpack(rxpkt_, (size_t)n, &h, &pl, &pln) != 0) return 0;
+        if (dev_ts) *dev_ts = h.timestamp;
         if (pln % sizeof(float)) return 0; /* whole float samples only */
         unsigned f = (unsigned)(pln / sizeof(float)); /* slot-interleaved floats */
         if (f > maxFloats) f = maxFloats; /* one packet always fits a sane out */

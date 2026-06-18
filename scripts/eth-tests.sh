@@ -71,25 +71,54 @@ else
     bad "bit-exact: conn=$conn rms=${rms:-none} (want connected + rms>0.30)"
 fi
 
-# ── multi-output demux + per-part routing over RTP ──────────────────────────────
+# ── ASRC fallback: a non-rate-lock device → host resamples to its own clock ───────
+# --no-rate-lock drops the audio.rate-lock capability from hello, so the host CANNOT
+# host-lock (no audio.trim) and must take the §8.7 ASRC path (host/freerun): recover
+# the device's rate from the RTP timestamps and varispeed-resample its stream to the
+# host clock. Models a real converter whose crystal the host can't steer. Asserts the
+# host actually CHOSE ASRC (the warning fires) AND still renders the tone faithfully
+# through the resampler — the ~42 ms elastic-buffer warm-up silence is negligible over
+# 8 s, so the tone's rms survives; no reanchors (ASRC sends no audio.trim).
+echo "──── ASRC: non-rate-lock device, host clock-recovers + resamples"
+start_dev --no-rate-lock --tone 440
+out=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" "$HOSTBIN" "$PLUG" --seconds 8 --realtime --json 2>/tmp/eth-asrc.err || true)
+rms=$(printf '%s' "$out" | sed -nE 's/.*"rms":([0-9.]+).*/\1/p')
+conn=$(grep -c 'connected:' /tmp/eth-asrc.err 2>/dev/null || true)
+asrc=$(grep -c 'ASRC resample' /tmp/eth-asrc.err 2>/dev/null || true)
+stop_dev
+echo "   rms=${rms:-?}  asrc-chosen=${asrc:-0}  conn=${conn:-0}  (ideal tone rms 0.3536)"
+if [ "${conn:-0}" -gt 0 ] && [ "${asrc:-0}" -gt 0 ] && [ -n "$rms" ] \
+   && [ "$(python3 -c "print(1 if $rms > 0.25 else 0)")" = 1 ]; then
+    ok "ASRC: chose resample path, tone rendered through it (rms $rms)"
+else
+    bad "ASRC: conn=$conn asrc=$asrc rms=${rms:-none} (want connected + ASRC + rms>0.25)"
+fi
+
+# ── multi-output demux + per-part routing over RTP (bit-exact AND ASRC) ──────────
 # The §8.7 coverage the USB rig can't run reliably (it wedges on the repeated
 # multi-instance --part-audio re-claims): the device streams the slot UNION over RTP
-# and the owner's reader() demuxes each part into its sink. Reuse the conformance
-# tests verbatim — they detect HARP_ETH_DEVICE and dial the localhost fake hardware:
+# and the owner's reader() demuxes each part into its sink. Run the conformance tests
+# BOTH ways — first a rate-lock device (1:1 union demux) and then a --no-rate-lock one
+# (the union is varispeed-resampled THEN demuxed: MULTICHANNEL ASRC, the per-part path
+# through host/freerun). Identical assertions both ways prove the resampled union
+# demuxes to the same per-part routing as the bit-exact one:
 #   alias-part-audio = the main mix is RICHER than a demuxed part (a strict subset),
 #   part-param-iso   = a part's level routes to ITS audio and stays out of the others.
 # A normal-synth device (no --tone) so the aliases' injected per-part notes render.
-echo "──── multi-output: per-part demux + routing over RTP"
-start_dev
-export HARP_ETH_DEVICE="127.0.0.1:$PORT"
 export HARP_DEVICE_SERIAL="SIM-0001"   # the --port daemon's serial (the connect-check matches it)
-for t in scripts/alias-part-audio-test.sh scripts/part-param-iso-test.sh; do
-    echo "──── $t (over §8.7 Ethernet)"
-    if sh "$t"; then ok "$(basename "$t" .sh): per-part over RTP"
-    else bad "$(basename "$t" .sh) over RTP (exit $?)"; fi
+export HARP_ETH_DEVICE="127.0.0.1:$PORT"
+for mode in "bit-exact:" "ASRC:--no-rate-lock"; do
+    label="${mode%%:*}"; devarg="${mode#*:}"
+    echo "──── multi-output ($label): per-part demux + routing over RTP"
+    start_dev $devarg
+    for t in scripts/alias-part-audio-test.sh scripts/part-param-iso-test.sh; do
+        echo "────── $t ($label over §8.7 Ethernet)"
+        if sh "$t"; then ok "$(basename "$t" .sh): per-part over RTP ($label)"
+        else bad "$(basename "$t" .sh) over RTP ($label) (exit $?)"; fi
+    done
+    stop_dev
 done
 unset HARP_ETH_DEVICE
-stop_dev
 
 echo "════ eth-tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
