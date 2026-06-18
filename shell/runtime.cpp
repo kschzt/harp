@@ -556,11 +556,12 @@ bool HarpRuntime::sessionUp() {
     /* connected_ goes true BEFORE the pump spawns: its run loop gates on
      * it, and spawning first would race a clean instant exit */
     connected_.store(true, std::memory_order_release);
-    /* USB: the reader thread drains the host-paced audio-IN endpoint into
-     * audioRing_. Ethernet free-running has no such endpoint — EthTransport owns
-     * its own RTP rx thread feeding its FIFO (pullAudio pulls from it), so we
-     * skip reader() entirely. The eventPump runs for both (events over TCP). */
-    if (!freeRunning_) readerThread_ = std::thread([this] { reader(); });
+    /* The reader thread feeds audioRing_ for BOTH bindings: USB drains the
+     * host-paced audio-IN endpoint (+ demux); Ethernet receives the RTP stream
+     * 1:1 (reader() branches on freeRunning_). Spawning it here — and joining it
+     * in sessionDown BEFORE transport_ is freed — is what keeps the DAW audio
+     * thread (which touches only audioRing_) clear of transport_ teardown. */
+    readerThread_ = std::thread([this] { reader(); });
     eventPumpThread_ = std::thread([this] { eventPump(); });
     return true;
 }
@@ -1061,20 +1062,10 @@ void HarpRuntime::syncSinkEpoch(AudioSink &sink) {
 }
 
 size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
-    if (freeRunning_) {
-        /* §8.7 bit-exact: pull the device's RTP samples 1:1 from EthTransport's
-         * FIFO — NO resampling. pullFree fills the whole stereo block (silence-
-         * padding a transient underrun) and returns the real frames delivered. */
-        unsigned real = transport_->pullFree(dst, (unsigned)nFrames);
-        ssiRead_.fetch_add(nFrames, std::memory_order_relaxed);
-        if (real < (unsigned)nFrames && connected_.load(std::memory_order_acquire)) {
-            unsigned pad = (unsigned)nFrames - real;
-            underruns_.fetch_add(1, std::memory_order_relaxed);
-            padSamples_.fetch_add(pad, std::memory_order_relaxed);
-            return pad;
-        }
-        return 0;
-    }
+    /* Reads the stable audioRing_ for BOTH bindings — USB's reader() demuxes the
+     * host-paced frames into it; Ethernet's reader() writes the 1:1 RTP frames
+     * into it (bit-exact). The DAW audio thread therefore never touches transport_,
+     * so a reconnect reaping the transport can't race this thread. */
     settlePadDebt();
     size_t want = nFrames * 2;
     size_t got = audioRing_.read(dst, want);
@@ -1229,7 +1220,7 @@ void HarpRuntime::feeder() {
             uint64_t nowNs = harp_now_ns();
             if (nowNs - ethLastTrimNs >= 50000000ull) {
                 ethLastTrimNs = nowNs;
-                unsigned fill = transport_->fillFrames();
+                unsigned fill = (unsigned)(audioRing_.readAvailable() / 2); /* the reader fills this */
                 if (!ethPrimed) { ethSmFill = fill; ethPrimed = true; }
                 else ethSmFill += 0.03 * ((double)fill - ethSmFill);
                 double trim = -2000.0 * (ethSmFill - (double)kEthTargetFrames);
@@ -1473,6 +1464,34 @@ void HarpRuntime::reader() {
 #ifdef __APPLE__
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
+    if (freeRunning_) {
+        /* §8.7 Ethernet: receive the device's RTP stream and write it 1:1 into
+         * audioRing_ (bit-exact — no resampling). The DAW audio thread consumes
+         * audioRing_ exactly as on USB; the feeder's audio.trim loop holds its
+         * fill at setpoint. RTP has no EOF, so if the stream goes silent we flip
+         * connected_ and let the supervisor reconnect. This thread is joined by
+         * sessionDown before transport_ is freed, so the audio thread never
+         * races the teardown. */
+#ifdef __APPLE__
+        WgState wgf;
+#endif
+        float buf[2048 * 2]; /* one RTP packet's stereo frames (<= 2048) */
+        while (running_.load(std::memory_order_relaxed) &&
+               !readerStop_.load(std::memory_order_acquire)) {
+#ifdef __APPLE__
+            wgMaintain(wgf);
+#endif
+            unsigned n = transport_->recvAudio(buf, 2048, 100);
+            if (n > 0)
+                audioRing_.write(buf, n * 2);
+            else if (transport_->silentMs() > 1000) {
+                log_msg("RTP stream silent >1s; device gone?");
+                connected_.store(false, std::memory_order_release);
+                break;
+            }
+        }
+        return;
+    }
     uint8_t acc[65536];
     size_t accLen = 0;
 #ifdef __APPLE__

@@ -50,23 +50,23 @@ struct ShellTransport {
     virtual bool isFreeRunning() const = 0;
 
     /* ---- free-running audio plane (§8.7), used only when isFreeRunning().
-     * pollFree drains the network and feeds clock recovery — call it on the
-     * rx/network thread. pullFree renders host-rate frames from the recovered
-     * stream — call it on the DAW audio thread. silentMs reports liveness (ms
-     * since the last packet) so the supervisor can reconnect a dead UDP stream
-     * that has no EOF. USB stubs all three (it never free-runs). */
-    virtual int      pollFree(int timeout_ms) { (void)timeout_ms; return 0; }
-    virtual unsigned pullFree(float *out, unsigned nframes) { (void)out; (void)nframes; return 0; }
-    virtual unsigned silentMs() const { return 0; }
-
-    /* ---- bit-exact (host-locked) hooks (§8.7), used only when isFreeRunning().
-     * audioPort() is the bound RTP rx port the device must stream to (carried in
-     * audio.start key 6). fillFrames() is the current jitter-buffer occupancy,
-     * which the feeder's control loop reads to compute the rate trim it sends
-     * back (audio.trim) — keeping the device's emit rate locked to the host so
-     * pullFree() plays 1:1, no resampling = bit-exact. USB stubs both. */
+     * recvAudio() receives ONE RTP packet's worth of interleaved stereo frames
+     * into `out` (up to maxFrames), waiting up to timeout_ms; returns the frames
+     * received (0 = none). It is called ONLY on the runtime's reader thread
+     * (NOT the DAW audio thread), which writes them into the stable audioRing_ —
+     * so the audio thread reads audioRing_ exactly as on USB and never touches
+     * transport_ (no use-after-free when the supervisor reaps the transport on a
+     * reconnect; the reader is joined first, like USB). audioPort() is the bound
+     * RTP rx port (audio.start key 6); silentMs() is ms since the last packet,
+     * so the reader can declare a dead RTP stream (no EOF) and trigger reconnect.
+     * USB stubs all three (it never free-runs; its audio is the host-paced
+     * endpoint via audioRead). The bit-exact RATE LOOP lives in the feeder and
+     * reads audioRing_ occupancy directly. */
+    virtual unsigned recvAudio(float *out, unsigned maxFrames, int timeout_ms) {
+        (void)out; (void)maxFrames; (void)timeout_ms; return 0;
+    }
     virtual int      audioPort() const { return 0; }
-    virtual unsigned fillFrames() const { return 0; }
+    virtual unsigned silentMs() const { return 0; }
 };
 
 #endif /* HARP_SHELL_TRANSPORT_H */
