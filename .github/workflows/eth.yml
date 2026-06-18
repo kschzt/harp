@@ -1,0 +1,51 @@
+name: eth
+
+# §8.7 Ethernet/IP conformance against FAKE HARDWARE: a localhost harp-deviced (the
+# real synth + protocol, not plugged in over USB) over TCP(ctl)+RTP(udp), with the
+# shell connecting via HARP_ETH_DEVICE. No physical device, so this runs on the cloud
+# runners in PARALLEL to hw.yml (the authoritative real-device USB suite). It is the
+# automated home of the Ethernet TRANSPORT coverage (bit-exact play, the host-locked
+# rate loop, the RTP audio plane) plus the transport-agnostic per-part tests the USB
+# rig can't run reliably. Cloud-sandboxed (no home hardware), so PRs are safe — unlike
+# hw.yml, which is push/dispatch-only.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  eth:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: clone VST3 SDK
+        run: git clone --depth 1 --recursive
+             https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
+      - name: clone CLAP SDK (header-only)
+        run: git clone --depth 1 --branch 1.2.8
+             https://github.com/free-audio/clap.git external/clap
+      - name: install deps (libusb + libsamplerate)
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libsamplerate0-dev
+          else
+            brew install libusb libsamplerate
+          fi
+      - name: build the fake-hardware device (harp-deviced)
+        run: |
+          cmake -B build -S .
+          cmake --build build --target harp-deviced -j
+      - name: build the shell + host (+ AU host on macOS)
+        run: |
+          cmake -B build-vst -S tools/vst3-host
+          cmake --build build-vst --target harp-vst3-host harp-shell -j
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cmake --build build-vst --target harp-au au-host -j
+          fi
+      - name: eth conformance (bit-exact, RTP audio plane, per-part demux over §8.7)
+        run: scripts/eth-tests.sh
