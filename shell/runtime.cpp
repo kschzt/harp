@@ -1647,21 +1647,68 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
         log_msg("recall: hash match, clean -> SYNCED silently");
         return true;
     }
-    log_msg("recall: mismatch%s -> Push with archive (v0 auto-resolve)",
-            live.dirty ? " + dirty edits" : "");
     harp_hash deviceHead = live.hash;
     if (live.dirty && !snapshotLocked(&deviceHead)) return false;
 
+    /* §11.4: a real conflict (the device holds divergent state) is NOT auto-resolved
+     * (spec §12.2) — post the offer to the front panel and let the user pick the
+     * action. An unborn device is a clean first push (no conflict). A panel-less setup
+     * falls back to an archive-protected Push if nobody answers within the window. */
+    int choice = 0; /* default Push — covers unborn first-push + the no-frontend path */
+    if (!live.unborn) {
+        char expect12[16], live12[16], hex[2 * HARP_HASH_LEN + 1];
+        harp_hash_hex(&target, hex);
+        snprintf(expect12, sizeof expect12, "%.12s", hex);
+        harp_hash_hex(&deviceHead, hex);
+        snprintf(live12, sizeof live12, "%.12s", hex);
+        choice = -1;
+        if (harp_client_reconcile_offer(&client_, expect12, live12, live.dirty ? 1 : 0) == 0) {
+            log_msg("recall: mismatch%s -> reconcile offer posted (expect %s live %s)",
+                    live.dirty ? " + dirty edits" : "", expect12, live12);
+            /* Wait for a front-panel pick. Bounded so a panel-less setup doesn't hang;
+             * HARP_RECONCILE_TIMEOUT_MS tunes it (0 = don't wait -> immediate fallback,
+             * which headless/CI recalls set to keep the old fast path). */
+            const int POLL_MS = 200;
+            int timeout_ms = 5000;
+            if (const char *env = getenv("HARP_RECONCILE_TIMEOUT_MS")) timeout_ms = atoi(env);
+            for (int waited = 0; waited < timeout_ms; waited += POLL_MS) {
+                bool pending = true;
+                if (harp_client_reconcile_poll(&client_, &pending, &choice) != 0) break;
+                if (!pending) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(POLL_MS));
+            }
+        }
+        if (choice < 0) { /* nobody answered (no panel attached, or timed out) */
+            log_msg("recall: no reconcile pick -> Push fallback (archive-protected)");
+            choice = 0;
+        }
+    }
+
+    if (choice == 1) { /* Pull to DAW: the host adopts the device state; device untouched */
+        log_msg("recall: reconcile -> Pull (host adopts the device state)");
+        return fetchClosureLocked(deviceHead);
+    }
+    if (choice == 2) { /* Read-only: observe, no writes either way */
+        log_msg("recall: reconcile -> Read-only (no writes)");
+        return true;
+    }
+
+    /* Push (0) or Duplicate (3): archive the displaced device state (Duplicate names
+     * it visibly as duplicate/<ts>, Push as archive/<ts>), push the target's closure,
+     * CAS the live ref to the target. */
+    const char *prefix = (choice == 3) ? "duplicate" : "archive";
+    if (choice == 3)
+        log_msg("recall: reconcile -> Duplicate (displaced state kept as duplicate/<ts>)");
+    else
+        log_msg("recall: %s -> Push (archive-then-CAS)", live.unborn ? "first push" : "reconcile");
     if (!live.unborn) {
         char archive[96];
         time_t now = time(nullptr);
         struct tm tm;
         harp_gmtime(now, &tm);
-        snprintf(archive, sizeof archive, "archive/%04d-%02d-%02dT%02d:%02d:%02dZ",
-                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
-                 tm.tm_sec);
-        if (harp_client_refset(&client_, archive, nullptr, &deviceHead, true, false, nullptr) !=
-            0)
+        snprintf(archive, sizeof archive, "%s/%04d-%02d-%02dT%02d:%02d:%02dZ", prefix,
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+        if (harp_client_refset(&client_, archive, nullptr, &deviceHead, true, false, nullptr) != 0)
             return false;
     }
 
@@ -1677,10 +1724,10 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
     bool ok = harp_client_refset(&client_, LIVE_REF, live.unborn ? nullptr : &deviceHead,
                                  &target, live.unborn, false, nullptr) == 0;
     if (ok) log_msg("recall: live/project restored");
-    /* The bundle reference is PERSISTENT, not consumed: the DAW project's
-     * notion of state re-asserts on every reconnect ("Live wins") — with
-     * the archive step keeping it loss-free. It only moves when a save
-     * pulls a new head (getStateBundle) or a new set loads. */
+    /* The bundle reference is PERSISTENT, not consumed: the DAW project's notion of
+     * state re-asserts on every reconnect ("Live wins") — the archive/duplicate step
+     * keeps it loss-free. It only moves when a save pulls a new head (getStateBundle)
+     * or a new set loads. */
     return ok;
 }
 
