@@ -210,7 +210,8 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, PROTO_MAJOR);
     harp_cbor_uint(m, PROTO_MINOR);
     harp_cbor_uint(m, 6); /* capabilities */
-    harp_cbor_array(m, 15); /* P3: +evt.multitimbral; §9.9: +evt.param.meter; +evt.param.mod */
+    harp_cbor_array(m, 16); /* P3: +evt.multitimbral; §9.9: +evt.param.meter; +evt.param.mod;
+                               §8.7: +audio.rate-lock */
     harp_cbor_text(m, "harp-core");
     harp_cbor_text(m, "harp-recall");
     harp_cbor_text(m, "harp-stream");
@@ -220,6 +221,10 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_text(m, "audio.host-paced");
     harp_cbor_text(m, "audio.deterministic");
     harp_cbor_text(m, "audio.offline-rate");
+    harp_cbor_text(m, "audio.rate-lock"); /* §8.7 bit-exact: device honors audio.trim to
+                                             slave its free-running emit rate to the host's
+                                             consumption, so the host plays 1:1 (bit-exact).
+                                             Absent => the host must ASRC-resample instead. */
     harp_cbor_text(m, "evt.param");
     harp_cbor_text(m, "evt.param.echo");
     harp_cbor_text(m, "evt.param.mod"); /* §9.4 non-destructive modulation: device

@@ -514,6 +514,12 @@ private:
                                 * read off the RT path): false on USB, so every existing
                                 * host-paced line is reached identically. The Ethernet
                                 * steps gate the free-running branches on this bool. */
+    bool deviceRateLock_ = false; /* §8.7: device advertised "audio.rate-lock" (it honors
+                                   * audio.trim). Captured in helloAndIdentity. */
+    bool bitExact_ = true; /* §8.7 clock mode (set at sessionUp): a free-running device that
+                            * rate-locks => play 1:1 + audio.trim (bit-exact). One that does
+                            * NOT => host ASRC-resample. Always true on USB (host-paced;
+                            * unused there) so the existing paths are unchanged. */
     harp_link link_;   /* rx reassembly: shared by client_ and pollEcho */
     harp_cbuf msg_;    /* pollEcho rx scratch */
     harp_client client_{};

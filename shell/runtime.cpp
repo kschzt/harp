@@ -81,6 +81,7 @@ bool HarpRuntime::helloAndIdentity() {
     engineId_ = id.engine_id;
     engineVer_ = id.engine_ver;
     paramMapHash_ = id.param_map_hash;
+    deviceRateLock_ = harp_client_has_cap(&id, "audio.rate-lock"); /* §8.7: honors audio.trim */
     return true;
 }
 
@@ -496,6 +497,14 @@ bool HarpRuntime::sessionUp() {
         log_msg("connected: %s %s (serial %s, engine %s %s)", vendorName_.c_str(),
                 productName_.c_str(), serial_.c_str(), engineId_.c_str(),
                 engineVer_.c_str());
+        /* §8.7 clock mode (auto-select): a free-running (Ethernet/RTP) device that
+         * advertises audio.rate-lock honors our audio.trim, so the feeder closes the
+         * rate loop and pullAudio plays 1:1 = bit-exact. One that does NOT must be
+         * ASRC-resampled host-side. USB is host-paced (bitExact_ unused there). */
+        bitExact_ = !freeRunning_ || deviceRateLock_;
+        if (freeRunning_ && !deviceRateLock_)
+            log_msg("warning: Ethernet device lacks audio.rate-lock -> ASRC resample "
+                    "(host-locked bit-exact unavailable)");
         /* re-assert the project's bundle ("Live wins") — covers both a
          * setState that arrived pre-connect and state the device grew
          * while unplugged. Copy the target out: pushStateLocked takes
@@ -1217,7 +1226,7 @@ void HarpRuntime::feeder() {
          * pullAudio plays 1:1 (bit-exact). Proportional-only on a smoothed fill =>
          * first-order stable (eth-bitexact-test: 127 dB, no oscillation). The send
          * takes ctlMutex_ so it serializes with the eventPump's evt writes. */
-        if (freeRunning_) {
+        if (freeRunning_ && bitExact_) { /* §8.7: trim only a rate-lockable device; ASRC needs none */
             uint64_t nowNs = harp_now_ns();
             if (nowNs - ethLastTrimNs >= 50000000ull) {
                 ethLastTrimNs = nowNs;
@@ -1665,11 +1674,12 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
         if (harp_client_reconcile_offer(&client_, expect12, live12, live.dirty ? 1 : 0) == 0) {
             log_msg("recall: mismatch%s -> reconcile offer posted (expect %s live %s)",
                     live.dirty ? " + dirty edits" : "", expect12, live12);
-            /* Wait for a front-panel pick. Bounded so a panel-less setup doesn't hang;
-             * HARP_RECONCILE_TIMEOUT_MS tunes it (0 = don't wait -> immediate fallback,
-             * which headless/CI recalls set to keep the old fast path). */
+            /* Wait for a front-panel pick. Default 30s so the DAW need NOT be launched
+             * with an env var to give you time to read + pick on the panel. Bounded so
+             * a panel-less setup doesn't hang forever; HARP_RECONCILE_TIMEOUT_MS tunes
+             * it (0 = don't wait -> immediate fallback, which headless/CI recalls set). */
             const int POLL_MS = 200;
-            int timeout_ms = 5000;
+            int timeout_ms = 30000;
             if (const char *env = getenv("HARP_RECONCILE_TIMEOUT_MS")) timeout_ms = atoi(env);
             for (int waited = 0; waited < timeout_ms; waited += POLL_MS) {
                 bool pending = true;
