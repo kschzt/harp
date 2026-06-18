@@ -171,27 +171,61 @@ def control_color(name):
 
 
 def build_preset(params):
-    """A 2-page Mini preset: the §9.3 params as CC faders (param id N -> CC N), 8 on
-    page 1 (the 8 knobs) and the rest on page 2. The CC binding is what the bridge
-    mirrors; the four-action buttons come in Phase 2."""
+    """The HARP front panel. Each PARAM page puts the Part selector on knob 1 (turn
+    to choose which of the 16 engine parts the knobs edit -> CC 116, the sidecar
+    re-scopes), then the §9.3 params as CC faders (id N -> CC N). Env Attack/Release
+    fold into ONE adr envelope on knob 6 (press it for the per-stage detail). Page 3
+    is the Reconcile page (Phase 2)."""
     devices = [{"id": 1, "name": "HARP", "port": 1, "channel": MIDI_CH + 1, "rate": 15}]
     pages = [{"id": 1, "name": "Synth"}, {"id": 2, "name": "Arp + Glide"}]
     controls = []
-    for i, p in enumerate(params):
-        page = 1 if i < 8 else 2
-        slot = i if i < 8 else i - 8        # 0..7 -> potId 1..8 (4x2 grid)
-        col, row = slot % COLS, slot // COLS
-        controls.append({
-            "id": p["id"], "type": "fader", "name": p["name"][:14],  # device's own casing
-            "color": control_color(p["name"]),
-            "bounds": [col * COL_W + PADX, TOP_Y if row == 0 else BOT_Y,
-                       COL_W - 2 * PADX, ROW_H],
-            "pageId": page, "controlSetId": 1,
-            "inputs": [{"potId": slot + 1, "valueId": "value"}],
-            "values": [{"id": "value", "min": 0, "max": 127,
-                        "message": {"deviceId": 1, "type": "cc7",
-                                    "parameterNumber": p["id"], "min": 0, "max": 127}}],
-        })
+    pname = {p["id"]: p["name"] for p in params}  # param id -> name
+
+    def bounds(pot):
+        col, row = (pot - 1) % COLS, (pot - 1) // COLS
+        return [col * COL_W + PADX, TOP_Y if row == 0 else BOT_Y, COL_W - 2 * PADX, ROW_H]
+
+    def part_selector(page):   # knob 1 on every param page: turn to pick the part
+        return {"id": 220 + page, "type": "fader", "name": "Part", "color": "FFD24A",
+                "bounds": bounds(1), "pageId": page, "controlSetId": 1,
+                "inputs": [{"potId": 1, "valueId": "value"}],
+                "values": [{"id": "value", "min": 1, "max": 16,
+                            "message": {"deviceId": 1, "type": "cc7",
+                                        "parameterNumber": 116, "min": 1, "max": 16}}]}
+
+    def fader(pid, page, pot):
+        return {"id": pid, "type": "fader", "name": pname.get(pid, "?")[:14],
+                "color": control_color(pname.get(pid, "")),
+                "bounds": bounds(pot), "pageId": page, "controlSetId": 1,
+                "inputs": [{"potId": pot, "valueId": "value"}],
+                "values": [{"id": "value", "min": 0, "max": 127,
+                            "message": {"deviceId": 1, "type": "cc7",
+                                        "parameterNumber": pid, "min": 0, "max": 127}}]}
+
+    # Page 1 (Synth): Part(1), Osc Pitch(2), Osc Shape(3), Filter Cutoff(4),
+    # Filter Reso(5), Env(6 = adr: attack CC5 + release CC6, press for the detail),
+    # Drone Mix(7), Master Level(8).
+    controls += [part_selector(1), fader(1, 1, 2), fader(2, 1, 3), fader(3, 1, 4),
+                 fader(4, 1, 5)]
+    controls.append({
+        "id": 5, "type": "adr", "name": "Env", "color": control_color("Env"),
+        "bounds": bounds(6), "pageId": 1, "controlSetId": 1,
+        "inputs": [{"potId": 6, "valueId": "attack"}],   # detail screen exposes all three
+        "values": [
+            {"id": "attack", "min": 0, "max": 127,
+             "message": {"deviceId": 1, "type": "cc7", "parameterNumber": 5, "min": 0, "max": 127}},
+            # adr ALWAYS has a decay stage; the refdev has none. Bind it to a CC the
+            # bridge ignores (60) — a harmless no-op decay — so the control is
+            # well-formed (an unmapped stage froze the firmware).
+            {"id": "decay", "min": 0, "max": 127,
+             "message": {"deviceId": 1, "type": "cc7", "parameterNumber": 60, "min": 0, "max": 127}},
+            {"id": "release", "min": 0, "max": 127,
+             "message": {"deviceId": 1, "type": "cc7", "parameterNumber": 6, "min": 0, "max": 127}},
+        ]})
+    controls += [fader(7, 1, 7), fader(8, 1, 8)]
+    # Page 2 (Arp + Glide): Part(1), then the 5 arp/glide params on knobs 2-6.
+    controls += [part_selector(2), fader(9, 2, 2), fader(10, 2, 3), fader(11, 2, 4),
+                 fader(12, 2, 5), fader(13, 2, 6)]
     # Phase-2 Reconcile page (§11.4): the four safe actions on knobs 1-4. The Mini
     # is non-touch, so a knob PRESS fires the action under it (caught as a CTRL pot
     # event); these controls are bound to CCs the bridge ignores (>13), so turning
@@ -348,6 +382,13 @@ def main():
     ACTION_CC = {110: 0, 111: 1, 112: 2, 113: 3}  # pad-fired CC -> action index
     recon = {"active": False}
 
+    # Multitimbral: the 8 knobs edit the FOCUSED part; the "Part" knob (CC 116) on
+    # the Arp+Glide page picks it (1..16 -> part 0..15). The display poll + every
+    # knob edit are scoped to focus["part"].
+    NPARTS = 16
+    PART_CC = 116
+    focus = {"part": 0}
+
     def fire(idx):
         r = panel.cmd("reconcile-choose %d" % idx)
         sys.stderr.write("electra-panel: reconcile -> %s %s\n" % (ACTIONS[idx], r))
@@ -364,9 +405,15 @@ def main():
             for st, d1, d2 in mp.feed(data):
                 if (st & 0xF0) != 0xB0:
                     continue
-                if d1 in by_cc:                       # a knob moved -> dirty the param
+                if d1 in by_cc:                       # a knob moved -> edit the focused part
                     shown[d1] = d2
-                    panel.cmd("knob %d %.5f" % (d1, d2 / 127.0))
+                    panel.cmd("knob %d %d %.5f" % (focus["part"], d1, d2 / 127.0))
+                elif d1 == PART_CC:                   # the Part knob -> change focus
+                    p = max(0, min(NPARTS - 1, int(d2) - 1))
+                    if p != focus["part"]:
+                        focus["part"] = p
+                        shown.clear()                 # force the display to the new part
+                        sys.stderr.write("electra-panel: focus part -> %d\n" % p)
                 elif d1 in ACTION_CC and d2 >= 64 and recon["active"]:  # a pad fired
                     fire(ACTION_CC[d1])
 
@@ -394,7 +441,7 @@ def main():
         # Param display CCs only when NOT reconciling (else they'd pull the screen off).
         if not recon["active"]:
             try:
-                cur = json.loads(panel.cmd("params"))["params"]
+                cur = json.loads(panel.cmd("params %d" % focus["part"]))["params"]
                 out = bytearray()
                 for p in cur:
                     cc = max(0, min(127, round(p["value"] * 127)))
