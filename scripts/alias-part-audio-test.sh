@@ -68,13 +68,16 @@ cmake -B "$BUILD" -S tools/vst3-host -DHARP_TSAN=ON -DHARP_TSAN_SANITIZE=OFF >/d
 cmake --build "$BUILD" --target tsan-host -j >/dev/null
 [ -x "$BUILD/tsan-host" ] || { echo "ALIAS-PART-AUDIO FAIL: harness build produced no binary"; exit 1; }
 
-# Pin an AUDIBLE voice on PART 0 via the front panel (the panel is part 0): drone
-# (7), level (8), tone (3), fast env (5/6) so part 0 is loud — this makes the main
-# mix clearly richer than the single attached part (assertion 2). The attached
-# part 1 sounds from its own control-thread notes/params (its defaults).
-for kv in "7 0.5" "8 0.6" "3 0.7" "5 0.05" "6 0.1"; do
-    "$PROBE" -d "usb:$SERIAL" knob $kv >/dev/null 2>&1 || true
-done
+# Make PART 0 RELIABLY out-shout part 1 with CONTROLLED, DETERMINISTIC levels. The
+# old design left part 1 on the harness's RANDOM param-flood (its level swung
+# 0..0.99 run-to-run), so part 1 frequently out-shouted part 0 and the paired
+# (main-sink) median tipped negative — the long-standing flake (failing since
+# Path 3). HARP_ISO_LEVELS drives BOTH instances as a fixed tone+env voice at a
+# fixed level (the SAME mechanism part-param-iso-test relies on — proven
+# jitter-robust on the bus): owner part 0 LOUD (0.9), attached part 1 MODEST (0.3).
+# main (part 0 + part 1) then exceeds the demuxed part-1 sink in every sample by
+# part 0's ~3x dominant energy, while part 1 at 0.3 stays well clear of the floor.
+export HARP_ISO_LEVELS="0.9,0.3"
 
 # median of stdin numbers (sh-portable: sort + middle pick). Works for floats.
 median() {
@@ -117,13 +120,14 @@ done
 MMED=$(median $MAINS); SMED=$(median $SINKS); DMED=$(median $DIFFS)
 
 # The subset check is PAIRED: median of per-sample (main - sink), NOT median(mains)
-# vs median(sinks) compared separately. main (part0 drone + part1) exceeds sink
-# (part1 alone) by part0's energy in EVERY run — but the absolute RMS swings
-# run-to-run (part 1 plays transient notes; the realtime pull's block alignment
-# jitters, as the header notes), so comparing the two medians INDEPENDENTLY lets a
-# quiet-part1 run's main lose to a loud-part1 run's sink even though main > sink
-# holds within each run. The paired median is jitter-robust and still catches a real
-# demux-copies-the-mix bug (then main-sink ~= 0 in every sample).
+# vs median(sinks) compared separately. With the controlled levels above (part 0 at
+# 0.9, part 1 at 0.3) main (part 0 + part 1) exceeds sink (part 1 alone) by part 0's
+# ~3x energy in EVERY run; the paired median then only has to defend the residual
+# block-alignment jitter of the realtime pull (RMS still swings a little run-to-run),
+# for which comparing the two medians INDEPENDENTLY would be fragile — a low main
+# sample could lose to a high sink sample even though main > sink within each run.
+# The paired median is jitter-robust and still catches a real demux-copies-the-mix
+# bug (then main-sink ~= 0 in every sample, regardless of levels).
 echo "── medians: main-rms=$MMED  sink-rms=$SMED  paired (main-sink) median=$DMED  (floor=$FLOOR)"
 HEARD=$(python3 -c "print(1 if $SMED > $FLOOR else 0)")
 SUBSET=$(python3 -c "print(1 if $DMED > 0 else 0)")
