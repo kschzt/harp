@@ -1675,11 +1675,16 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
     if (live.dirty && !snapshotLocked(&deviceHead)) return false;
 
     /* §11.4: a real conflict (the device holds divergent state) is NOT auto-resolved
-     * (spec §12.2) — post the offer to the front panel and let the user pick the
-     * action. An unborn device is a clean first push (no conflict). A panel-less setup
-     * falls back to an archive-protected Push if nobody answers within the window. */
-    int choice = 0; /* default Push — covers unborn first-push + the no-frontend path */
-    if (!live.unborn) {
+     * (spec §12.2) — post an offer to the front panel and let the user pick the action.
+     * The window is HARP_RECONCILE_TIMEOUT_MS (default 30s, so a live DAW needs no env
+     * var). With it 0 (headless/CI) we SKIP the offer ENTIRELY and Push straight away:
+     * the per-part-audio stress fires setStateBundle ~5x/s, and an offer+poll round-trip
+     * per push wedges the device — so headless takes the same archive-protected Push the
+     * pre-recall baseline did. An unborn device is always a clean first push. */
+    int timeout_ms = 30000;
+    if (const char *env = getenv("HARP_RECONCILE_TIMEOUT_MS")) timeout_ms = atoi(env);
+    int choice = 0; /* default Push — unborn, headless (timeout 0), and the no-pick path */
+    if (!live.unborn && timeout_ms > 0) {
         char expect12[16], live12[16], hex[2 * HARP_HASH_LEN + 1];
         harp_hash_hex(&target, hex);
         snprintf(expect12, sizeof expect12, "%.12s", hex);
@@ -1689,13 +1694,7 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
         if (harp_client_reconcile_offer(&client_, expect12, live12, live.dirty ? 1 : 0) == 0) {
             log_msg("recall: mismatch%s -> reconcile offer posted (expect %s live %s)",
                     live.dirty ? " + dirty edits" : "", expect12, live12);
-            /* Wait for a front-panel pick. Default 30s so the DAW need NOT be launched
-             * with an env var to give you time to read + pick on the panel. Bounded so
-             * a panel-less setup doesn't hang forever; HARP_RECONCILE_TIMEOUT_MS tunes
-             * it (0 = don't wait -> immediate fallback, which headless/CI recalls set). */
             const int POLL_MS = 200;
-            int timeout_ms = 30000;
-            if (const char *env = getenv("HARP_RECONCILE_TIMEOUT_MS")) timeout_ms = atoi(env);
             for (int waited = 0; waited < timeout_ms; waited += POLL_MS) {
                 bool pending = true;
                 if (harp_client_reconcile_poll(&client_, &pending, &choice) != 0) break;
