@@ -43,6 +43,14 @@ jobs:
           test -n "$plug" || { echo "harp-shell.vst3 not found under build-vst"; exit 1; }
           ./pluginval.app/Contents/MacOS/pluginval --strictness-level 10 --skip-gui-tests \
             --validate "$plug"
+      - name: clap-validator (CLAP contract)
+        run: |
+          curl -sL https://github.com/free-audio/clap-validator/releases/download/0.3.2/clap-validator-0.3.2-macos-universal.tar.gz -o cv.tar.gz
+          tar xzf cv.tar.gz
+          cv=$(find . -maxdepth 2 -name clap-validator -type f | head -1); chmod +x "$cv"
+          clap=$(find build-vst -name 'harp-clap.clap' | head -1)
+          test -n "$clap" || { echo "harp-clap.clap not found under build-vst"; exit 1; }
+          "$cv" validate "$clap"
 
   shell-windows:
     # Pinned to the VS 2022 image deliberately: this port targets the
@@ -133,6 +141,21 @@ jobs:
           Get-Content pv-out.txt, pv-err.txt
           Write-Host "pluginval exit code: $($p.ExitCode)"
           if ($p.ExitCode -ne 0) { throw "pluginval failed (exit $($p.ExitCode))" }
+      - name: clap-validator (CLAP contract)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Invoke-WebRequest -UseBasicParsing `
+            https://github.com/free-audio/clap-validator/releases/download/0.3.2/clap-validator-0.3.2-windows.zip `
+            -OutFile cv.zip
+          Expand-Archive cv.zip -DestinationPath cv -Force
+          $cv = (Get-ChildItem cv -Recurse -Filter clap-validator.exe | Select-Object -First 1).FullName
+          $clap = (Get-ChildItem build-vst -Recurse -Filter harp-clap.clap | Select-Object -First 1).FullName
+          if (-not $clap) { throw "harp-clap.clap not found under build-vst" }
+          # clap-validator is a console app, so & waits and $LASTEXITCODE is real.
+          & $cv validate $clap
+          if ($LASTEXITCODE -ne 0) { throw "clap-validator failed (exit $LASTEXITCODE)" }
 
   shell-linux:
     runs-on: ubuntu-latest
@@ -161,6 +184,15 @@ jobs:
           test -n "$plug" || { echo "harp-shell.vst3 not found under build-vst"; exit 1; }
           # xvfb: loading a VST3 module on Linux touches X even with GUI tests off.
           xvfb-run -a ./pluginval --strictness-level 10 --skip-gui-tests --validate "$plug"
+      - name: clap-validator (CLAP contract)
+        run: |
+          curl -sL https://github.com/free-audio/clap-validator/releases/download/0.3.2/clap-validator-0.3.2-ubuntu-18.04.tar.gz -o cv.tar.gz
+          tar xzf cv.tar.gz
+          cv=$(find . -maxdepth 2 -name clap-validator -type f | head -1); chmod +x "$cv"
+          clap=$(find build-vst -name 'harp-clap.clap' | head -1)
+          test -n "$clap" || { echo "harp-clap.clap not found under build-vst"; exit 1; }
+          # xvfb: loading a CLAP module on Linux touches X, same as the VST3 above.
+          xvfb-run -a "$cv" validate "$clap"
 
   core:
     runs-on: ubuntu-latest
