@@ -7,6 +7,13 @@
 #   4. assert params restored AND an archive ref captured the mutation
 # usage: scripts/recall-test.sh   (device must be unclaimed)
 set -u
+# This test asserts the INTERACTIVE recall path archives the displaced device state
+# before the Push (step 4). The §11.4 archive is skipped in headless mode
+# (HARP_RECONCILE_TIMEOUT_MS=0) — which the conformance suite sets globally to keep
+# the real-time audio tests from stalling on a panel pick. So opt OUT of headless
+# here: a small non-zero timeout takes the interactive archive-then-CAS path (no
+# panel answers, so it falls back to Push after a brief wait — fast, and it archives).
+export HARP_RECONCILE_TIMEOUT_MS=1000
 HOST=${HARP_HOST:-harp.local}
 VST=${VST:-$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3}
 HOSTBIN=${HOSTBIN:-./build-vst/harp-vst3-host}
