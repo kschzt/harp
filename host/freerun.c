@@ -23,6 +23,7 @@
 #include "freerun.h"
 
 #include <samplerate.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -47,7 +48,8 @@ struct harp_freerun {
     double     ratio;
     int        obs_primed;
     unsigned long long ts0, host0;
-    double     Sw, Sx, Sy, Sxx, Sxy;
+    double     Sw, Sx, Sy, Sxx, Sxy, Syy;
+    _Atomic uint64_t jitter_bits; /* residual arrival jitter, µs (bit-punned); diagnostic */
     _Atomic unsigned underflow, overflow;
 };
 
@@ -110,11 +112,25 @@ void harp_freerun_observe(harp_freerun *fr, unsigned long long dev_ts,
     if (!fr->obs_primed) { fr->obs_primed = 1; fr->ts0 = dev_ts; fr->host0 = host_ns; return; }
     double x = (double)(host_ns - fr->host0) / 1e9;       /* host seconds since anchor */
     double y = (double)(dev_ts - fr->ts0);                /* device samples since anchor */
-    fr->Sw += 1; fr->Sx += x; fr->Sy += y; fr->Sxx += x*x; fr->Sxy += x*y;
+    fr->Sw += 1; fr->Sx += x; fr->Sy += y; fr->Sxx += x*x; fr->Sxy += x*y; fr->Syy += y*y;
     double denom = fr->Sw * fr->Sxx - fr->Sx * fr->Sx;
     if (denom <= 0) return;
     double slope = (fr->Sw * fr->Sxy - fr->Sx * fr->Sy) / denom;   /* dev samples/sec */
     if (slope <= 0) return;
+    /* DIAGNOSTIC: residual of the dev_ts-vs-arrival fit, expressed as arrival-time
+     * error in µs (the SSE of the regression / slope). This is the jitter the
+     * recovery must average down; the unit test hits 90.9 dB at ~50 µs, so a
+     * reading >> 50 µs means the arrival timing (not the resampler or the loop)
+     * is the SINAD ceiling. Computed here on the producer thread; published as an
+     * atomic for get_stats. */
+    if (fr->Sw > 2) {
+        double icpt = (fr->Sy - slope * fr->Sx) / fr->Sw;
+        double sse = fr->Syy - icpt * fr->Sy - slope * fr->Sxy;
+        if (sse < 0) sse = 0;
+        double jit_us = sqrt(sse / fr->Sw) / slope * 1e6;
+        uint64_t b; memcpy(&b, &jit_us, sizeof b);
+        atomic_store_explicit(&fr->jitter_bits, b, memory_order_relaxed);
+    }
     double t = fr->host_rate / slope;                     /* out/in == host/dev */
     double lo = fr->nominal * (1.0 - FR_MAXADJ), hi = fr->nominal * (1.0 + FR_MAXADJ);
     if (t < lo) t = lo; else if (t > hi) t = hi;
@@ -172,4 +188,6 @@ void harp_freerun_get_stats(const harp_freerun *fr, harp_freerun_stats *st) {
     st->fill_frames = (unsigned)(head - tail);
     st->underflow_frames = atomic_load_explicit(&fr->underflow, memory_order_relaxed);
     st->overflow_frames = atomic_load_explicit(&fr->overflow, memory_order_relaxed);
+    uint64_t jb = atomic_load_explicit(&fr->jitter_bits, memory_order_relaxed);
+    double ju; memcpy(&ju, &jb, sizeof ju); st->jitter_us = ju;
 }

@@ -40,6 +40,18 @@ static unsigned long long now_ns(void) {
     return (unsigned long long)t.tv_sec * 1000000000ull + (unsigned long long)t.tv_nsec;
 }
 static void sleep_until(unsigned long long target) {
+    /* Sample-accurate pull pacing. nanosleep's ms-scale granularity jitters the
+     * pull cadence, which wobbles the elastic-buffer fill -> the recovery's
+     * centering trim wobbles the resample ratio -> FM on the tone (a HARNESS
+     * artifact, not the transport). A DAW pulls on the hardware audio clock,
+     * rock-steady; HARP_SPIN_PULL=1 busy-waits here to mimic that, so we measure
+     * the recovery and not our own sleep. Default keeps the cheap nanosleep. */
+    static int spin = -1;
+    if (spin < 0) { const char *e = getenv("HARP_SPIN_PULL"); spin = (e && e[0] == '1'); }
+    if (spin) {
+        while (now_ns() < target) { /* busy-wait to the exact deadline */ }
+        return;
+    }
     unsigned long long n = now_ns();
     if (target <= n) return;
     struct timespec d = {.tv_sec = (long)((target - n) / 1000000000ull),
@@ -183,9 +195,9 @@ int main(int argc, char **argv) {
     for (long j = 0; j < na; j++) sumsq += (double)yl[j] * yl[j];
     double rms = na ? sqrt(sumsq / na) : 0;
     double tone = 0, sinad = measure_sinad(yl, na, &tone);
-    printf("eth-rtp: drift %.2f ppm  fill %u  RMS %.4f  tone %.1f Hz  SINAD %.1f dB  "
-           "pkts ok=%lu lost=%lu bad=%lu under=%u over=%u\n",
-           st.est_ppm, st.fill_frames, rms, tone, sinad, ok, lost, bad,
+    printf("eth-rtp: drift %.2f ppm  jitter %.0f us  fill %u  RMS %.4f  tone %.1f Hz  "
+           "SINAD %.1f dB  pkts ok=%lu lost=%lu bad=%lu under=%u over=%u\n",
+           st.est_ppm, st.jitter_us, st.fill_frames, rms, tone, sinad, ok, lost, bad,
            st.underflow_frames, st.overflow_frames);
     int clean = (na > 0 && rms > 0.001 && lost == 0 && bad == 0 && st.underflow_frames == 0);
     printf("%s\n", clean ? "ETH-RTP PASS (clean recovery: signal present, no loss/underflow)"

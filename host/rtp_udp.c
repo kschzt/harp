@@ -103,7 +103,13 @@ int harp_rtp_rx_poll(harp_rtp_rx *rx, int timeout_ms) {
         /* kernel RX timestamp drives recovery (sub-scheduling-jitter); fall back
          * to the userspace monotonic stamp if the OS delivered no SCM_TIMESTAMP. */
         unsigned long long arr = 0;
-        for (struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm)) {
+        /* HARP_RX_USERSPACE_TS=1 forces the monotonic userspace stamp instead of the
+         * kernel SCM_TIMESTAMP. Diagnostic A/B: SCM_TIMESTAMP is CLOCK_REALTIME, which
+         * NTP can slew (corrupting the rate regression); the monotonic stamp avoids
+         * the slew but folds in scheduling jitter. Lets us measure which wins. */
+        static int use_mono = -1;
+        if (use_mono < 0) { const char *e = getenv("HARP_RX_USERSPACE_TS"); use_mono = (e && e[0] == '1'); }
+        for (struct cmsghdr *cm = use_mono ? NULL : CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm)) {
             if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_TIMESTAMP) {
                 struct timeval tv;
                 memcpy(&tv, CMSG_DATA(cm), sizeof tv);

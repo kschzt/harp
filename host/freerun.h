@@ -40,6 +40,10 @@ typedef struct {
     unsigned fill_frames;       /* current buffer occupancy                     */
     unsigned underflow_frames;  /* output frames synthesized on an empty buffer */
     unsigned overflow_frames;   /* input frames dropped on a full buffer        */
+    double   jitter_us;         /* residual arrival jitter (RMS of the recovery
+                                 * regression), as arrival-time error in µs — the
+                                 * floor the recovery must average down (~50 µs in
+                                 * the unit test that hits 90.9 dB) */
 } harp_freerun_stats;
 
 /* NULL on bad cfg or allocation/SRC-init failure. */
