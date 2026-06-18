@@ -61,8 +61,9 @@ class RawMidi:
 
     def write(self, data):
         buf = (ctypes.c_ubyte * len(data))(*data)
-        _snd.snd_rawmidi_write(self.h_out, buf, len(data))
+        n = _snd.snd_rawmidi_write(self.h_out, buf, len(data))
         _snd.snd_rawmidi_drain(self.h_out)
+        return n
 
     def read(self, n=512):
         buf = (ctypes.c_ubyte * n)()
@@ -200,13 +201,17 @@ def build_preset(params):
                ("Read-only", "9AA0A6"), ("Duplicate", "C44795")]
     for j, (nm, color) in enumerate(actions):
         controls.append({
-            "id": 200 + j, "type": "fader", "name": nm, "color": color,
+            # pad, not fader: a pad fires on CLICK (the Electra's "select"); a fader
+            # only moves on a turn, which bleeds into the next page's knob after we
+            # bounce back. Momentary -> sends onValue (127) on press, caught below.
+            "id": 200 + j, "type": "pad", "name": nm, "color": color,
+            "mode": "momentary",
             "bounds": [j * COL_W + PADX, TOP_Y, COL_W - 2 * PADX, ROW_H],
             "pageId": 3, "controlSetId": 1,
             "inputs": [{"potId": j + 1, "valueId": "value"}],
-            "values": [{"id": "value", "min": 0, "max": 127,
+            "values": [{"id": "value",
                         "message": {"deviceId": 1, "type": "cc7",
-                                    "parameterNumber": 110 + j, "min": 0, "max": 127}}],
+                                    "parameterNumber": 110 + j, "onValue": 127, "offValue": 0}}],
         })
     return {"version": 2, "name": "HARP RefDev", "pages": pages, "devices": devices,
             "controls": controls, "groups": [], "overlays": []}
@@ -217,12 +222,37 @@ def upload_preset(ctrl, preset):
     ctrl.write(ELECTRA_SYSEX + bytes([0x01, 0x01]) + js + bytes([0xF7]))
 
 
-def force_page(ctrl, page):
-    """Jump the Electra to a given active page (SysEx 09 0A). This is the host
-    forcing the screen — the mechanism that auto-opens the Phase-2 Reconcile page
-    when a recall conflict fires (so the user is taken to the actions, not asked
-    to navigate). Pages are 1-indexed by their order in the preset."""
-    ctrl.write(ELECTRA_SYSEX + bytes([0x09, 0x0A, page & 0x7F, 0xF7]))
+# The preset's Lua: one user function per §11.4 action, each emitting a CC the
+# sidecar catches. These appear in the Mini's on-device "Assign Buttons" menu
+# (fw >= 4.1.0) where the four hardware buttons get bound to them — a deliberate
+# press, unlike knob touch which the firmware overloads (usePotTouchSelections /
+# openDetail). Sent to PORT_1, the same Electra Port the sidecar reads.
+RECONCILE_LUA = """
+function harpPush() midi.sendControlChange(PORT_1, 1, 110, 127) end
+function harpPull() midi.sendControlChange(PORT_1, 1, 111, 127) end
+function harpReadOnly() midi.sendControlChange(PORT_1, 1, 112, 127) end
+function harpDuplicate() midi.sendControlChange(PORT_1, 1, 113, 127) end
+preset.userFunctions = {
+  pot1 = {call = harpPush, name = "Push"},
+  pot2 = {call = harpPull, name = "Pull"},
+  pot3 = {call = harpReadOnly, name = "Read-only"},
+  pot4 = {call = harpDuplicate, name = "Duplicate"},
+}
+-- Host page-switch over MIDI is unreliable while the sidecar holds the ports
+-- (09 0A is dropped; a control CC just drags focus). So switch ON-DEVICE: the
+-- sidecar sends CC 119 with value = target page, and this handler flips the page
+-- locally via pages.display(), the firmware's own page API.
+function midi.onControlChange(midiInput, channel, controllerNumber, value)
+  if controllerNumber == 119 and value >= 1 and value <= 12 then
+    pages.display(value)
+  end
+end
+"""
+
+
+def upload_lua(ctrl, script):
+    """Upload the preset's Lua script (SysEx 01 0C)."""
+    ctrl.write(ELECTRA_SYSEX + bytes([0x01, 0x0C]) + script.encode("ascii") + bytes([0xF7]))
 
 
 # ---------------- a tiny streaming MIDI parser (channel-voice messages) ----------------
@@ -267,15 +297,15 @@ def main():
     panel = Panel(PANEL_SOCK)
     params = json.loads(panel.cmd("params"))["params"]
 
-    # CTRL as TWO independent opens. Writing (upload, force_page) and reading
-    # (events) the SAME open made force_page writes silently vanish once a reader
-    # was live (a lock didn't help — it's the shared open, not a race); separate
-    # in/out opens decouple them.
-    ctrl_out = RawMidi(ctrl_name, want_in=False, want_out=True)
-    ctrl_in = RawMidi(ctrl_name, want_in=True, want_out=False)
-    upload_preset(ctrl_out, build_preset(params))
+    # CTRL is a quiet command channel: used only at startup to upload the preset +
+    # Lua and read their ACKs. We do NOT subscribe to its events or read it after
+    # that. Page-switching is done ON-DEVICE by Lua (the host's 09 0A page-switch
+    # was unreliable while the sidecar holds the ports, and a control CC just drags
+    # focus); the action pads send their CC on the Electra Port instead.
+    ctrl = RawMidi(ctrl_name, want_in=True, want_out=True)
+    upload_preset(ctrl, build_preset(params))
     # The Electra replies on the CTRL port: ACK = F0 00 21 45 7E 01 ..., NACK = ... 7E 00 ...
-    ack = ctrl_in.read_window(0.8)
+    ack = ctrl.read_window(0.8)
     if ELECTRA_SYSEX + b"\x7e\x00" in ack:
         sys.stderr.write("electra-panel: preset upload NACK [%s]\n" % ack.hex())
     elif ELECTRA_SYSEX + b"\x7e\x01" in ack:
@@ -283,19 +313,34 @@ def main():
     else:
         sys.stderr.write("electra-panel: no clear upload ACK [%s]\n" % (ack.hex() or "(silence)"))
     time.sleep(0.4)  # let the controller swap to the new preset
-
-    # Subscribe to controller events on the CTRL port. The Reconcile page fires on a
-    # knob PRESS/click — F0 00 21 45 7E 06 <potId> F7 — which is DISTINCT from the
-    # capacitive TOUCH (7E 0A <potId> <ctrlId-lo> <ctrlId-hi> <on/off> F7), so a mere
-    # brush never fires a consequential action.
-    ctrl_out.write(ELECTRA_SYSEX + bytes([0x14, 0x7B, 0x02, 0xF7]))  # route events -> CTRL
-    ctrl_out.write(ELECTRA_SYSEX + bytes([0x14, 0x79, 0x7F, 0xF7]))  # enable all event types
+    upload_lua(ctrl, RECONCILE_LUA)  # user functions for the Assign-Buttons menu
+    lack = ctrl.read_window(0.5)
+    if ELECTRA_SYSEX + b"\x7e\x00" in lack:
+        sys.stderr.write("electra-panel: Lua upload NACK [%s]\n" % lack.hex())
+    else:
+        sys.stderr.write("electra-panel: reconcile Lua uploaded (Push/Pull/Read-only/Duplicate)\n")
 
     port = RawMidi(port_name, want_in=True, want_out=True)
     by_cc = {p["id"] for p in params}
     shown = {}  # param id -> last CC value exchanged, so we never echo a value back
 
-    def reader():
+    # Phase-2 reconcile: when the device parks a §11.4 offer (a shell found
+    # live/project != its saved bundle), open the Reconcile page (CC 119 -> the Lua
+    # pages.display handler) and let the user pick with a PAD click (the Electra's
+    # "select"; a fader's turn bleeds into the next page's knob after the bounce).
+    # The pad sends CC 110-113, caught in the port reader -> reconcile-choose.
+    RECONCILE_PAGE = 3
+    ACTIONS = ["Push", "Pull", "Read-only", "Duplicate"]
+    ACTION_CC = {110: 0, 111: 1, 112: 2, 113: 3}  # pad-fired CC -> action index
+    recon = {"active": False}
+
+    def fire(idx):
+        r = panel.cmd("reconcile-choose %d" % idx)
+        sys.stderr.write("electra-panel: reconcile -> %s %s\n" % (ACTIONS[idx], r))
+        port.write(bytes([0xB0 | MIDI_CH, 119, 1]))  # Lua -> back to Synth (page 1)
+        recon["active"] = False
+
+    def reader():  # the Electra Port: knob CCs in, plus the pad-fired action CCs
         mp = MidiParse()
         while True:
             data = port.read()
@@ -303,89 +348,48 @@ def main():
                 time.sleep(0.005)
                 continue
             for st, d1, d2 in mp.feed(data):
-                if (st & 0xF0) == 0xB0 and d1 in by_cc:  # a knob moved
+                if (st & 0xF0) != 0xB0:
+                    continue
+                if d1 in by_cc:                       # a knob moved -> dirty the param
                     shown[d1] = d2
                     panel.cmd("knob %d %.5f" % (d1, d2 / 127.0))
+                elif d1 in ACTION_CC and d2 >= 64 and recon["active"]:  # a pad fired
+                    fire(ACTION_CC[d1])
 
     threading.Thread(target=reader, daemon=True).start()
-
-    # Phase-2 reconcile: when the device parks a §11.4 offer (a shell found
-    # live/project != its saved bundle), force-open the Reconcile page; the user
-    # picks an action there, posted back for the shell. The knobs have no click
-    # event, only capacitive TOUCH (7E 0A) — and a brush fired actions by accident
-    # — so a choice requires a deliberate TOUCH-AND-HOLD. 7E 06 is the active-page
-    # change event (force_page emits it); we track it to return the user afterwards.
-    RECONCILE_PAGE = 3
-    HOLD_SECS = 0.4
-    ACTIONS = ["Push", "Pull", "Read-only", "Duplicate"]
-    recon = {"active": False, "page": 1, "return_to": 1}
-    out_lock = threading.Lock()  # two threads write ctrl_out (poll forces, reader returns)
-
-    def force(page):
-        with out_lock:
-            force_page(ctrl_out, page)
-
-    def ctrl_reader():
-        touch = ELECTRA_SYSEX + b"\x7e\x0a"  # <potId><ctrlLo><ctrlHi><on/off> capacitive
-        page = ELECTRA_SYSEX + b"\x7e\x06"   # <pageNo> active-page change
-        held_since = {}
-        acc = b""
-        while True:
-            chunk = ctrl_in.read()
-            if not chunk:
-                time.sleep(0.005)
-                continue
-            acc += chunk
-            while b"\xf7" in acc:
-                i = acc.index(b"\xf7")
-                msg, acc = acc[: i + 1], acc[i + 1:]
-                if msg[:6] == page and len(msg) >= 8:
-                    recon["page"] = msg[6]  # track where the user is, to return later
-                elif msg[:6] == touch and len(msg) >= 11 and recon["active"]:
-                    pot, on = msg[6], msg[9]
-                    if 0 <= pot <= 3:
-                        if on:
-                            held_since[pot] = time.monotonic()
-                        elif pot in held_since:
-                            held = time.monotonic() - held_since.pop(pot)
-                            if held >= HOLD_SECS:  # deliberate hold, not a brush
-                                r = panel.cmd("reconcile-choose %d" % pot)
-                                sys.stderr.write("electra-panel: reconcile -> %s (held %.2fs) %s\n"
-                                                 % (ACTIONS[pot], held, r))
-                                recon["active"] = False
-                                force(recon["return_to"] or 1)
-
-    ctrl_in.nonblock(True)  # poll, don't park a blocking read
-    while ctrl_in.read():    # discard stale buffered events (e.g. taps from before)
-        pass
-    threading.Thread(target=ctrl_reader, daemon=True).start()
 
     # display poll: the device's live param values -> CC out, so the Electra tracks
     # the device however it changed (web panel, a DAW, or a hardware front-panel move).
     period = 1.0 / POLL_HZ
     while True:
+        # Offer FIRST: go active + open Reconcile BEFORE any param CC goes out this
+        # iteration. The Electra follows an incoming CC to that control's page, so a
+        # stray param CC after we open would drag the screen back off Reconcile.
         try:
-            cur = json.loads(panel.cmd("params"))["params"]
-            out = bytearray()
-            for p in cur:
-                cc = max(0, min(127, round(p["value"] * 127)))
-                if shown.get(p["id"]) != cc:
-                    shown[p["id"]] = cc
-                    out += bytes([0xB0 | MIDI_CH, p["id"], cc])
-            if out:
-                port.write(out)
-        except (OSError, ValueError, KeyError):
-            pass
-        try:  # a parked §11.4 offer -> yank the screen onto the Reconcile page
             rj = json.loads(panel.cmd("reconcile-get"))
             if rj.get("pending") and not recon["active"]:
-                recon["return_to"] = recon["page"]  # capture where they are, pre-force
                 recon["active"] = True
-                force(RECONCILE_PAGE)
-                sys.stderr.write("electra-panel: reconcile offer expect=%s live=%s%s -> Reconcile\n"
+                # Open Reconcile via on-device Lua: CC 119 value = target page ->
+                # the Lua midi.onControlChange handler calls pages.display(page).
+                port.write(bytes([0xB0 | MIDI_CH, 119, RECONCILE_PAGE]))
+                sys.stderr.write("electra-panel: reconcile offer expect=%s live=%s%s -> Reconcile (Lua)\n"
                                  % (rj.get("expect"), rj.get("live"), " dirty" if rj.get("dirty") else ""))
         except (OSError, ValueError):
             pass
+        # Param display CCs only when NOT reconciling (else they'd pull the screen off).
+        if not recon["active"]:
+            try:
+                cur = json.loads(panel.cmd("params"))["params"]
+                out = bytearray()
+                for p in cur:
+                    cc = max(0, min(127, round(p["value"] * 127)))
+                    if shown.get(p["id"]) != cc:
+                        shown[p["id"]] = cc
+                        out += bytes([0xB0 | MIDI_CH, p["id"], cc])
+                if out:
+                    port.write(out)
+            except (OSError, ValueError, KeyError):
+                pass
         time.sleep(period)
 
 
