@@ -96,22 +96,22 @@ struct EthTransport final : ShellTransport {
     bool isFreeRunning() const override { return true; }
     int  audioPort() const override { return rxport_; } /* audio.start key 6 */
 
-    /* Reader thread: receive ONE RTP packet's stereo frames into `out` (up to
-     * maxFrames), waiting up to timeout_ms. Returns frames received (0 = none /
-     * timeout / malformed). The caller (reader) writes them into audioRing_. */
-    unsigned recvAudio(float *out, unsigned maxFrames, int timeout_ms) override {
+    /* Reader thread: receive ONE RTP packet's slot-interleaved samples into `out`
+     * (up to maxFloats), waiting up to timeout_ms. Returns FLOATS received (0 = none
+     * / timeout / malformed). The payload is nsamples x slots (the negotiated union);
+     * the caller splits it by the union width and demuxes per part. */
+    unsigned recvAudio(float *out, unsigned maxFloats, int timeout_ms) override {
         if (!readable(rxsock_, timeout_ms)) return 0;
-        uint8_t buf[16384];
-        int n = (int)::recv(rxsock_, (char *)buf, (int)sizeof buf, 0);
+        int n = (int)::recv(rxsock_, (char *)rxpkt_, (int)sizeof rxpkt_, 0);
         if (n < 0) return 0;
         harp_rtp_hdr h;
         const uint8_t *pl;
         size_t pln;
-        if (harp_rtp_unpack(buf, (size_t)n, &h, &pl, &pln) != 0) return 0;
-        if (pln % (2 * sizeof(float))) return 0; /* stereo frames only */
-        unsigned f = (unsigned)(pln / (2 * sizeof(float)));
-        if (f > maxFrames) f = maxFrames; /* one packet always fits a sane out */
-        memcpy(out, pl, (size_t)f * 2 * sizeof(float));
+        if (harp_rtp_unpack(rxpkt_, (size_t)n, &h, &pl, &pln) != 0) return 0;
+        if (pln % sizeof(float)) return 0; /* whole float samples only */
+        unsigned f = (unsigned)(pln / sizeof(float)); /* slot-interleaved floats */
+        if (f > maxFloats) f = maxFloats; /* one packet always fits a sane out */
+        memcpy(out, pl, (size_t)f * sizeof(float));
         lastArr_.store(harp_now_ns(), std::memory_order_relaxed);
         return f;
     }
@@ -152,6 +152,9 @@ private:
     int             rxport_ = 0;
     std::string     peer_;
     std::atomic<unsigned long long> lastArr_{0};
+    /* one RTP datagram: the widest union is nsamples(256) x 34 slots x 4B ≈ 34 KB,
+     * so 64 KB covers it (incl. the RTP header) with margin. Reader-thread only. */
+    uint8_t rxpkt_[65536];
 };
 
 #endif /* HARP_SHELL_ETH_TRANSPORT_H */

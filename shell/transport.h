@@ -50,20 +50,22 @@ struct ShellTransport {
     virtual bool isFreeRunning() const = 0;
 
     /* ---- free-running audio plane (§8.7), used only when isFreeRunning().
-     * recvAudio() receives ONE RTP packet's worth of interleaved stereo frames
-     * into `out` (up to maxFrames), waiting up to timeout_ms; returns the frames
-     * received (0 = none). It is called ONLY on the runtime's reader thread
-     * (NOT the DAW audio thread), which writes them into the stable audioRing_ —
-     * so the audio thread reads audioRing_ exactly as on USB and never touches
-     * transport_ (no use-after-free when the supervisor reaps the transport on a
-     * reconnect; the reader is joined first, like USB). audioPort() is the bound
-     * RTP rx port (audio.start key 6); silentMs() is ms since the last packet,
-     * so the reader can declare a dead RTP stream (no EOF) and trigger reconnect.
-     * USB stubs all three (it never free-runs; its audio is the host-paced
-     * endpoint via audioRead). The bit-exact RATE LOOP lives in the feeder and
-     * reads audioRing_ occupancy directly. */
-    virtual unsigned recvAudio(float *out, unsigned maxFrames, int timeout_ms) {
-        (void)out; (void)maxFrames; (void)timeout_ms; return 0;
+     * recvAudio() receives ONE RTP packet's worth of slot-interleaved samples into
+     * `out` (up to maxFloats), waiting up to timeout_ms; returns the FLOATS received
+     * (0 = none). The payload is `nsamples x slots` (the audio.start key-4 union — a
+     * single instance is the {0,1} stereo main mix, wider with per-part sinks); the
+     * reader splits it by the negotiated union width and demuxes per part. Called
+     * ONLY on the runtime's reader thread (NOT the DAW audio thread), which writes
+     * the demuxed frames into the stable audioRing_ / per-part sink rings — so the
+     * audio thread reads those exactly as on USB and never touches transport_ (no
+     * use-after-free when the supervisor reaps the transport on a reconnect; the
+     * reader is joined first, like USB). audioPort() is the bound RTP rx port
+     * (audio.start key 6); silentMs() is ms since the last packet, so the reader can
+     * declare a dead RTP stream (no EOF) and trigger reconnect. USB stubs all three
+     * (it never free-runs; its audio is the host-paced endpoint via audioRead). The
+     * bit-exact RATE LOOP lives in the feeder and reads audioRing_ occupancy. */
+    virtual unsigned recvAudio(float *out, unsigned maxFloats, int timeout_ms) {
+        (void)out; (void)maxFloats; (void)timeout_ms; return 0;
     }
     virtual int      audioPort() const { return 0; }
     virtual unsigned silentMs() const { return 0; }

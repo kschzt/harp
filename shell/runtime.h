@@ -418,6 +418,10 @@ private:
     void sessionDown(); /* reap reader+pump, orderly stop if alive, close usb */
     void feeder();      /* runs on the supervisor thread while connected */
     void reader();
+    /* demux one union audio frame (ns frames of S slot-interleaved floats): main
+     * mix {0,1} -> audioRing_, each per-part sink's columns -> its ring. Shared by
+     * the USB framed reader and the §8.7 RTP reader. */
+    void demuxUnionFrame(const float *pl, size_t ns, uint16_t S);
     void eventPump();   /* dedicated event->wire thread: an event's deadline
                            budget is ~one DAW block (5.3 ms at 256), while a
                            pacing write can stall 8 ms in drain-on-stall —
@@ -520,6 +524,9 @@ private:
                             * rate-locks => play 1:1 + audio.trim (bit-exact). One that does
                             * NOT => host ASRC-resample. Always true on USB (host-paced;
                             * unused there) so the existing paths are unchanged. */
+    std::atomic<uint16_t> unionWidth_{2}; /* §8.7: slot columns per RTP frame (the audio.start
+                            * key-4 union the reader demuxes by). Set at audioStart, read per
+                            * packet on the reader thread. USB carries it in the frame header. */
     harp_link link_;   /* rx reassembly: shared by client_ and pollEcho */
     harp_cbuf msg_;    /* pollEcho rx scratch */
     harp_client client_{};
