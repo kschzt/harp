@@ -207,6 +207,10 @@ static void control_thread(HarpRuntime *rt, EventSource *src, bool isOwner,
 int main(int argc, char **argv) {
     int instances = 1, seconds = 12;
     uint32_t block = 256;
+    int rmsWindows = 1; /* --rms-windows N: with --out, also emit per-window main/sink
+                         * rms (N equal time-slices of ONE run), so a hw script gets N
+                         * samples from ONE device claim. The rig wedges on repeated
+                         * multi-instance --part-audio RE-claims; one claim sidesteps it. */
     bool partAudio = false; /* --part-audio: each attached instance pulls its OWN
                              * demuxed part sink (P5b), not silence — exercises the
                              * per-part sink registry + reader() demux under TSan */
@@ -223,6 +227,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outPath = argv[++i];
         else if (!strcmp(argv[i], "--part-audio")) partAudio = true;
         else if (!strcmp(argv[i], "--no-state-stress")) g_state_stress = false;
+        else if (!strcmp(argv[i], "--rms-windows") && i + 1 < argc) rmsWindows = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--late-sink")) { lateSink = true; partAudio = true; }
     }
     /* Bound the play-proof capture to the run length (+1 s slack), so --out on a
@@ -444,6 +449,22 @@ int main(int argc, char **argv) {
         printf("main-rms: %.6f\n", rms(g_capture));
         if (g_sink_capture_cap) /* --part-audio: the designated attached part's audio */
             printf("sink-rms: %.6f\n", rms(g_sink_capture));
+        /* --rms-windows N: N equal time-slices of this ONE run, so the hw script gets
+         * N samples from a single claim (no flaky multi-instance re-claim). Each slice
+         * is the same iso config, so per-window rms is clean (no boundary blur). */
+        if (rmsWindows > 1) {
+            auto wrms = [](const std::vector<float> &v, int w, int n) {
+                size_t a = (size_t)w * v.size() / n, b = (size_t)(w + 1) * v.size() / n;
+                a &= ~size_t(1); b &= ~size_t(1); /* keep L/R stereo pairs intact */
+                if (b <= a) return 0.0;
+                double s = 0;
+                for (size_t k = a; k < b; k++) s += (double)v[k] * v[k];
+                return sqrt(s / (double)(b - a));
+            };
+            for (int w = 0; w < rmsWindows; w++)
+                printf("sample %d: main-rms=%.6f sink-rms=%.6f\n", w, wrms(g_capture, w, rmsWindows),
+                       g_sink_capture_cap ? wrms(g_sink_capture, w, rmsWindows) : 0.0);
+        }
         fflush(stdout);
         harp_write_wav16(outPath, g_capture, 2, 48000);
         fprintf(stderr, "tsan-host: captured %zu owner main-mix samples -> %s\n",

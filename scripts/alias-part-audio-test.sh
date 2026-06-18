@@ -91,38 +91,38 @@ median() {
     printf '%s\n' "$@" | sort -g | sed -n "$(((n + 1) / 2))p"
 }
 
-# capture once: run --instances N --part-audio, echo "<main-rms> <sink-rms>".
-# Retries the transient post-teardown claim race (renders as silence), exactly as
-# alias-play-test: a clean, connected, non-silent capture is what we want.
-capture() {
-    for try in 1 2 3; do
-        out=$(mktemp /tmp/alias-pa.XXXXXX)
-        "$BUILD/tsan-host" --instances "$INSTANCES" --part-audio --no-state-stress --seconds "$SECONDS_RUN" \
-            --block 256 --out "/tmp/alias-pa-$1.wav" >"$out" 2>&1 || true
-        m=$(grep '^main-rms:' "$out" | awk '{print $2}')
-        s=$(grep '^sink-rms:' "$out" | awk '{print $2}')
-        conn=$(grep -c "harp-shell: connected:.*serial $SERIAL" "$out" || true)
-        rm -f "$out"
-        if [ "$conn" -gt 0 ] && [ -n "$m" ] && [ -n "$s" ] \
-           && [ "$(python3 -c "print(1 if $s>0 else 0)")" = 1 ]; then
-            echo "$m $s"; return
-        fi
-        sleep 1
-    done
-    echo "-1 -1"
-}
+# ONE device claim, $SAMPLES internal windows (tsan-host --rms-windows). This rig
+# wedges on repeated multi-instance --part-audio RE-claims (the first claim always
+# works), so taking every sample from a SINGLE run sidesteps it — the 5-separate-
+# claims loop is what tripped the bus. Retries only the transient first-claim race.
+RUN_SECONDS="${RUN_SECONDS:-10}"   # ~RUN_SECONDS/$SAMPLES per window; first window eats warmup
+runlog=""
+for try in 1 2 3; do
+    runlog=$(mktemp /tmp/alias-pa.XXXXXX)
+    "$BUILD/tsan-host" --instances "$INSTANCES" --part-audio --no-state-stress \
+        --rms-windows "$SAMPLES" --seconds "$RUN_SECONDS" --block 256 \
+        --out /tmp/alias-pa.wav >"$runlog" 2>&1 || true
+    if grep -q "harp-shell: connected:.*serial $SERIAL" "$runlog" \
+       && [ "$(grep -c '^sample ' "$runlog")" -ge "$SAMPLES" ]; then
+        s0=$(grep '^sample 0:' "$runlog" | awk -F'sink-rms=' '{print $2}')
+        [ -n "$s0" ] && [ "$(python3 -c "print(1 if $s0>0 else 0)")" = 1 ] && break
+    fi
+    rm -f "$runlog"; runlog=""; sleep 1
+done
+[ -z "$runlog" ] && { echo "ALIAS-PART-AUDIO FAIL: never connected / sink silent (device busy?)"; exit 3; }
 
-echo "── sampling owner main-rms + attached sink-rms ×$SAMPLES"
+echo "── owner main-rms + attached sink-rms ×$SAMPLES (one claim, windowed)"
 MAINS=""; SINKS=""; DIFFS=""; i=0
 while [ "$i" -lt "$SAMPLES" ]; do
-    pair=$(capture "$i")
-    m=${pair% *}; s=${pair#* }
-    case "$m$s" in *-1*) echo "ALIAS-PART-AUDIO FAIL: never connected / sink silent (device busy?)"; exit 3 ;; esac
+    line=$(grep "^sample $i:" "$runlog")
+    m=$(printf '%s' "$line" | awk -F'main-rms=' '{print $2}' | awk '{print $1}')
+    s=$(printf '%s' "$line" | awk -F'sink-rms=' '{print $2}')
     echo "   sample $i: main-rms=$m  sink-rms=$s"
     MAINS="$MAINS $m"; SINKS="$SINKS $s"
-    DIFFS="$DIFFS $(python3 -c "print($m - $s)")"   # PAIRED, same run — see below
-    i=$((i + 1)); sleep 1
+    DIFFS="$DIFFS $(python3 -c "print($m - $s)")"   # PAIRED, same window — see below
+    i=$((i + 1))
 done
+rm -f "$runlog"
 MMED=$(median $MAINS); SMED=$(median $SINKS); DMED=$(median $DIFFS)
 
 # The subset check is PAIRED: median of per-sample (main - sink), NOT median(mains)

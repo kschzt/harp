@@ -66,25 +66,31 @@ median() {
 # sink_rms LEVELS — run a 2-instance shared session with HARP_ISO_LEVELS=LEVELS and
 # --part-audio, echo the attached part-1 sink RMS (median of $SAMPLES, retries the
 # transient post-teardown claim race exactly as alias-part-audio-test).
+# ONE device claim per config, $SAMPLES internal windows (tsan-host --rms-windows):
+# the rig wedges on repeated multi-instance --part-audio RE-claims, so each config's
+# samples come from a SINGLE run (3 claims total, not 3*$SAMPLES). Median the windows'
+# sink-rms. Retries only the transient first-claim race.
+RUN_SECONDS="${RUN_SECONDS:-10}"
 sink_rms() {
-    levels="$1"; vals=""; i=0
-    while [ "$i" -lt "$SAMPLES" ]; do
-        r=""
-        for try in 1 2 3; do
-            out=$(mktemp /tmp/iso.XXXXXX)
-            HARP_ISO_LEVELS="$levels" "$BUILD/tsan-host" --instances 2 --part-audio --no-state-stress \
-                --seconds "$SECONDS_RUN" --block 256 --out "/tmp/iso-$i.wav" >"$out" 2>&1 || true
-            s=$(grep '^sink-rms:' "$out" | awk '{print $2}')
-            conn=$(grep -c "harp-shell: connected:.*serial $SERIAL" "$out" || true)
-            rm -f "$out"
-            if [ "$conn" -gt 0 ] && [ -n "$s" ] && [ "$(python3 -c "print(1 if $s>0 else 0)")" = 1 ]; then
-                r="$s"; break
-            fi
-            sleep 1
-        done
-        [ -z "$r" ] && { echo "-1"; return; }
-        vals="$vals $r"; i=$((i + 1)); sleep 1
+    levels="$1"; runlog=""
+    for try in 1 2 3; do
+        runlog=$(mktemp /tmp/iso.XXXXXX)
+        HARP_ISO_LEVELS="$levels" "$BUILD/tsan-host" --instances 2 --part-audio --no-state-stress \
+            --rms-windows "$SAMPLES" --seconds "$RUN_SECONDS" --block 256 --out /tmp/iso.wav >"$runlog" 2>&1 || true
+        if grep -q "harp-shell: connected:.*serial $SERIAL" "$runlog" \
+           && [ "$(grep -c '^sample ' "$runlog")" -ge "$SAMPLES" ]; then
+            s0=$(grep '^sample 0:' "$runlog" | awk -F'sink-rms=' '{print $2}')
+            [ -n "$s0" ] && [ "$(python3 -c "print(1 if $s0>0 else 0)")" = 1 ] && break
+        fi
+        rm -f "$runlog"; runlog=""; sleep 1
     done
+    [ -z "$runlog" ] && { echo "-1"; return; }
+    vals=""; i=0
+    while [ "$i" -lt "$SAMPLES" ]; do
+        vals="$vals $(grep "^sample $i:" "$runlog" | awk -F'sink-rms=' '{print $2}')"
+        i=$((i + 1))
+    done
+    rm -f "$runlog"
     median $vals
 }
 
