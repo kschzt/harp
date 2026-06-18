@@ -39,7 +39,7 @@ PROBE="${PROBE:-./build/harp-probe}"
 BUILD="${BUILD:-build-mt-host}"      # the multi-instance harness, built WITHOUT TSan
 INSTANCES="${INSTANCES:-2}"          # owner part 0 + one attached part 1 (the proof)
 SECONDS_RUN="${SECONDS_RUN:-4}"
-SAMPLES="${SAMPLES:-3}"              # captures (median defeats the realtime-pull jitter)
+SAMPLES="${SAMPLES:-5}"              # captures; the PAIRED median (below) defeats the run-to-run RMS jitter
 FLOOR="${FLOOR:-0.002}"              # sink-rms floor: clearly non-silent (obs ~0.013)
 
 # claim guard: a DAW holding the device steals the claim and every render is
@@ -104,20 +104,29 @@ capture() {
 }
 
 echo "── sampling owner main-rms + attached sink-rms ×$SAMPLES"
-MAINS=""; SINKS=""; i=0
+MAINS=""; SINKS=""; DIFFS=""; i=0
 while [ "$i" -lt "$SAMPLES" ]; do
     pair=$(capture "$i")
     m=${pair% *}; s=${pair#* }
     case "$m$s" in *-1*) echo "ALIAS-PART-AUDIO FAIL: never connected / sink silent (device busy?)"; exit 3 ;; esac
     echo "   sample $i: main-rms=$m  sink-rms=$s"
     MAINS="$MAINS $m"; SINKS="$SINKS $s"
+    DIFFS="$DIFFS $(python3 -c "print($m - $s)")"   # PAIRED, same run — see below
     i=$((i + 1)); sleep 1
 done
-MMED=$(median $MAINS); SMED=$(median $SINKS)
+MMED=$(median $MAINS); SMED=$(median $SINKS); DMED=$(median $DIFFS)
 
-echo "── medians: main-rms=$MMED  sink-rms=$SMED  (floor=$FLOOR)"
+# The subset check is PAIRED: median of per-sample (main - sink), NOT median(mains)
+# vs median(sinks) compared separately. main (part0 drone + part1) exceeds sink
+# (part1 alone) by part0's energy in EVERY run — but the absolute RMS swings
+# run-to-run (part 1 plays transient notes; the realtime pull's block alignment
+# jitters, as the header notes), so comparing the two medians INDEPENDENTLY lets a
+# quiet-part1 run's main lose to a loud-part1 run's sink even though main > sink
+# holds within each run. The paired median is jitter-robust and still catches a real
+# demux-copies-the-mix bug (then main-sink ~= 0 in every sample).
+echo "── medians: main-rms=$MMED  sink-rms=$SMED  paired (main-sink) median=$DMED  (floor=$FLOOR)"
 HEARD=$(python3 -c "print(1 if $SMED > $FLOOR else 0)")
-SUBSET=$(python3 -c "print(1 if $MMED > $SMED else 0)")
+SUBSET=$(python3 -c "print(1 if $DMED > 0 else 0)")
 if [ "$HEARD" = 1 ] && [ "$SUBSET" = 1 ]; then
     echo "ALIAS-PART-AUDIO PASS (attached alias on $SERIAL hears its part: sink-rms $SMED >"
     echo "   floor $FLOOR — non-silent demux — and the owner main mix $MMED is richer than the"
@@ -128,7 +137,7 @@ elif [ "$HEARD" != 1 ]; then
     echo "   did not hear its part (sink not in the audio.start union, or demux delivered nothing)"
     exit 1
 else
-    echo "ALIAS-PART-AUDIO FAIL: sink-rms $SMED >= main-rms $MMED — the sink is not a strict"
-    echo "   subset of the mix (demux may have handed it the main-mix columns)"
+    echo "ALIAS-PART-AUDIO FAIL: paired (main-sink) median $DMED <= 0 — the sink is not a"
+    echo "   strict subset of the mix (demux may have handed it the main-mix columns)"
     exit 1
 fi
