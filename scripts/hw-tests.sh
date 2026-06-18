@@ -10,6 +10,11 @@ export HARP_DEVICE_SERIAL="${HARP_DEVICE_SERIAL:-PI4B-0001}"
 SERIAL="$HARP_DEVICE_SERIAL"
 PROBE="${PROBE:-./build/harp-probe}"
 PI="${PI:-jak@harp.local}"   # ssh target for device recovery (the desk board)
+# No human answers a recall CONFLICT on an automated suite, so make the §11.4
+# reconcile offer fall back IMMEDIATELY (0 = don't wait) instead of stalling each
+# conflicting recall ~8s waiting for a front-panel pick that never comes. Override
+# (e.g. =8000) to exercise the interactive reconcile path by hand.
+export HARP_RECONCILE_TIMEOUT_MS="${HARP_RECONCILE_TIMEOUT_MS:-0}"
 
 # recover: reset the device by restarting its daemon, then wait until claimable.
 # A long suite's cumulative rapid claim/release (esp. the re-neg's audio.stop/start

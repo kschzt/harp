@@ -30,6 +30,12 @@ cd "$(dirname "$0")/.."
 
 SERIAL="${HARP_DEVICE_SERIAL:-PI4B-0001}"
 export HARP_DEVICE_SERIAL="$SERIAL"
+# This capture drives the harness's setStateBundle loop, which now hits the §11.4
+# recall reconcile on every conflict. With no front panel to answer, the default
+# timeout stalls each recall ~8s and the capture records SILENCE — a bogus
+# "produced no audio" fail. 0 = immediate Push fallback. The suite exports this
+# too; set it here so the test is correct run standalone (override =8000 by hand).
+export HARP_RECONCILE_TIMEOUT_MS="${HARP_RECONCILE_TIMEOUT_MS:-0}"
 PROBE="${PROBE:-./build/harp-probe}"
 BUILD="${BUILD:-build-mt-host}"
 SECONDS_RUN="${SECONDS_RUN:-4}"

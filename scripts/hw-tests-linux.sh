@@ -27,6 +27,10 @@ export HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 export PROBE="${PROBE:-./build/harp-probe}"
 export PI="${PI:-ci@harptest.local}"               # replug ssh target (NOT jak)
 export SERIAL="$HARP_DEVICE_SERIAL"                # replug pins this board
+# No human answers a recall CONFLICT on the runner, so make the §11.4 reconcile
+# offer fall back IMMEDIATELY (0 = don't wait) instead of stalling each conflicting
+# recall ~8s waiting for a front-panel pick that never comes.
+export HARP_RECONCILE_TIMEOUT_MS="${HARP_RECONCILE_TIMEOUT_MS:-0}"
 
 # recover: reset the device to a known-clean state by restarting the daemon, then
 # wait until it is claimable. A CI job killed mid-USB-stream (cancellation/timeout)
