@@ -371,6 +371,12 @@ private:
      * HARP_CUSHION_BLOCKS overrides for measurement. */
     static constexpr uint32_t kTargetDepthFrames = 2;
 
+    /* §8.7 bit-exact: the Ethernet jitter-buffer setpoint (frames). The feeder's
+     * audio.trim loop holds audioRing_ here, AND audio.start sends it as key 2 so
+     * the device PREFILLS this many frames in a startup burst — otherwise the
+     * ppm-limited trim takes seconds to fill from empty (startup silence). */
+    static constexpr uint32_t kEthTargetFrames = 2048;
+
     /* Ring target depth in frames for a given DAW block — the single source
      * of the cushion math (incl. the HARP_CUSHION_BLOCKS override) shared by
      * configure() and the static latencyFor(). */

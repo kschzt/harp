@@ -107,11 +107,13 @@ bool HarpRuntime::audioStart(uint32_t rate) {
          * port (key 6). The device emits its stereo main mix over RTP to us; the
          * host plays it 1:1 from EthTransport's FIFO — no per-part union, no
          * host-paced pacing. Mirrors the proven eth-bitexact-test request. */
-        harp_cbor_map(&req, 4);
+        harp_cbor_map(&req, 5);
         harp_cbor_uint(&req, 0);
         harp_cbor_uint(&req, rate);
         harp_cbor_uint(&req, 1);
         harp_cbor_uint(&req, kBlock);
+        harp_cbor_uint(&req, 2);
+        harp_cbor_uint(&req, kEthTargetFrames); /* prefill-burst depth (avoids startup silence) */
         harp_cbor_uint(&req, 5);
         harp_cbor_uint(&req, 0); /* free-running */
         harp_cbor_uint(&req, 6);
@@ -1177,7 +1179,6 @@ void HarpRuntime::feeder() {
     double ethSmFill = 0;
     bool ethPrimed = false;
     uint64_t ethLastTrimNs = 0;
-    const unsigned kEthTargetFrames = 2048; /* FIFO setpoint (~43 ms; tunable) */
     while (running_.load(std::memory_order_relaxed) &&
            connected_.load(std::memory_order_relaxed)) {
 #ifdef __APPLE__

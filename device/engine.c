@@ -898,6 +898,10 @@ void *audio_thread(void *arg) {
     uint64_t msc = 0;
     uint64_t period_ns = (uint64_t)a->nsamples * 1000000000ull / a->rate;
     bool discont = false;
+    /* §8.7 prefill burst: emit rtp_prebuffer frames back-to-back (no pacing) at
+     * stream start so the host's jitter buffer fills from the first block, then
+     * pace at realtime. 0 (USB / no-prebuffer) => paced immediately, unchanged. */
+    bool primed = (a->rtp_prebuffer == 0);
 
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
@@ -915,6 +919,16 @@ void *audio_thread(void *arg) {
             break; /* endpoint died (stop/unplug) */
         audio_rtp_emit(a, samples, payload, msc);  /* §8.7: no-op unless rtp_fd set */
         msc += a->nsamples;
+
+        /* §8.7 prefill burst: while priming, emit back-to-back (skip the pace)
+         * until rtp_prebuffer frames are out; then anchor realtime pacing at now
+         * so the steady-state period starts from a freshly-filled host buffer. */
+        if (!primed) {
+            if (msc < a->rtp_prebuffer)
+                continue;
+            primed = true;
+            clock_gettime(CLOCK_MONOTONIC, &next);
+        }
 
         /* §8.7 bit-exact (host-locked): apply the host's rate trim (ppb) to the
          * emit period so the device emits at exactly the host's consumption rate.
