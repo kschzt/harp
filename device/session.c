@@ -870,6 +870,29 @@ static void handle_audio_stop(device *d, const harp_env *e) {
     harp_cbuf_free(&m);
 }
 
+/* audio.trim (§8.7 bit-exact): the host's rate correction, key 0 = ppb (float,
+ * signed). Stored for the free-running render loop to apply to its emit period.
+ * Fire-and-forget — no response (the host streams these ~20/s and never waits),
+ * so it never head-of-line-blocks the control plane. */
+static void handle_audio_trim(device *d, const harp_env *e) {
+    if (!e->has_body) return;
+    harp_cdec b;
+    harp_cdec_init(&b, e->body, e->body_len);
+    uint64_t n, key;
+    double v = 0;
+    if (!harp_cdec_map(&b, &n)) return;
+    for (uint64_t i = 0; i < n; i++) {
+        if (!harp_cdec_uint(&b, &key)) break;
+        if (key == 0) {
+            if (!harp_cdec_float(&b, &v)) break;
+        } else if (!harp_cdec_skip(&b))
+            break;
+    }
+    if (v > 200000.0) v = 200000.0; /* clamp to +/-200 ppm */
+    else if (v < -200000.0) v = -200000.0;
+    atomic_store_explicit(&d->audio.rate_trim_ppb, (int)v, memory_order_relaxed);
+}
+
 /* evt.params (§9.3): the descriptor set */
 static void handle_evt_params(device *d, const harp_env *e) {
     harp_cbuf m;
@@ -1228,6 +1251,8 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
         handle_audio_start(d, &e);
     else if (strcmp(e.method, "audio.stop") == 0)
         handle_audio_stop(d, &e);
+    else if (strcmp(e.method, "audio.trim") == 0)
+        handle_audio_trim(d, &e);
     else if (strcmp(e.method, "diag.counters") == 0)
         handle_diag_counters(d, &e);
     else if (strcmp(e.method, "x.harp-refdev.knob") == 0)

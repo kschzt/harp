@@ -206,6 +206,15 @@ if(SAMPLERATE_FOUND)
     target_link_libraries(harp-eth-rtp-test harpcore ${SAMPLERATE_LIBRARIES}
       ${HARP_MATH_LIB} ${HARP_PLAT_LIBS} Threads::Threads)
 
+    # harp-eth-bitexact-test: the §8.7 BIT-EXACT (host-locked) path — plays the
+    # device's RTP 1:1 (no resampler, hence no libsamplerate) and feeds back
+    # audio.trim so the device emits at the host's rate. Proves bit-exact.
+    add_executable(harp-eth-bitexact-test tools/eth-bitexact-test.c
+      host/client.c host/sock_io.c host/rtp.c ${HARP_PLAT_SRC})
+    target_include_directories(harp-eth-bitexact-test PRIVATE host)
+    target_link_libraries(harp-eth-bitexact-test harpcore
+      ${HARP_MATH_LIB} ${HARP_PLAT_LIBS} Threads::Threads)
+
     # harp-freerun-mt-tests: concurrent SPSC stress under ThreadSanitizer — proves
     # freerun is race-free for the runtime's rx-thread-push / audio-thread-pull
     # topology. TSan-instrumented (this target only) so it aborts on any data race.

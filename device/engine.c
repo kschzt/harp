@@ -916,6 +916,13 @@ void *audio_thread(void *arg) {
         audio_rtp_emit(a, samples, payload, msc);  /* §8.7: no-op unless rtp_fd set */
         msc += a->nsamples;
 
+        /* §8.7 bit-exact (host-locked): apply the host's rate trim (ppb) to the
+         * emit period so the device emits at exactly the host's consumption rate.
+         * trim 0 => nominal period, byte-identical to the untrimmed free-run. */
+        int trim_ppb = atomic_load_explicit(&a->rate_trim_ppb, memory_order_relaxed);
+        period_ns = (uint64_t)((double)a->nsamples * 1000000000.0 /
+                               ((double)a->rate * (1.0 + (double)trim_ppb * 1e-9)));
+
         next.tv_nsec += (long)(period_ns % 1000000000ull);
         next.tv_sec += (time_t)(period_ns / 1000000000ull);
         if (next.tv_nsec >= 1000000000L) {
