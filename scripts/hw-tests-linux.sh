@@ -18,6 +18,11 @@
 set -u
 cd "$(dirname "$0")/.."
 
+# Automated conformance: never block a shell recall waiting for a front-panel pick
+# (mirrors hw-tests.sh). The §11.4 reconcile defaults to a 30s window for live DAW
+# use; 0 = fall back immediately (archive-protected Push), keeping the suite fast.
+export HARP_RECONCILE_TIMEOUT_MS="${HARP_RECONCILE_TIMEOUT_MS:-0}"
+
 # the Linux VST3 bundle (cmake --build build-vst --target install-linux)
 export PLUG="${PLUG:-$HOME/.vst3/harp-shell.vst3}"
 export VST="$PLUG"                                  # recall/timing/soak read $VST

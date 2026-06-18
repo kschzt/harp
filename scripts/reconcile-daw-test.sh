@@ -31,11 +31,9 @@ prereqs)
    (harp-electra.service is already active — it surfaces the Reconcile page.)
 2. Mac — install the layer-2 shell into Live's VST3 folder:
      cmake --build build-vst --target install-live
-3. Launch Live WITH a generous reconcile window so you have time to pick on the
-   Electra (the VST3 inherits the env of whatever launches it):
-     HARP_RECONCILE_TIMEOUT_MS=30000 \
-       /Applications/"Ableton Live 12 Suite.app"/Contents/MacOS/"Ableton Live 12 Suite"
-   (0 = don't wait -> immediate archive-protected Push, the headless default.)
+3. Launch Live normally. The reconcile wait defaults to 30s — a comfortable window
+   to read + pick on the Electra — so NO env var is needed. (Override with
+   HARP_RECONCILE_TIMEOUT_MS if you like: 0 = don't wait -> immediate Push.)
 EOF
     ;;
 procedure)
