@@ -158,7 +158,8 @@ int main(int argc, char **argv) {
     const char *hostport = argv[1];
     double secs = argc > 2 ? atof(argv[2]) : 10.0;
     int rtp_port = argc > 3 ? atoi(argv[3]) : 47820;
-    uint32_t rate = 48000, nsamples = 256;
+    uint32_t rate = 48000;
+    uint32_t nsamples = (uint32_t)(getenv("HARP_NSAMPLES") ? atoi(getenv("HARP_NSAMPLES")) : 256);
     unsigned target = (unsigned)(getenv("HARP_TARGET") ? atoi(getenv("HARP_TARGET")) : 2048);
     /* Proportional-only by default: control of the buffer (an integrator) by a
      * single gain is FIRST-ORDER -> unconditionally stable, no oscillation, no
