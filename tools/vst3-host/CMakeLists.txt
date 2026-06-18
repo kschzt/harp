@@ -8,6 +8,8 @@ endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11) # host/freerun.c uses C11 <stdatomic.h>; matches the top-level
+set(CMAKE_C_STANDARD_REQUIRED ON) # build. gcc/clang default to C11+; MSVC needs /std:c11.
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
