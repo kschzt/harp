@@ -157,15 +157,19 @@ static const clap_plugin_params_t s_params = {pa_count,         pa_get_info, pa_
                                               pa_value_to_text, pa_text_to_value, pa_flush};
 
 /* ------------------------------------------------------------------- state */
+/* Marker for a device-less state: when no device is attached there's no Recall
+ * Bundle to save, so we persist the param cache instead (tagged so load() tells it
+ * from a real bundle). First byte 'H' (0x48) can't be a CBOR map header (0xA0-0xBF),
+ * so it never collides with a real bundle's first byte. */
+static const uint8_t kParamCacheTag[4] = {'H', 'c', 'P', 'c'};
 static bool st_save(const clap_plugin_t *p, const clap_ostream_t *os) {
     HarpClap *h = self(p);
-    if (!h->rt()) return false;
     std::vector<uint8_t> bundle;
-    /* getStateBundle yields an empty bundle when no device is attached (a host scan
-     * or validator with no hardware). That is still a valid, reloadable state — the
-     * header below makes it a well-formed HARP state — so save() MUST succeed: a CLAP
-     * host treats a false save() as a hard error (and clap-validator fails it). */
-    h->rt()->getStateBundle(bundle);
+    /* getStateBundle yields an empty bundle when there's no runtime yet (a host that
+     * saves before activate, like clap-validator) or no device attached. That's still
+     * a valid, reloadable state once the header (magic + part) is written, so save()
+     * MUST succeed — a CLAP host treats a false save() as a hard error. */
+    if (h->rt()) h->rt()->getStateBundle(bundle);
     /* SAME header as VST3/AU getState: magic + part byte, then the bundle. The
      * device gets the identical bundle on reload (load strips the header), so a
      * project round-trips byte-transparently across all three formats. */
@@ -173,9 +177,23 @@ static bool st_save(const clap_plugin_t *p, const clap_ostream_t *os) {
     memcpy(header, kStateHeaderMagic, sizeof kStateHeaderMagic);
     header[sizeof kStateHeaderMagic] = (uint8_t)(h->part & 0xf);
     if (os->write(os, header, sizeof header) != (int64_t)sizeof header) return false;
+    /* With a device, write the Recall Bundle (shared with VST3/AU — cross-format
+     * project moves ride it). With NO device the bundle is empty, but the host still
+     * expects our parameters to round-trip (clap-validator, or an offline save), so
+     * persist the tagged param cache instead. The device path is unchanged. */
+    const uint8_t *body = bundle.data();
+    size_t bodyLen = bundle.size();
+    std::vector<uint8_t> cache;
+    if (bundle.empty()) {
+        cache.insert(cache.end(), kParamCacheTag, kParamCacheTag + sizeof kParamCacheTag);
+        const uint8_t *pv = (const uint8_t *)h->paramVals;
+        cache.insert(cache.end(), pv, pv + sizeof h->paramVals);
+        body = cache.data();
+        bodyLen = cache.size();
+    }
     size_t off = 0;
-    while (off < bundle.size()) {
-        int64_t w = os->write(os, bundle.data() + off, bundle.size() - off);
+    while (off < bodyLen) {
+        int64_t w = os->write(os, body + off, bodyLen - off);
         if (w <= 0) return false;
         off += (size_t)w;
     }
@@ -200,6 +218,15 @@ static bool st_load(const clap_plugin_t *p, const clap_istream_t *is) {
         return false;
     h->part = (uint8_t)(raw[sizeof kStateHeaderMagic] & 0xf);
     raw.erase(raw.begin(), raw.begin() + kStateHeaderLen);
+    /* A device-less save (st_save) stored the tagged param cache instead of a bundle.
+     * Restore it so get_value round-trips with no hardware. A real bundle (the device
+     * path) is handled below as before. */
+    if (raw.size() >= sizeof kParamCacheTag &&
+        memcmp(raw.data(), kParamCacheTag, sizeof kParamCacheTag) == 0) {
+        if (raw.size() - sizeof kParamCacheTag == sizeof h->paramVals)
+            memcpy(h->paramVals, raw.data() + sizeof kParamCacheTag, sizeof h->paramVals);
+        return true;
+    }
     if (h->rt() && h->owner())
         h->rt()->setStateBundle(raw.data(), raw.size()); /* live reload */
     else
@@ -312,12 +339,24 @@ static void applyTransport(HarpClap *h, const clap_event_transport_t *e, uint32_
 static void pa_flush(const clap_plugin_t *p, const clap_input_events_t *in,
                      const clap_output_events_t *) {
     HarpClap *h = self(p);
-    if (!h->rt() || !h->source || !in) return;
-    uint64_t base = h->rt()->streamPos() + h->rt()->latencySamples();
+    if (!in) return;
+    /* The host may flush param changes at any time — including before activate / with
+     * no device (clap-validator does exactly this). ALWAYS reflect a value event in
+     * the cache so get_value and save() round-trip; forward to the engine only when a
+     * runtime + source exist (the live path's applyEvent updates the cache itself). */
+    bool live = h->rt() && h->source;
+    uint64_t base = live ? h->rt()->streamPos() + h->rt()->latencySamples() : 0;
     uint32_t n = in->size(in);
     for (uint32_t i = 0; i < n; i++) {
         const clap_event_header_t *hdr = in->get(in, i);
-        if (hdr && hdr->type == CLAP_EVENT_PARAM_VALUE) applyEvent(h, hdr, base);
+        if (!hdr || hdr->type != CLAP_EVENT_PARAM_VALUE) continue;
+        if (live) {
+            applyEvent(h, hdr, base);
+        } else {
+            auto *e = (const clap_event_param_value *)hdr;
+            for (uint32_t k = 0; k < kNumParams; k++)
+                if (kParams[k].id == e->param_id) h->paramVals[k] = e->value;
+        }
     }
 }
 
