@@ -388,5 +388,15 @@ if(LIBUSB_FOUND)
       COMMENT "Installing harp-au.component")
   endif()
 else()
-  message(STATUS "harp-shell: libusb not found, shell not built")
+  # Without libusb NONE of the shell targets (harp-shell, install-live, install-au,
+  # install-clap, ...) are generated — so a later `--target install-live` fails with
+  # the cryptic "project file does not exist". This build root exists ONLY to build
+  # the shell, so fail fast at configure with the actual cause and the cure.
+  message(FATAL_ERROR
+    "libusb not found: the harp-shell plugin and its install-* targets cannot be "
+    "built (this is why `cmake --build ... --target install-live` fails with "
+    "\"project file does not exist\").\n"
+    "  Windows: fetch the prebuilt MSVC libusb into external/libusb-win (README Path 3).\n"
+    "  macOS:   brew install libusb\n"
+    "  Linux:   apt install libusb-1.0-0-dev")
 endif()

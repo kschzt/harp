@@ -193,8 +193,20 @@ git clone --recursive https://github.com/steinbergmedia/vst3sdk.git external/vst
 git clone --branch 1.2.8 https://github.com/free-audio/clap.git external/clap
 ```
 
+On **Windows** also fetch the prebuilt libusb into `external/libusb-win` — there is no
+pkg-config, so the shell looks for it there; without it the configure now aborts with
+the cause (previously the shell targets silently weren't generated and a later
+`--target install-live` failed with "project file does not exist"):
+
+```powershell
+$ver = '1.0.27'
+Invoke-WebRequest -UseBasicParsing "https://github.com/libusb/libusb/releases/download/v$ver/libusb-$ver.7z" -OutFile libusb.7z
+New-Item -ItemType Directory -Force external/libusb-win | Out-Null
+7z x libusb.7z -oexternal/libusb-win -y   # needs 7-Zip; the bundled tar lacks the LZMA codec
+```
+
 ```sh
-cmake -B build-vst -S tools/vst3-host
+cmake -B build-vst -S tools/vst3-host   # Windows: add -G "Visual Studio 17 2022" -A x64 if the default generator fails
 cmake --build build-vst --target install-live   # macOS/Windows: install to the OS VST3 folder (+sign on macOS)
 cmake --build build-vst --target install-linux  # Linux: install to ~/.vst3
 cmake --build build-vst --target install-au     # macOS: the Audio Unit shell
