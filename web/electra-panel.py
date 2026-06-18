@@ -213,12 +213,13 @@ def build_preset(params):
                         "message": {"deviceId": 1, "type": "cc7",
                                     "parameterNumber": 110 + j, "onValue": 127, "offValue": 0}}],
         })
-    # Headline on the Reconcile page so the four pads aren't context-free: a group
-    # header spanning the top, above the action row (which starts at TOP_Y=44).
+    # Headline: a group header at the top. (Bigger text would need a control, which
+    # always carries chrome — a pad's box or a fader's bar — so a clean text-only
+    # title is only available at the group's fixed small font.) Lua relabels it.
     groups = [{
         "id": 1, "pageId": 3, "controlSetId": 1,
-        "name": "Recall conflict: Project vs Synth",
-        "bounds": [0, 4, CANVAS_W, 34], "color": "F45C51",
+        "name": "Project and Synth differ",
+        "bounds": [0, 4, CANVAS_W, 34], "color": "F49500",
     }]
     return {"version": 2, "name": "HARP RefDev", "pages": pages, "devices": devices,
             "controls": controls, "groups": groups, "overlays": []}
@@ -251,7 +252,13 @@ preset.userFunctions = {
 -- locally via pages.display(), the firmware's own page API.
 function midi.onControlChange(midiInput, channel, controllerNumber, value)
   if controllerNumber == 119 and value >= 1 and value <= 12 then
-    pages.display(value)
+    pages.display(value)          -- CC 119 = target page
+  elseif controllerNumber == 118 then  -- CC 118 = dirty flag: relabel the headline
+    local g = groups.get(1)
+    if g then
+      if value == 1 then g:setLabel("Synth has unsaved edits")
+      else g:setLabel("Project and Synth differ") end
+    end
   end
 end
 """
@@ -376,8 +383,9 @@ def main():
             rj = json.loads(panel.cmd("reconcile-get"))
             if rj.get("pending") and not recon["active"]:
                 recon["active"] = True
-                # Open Reconcile via on-device Lua: CC 119 value = target page ->
-                # the Lua midi.onControlChange handler calls pages.display(page).
+                # CC 118 = dirty flag (Lua relabels the headline), then CC 119 =
+                # target page (Lua pages.display). Label set before the page shows.
+                port.write(bytes([0xB0 | MIDI_CH, 118, 1 if rj.get("dirty") else 0]))
                 port.write(bytes([0xB0 | MIDI_CH, 119, RECONCILE_PAGE]))
                 sys.stderr.write("electra-panel: reconcile offer expect=%s live=%s%s -> Reconcile (Lua)\n"
                                  % (rj.get("expect"), rj.get("live"), " dirty" if rj.get("dirty") else ""))
