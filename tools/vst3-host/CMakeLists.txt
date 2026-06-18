@@ -15,11 +15,17 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 if(MSVC)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS) # harp C sources use getenv/snprintf
-  # MSVC gates C11 <stdatomic.h> (host/freerun.c) behind this flag even under /std:c11
-  # (else "C atomic support is not enabled"). CMAKE_C_FLAGS is C-only, so the C++ SDK/
-  # shell sources are untouched, and it lands reliably on every C compile (unlike a
-  # COMPILE_LANGUAGE genexp, which the VS generator does not apply here).
-  string(APPEND CMAKE_C_FLAGS " /experimental:c11atomics")
+endif()
+# host/freerun.c uses C11 <stdatomic.h>, which MSVC gates behind /experimental:c11atomics
+# (else "C atomic support is not enabled" even under /std:c11). The flag must land on
+# THAT file specifically: a directory/target COMPILE_LANGUAGE genexp and CMAKE_C_FLAGS
+# both fail to reach a C file inside the C++-dominant shell target under the VS
+# generator, but a per-source COMPILE_OPTIONS is emitted into its own <AdditionalOptions>.
+# Set once here (directory-scoped) so all five runtime targets that compile freerun.c
+# pick it up. /std:c11 itself arrives via CMAKE_C_STANDARD (handled per-language).
+if(MSVC)
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/../../host/freerun.c
+    PROPERTIES COMPILE_OPTIONS "/experimental:c11atomics")
 endif()
 
 set(SMTG_ENABLE_VST3_HOSTING_EXAMPLES OFF CACHE BOOL "" FORCE)
