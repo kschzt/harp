@@ -99,22 +99,29 @@ bool HarpRuntime::audioStart(uint32_t rate) {
         std::lock_guard<std::mutex> lk(sinksMutex_);
         computeUnionSlotsLocked();
     }
+    /* the reader demuxes RTP packets by this width (USB carries it per-frame). Set
+     * before audio.start so it is live before the device's first post-start RTP. */
+    unionWidth_.store((uint16_t)unionSlots_.size(), std::memory_order_relaxed);
     harp_cbuf req, rsp;
     harp_cbuf_init(&req);
     harp_cbuf_init(&rsp);
     harp_client_req_head(&client_, &req, "audio.start", true);
     if (freeRunning_) {
-        /* §8.7 Ethernet / bit-exact: free-running (key 5 = 0) with the RTP dest
-         * port (key 6). The device emits its stereo main mix over RTP to us; the
-         * host plays it 1:1 from EthTransport's FIFO — no per-part union, no
-         * host-paced pacing. Mirrors the proven eth-bitexact-test request. */
-        harp_cbor_map(&req, 5);
+        /* §8.7 Ethernet: free-running (key 5 = 0) to the RTP dest port (key 6),
+         * carrying the SAME slot union (key 4) the USB path sends — so the device
+         * RTP-streams main {0,1} PLUS every per-part sink pair, and reader()
+         * demuxes per part exactly as on USB. Default (no sink) = {0,1}, the
+         * stereo main mix (bit-exact, as the proven eth-bitexact-test). */
+        harp_cbor_map(&req, 6);
         harp_cbor_uint(&req, 0);
         harp_cbor_uint(&req, rate);
         harp_cbor_uint(&req, 1);
         harp_cbor_uint(&req, kBlock);
         harp_cbor_uint(&req, 2);
         harp_cbor_uint(&req, kEthTargetFrames); /* prefill-burst depth (avoids startup silence) */
+        harp_cbor_uint(&req, 4); /* active-slots-out union (main + per-part pairs) */
+        harp_cbor_array(&req, unionSlots_.size());
+        for (uint32_t slot : unionSlots_) harp_cbor_uint(&req, slot);
         harp_cbor_uint(&req, 5);
         harp_cbor_uint(&req, 0); /* free-running */
         harp_cbor_uint(&req, 6);
@@ -1485,6 +1492,73 @@ void HarpRuntime::eventPump() {
     harp_cbuf_free(&batch);
 }
 
+/* Demux ONE union audio frame (pl = ns frames of S slot-interleaved floats): the
+ * owner's main-mix columns {0,1} -> audioRing_, and each per-part sink's columns ->
+ * its ring. Shared by the USB reader (host-paced framed audio) and the §8.7 RTP
+ * reader (bit-exact + ASRC), so BOTH bindings deliver per-part audio identically.
+ * S==2 is the contiguous {0,1}-only fast path (a single instance / no per-part sink
+ * — the byte-identical golden case). Caller is the sole writer of audioRing_ and the
+ * sink rings (the reader thread, or — for ASRC — the owner's resampling pull). */
+void HarpRuntime::demuxUnionFrame(const float *pl, size_t ns, uint16_t S) {
+    if (S == 2) {
+        audioRing_.write(pl, ns * 2);
+    } else if (S > 2) {
+        /* wider union: gather the owner's columns 0,1 (the main mix) out
+         * of the slot-interleaved frame into an interleaved L/R chunk. */
+        float tmp[1024 * 2];
+        size_t i = 0;
+        while (i < ns) {
+            size_t chunk = ns - i < 1024 ? ns - i : 1024;
+            for (size_t j = 0; j < chunk; j++) {
+                tmp[2 * j] = pl[(i + j) * S + 0];
+                tmp[2 * j + 1] = pl[(i + j) * S + 1];
+            }
+            audioRing_.write(tmp, chunk * 2);
+            i += chunk;
+        }
+    } else if (S == 1) {
+        /* mono union (a single-slot owner subscription): duplicate L=R
+         * so the owner ring stays interleaved-stereo. The default path
+         * is always a 2-slot {0,1} pair, so this is a robustness branch,
+         * never the golden case. */
+        float tmp[1024 * 2];
+        size_t i = 0;
+        while (i < ns) {
+            size_t chunk = ns - i < 1024 ? ns - i : 1024;
+            for (size_t j = 0; j < chunk; j++)
+                tmp[2 * j] = tmp[2 * j + 1] = pl[i + j];
+            audioRing_.write(tmp, chunk * 2);
+            i += chunk;
+        }
+    }
+    /* P5b DEMUX: split this frame's slot columns into every per-part sink's ring.
+     * The caller is the SOLE writer of every sink (SPSC producer side); the lock is
+     * the safe-free invariant against unregisterAudioSink (it removes a sink under
+     * the same lock before freeing, so we never write a freed ring). Pure memory
+     * work — no I/O under the lock. The relaxed haveSinks_ gate keeps the single-
+     * instance / default-main-mix path LOCK-FREE: with no sink the lock is never
+     * taken at all. */
+    if (haveSinks_.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lk(sinksMutex_);
+        for (size_t si = 0; si < nSinks_; si++) {
+            AudioSink *sk = sinks_[si];
+            uint16_t cL = sk->cols[0], cR = sk->cols[1];
+            if (cL >= S || cR >= S) continue; /* slot not in this union */
+            float tmp[1024 * 2];
+            size_t i = 0;
+            while (i < ns) {
+                size_t chunk = ns - i < 1024 ? ns - i : 1024;
+                for (size_t j = 0; j < chunk; j++) {
+                    tmp[2 * j] = pl[(i + j) * S + cL];
+                    tmp[2 * j + 1] = pl[(i + j) * S + cR];
+                }
+                sk->ring.write(tmp, chunk * 2);
+                i += chunk;
+            }
+        }
+    }
+}
+
 void HarpRuntime::reader() {
 #ifdef __APPLE__
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -1500,16 +1574,24 @@ void HarpRuntime::reader() {
 #ifdef __APPLE__
         WgState wgf;
 #endif
-        float buf[2048 * 2]; /* one RTP packet's stereo frames (<= 2048) */
+        /* one RTP union packet = ns(=kBlock) frames of S(<=34) slot-interleaved
+         * floats — sized to the widest union (main {0,1} + 16 stereo part pairs).
+         * recvAudio returns the raw payload as floats; we split it by the union
+         * width the host negotiated at audio.start (key 4) and demux exactly as the
+         * USB reader does, so per-part audio lands in the same sinks. */
+        static constexpr unsigned kRtpBufFloats = kBlock * 34;
+        float buf[kRtpBufFloats];
         while (running_.load(std::memory_order_relaxed) &&
                !readerStop_.load(std::memory_order_acquire)) {
 #ifdef __APPLE__
             wgMaintain(wgf);
 #endif
-            unsigned n = transport_->recvAudio(buf, 2048, 100);
-            if (n > 0)
-                audioRing_.write(buf, n * 2);
-            else if (transport_->silentMs() > 1000) {
+            unsigned floats = transport_->recvAudio(buf, kRtpBufFloats, 100);
+            unsigned width = unionWidth_.load(std::memory_order_relaxed);
+            if (!width) width = 2;
+            if (floats >= width)
+                demuxUnionFrame(buf, floats / width, (uint16_t)width);
+            else if (floats == 0 && transport_->silentMs() > 1000) {
                 log_msg("RTP stream silent >1s; device gone?");
                 connected_.store(false, std::memory_order_release);
                 break;
@@ -1552,74 +1634,7 @@ void HarpRuntime::reader() {
             const float *pl = (const float *)(acc + off + HARP_AUDIO_HDR_LEN);
             size_t ns = (size_t)h.nsamples;
             uint16_t S = h.slots; /* columns in this frame == |unionSlots_| */
-            /* OWNER main mix: the owner subscribes to the contiguous union
-             * PREFIX (computeUnionSlotsLocked puts outSlots_ first), so its
-             * two columns are 0 and 1. When the frame carries EXACTLY 2 slots
-             * (the default {0,1}-only union — a single instance, or any group
-             * where no sibling requested a per-part slot), the prefix IS the
-             * whole frame and this write is the SAME contiguous nsamples*2 copy
-             * the pre-P5b reader did — BYTE-IDENTICAL (the golden gate). With a
-             * wider union (per-part sinks present) we still write the owner's
-             * columns 0,1, demuxed below; the {0,1} sub-case stays the fast
-             * contiguous path. */
-            if (S == 2) {
-                audioRing_.write(pl, ns * 2);
-            } else if (S > 2) {
-                /* wider union: gather the owner's columns 0,1 (the main mix) out
-                 * of the slot-interleaved frame into an interleaved L/R chunk. */
-                float tmp[1024 * 2];
-                size_t i = 0;
-                while (i < ns) {
-                    size_t chunk = ns - i < 1024 ? ns - i : 1024;
-                    for (size_t j = 0; j < chunk; j++) {
-                        tmp[2 * j] = pl[(i + j) * S + 0];
-                        tmp[2 * j + 1] = pl[(i + j) * S + 1];
-                    }
-                    audioRing_.write(tmp, chunk * 2);
-                    i += chunk;
-                }
-            } else if (S == 1) {
-                /* mono union (a single-slot owner subscription): duplicate L=R
-                 * so the owner ring stays interleaved-stereo. The default path
-                 * is always a 2-slot {0,1} pair, so this is a robustness branch,
-                 * never the golden case. */
-                float tmp[1024 * 2];
-                size_t i = 0;
-                while (i < ns) {
-                    size_t chunk = ns - i < 1024 ? ns - i : 1024;
-                    for (size_t j = 0; j < chunk; j++)
-                        tmp[2 * j] = tmp[2 * j + 1] = pl[i + j];
-                    audioRing_.write(tmp, chunk * 2);
-                    i += chunk;
-                }
-            }
-            /* P5b DEMUX: split this frame's slot columns into every per-part
-             * sink's ring. reader() is the SOLE writer of every sink (SPSC
-             * producer side); the lock is the safe-free invariant against
-             * unregisterAudioSink (it removes a sink under the same lock before
-             * freeing, so we never write a freed ring). Pure memory work — no
-             * I/O under the lock. The relaxed haveSinks_ gate keeps the single-
-             * instance / default-main-mix reader on its pre-P5b LOCK-FREE path:
-             * with no sink registered the demux lock is never taken at all. */
-            if (haveSinks_.load(std::memory_order_relaxed)) {
-                std::lock_guard<std::mutex> lk(sinksMutex_);
-                for (size_t si = 0; si < nSinks_; si++) {
-                    AudioSink *sk = sinks_[si];
-                    uint16_t cL = sk->cols[0], cR = sk->cols[1];
-                    if (cL >= S || cR >= S) continue; /* slot not in this union */
-                    float tmp[1024 * 2];
-                    size_t i = 0;
-                    while (i < ns) {
-                        size_t chunk = ns - i < 1024 ? ns - i : 1024;
-                        for (size_t j = 0; j < chunk; j++) {
-                            tmp[2 * j] = pl[(i + j) * S + cL];
-                            tmp[2 * j + 1] = pl[(i + j) * S + cR];
-                        }
-                        sk->ring.write(tmp, chunk * 2);
-                        i += chunk;
-                    }
-                }
-            }
+            demuxUnionFrame(pl, ns, S); /* main mix -> audioRing_; per-part -> sinks */
             framesRecvAtomic_.fetch_add(1, std::memory_order_release);
             off += need;
         }
@@ -1725,7 +1740,11 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
         log_msg("recall: reconcile -> Duplicate (displaced state kept as duplicate/<ts>)");
     else
         log_msg("recall: %s -> Push (archive-then-CAS)", live.unborn ? "first push" : "reconcile");
-    if (!live.unborn) {
+    /* The archive is loss-prevention for the interactive Push/Duplicate. Headless
+     * (timeout 0) skips it: under the per-part-audio stress a per-push archive/<ts>
+     * ref (5x/s across the whole cluster) is pure churn that can wedge the gadget,
+     * and a CI stress run has no displaced state worth keeping. */
+    if (!live.unborn && timeout_ms > 0) {
         char archive[96];
         time_t now = time(nullptr);
         struct tm tm;
