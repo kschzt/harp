@@ -447,9 +447,24 @@ ShellTransport *HarpRuntime::selectDevice() {
             io = harp_usb_open_match_ctx(usbCtx_, nullptr, true, wvid, wpid);
         return wrapUsb(io); /* a known model is never satisfied by a different model */
     }
-    /* fresh instance (or a bundle predating usb-identity): first unclaimed
-     * HARP device of any model — it adopts whatever is there and records
-     * it on first save. */
+    /* fresh instance (or a bundle predating usb-identity), no env pin: a multi-board
+     * desk can name a DEFAULT unit without an env var — the serial in
+     * ~/.config/harp/device. Tried as a preference (exact match); if it is not on the
+     * bus, fall through so a single-board setup still just works. The bundle's own
+     * serial and HARP_DEVICE_SERIAL both take precedence (handled above). */
+    if (const char *home = getenv("HOME")) {
+        char pref[64] = {0};
+        std::string path = std::string(home) + "/.config/harp/device";
+        if (FILE *f = fopen(path.c_str(), "r")) {
+            if (fgets(pref, sizeof pref, f)) pref[strcspn(pref, "\r\n \t")] = 0; /* trim */
+            fclose(f);
+        }
+        if (pref[0])
+            if (harp_io *io = harp_usb_open_match_ctx(usbCtx_, pref, false, 0, 0))
+                return wrapUsb(io);
+    }
+    /* else: first unclaimed HARP device of any model — adopts whatever is there and
+     * records it on first save. */
     return wrapUsb(harp_usb_open_match_ctx(usbCtx_, nullptr, false, 0, 0));
 }
 
