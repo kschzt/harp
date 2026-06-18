@@ -1027,6 +1027,23 @@ int main(int argc, char **argv) {
         printf("device daemon restarting (systemd respawn)\n");
         harp_cbuf_free(&req);
         harp_cbuf_free(&rsp);
+    } else if (strcmp(cmd, "reconcile-offer") == 0 && i + 3 < argc) {
+        /* §11.4: post a conflict for the front panel (short-hex display strings) */
+        do_hello(&p);
+        int rc = harp_client_reconcile_offer(&p.client, argv[i + 1], argv[i + 2],
+                                             atoi(argv[i + 3]));
+        printf("reconcile-offer: %s (expect %s live %s dirty %s)\n",
+               rc == 0 ? "posted" : "FAILED", argv[i + 1], argv[i + 2], argv[i + 3]);
+    } else if (strcmp(cmd, "reconcile-poll") == 0) {
+        /* read the front-panel pick back */
+        do_hello(&p);
+        bool pending = false;
+        int choice = -1;
+        int rc = harp_client_reconcile_poll(&p.client, &pending, &choice);
+        static const char *names[] = {"push", "pull", "read-only", "duplicate"};
+        printf("reconcile-poll: %s pending=%s choice=%d (%s)\n", rc == 0 ? "ok" : "FAILED",
+               pending ? "true" : "false", choice,
+               (choice >= 0 && choice <= 3) ? names[choice] : "none");
     } else if (strcmp(cmd, "record") == 0 && i + 2 < argc) {
 #ifdef HAVE_LIBUSB
         cmd_record(&p, strtod(argv[i + 1], NULL), argv[i + 2]);

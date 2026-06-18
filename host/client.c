@@ -544,3 +544,56 @@ int harp_client_refset(harp_client *c, const char *name, const harp_hash *expect
     harp_cbuf_free(&rsp);
     return rc;
 }
+
+int harp_client_reconcile_offer(harp_client *c, const char *expect, const char *live,
+                                bool dirty) {
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    harp_client_req_head(c, &req, "x.harp.reconcile.offer", true);
+    harp_cbor_map(&req, 3);
+    harp_cbor_uint(&req, 0);
+    harp_cbor_text(&req, expect ? expect : "");
+    harp_cbor_uint(&req, 1);
+    harp_cbor_text(&req, live ? live : "");
+    harp_cbor_uint(&req, 2);
+    harp_cbor_uint(&req, dirty ? 1 : 0);
+    harp_env e;
+    int rc = harp_client_request(c, &req, &rsp, &e);
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+    return rc;
+}
+
+int harp_client_reconcile_poll(harp_client *c, bool *pending, int *choice) {
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    harp_client_req_head(c, &req, "x.harp.reconcile.poll", false);
+    harp_env e;
+    int rc = harp_client_request(c, &req, &rsp, &e);
+    if (rc == 0 && e.has_body) {
+        harp_cdec b;
+        harp_cdec_init(&b, e.body, e.body_len);
+        uint64_t n, key;
+        if (harp_cdec_map(&b, &n)) {
+            for (uint64_t i = 0; i < n; i++) {
+                if (!harp_cdec_uint(&b, &key)) break;
+                if (key == 0) {
+                    bool v = false;
+                    harp_cdec_bool(&b, &v);
+                    if (pending) *pending = v;
+                } else if (key == 1) {
+                    int64_t v = -1;
+                    harp_cdec_int(&b, &v);
+                    if (choice) *choice = (int)v;
+                } else {
+                    harp_cdec_skip(&b);
+                }
+            }
+        }
+    }
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+    return rc;
+}

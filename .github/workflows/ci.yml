@@ -188,6 +188,8 @@ jobs:
           # unpushed-closure target -> not-found.
           ./build/harp-probe -d 127.0.0.1:47800 -s /tmp/host cas-test | tee cas.out
           grep -q "CAS-TEST PASS" cas.out
+      - name: reconcile relay (§11.4 four actions over the protocol, sim device + panel)
+        run: ./scripts/reconcile-relay-test.sh
 
   fuzz:
     runs-on: ubuntu-latest

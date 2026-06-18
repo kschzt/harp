@@ -730,6 +730,7 @@ int harp_ffs_audio_out_fd(void); /* device/ffs.c */
 static void handle_audio_start(device *d, const harp_env *e) {
     uint64_t rate = 48000, nsamples = 256, mode = 0;
     uint64_t rtp_port = 0; /* §8.7 key 6: host's RTP audio port; 0 => USB transport */
+    uint64_t prebuf = 0;   /* §8.7 key 2: RTP prefill-burst depth in frames (0 = none) */
     /* active-slots-out (§6.3, key 4): the output slots the host wants, in
      * request order. Parsed into a local array first; an absent or empty key
      * defaults to the stereo main mix {0,1} (the P2.1 byte-identical path). */
@@ -763,6 +764,8 @@ static void handle_audio_start(device *d, const harp_env *e) {
                     if (!harp_cdec_uint(&b, &mode)) break;
                 } else if (key == 6) { /* §8.7: RTP audio destination port (Ethernet) */
                     if (!harp_cdec_uint(&b, &rtp_port)) break;
+                } else if (key == 2) { /* §8.7: RTP prefill-burst depth, frames */
+                    if (!harp_cdec_uint(&b, &prebuf)) break;
                 } else if (!harp_cdec_skip(&b))
                     break;
             }
@@ -828,6 +831,7 @@ static void handle_audio_start(device *d, const harp_env *e) {
         d->audio.rtp_ssrc = 0x48415250u; /* "HARP" */
         d->audio.rtp_seq = 0;
     }
+    d->audio.rtp_prebuffer = (rtp_fd >= 0) ? (uint32_t)prebuf : 0; /* startup burst (RTP only) */
     d->audio.mode = (uint32_t)mode;
     d->audio.rate = (uint32_t)rate;
     d->audio.nsamples = (uint32_t)nsamples;
@@ -1112,6 +1116,61 @@ static void handle_knob(device *d, const harp_env *e) {
     harp_cbuf_free(&m);
 }
 
+/* x.harp.reconcile.offer {0: expect (short-hex text), 1: live (short-hex text),
+ * 2: dirty (optional)} — a shell whose saved Recall Bundle differs from the device's
+ * live ref POSTs the §11.4 conflict; the panel frontend force-opens its Reconcile
+ * screen and the user's pick returns via .poll. The device only relays for display:
+ * the shell owns the hash comparison and the chosen action. */
+static void handle_reconcile_offer(device *d, const harp_env *e) {
+    char expect[16] = "", live[16] = "";
+    uint64_t dirty = 0;
+    bool ok = false;
+    if (e->has_body) {
+        harp_cdec b;
+        harp_cdec_init(&b, e->body, e->body_len);
+        uint64_t n, key;
+        const char *s;
+        size_t sl;
+        if (harp_cdec_map(&b, &n) && n >= 2 && harp_cdec_uint(&b, &key) && key == 0 &&
+            harp_cdec_text(&b, &s, &sl)) {
+            snprintf(expect, sizeof expect, "%.*s", (int)(sl < 15 ? sl : 15), s);
+            if (harp_cdec_uint(&b, &key) && key == 1 && harp_cdec_text(&b, &s, &sl)) {
+                snprintf(live, sizeof live, "%.*s", (int)(sl < 15 ? sl : 15), s);
+                ok = true;
+                if (n >= 3 && harp_cdec_uint(&b, &key) && key == 2)
+                    harp_cdec_uint(&b, &dirty); /* optional */
+            }
+        }
+    }
+    if (!ok) {
+        send_error(d, e->rid, e->method, "malformed", NULL);
+        return;
+    }
+    reconcile_post_offer(expect, live, (int)dirty);
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, false);
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+
+/* x.harp.reconcile.poll {} -> {0: pending, 1: choice (-1 none, 0..3)} — the shell
+ * polls for the front-panel pick, then executes the §11.4 action. */
+static void handle_reconcile_poll(device *d, const harp_env *e) {
+    int pending = 0, choice = -1;
+    reconcile_read(&pending, NULL, NULL, NULL, &choice);
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, true);
+    harp_cbor_map(&m, 2);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_bool(&m, pending != 0);
+    harp_cbor_uint(&m, 1);
+    harp_cbor_int(&m, choice);
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+
 static void handle_dev_params(device *d, const harp_env *e) {
     harp_cbuf m;
     harp_cbuf_init(&m);
@@ -1257,6 +1316,10 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
         handle_diag_counters(d, &e);
     else if (strcmp(e.method, "x.harp-refdev.knob") == 0)
         handle_knob(d, &e);
+    else if (strcmp(e.method, "x.harp.reconcile.offer") == 0)
+        handle_reconcile_offer(d, &e);
+    else if (strcmp(e.method, "x.harp.reconcile.poll") == 0)
+        handle_reconcile_poll(d, &e);
     else if (strcmp(e.method, "x.harp-refdev.params") == 0)
         handle_dev_params(d, &e);
     else if (strcmp(e.method, "x.harp-refdev.meters") == 0)

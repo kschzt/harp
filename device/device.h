@@ -226,6 +226,10 @@ typedef struct {
     int rtp_fd;
     uint16_t rtp_seq;
     uint32_t rtp_ssrc;
+    uint32_t rtp_prebuffer; /* §8.7 bit-exact: frames to emit in a startup BURST
+                             * (no pacing) before settling into realtime, so the
+                             * host's jitter buffer is full from the first block
+                             * (audio.start key 2). 0 = no burst. RTP path only. */
     uint32_t mode, rate, nsamples, epoch;
     uint64_t reanchors;
     _Atomic int rate_trim_ppb; /* §8.7 bit-exact (host-locked): the host's rate
@@ -398,5 +402,12 @@ struct panel_args {
     const char *path;
 };
 void *panel_main(void *arg); /* arg: struct panel_args*, must outlive the thread */
+
+/* Recall-reconcile mailbox (panel.c), §11.4. Shared by the panel verbs and
+ * session.c's x.harp.reconcile.* methods; locked internally. expect12/live12 must
+ * be char[16]. reconcile_set_choice returns 0 if n is out of 0..3. */
+void reconcile_post_offer(const char *expect, const char *live, int dirty);
+void reconcile_read(int *pending, char *expect12, char *live12, int *dirty, int *choice);
+int reconcile_set_choice(int n);
 
 #endif /* HARP_DEVICED_DEVICE_H */
