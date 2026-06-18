@@ -197,7 +197,7 @@ def build_preset(params):
     # event); these controls are bound to CCs the bridge ignores (>13), so turning
     # one is harmless — only the press matters.
     pages.append({"id": 3, "name": "Reconcile"})
-    actions = [("Push", "F49500"), ("Pull", "529DEC"),
+    actions = [("Push to Synth", "F49500"), ("Pull to DAW", "529DEC"),
                ("Read-only", "9AA0A6"), ("Duplicate", "C44795")]
     for j, (nm, color) in enumerate(actions):
         controls.append({
@@ -213,8 +213,15 @@ def build_preset(params):
                         "message": {"deviceId": 1, "type": "cc7",
                                     "parameterNumber": 110 + j, "onValue": 127, "offValue": 0}}],
         })
+    # Headline on the Reconcile page so the four pads aren't context-free: a group
+    # header spanning the top, above the action row (which starts at TOP_Y=44).
+    groups = [{
+        "id": 1, "pageId": 3, "controlSetId": 1,
+        "name": "Recall conflict: Project vs Synth",
+        "bounds": [0, 4, CANVAS_W, 34], "color": "F45C51",
+    }]
     return {"version": 2, "name": "HARP RefDev", "pages": pages, "devices": devices,
-            "controls": controls, "groups": [], "overlays": []}
+            "controls": controls, "groups": groups, "overlays": []}
 
 
 def upload_preset(ctrl, preset):
@@ -233,8 +240,8 @@ function harpPull() midi.sendControlChange(PORT_1, 1, 111, 127) end
 function harpReadOnly() midi.sendControlChange(PORT_1, 1, 112, 127) end
 function harpDuplicate() midi.sendControlChange(PORT_1, 1, 113, 127) end
 preset.userFunctions = {
-  pot1 = {call = harpPush, name = "Push"},
-  pot2 = {call = harpPull, name = "Pull"},
+  pot1 = {call = harpPush, name = "Push to Synth"},
+  pot2 = {call = harpPull, name = "Pull to DAW"},
   pot3 = {call = harpReadOnly, name = "Read-only"},
   pot4 = {call = harpDuplicate, name = "Duplicate"},
 }
@@ -330,7 +337,7 @@ def main():
     # "select"; a fader's turn bleeds into the next page's knob after the bounce).
     # The pad sends CC 110-113, caught in the port reader -> reconcile-choose.
     RECONCILE_PAGE = 3
-    ACTIONS = ["Push", "Pull", "Read-only", "Duplicate"]
+    ACTIONS = ["Push to Synth", "Pull to DAW", "Read-only", "Duplicate"]
     ACTION_CC = {110: 0, 111: 1, 112: 2, 113: 3}  # pad-fired CC -> action index
     recon = {"active": False}
 
