@@ -161,7 +161,11 @@ static bool st_save(const clap_plugin_t *p, const clap_ostream_t *os) {
     HarpClap *h = self(p);
     if (!h->rt()) return false;
     std::vector<uint8_t> bundle;
-    if (!h->rt()->getStateBundle(bundle)) return false;
+    /* getStateBundle yields an empty bundle when no device is attached (a host scan
+     * or validator with no hardware). That is still a valid, reloadable state — the
+     * header below makes it a well-formed HARP state — so save() MUST succeed: a CLAP
+     * host treats a false save() as a hard error (and clap-validator fails it). */
+    h->rt()->getStateBundle(bundle);
     /* SAME header as VST3/AU getState: magic + part byte, then the bundle. The
      * device gets the identical bundle on reload (load strips the header), so a
      * project round-trips byte-transparently across all three formats. */
@@ -187,12 +191,15 @@ static bool st_load(const clap_plugin_t *p, const clap_istream_t *is) {
         if (r == 0) break;
         raw.insert(raw.end(), buf, buf + r);
     }
-    /* strip the shared header (magic + part), recall the per-project part */
-    if (raw.size() >= kStateHeaderLen &&
-        memcmp(raw.data(), kStateHeaderMagic, sizeof kStateHeaderMagic) == 0) {
-        h->part = (uint8_t)(raw[sizeof kStateHeaderMagic] & 0xf);
-        raw.erase(raw.begin(), raw.begin() + kStateHeaderLen);
-    }
+    /* A valid HARP state starts with the shared header (magic + part). An empty or
+     * foreign state is NOT ours — reject it (a CLAP host must see load() FAIL on a
+     * malformed state, not silently accept it; clap-validator fails a true return on
+     * an empty state). */
+    if (raw.size() < kStateHeaderLen ||
+        memcmp(raw.data(), kStateHeaderMagic, sizeof kStateHeaderMagic) != 0)
+        return false;
+    h->part = (uint8_t)(raw[sizeof kStateHeaderMagic] & 0xf);
+    raw.erase(raw.begin(), raw.begin() + kStateHeaderLen);
     if (h->rt() && h->owner())
         h->rt()->setStateBundle(raw.data(), raw.size()); /* live reload */
     else
