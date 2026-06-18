@@ -102,27 +102,43 @@ bool HarpRuntime::audioStart(uint32_t rate) {
     harp_cbuf_init(&req);
     harp_cbuf_init(&rsp);
     harp_client_req_head(&client_, &req, "audio.start", true);
-    harp_cbor_map(&req, 6);
-    harp_cbor_uint(&req, 0);
-    harp_cbor_uint(&req, rate);
-    harp_cbor_uint(&req, 1);
-    harp_cbor_uint(&req, kBlock);
-    harp_cbor_uint(&req, 2);
-    harp_cbor_uint(&req, kTargetDepthFrames);
-    harp_cbor_uint(&req, 3);
-    harp_cbor_array(&req, 2);
-    harp_cbor_uint(&req, 0);
-    harp_cbor_uint(&req, 1);
-    harp_cbor_uint(&req, 4); /* active-slots-out: the UNION the host subscribes
-                              * to. DEFAULT (no per-part sink) = outSlots_ {0,1}
-                              * (the stereo main mix), which renders exactly as
-                              * the historical empty [] did — the golden byte-
-                              * identical default. Per-part sinks append their
-                              * pairs {2+2N,3+2N}; reader() demuxes them out. */
-    harp_cbor_array(&req, unionSlots_.size());
-    for (uint32_t slot : unionSlots_) harp_cbor_uint(&req, slot);
-    harp_cbor_uint(&req, 5);
-    harp_cbor_uint(&req, 1); /* host-paced */
+    if (freeRunning_) {
+        /* §8.7 Ethernet / bit-exact: free-running (key 5 = 0) with the RTP dest
+         * port (key 6). The device emits its stereo main mix over RTP to us; the
+         * host plays it 1:1 from EthTransport's FIFO — no per-part union, no
+         * host-paced pacing. Mirrors the proven eth-bitexact-test request. */
+        harp_cbor_map(&req, 4);
+        harp_cbor_uint(&req, 0);
+        harp_cbor_uint(&req, rate);
+        harp_cbor_uint(&req, 1);
+        harp_cbor_uint(&req, kBlock);
+        harp_cbor_uint(&req, 5);
+        harp_cbor_uint(&req, 0); /* free-running */
+        harp_cbor_uint(&req, 6);
+        harp_cbor_uint(&req, (uint64_t)transport_->audioPort()); /* RTP dest port */
+    } else {
+        harp_cbor_map(&req, 6);
+        harp_cbor_uint(&req, 0);
+        harp_cbor_uint(&req, rate);
+        harp_cbor_uint(&req, 1);
+        harp_cbor_uint(&req, kBlock);
+        harp_cbor_uint(&req, 2);
+        harp_cbor_uint(&req, kTargetDepthFrames);
+        harp_cbor_uint(&req, 3);
+        harp_cbor_array(&req, 2);
+        harp_cbor_uint(&req, 0);
+        harp_cbor_uint(&req, 1);
+        harp_cbor_uint(&req, 4); /* active-slots-out: the UNION the host subscribes
+                                  * to. DEFAULT (no per-part sink) = outSlots_ {0,1}
+                                  * (the stereo main mix), which renders exactly as
+                                  * the historical empty [] did — the golden byte-
+                                  * identical default. Per-part sinks append their
+                                  * pairs {2+2N,3+2N}; reader() demuxes them out. */
+        harp_cbor_array(&req, unionSlots_.size());
+        for (uint32_t slot : unionSlots_) harp_cbor_uint(&req, slot);
+        harp_cbor_uint(&req, 5);
+        harp_cbor_uint(&req, 1); /* host-paced */
+    }
     harp_env e;
     bool ok = request(&req, &rsp, &e);
     harp_cbuf_free(&req);
@@ -540,7 +556,11 @@ bool HarpRuntime::sessionUp() {
     /* connected_ goes true BEFORE the pump spawns: its run loop gates on
      * it, and spawning first would race a clean instant exit */
     connected_.store(true, std::memory_order_release);
-    readerThread_ = std::thread([this] { reader(); });
+    /* USB: the reader thread drains the host-paced audio-IN endpoint into
+     * audioRing_. Ethernet free-running has no such endpoint — EthTransport owns
+     * its own RTP rx thread feeding its FIFO (pullAudio pulls from it), so we
+     * skip reader() entirely. The eventPump runs for both (events over TCP). */
+    if (!freeRunning_) readerThread_ = std::thread([this] { reader(); });
     eventPumpThread_ = std::thread([this] { eventPump(); });
     return true;
 }
@@ -1041,6 +1061,20 @@ void HarpRuntime::syncSinkEpoch(AudioSink &sink) {
 }
 
 size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
+    if (freeRunning_) {
+        /* §8.7 bit-exact: pull the device's RTP samples 1:1 from EthTransport's
+         * FIFO — NO resampling. pullFree fills the whole stereo block (silence-
+         * padding a transient underrun) and returns the real frames delivered. */
+        unsigned real = transport_->pullFree(dst, (unsigned)nFrames);
+        ssiRead_.fetch_add(nFrames, std::memory_order_relaxed);
+        if (real < (unsigned)nFrames && connected_.load(std::memory_order_acquire)) {
+            unsigned pad = (unsigned)nFrames - real;
+            underruns_.fetch_add(1, std::memory_order_relaxed);
+            padSamples_.fetch_add(pad, std::memory_order_relaxed);
+            return pad;
+        }
+        return 0;
+    }
     settlePadDebt();
     size_t want = nFrames * 2;
     size_t got = audioRing_.read(dst, want);
@@ -1146,6 +1180,13 @@ void HarpRuntime::feeder() {
 #ifdef __APPLE__
     WgState wg;
 #endif
+    /* §8.7 bit-exact rate-control state (Ethernet only; see the freeRunning_
+     * block below). Proportional-only on a smoothed FIFO fill, mirroring the
+     * proven eth-bitexact-test loop. */
+    double ethSmFill = 0;
+    bool ethPrimed = false;
+    uint64_t ethLastTrimNs = 0;
+    const unsigned kEthTargetFrames = 2048; /* FIFO setpoint (~43 ms; tunable) */
     while (running_.load(std::memory_order_relaxed) &&
            connected_.load(std::memory_order_relaxed)) {
 #ifdef __APPLE__
@@ -1162,7 +1203,7 @@ void HarpRuntime::feeder() {
          * but the session dropped, the next sessionUp's audio.start picks up the
          * sink set from the registry anyway. The single-instance / no-sink path
          * never sets the flag, so it never reaches this block. */
-        if (audioRenegPending_.exchange(false, std::memory_order_acq_rel)) {
+        if (!freeRunning_ && audioRenegPending_.exchange(false, std::memory_order_acq_rel)) {
             std::lock_guard<std::mutex> lk(ctlMutex_);
             if (connected_.load(std::memory_order_relaxed)) audioRenegotiateLocked();
         }
@@ -1178,10 +1219,42 @@ void HarpRuntime::feeder() {
          * stall 8 ms in drain-on-stall — head-of-line blocking here is
          * exactly how block-256 sessions leaked evt_late) */
 
-        /* 2. pace: ring to target depth, small fixed pipeline on top. The
-         * reader thread keeps an audio-IN read permanently pending, so the
-         * device's response writes land instantly and its pacing turnaround
-         * is just render time. */
+        /* 2a. ETHERNET bit-exact rate control (no host-paced writes). Every ~50 ms
+         * read EthTransport's FIFO fill, smooth it, and stream an audio.trim rate
+         * correction so the device emits at exactly our consumption rate — then
+         * pullAudio plays 1:1 (bit-exact). Proportional-only on a smoothed fill =>
+         * first-order stable (eth-bitexact-test: 127 dB, no oscillation). The send
+         * takes ctlMutex_ so it serializes with the eventPump's evt writes. */
+        if (freeRunning_) {
+            uint64_t nowNs = harp_now_ns();
+            if (nowNs - ethLastTrimNs >= 50000000ull) {
+                ethLastTrimNs = nowNs;
+                unsigned fill = transport_->fillFrames();
+                if (!ethPrimed) { ethSmFill = fill; ethPrimed = true; }
+                else ethSmFill += 0.03 * ((double)fill - ethSmFill);
+                double trim = -2000.0 * (ethSmFill - (double)kEthTargetFrames);
+                if (trim > 200000.0) trim = 200000.0;
+                else if (trim < -200000.0) trim = -200000.0;
+                harp_cbuf tm;
+                harp_cbuf_init(&tm);
+                harp_client_req_head(&client_, &tm, "audio.trim", true);
+                harp_cbor_map(&tm, 1);
+                harp_cbor_uint(&tm, 0);
+                harp_cbor_float(&tm, (float)trim);
+                {
+                    std::lock_guard<std::mutex> lk(ctlMutex_);
+                    harp_client_send(&client_, &tm); /* fire-and-forget */
+                }
+                harp_cbuf_free(&tm);
+                didWork = true;
+            }
+        }
+
+        /* 2. pace (USB host-paced only): ring to target depth, small fixed
+         * pipeline on top. The reader thread keeps an audio-IN read permanently
+         * pending, so the device's response writes land instantly and its pacing
+         * turnaround is just render time. */
+        if (!freeRunning_) {
         size_t ringFrames = audioRing_.readAvailable() / 2;
         uint64_t inFlight = framesSent_ - framesRecv_;
         /* The frontier cap is event-timing law, not flow control: event
@@ -1238,6 +1311,7 @@ void HarpRuntime::feeder() {
             inFlight++;
             didWork = true;
         }
+        } /* end if(!freeRunning_): host-paced pacing */
 
         /* 4. (audio draining lives on the reader thread; sync the count) */
         framesRecv_ = framesRecvAtomic_.load(std::memory_order_acquire);
