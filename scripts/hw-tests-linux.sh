@@ -33,30 +33,24 @@ export PROBE="${PROBE:-./build/harp-probe}"
 export PI="${PI:-ci@harptest.local}"               # replug ssh target (NOT jak)
 export SERIAL="$HARP_DEVICE_SERIAL"                # replug pins this board
 
-# recover: reset the device to a known-clean state, then wait until claimable. A CI
-# job killed mid-USB-stream (cancellation/timeout) OR a long suite's cumulative rapid
-# claim/release can leave the gadget poisoned ("device busy / never connects"). TWO
-# layers, because the wedge can sit on either side:
-#   - device side: restart the daemon on the Pi (re-creates the FunctionFS gadget);
-#   - host side: a stale interface claim / wedged enumeration on the RUNNER survives
-#     that restart (the host kernel holds the claim until the device re-enumerates),
-#     so issue USBDEVFS_RESET on the device node to force the host to re-enumerate.
-#     The udev rule makes the node 0666, so ci needs no sudo. Best-effort: if lsusb/
-#     python are absent or the node isn't found, fall through to the claimable wait.
-# Used as the start-of-suite preflight AND, in run(), to self-heal a test that reports
-# the bus busy (rc=3). Graceful if the Pi is unreachable.
+# recover: reset the device to a known-clean state by restarting the daemon (re-creates
+# the FunctionFS gadget), then wait until claimable. A CI job killed mid-USB-stream
+# (cancellation/timeout) OR a long suite's cumulative rapid claim/release can leave the
+# gadget poisoned ("device busy / never connects"). Each claimable probe is time-boxed
+# (`timeout`) so a wedged device can NEVER hang the whole suite — a probe against a
+# half-enumerated gadget can otherwise block indefinitely (it once stalled the suite
+# ~20min to the job timeout). Used as the start-of-suite preflight AND, in run(), to
+# self-heal a test that reports the bus busy (rc=3). Graceful if the Pi is unreachable.
+#
+# NOTE: a host-side USBDEVFS_RESET was tried here to clear a host-side claim a daemon
+# restart can't, but on this rig (FunctionFS gadget + PCI-passthrough to the runner VM)
+# it reset the freshly-rebound gadget into a non-responsive state and HUNG the next
+# probe — net worse. Removed. The host-side wedge needs a different lever (TODO).
 recover() {
     ssh -o BatchMode=yes -o ConnectTimeout=8 "$PI" 'sudo -n systemctl restart harp-deviced-usb' 2>/dev/null \
         || { echo "   (recover skipped: $PI unreachable)"; return 0; }
-    sleep 2 # let the freshly-restarted gadget enumerate before we reset its node
-    devnode=$(lsusb -d 1209:4852 2>/dev/null \
-        | sed -nE 's@^Bus ([0-9]+) Device ([0-9]+):.*@/dev/bus/usb/\1/\2@p' | head -1) # 1209:4852 = the HARP gadget
-    if [ -n "$devnode" ]; then
-        python3 -c 'import fcntl,sys; fcntl.ioctl(open(sys.argv[1],"wb"),0x5514,0)' "$devnode" 2>/dev/null \
-            && echo "   host-side USB reset ($devnode)" || true   # 0x5514 = USBDEVFS_RESET (_IO('U',20))
-    fi
     for i in $(seq 1 20); do
-        "$PROBE" -d "usb:$SERIAL" identify >/dev/null 2>&1 && { echo "   device claimable after ~${i}s"; return 0; }
+        timeout 8 "$PROBE" -d "usb:$SERIAL" identify >/dev/null 2>&1 && { echo "   device claimable after ~${i}s"; return 0; }
         sleep 1
     done
 }
