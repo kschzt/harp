@@ -118,6 +118,12 @@ int main(int argc, char **argv) {
     std::string out_path;
     bool do_hash = false;
     double note_period = 0.0;
+    /* §8.3-over-§8.7 mid-stream toggle test: render LIVE (free-running) until this time,
+     * then flip to OFFLINE on the LIVE active plugin (render->set on a live session -> the
+     * shell re-dials host-paced). <0 = the default clean bounce (offline set before
+     * activate). With it set, `tail-hash:` covers [toggle..end] — the deterministic
+     * post-toggle window; run twice and compare to prove the toggle re-dialed host-paced. */
+    double toggle_offline_at = -1.0;
 
     auto next = [&](int &i) -> std::string {
         if (i + 1 >= argc) die("missing arg after " + std::string(argv[i]));
@@ -138,6 +144,7 @@ int main(int argc, char **argv) {
         else if (a == "--press-idx") press_idx = atoi(next(i).c_str());
         else if (a == "--out") out_path = next(i);
         else if (a == "--hash") do_hash = true;
+        else if (a == "--toggle-offline-at") toggle_offline_at = atof(next(i).c_str());
         else if (a == "--set") {
             std::string s = next(i);
             size_t eq = s.find('=');
@@ -177,7 +184,9 @@ int main(int argc, char **argv) {
      * stream. (A real CLAP host that toggles render mode on a LIVE session is the
      * mid-stream-toggle case — exercised by a separate test, not this clean bounce.) */
     auto *render = (const clap_plugin_render_t *)plugin->get_extension(plugin, CLAP_EXT_RENDER);
-    if (render) render->set(plugin, CLAP_RENDER_OFFLINE);
+    /* Clean bounce: offline BEFORE activate (deterministic from the first sample). Toggle
+     * test (toggle_offline_at >= 0): start LIVE and flip mid-render below. */
+    if (render && toggle_offline_at < 0) render->set(plugin, CLAP_RENDER_OFFLINE);
     if (!plugin->activate(plugin, (double)rate, block, block)) die("activate failed");
     if (!plugin->start_processing(plugin)) die("start_processing failed");
 
@@ -188,10 +197,20 @@ int main(int argc, char **argv) {
     size_t onAt = (size_t)(0.1 * rate); /* --chord note-on, matches the VST3 host */
     int64_t steady = 0;
     bool first = true;
+    bool toggled = false;
+    size_t toggle_sample = toggle_offline_at >= 0 ? (size_t)(toggle_offline_at * rate) : 0;
 
     for (size_t done = 0; done < total;) {
         uint32_t n = (uint32_t)((total - done) < block ? (total - done) : block);
         bool last = done + n >= total;
+        /* §8.3-over-§8.7 mid-stream toggle: flip the LIVE active plugin to OFFLINE at the
+         * block boundary >= toggle_sample. render->set runs on this (main) thread and the
+         * shell BLOCKS it until the host-paced re-dial is up — fine for an offline render.
+         * Subsequent blocks render deterministic host-paced. */
+        if (render && toggle_offline_at >= 0 && !toggled && done >= toggle_sample) {
+            render->set(plugin, CLAP_RENDER_OFFLINE);
+            toggled = true;
+        }
         InEvents in;
         in.list.ctx = &in;
         in.list.size = ie_size;
@@ -340,6 +359,17 @@ int main(int argc, char **argv) {
         char hex[17];
         snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
         printf("output-hash: %s\n", hex);
+    }
+    /* §8.3-over-§8.7 toggle test: hash ONLY the post-toggle window [toggle..end] (the
+     * pre-toggle live/free-running portion is non-deterministic and excluded). Two runs
+     * must match IFF the toggle re-dialed to deterministic host-paced. */
+    if (toggle_offline_at >= 0) {
+        size_t tail = toggle_sample * 2; /* interleaved stereo */
+        if (tail > capture.size()) tail = capture.size();
+        uint64_t th = harp_fnv1a(capture.data() + tail, (capture.size() - tail) * sizeof(float));
+        char hex[17];
+        snprintf(hex, sizeof hex, "%016llx", (unsigned long long)th);
+        printf("tail-hash: %s\n", hex);
     }
     printf("processed %zu samples x 2 ch, rms=%.5f\n", capture.size() / 2, rms);
     return 0;

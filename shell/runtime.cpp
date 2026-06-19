@@ -660,7 +660,20 @@ bool HarpRuntime::sessionUp() {
  * is still talking to us, release the claim. Safe on a dead transport. */
 void HarpRuntime::sessionDown() {
     bool wasConnected = connected_.exchange(false, std::memory_order_acq_rel);
+    /* QUIESCE the reader before joining it. On a mid-stream live<->offline flip the
+     * transport is STILL ALIVE, so the free-running reader's recvAudio keeps returning
+     * data and its loop (running_ && !readerStop_) never exits on its own — connected_
+     * =false does NOT stop it (the reader is the thread that SETS connected_=false on
+     * device-gone, so by design it can't gate on connected_; the eventPump DOES gate on
+     * connected_, so its join below already returns). Without this, join() hangs forever
+     * on a flip and the supervisor never re-dials -> the pullAudioBlocking flip-fence
+     * nanosleeps forever. Mirror audioRenegotiateLocked's quiesce: readerStop_ makes the
+     * reader exit within one recvAudio timeout (<=100 ms); reset it so the next sessionUp
+     * spawns a clean reader. On a dead-transport RECONNECT the reader already self-exits
+     * (silentMs>1s) — this just makes the reap prompt and explicit, never relying on it. */
+    readerStop_.store(true, std::memory_order_release);
     if (readerThread_.joinable()) readerThread_.join();
+    readerStop_.store(false, std::memory_order_release);
     if (eventPumpThread_.joinable()) eventPumpThread_.join();
     if (!transport_) return;
     std::lock_guard<std::mutex> lk(ctlMutex_);

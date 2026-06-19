@@ -59,6 +59,26 @@ render() {
     printf '%s' "$h"
 }
 
+# toggle_tail: clap-host renders a note line LIVE (free-running RTP), then flips to OFFLINE
+# on the LIVE active plugin at 2 s (render->set -> the §8.7 mid-stream re-dial). Echoes the
+# tail-hash = the POST-toggle window only (the pre-toggle free-running portion is non-
+# deterministic and excluded). Notes span the toggle so the tail carries real audio.
+toggle_tail() {
+    sd="/tmp/ogeth-tg$PORT"
+    rm -rf "$sd"; : > "$sd.log"
+    "$DEVICED" --port "$PORT" --state-dir "$sd" --panel-sock "" > "$sd.log" 2>&1 &
+    dpid=$!
+    i=0
+    while [ $i -lt 25 ]; do grep -q "listening on $PORT" "$sd.log" 2>/dev/null && break; sleep 0.2; i=$((i + 1)); done
+    h=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" "$CHOST" "$CPLUG" \
+        --notes 60,64,67,72,60,64,67,72 --seconds 5 --toggle-offline-at 2 --hash \
+        2>>"$sd.err" | sed -nE 's/tail-hash: //p')
+    kill -9 "$dpid" 2>/dev/null
+    wait "$dpid" 2>/dev/null
+    PORT=$((PORT + 1))
+    printf '%s' "$h"
+}
+
 echo "── offline-golden-eth: deterministic host-paced bounce over §8.7 (fake hardware, kOffline)"
 
 # ── VST3 ────────────────────────────────────────────────────────────────────────
@@ -104,6 +124,25 @@ if [ -n "${v1:-}" ] && [ -n "${c1:-}" ]; then
     else
         bad "cross-format: VST3 ($v1) != CLAP ($c1) — shells diverge on the same input"
     fi
+fi
+
+# ── mid-stream live->offline toggle (CLAP) ──────────────────────────────────────
+# A real CLAP/AU host flips render mode on a LIVE active plugin (no deactivate). v1
+# RE-DIALS the §8.7 session free-running -> host-paced mid-stream. clap-host renders LIVE
+# then flips to OFFLINE at 2 s; the POST-toggle tail must be deterministic host-paced
+# (run-to-run equal) — proving the re-dial switched modes (a stale live session would
+# leave the tail non-deterministic). The pre-toggle free-running portion is excluded.
+if [ -n "${CPLUG:-}" ] && [ -x "$CHOST" ]; then
+    g1=$(toggle_tail)
+    g2=$(toggle_tail)
+    echo "──── mid-stream toggle: post-toggle tail #1=${g1:-<none>}  #2=${g2:-<none>}"
+    if [ -n "$g1" ] && [ "$g1" = "$g2" ]; then
+        ok "mid-stream live->offline toggle re-dials to deterministic host-paced (tail $g1)"
+    else
+        bad "mid-stream toggle tail non-deterministic (#1=$g1 #2=$g2) — re-dial didn't reach host-paced"
+    fi
+else
+    echo "──── mid-stream toggle: SKIP (clap host/bundle not built)"
 fi
 
 echo "════ offline-golden-eth: $PASS passed, $FAIL failed"
