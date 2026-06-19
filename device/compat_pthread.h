@@ -24,6 +24,8 @@
 #include <windows.h>
 #include <stdlib.h> /* malloc/free for the thread thunk (device.h includes it later) */
 
+typedef SSIZE_T ssize_t; /* MSVC has no ssize_t; SSIZE_T (from windows.h) is the right width */
+
 /* ---------- mutex ---------- */
 typedef struct {
     INIT_ONCE once;      /* lazy one-time init of cs — covers static initializer */

@@ -72,12 +72,15 @@ if(WIN32)
   # panel.c (AF_UNIX) gated out — POSIX-only; session.c's reconcile symbols come from
   # the tiny panel_stub_win.c. sock_io = recv/send accept path (harp_io_fd's
   # _read/_write don't work on Winsock SOCKETs).
-  target_sources(harp-deviced PRIVATE device/panel_stub_win.c host/sock_io.c)
-  target_link_libraries(harp-deviced ws2_32)
+  # ${HARP_PLAT_SRC}=plat_win.c gives harp_now_ns/harp_sleep_ns (winmm), which the
+  # MSVC clock_gettime/nanosleep shim (compat_time_win.h) routes through.
+  target_sources(harp-deviced PRIVATE device/panel_stub_win.c host/sock_io.c ${HARP_PLAT_SRC})
+  target_link_libraries(harp-deviced ws2_32 ${HARP_PLAT_LIBS})
   if(MSVC)
     # every device .c pulls C11 <stdatomic.h> via device.h; MSVC gates it behind
     # this flag even under /std:c11 (same as host/freerun.c in tools/vst3-host).
     target_compile_options(harp-deviced PRIVATE /experimental:c11atomics)
+    target_compile_definitions(harp-deviced PRIVATE _USE_MATH_DEFINES) # M_PI from <math.h>
   endif()
 else()
   find_package(Threads REQUIRED)

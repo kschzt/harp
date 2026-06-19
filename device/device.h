@@ -21,7 +21,8 @@
 #define HARP_DEVICED_DEVICE_H
 
 #if defined(_WIN32) && !defined(__MINGW32__)
-#include "compat_pthread.h" /* MSVC: no pthread/clock_gettime — map the small surface we use */
+#include "compat_pthread.h"  /* MSVC: pthread surface + ssize_t */
+#include "compat_time_win.h" /* MSVC: struct timespec + clock_gettime/CLOCK_MONOTONIC/nanosleep */
 #else
 #include <pthread.h> /* POSIX, and MinGW (winpthreads supplies pthread + clock_gettime) */
 #endif
