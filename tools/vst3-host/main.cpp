@@ -69,9 +69,9 @@ static void save_state_file(const std::string &path, MemoryStream &comp, MemoryS
     if (!f) die("cannot write state file");
     uint32_t a = (uint32_t)comp.getSize(), b = (uint32_t)ctrl.getSize();
     fwrite(&a, 4, 1, f);
-    fwrite(comp.getData(), 1, a, f);
-    fwrite(&b, 4, 1, f);
-    fwrite(ctrl.getData(), 1, b, f);
+    if (a) fwrite(comp.getData(), 1, a, f); /* getData() is null for an empty stream, and */
+    fwrite(&b, 4, 1, f);                    /* fwrite's buffer arg is nonnull even when n==0 */
+    if (b) fwrite(ctrl.getData(), 1, b, f); /* (UB; AU/CLAP have no controller -> b==0). */
     fclose(f);
 }
 
