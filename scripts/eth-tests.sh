@@ -69,7 +69,7 @@ echo "   device=$DEVICED  host=$HOSTBIN  plug=$PLUG"
 # jitter (padding lowers rms), and report the exact rms so drift is visible.
 echo "──── bit-exact: device free-runs 440 Hz, host plays 1:1 + rate-trims"
 start_dev --tone 440
-out=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" "$HOSTBIN" "$PLUG" --seconds 8 --realtime --json 2>/tmp/eth-host.err || true)
+out=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" perl -e 'alarm 20; exec @ARGV' "$HOSTBIN" "$PLUG" --seconds 8 --realtime --json 2>/tmp/eth-host.err || true)
 rms=$(printf '%s' "$out" | sed -nE 's/.*"rms":([0-9.]+).*/\1/p')
 conn=$(grep -c 'connected:' /tmp/eth-host.err 2>/dev/null || true)
 under=$(grep -oE 'underruns: [0-9]+' /tmp/eth-host.err 2>/dev/null | grep -oE '[0-9]+' | tail -1)
@@ -111,7 +111,7 @@ else
     echo "──── small-target stability: HARP_ETH_TARGET=512 (~10.6 ms, 4x below default; baseline underruns=$base_under)"
     start_dev --tone 440
     out=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" HARP_ETH_TARGET=512 HARP_ETH_NSAMPLES=128 \
-          "$HOSTBIN" "$PLUG" --seconds 8 --realtime --block 256 --json 2>/tmp/eth-small.err || true)
+          perl -e 'alarm 20; exec @ARGV' "$HOSTBIN" "$PLUG" --seconds 8 --realtime --block 256 --json 2>/tmp/eth-small.err || true)
     rms=$(printf '%s' "$out" | sed -nE 's/.*"rms":([0-9.]+).*/\1/p')
     conn=$(grep -c 'connected:' /tmp/eth-small.err 2>/dev/null || true)
     under=$(grep -oE 'underruns: [0-9]+' /tmp/eth-small.err 2>/dev/null | grep -oE '[0-9]+' | tail -1)
@@ -138,7 +138,7 @@ fi
 # 8 s, so the tone's rms survives; no reanchors (ASRC sends no audio.trim).
 echo "──── ASRC: non-rate-lock device, host clock-recovers + resamples"
 start_dev --no-rate-lock --tone 440
-out=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" "$HOSTBIN" "$PLUG" --seconds 8 --realtime --json 2>/tmp/eth-asrc.err || true)
+out=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" perl -e 'alarm 20; exec @ARGV' "$HOSTBIN" "$PLUG" --seconds 8 --realtime --json 2>/tmp/eth-asrc.err || true)
 rms=$(printf '%s' "$out" | sed -nE 's/.*"rms":([0-9.]+).*/\1/p')
 conn=$(grep -c 'connected:' /tmp/eth-asrc.err 2>/dev/null || true)
 asrc=$(grep -c 'ASRC resample' /tmp/eth-asrc.err 2>/dev/null || true)
