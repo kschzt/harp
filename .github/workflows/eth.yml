@@ -42,7 +42,7 @@ jobs:
           cmake --build build --target harp-deviced harp-probe -j
       - name: build the shell + host (+ AU host on macOS)
         run: |
-          cmake -B build-vst -S tools/vst3-host -DCMAKE_BUILD_TYPE=RelWithDebInfo  # -g for the lldb line numbers
+          cmake -B build-vst -S tools/vst3-host
           cmake --build build-vst --target harp-vst3-host harp-shell -j
           if [ "$RUNNER_OS" = "macOS" ]; then
             cmake --build build-vst --target harp-au au-host -j
@@ -64,9 +64,4 @@ jobs:
           ./build/harp-deviced --port 47903 --state-dir /tmp/xf-eth-state >/tmp/xf-eth-dev.log 2>&1 &
           DP=$!; trap 'kill -9 $DP 2>/dev/null || true' EXIT
           for _ in $(seq 1 25); do grep -q "listening on 47903" /tmp/xf-eth-dev.log && break; sleep 0.2; done
-          echo "── is our AU registered? (auval -a | grep rfdv/HARP):"
-          auval -a 2>/dev/null | grep -iE "rfdv|HARP" || echo "   NOT listed by auval -a"
-          echo "── au-host under lldb (breakpoint on __cxa_throw -> backtrace at the throw site):"
-          HARP_ETH_DEVICE=127.0.0.1:47903 lldb --batch -o "b __cxa_throw" -o run -o "bt" -o quit \
-            -- ./build-vst/au-host --save-state /tmp/auprobe.state 2>&1 | tail -45 || true
           PLUG="$PLUG" HARP_ETH_DEVICE=127.0.0.1:47903 scripts/cross-format-recall-test.sh
