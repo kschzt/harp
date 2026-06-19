@@ -64,6 +64,7 @@ private:
 struct ParamChange {
     uint32_t id;
     float value;
+    uint16_t part; /* §9.4 multitimbral part for device echoes; 0 on the input/param-set ring */
 };
 
 /* Timestamped outbound events (params, ramps, notes) — one ring so cross-

@@ -113,7 +113,11 @@ static void audio_thread(HarpRuntime *rt, uint32_t block, bool capture) {
         }
         uint32_t id;
         float v;
-        while (rt->popEcho(id, v)) { /* drain */
+        /* drain the echo ring so it can't fill — tsan-host tests AUDIO routing, not
+         * echoes, so the values are discarded. popEcho(part) drains the whole ring
+         * regardless of part (non-matching entries are popped + dropped), so part 0 is
+         * fine here. (§9.4 popEcho now takes the consuming part — see shell/runtime.h.) */
+        while (rt->popEcho(0, id, v)) {
         }
         struct timespec ts = {0, (long)block * 1000000000L / 48000};
         nanosleep(&ts, nullptr);

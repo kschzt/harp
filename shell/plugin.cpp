@@ -572,7 +572,7 @@ public:
         {
             uint32_t id;
             float v;
-            while (rt.popEcho(id, v)) {
+            while (rt.popEcho(part_, id, v)) { /* only THIS instance's part (§9.4) */
                 if (!data.outputParameterChanges) continue; /* drain regardless */
                 int32 qi = 0;
                 IParamValueQueue *q = data.outputParameterChanges->addParameterData(id, qi);

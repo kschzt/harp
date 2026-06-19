@@ -361,7 +361,7 @@ void HarpRuntime::pollEcho() {
                 !harp_cdec_uint(&dec, &ts) || !harp_cdec_uint(&dec, &etype))
                 continue;
             if (etype != 1) continue;
-            uint64_t n, key, id = 0;
+            uint64_t n, key, id = 0, part = 0;
             double v = 0;
             bool ok = harp_cdec_map(&dec, &n);
             for (uint64_t i = 0; ok && i < n; i++) {
@@ -370,10 +370,12 @@ void HarpRuntime::pollEcho() {
                     ok = harp_cdec_uint(&dec, &id);
                 else if (key == 1)
                     ok = harp_cdec_float(&dec, &v);
+                else if (key == 5) /* §9.4 multitimbral part; omitted => part 0 */
+                    ok = harp_cdec_uint(&dec, &part);
                 else
                     ok = harp_cdec_skip(&dec);
             }
-            if (ok) echoRing_.push({(uint32_t)id, (float)v});
+            if (ok) echoRing_.push({(uint32_t)id, (float)v, (uint16_t)part});
         } else if (stream == HARP_STREAM_OBJ && storeOk_) {
             harp_store_put(&store_, msg_.buf, msg_.len, nullptr);
         }
@@ -428,6 +430,38 @@ void HarpRuntime::wgMaintain(WgState &st) {
  * Step 1 only ever builds UsbTransport here; the Ethernet binding is selected
  * elsewhere (next step). nullptr in => nullptr out (no device was claimed). */
 static ShellTransport *wrapUsb(harp_io *io) { return io ? new UsbTransport(io) : nullptr; }
+
+/* §8.3-over-§8.7 mid-stream live<->offline toggle. The shell calls this from its
+ * offline-render hook (a host/main thread — never the audio thread). On a genuine mode
+ * change on a LIVE Ethernet session, arm a re-dial and BLOCK (bounded) until the new-mode
+ * session is up, so the host's next process()->pull is deterministic host-paced (not the
+ * stale free-running ring). Pre-start / no-session / USB are early no-ops. */
+void HarpRuntime::setOffline(bool o) {
+    bool prev = wantHostPaced_.exchange(o, std::memory_order_release);
+    if (prev == o) return;                                          /* idempotent: no change */
+    if (!running_.load(std::memory_order_acquire)) return;          /* pre-start: first dial reads it */
+    if (!connected_.load(std::memory_order_acquire)) return;        /* no live session: next sessionUp reads it */
+    const char *e = getenv("HARP_ETH_DEVICE");
+    if (!(e && e[0])) return;                                       /* USB: host-paced always -> no-op */
+    /* freeRunning_!=o means the live session is ALREADY in the requested mode (want
+     * offline o=true <-> host-paced freeRunning_=false): nothing to re-dial. */
+    if (freeRunning_.load(std::memory_order_acquire) != o) return;
+    /* Genuine flip on a live eth session. Publish the absolute target BEFORE the sticky
+     * flag; the supervisor re-dials, sessionUp bumps sessionGen_ to the target + clears
+     * the flag, and the pull fence releases on sessionGen_>=flipTargetGen_. */
+    uint64_t g0 = sessionGen_.load(std::memory_order_acquire);
+    flipTargetGen_.store(g0 + 1, std::memory_order_release);
+    modeFlipPending_.store(true, std::memory_order_release);
+    /* Bounded host-thread wait (~2s covers a slow RPi/KR260 connect-back); wakes on stop.
+     * Done when a new session is up (gen advanced) AND it is the requested mode. */
+    for (int i = 0; i < 4000; i++) {
+        if (!running_.load(std::memory_order_acquire)) break;
+        if (sessionGen_.load(std::memory_order_acquire) >= g0 + 1 &&
+            freeRunning_.load(std::memory_order_acquire) != o)
+            break;
+        harp_sleep_ns(500000ull); /* 0.5 ms */
+    }
+}
 
 ShellTransport *HarpRuntime::selectDevice() {
     /* Ethernet binding (§8.7): HARP_ETH_DEVICE=HOST:PORT routes to the RTP/TCP
@@ -604,6 +638,14 @@ bool HarpRuntime::sessionUp() {
     /* connected_ goes true BEFORE the pump spawns: its run loop gates on
      * it, and spawning first would race a clean instant exit */
     connected_.store(true, std::memory_order_release);
+    /* §8.3-over-§8.7 mid-stream toggle: publish the new session generation, then clear
+     * any pending mode flip (the clear is LAST, after the gen bump, so an offline pull
+     * that already observed modeFlipPending_=true still releases via the absolute
+     * sessionGen_>=flipTargetGen_ test). EVERY sessionUp re-reads wantHostPaced_, so the
+     * session is always in the latest requested mode — even a coincidental reconnect
+     * satisfies a pending flip. */
+    sessionGen_.fetch_add(1, std::memory_order_release);
+    modeFlipPending_.store(false, std::memory_order_release);
     /* The reader thread feeds audioRing_ for BOTH bindings: USB drains the
      * host-paced audio-IN endpoint (+ demux); Ethernet receives the RTP stream
      * 1:1 (reader() branches on freeRunning_). Spawning it here — and joining it
@@ -648,9 +690,21 @@ void HarpRuntime::supervisor() {
 #endif
     bool everConnected = connected_.load(std::memory_order_acquire);
     while (running_.load(std::memory_order_acquire)) {
+        /* §8.3-over-§8.7 mid-stream toggle: a host flipped offline<->live on a LIVE
+         * session, so the feeder returned with connected_ still true and modeFlipPending_
+         * set. Re-dial in the new mode using the EXISTING teardown+bring-up (sessionUp
+         * re-reads wantHostPaced_, bumps sessionGen_, clears the flag) — no bespoke
+         * lifecycle path, so the UAF-safe join-before-delete invariant is reused verbatim. */
+        if (connected_.load(std::memory_order_acquire) &&
+            modeFlipPending_.load(std::memory_order_acquire)) {
+            sessionDown();
+            if (!running_.load(std::memory_order_acquire)) break;
+            if (sessionUp()) log_msg("audio mode re-dialed (live<->offline)");
+            continue;
+        }
         if (connected_.load(std::memory_order_acquire)) {
             everConnected = true;
-            feeder(); /* returns when !running_ or the transport died */
+            feeder(); /* returns when !running_, the transport died, or a mode flip is pending */
             continue;
         }
         sessionDown(); /* reap whatever is left of the dead session */
@@ -1160,15 +1214,32 @@ size_t HarpRuntime::pullAudio(AudioSink *sink, float *dst, size_t nFrames) {
 }
 
 size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeoutMs) {
-    settlePadDebt();
     size_t want = nFrames * 2;
     size_t got = 0;
     unsigned waited = 0;
-    ssiRead_.fetch_add(nFrames, std::memory_order_relaxed);
+    bool settled = false; /* settlePadDebt + ssiRead_ advance run ONCE, after any flip clears */
     while (got < want) {
-        got += audioRing_.read(dst + got, want - got);
-        if (got >= want) break;
-        if (!connected_.load(std::memory_order_acquire) || waited >= timeoutMs) {
+        /* §8.3-over-§8.7 mid-stream toggle fence: while a live<->offline re-dial is in
+         * flight, the OLD session's ring holds stale samples and ssiRead_/padDebt belong
+         * to the OLD SSI domain. Don't read, don't pad-settle, don't treat !connected_ as
+         * terminal — wait for the NEW session (ABSOLUTE gen test, so a pull that starts
+         * after the target was reached still releases). sessionUp clear()'d the ring and
+         * reset ssiRead_/padDebt for the new domain. The no-flip path is byte-identical to
+         * before: first iteration settles + advances + reads, exactly as the old top-of-fn. */
+        bool flipping = modeFlipPending_.load(std::memory_order_acquire) &&
+                        sessionGen_.load(std::memory_order_acquire) <
+                            flipTargetGen_.load(std::memory_order_acquire);
+        if (!flipping) {
+            if (!settled) {
+                settlePadDebt();
+                ssiRead_.fetch_add(nFrames, std::memory_order_relaxed);
+                settled = true;
+            }
+            got += audioRing_.read(dst + got, want - got);
+            if (got >= want) break;
+        }
+        if ((!flipping && !connected_.load(std::memory_order_acquire)) || waited >= timeoutMs) {
+            if (!settled) ssiRead_.fetch_add(nFrames, std::memory_order_relaxed); /* advance EXACTLY once per call */
             memset(dst + got, 0, (want - got) * sizeof(float));
             padDebtFloats_ += want - got;
             underruns_.fetch_add(1, std::memory_order_relaxed);
@@ -1190,15 +1261,27 @@ size_t HarpRuntime::pullAudioBlocking(AudioSink *sink, float *dst, size_t nFrame
         memset(dst, 0, nFrames * 2 * sizeof(float));
         return nFrames;
     }
-    syncSinkEpoch(*sink); /* B3: drop pre-(re)negotiation pad debt + stale ring */
-    settleSinkPadDebt(*sink);
     size_t want = nFrames * 2;
     size_t got = 0;
     unsigned waited = 0;
+    bool settled = false; /* syncSinkEpoch + settleSinkPadDebt run ONCE, after any flip clears */
     while (got < want) {
-        got += sink->ring.read(dst + got, want - got);
-        if (got >= want) break;
-        if (!connected_.load(std::memory_order_acquire) || waited >= timeoutMs) {
+        /* §8.3-over-§8.7 mid-stream toggle fence (same as the owner form): wait out a
+         * live<->offline re-dial before touching the sink ring/epoch, which belong to the
+         * OLD SSI domain. No ssiRead_ here — the sink form never advances the owner clock. */
+        bool flipping = modeFlipPending_.load(std::memory_order_acquire) &&
+                        sessionGen_.load(std::memory_order_acquire) <
+                            flipTargetGen_.load(std::memory_order_acquire);
+        if (!flipping) {
+            if (!settled) {
+                syncSinkEpoch(*sink); /* B3: drop pre-(re)negotiation pad debt + stale ring */
+                settleSinkPadDebt(*sink);
+                settled = true;
+            }
+            got += sink->ring.read(dst + got, want - got);
+            if (got >= want) break;
+        }
+        if ((!flipping && !connected_.load(std::memory_order_acquire)) || waited >= timeoutMs) {
             memset(dst + got, 0, (want - got) * sizeof(float));
             sink->padDebt += want - got;
             underruns_.fetch_add(1, std::memory_order_relaxed);
@@ -1227,6 +1310,10 @@ void HarpRuntime::feeder() {
     uint64_t ethLastTrimNs = 0;
     while (running_.load(std::memory_order_relaxed) &&
            connected_.load(std::memory_order_relaxed)) {
+        /* §8.3-over-§8.7 mid-stream toggle: a host flipped offline<->live on this live
+         * session. Return to the supervisor (leaving connected_ true) so it re-dials in
+         * the new mode — checked at the top so the flip is honored within ~one cycle. */
+        if (modeFlipPending_.load(std::memory_order_acquire)) return;
 #ifdef __APPLE__
         wgMaintain(wg);
 #endif

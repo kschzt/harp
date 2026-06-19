@@ -162,12 +162,14 @@ public:
     void stop();
     bool connected() const { return connected_.load(std::memory_order_acquire); }
     /* §8.3-over-§8.7: the shell calls this from its offline-render hook (VST3
-     * processMode==kOffline, CLAP CLAP_RENDER_OFFLINE, AU OfflineRender) BEFORE the
-     * session starts. On an Ethernet binding it selects HOST-PACED (deterministic
-     * offline bounce over TCP) instead of free-running RTP; on USB it's a no-op
-     * (always host-paced). Read once when selectDevice builds the transport; a
-     * mid-stream toggle needs a session re-dial (v1 fixes the mode at connect). */
-    void setOffline(bool o) { wantHostPaced_.store(o, std::memory_order_relaxed); }
+     * processMode==kOffline, CLAP CLAP_RENDER_OFFLINE, AU OfflineRender). On an
+     * Ethernet binding it selects HOST-PACED (deterministic offline bounce over TCP)
+     * vs free-running RTP; on USB it's a no-op (always host-paced). Before the session
+     * starts, selectDevice reads it at the first dial. On a LIVE session (AU/CLAP can
+     * flip OfflineRender / render-mode while active), a genuine mode change RE-DIALS
+     * the Ethernet session in the new mode and BLOCKS (bounded, host-thread only) until
+     * it is up — so the next offline pull is deterministic, not stale free-running. */
+    void setOffline(bool o);
     /* Count of COMPLETED P5b audio re-negotiations this runtime has performed
      * (a late/removed sink changed the union -> the feeder re-streamed it). 0 on
      * the single-instance / owner-only / no-sink path, which never re-negotiates.
@@ -570,10 +572,12 @@ private:
     bool pushStateLocked(const harp_hash &target);
 
     ShellTransport *transport_ = nullptr; /* the active binding (USB now; Ethernet next) */
-    bool freeRunning_ = false; /* cached transport_->isFreeRunning() (set at sessionUp,
-                                * read off the RT path): false on USB, so every existing
-                                * host-paced line is reached identically. The Ethernet
-                                * steps gate the free-running branches on this bool. */
+    std::atomic<bool> freeRunning_{false}; /* cached transport_->isFreeRunning() (set at
+                                * sessionUp): false on USB, so every existing host-paced line
+                                * is reached identically. The Ethernet steps gate the free-
+                                * running branches on it. ATOMIC (relaxed everywhere — off the
+                                * RT path) because setOffline reads it cross-thread to decide
+                                * whether a live mode flip needs a re-dial. */
     std::atomic<bool> wantHostPaced_{false}; /* §8.3-over-§8.7: the DAW is rendering OFFLINE,
                                 * so select host-paced (deterministic TCP) for an Ethernet
                                 * binding instead of free-running RTP. Set by setOffline()
@@ -692,6 +696,17 @@ private:
      * only / no-sink path (the union never changes), so that path NEVER
      * re-negotiates and stays byte-identical (the golden gate). */
     std::atomic<bool> audioRenegPending_{false};
+    /* §8.3-over-§8.7 MID-STREAM LIVE<->OFFLINE TOGGLE. setOffline (host thread), on a
+     * genuine mode flip on a LIVE Ethernet session, sets modeFlipPending_ (sticky, like
+     * audioRenegPending_ — NOT a connected_ stomp an in-flight sessionUp could clobber).
+     * The feeder returns on it; the supervisor then re-dials (sessionDown+sessionUp in the
+     * new mode). sessionGen_ bumps at the END of every sessionUp; flipTargetGen_ is the
+     * absolute generation the offline pull fence waits for (read the ring only once
+     * sessionGen_>=flipTargetGen_, so opening samples are the fresh host-paced stream, not
+     * the stale live ring). sessionUp clears modeFlipPending_ after the bump. */
+    std::atomic<bool> modeFlipPending_{false};
+    std::atomic<uint64_t> sessionGen_{0};
+    std::atomic<uint64_t> flipTargetGen_{0};
     /* Signal to the reader to EXIT its loop for a re-negotiation WITHOUT tearing
      * the session down. The reader loops on running_ && !readerStop_; the re-neg
      * sets it, joins the reader (so the audio-IN endpoint has a single owner for
@@ -752,13 +767,19 @@ private:
     std::atomic<uint64_t> ssiRead_{0};
 
 public:
-    /* audio thread: drain echoed device-side edits (§9.4 echo) */
-    bool popEcho(uint32_t &id, float &v) {
+    /* audio thread: drain echoed device-side edits (§9.4 echo) for THIS instance's part
+     * only. A device front-panel edit carries its part; an instance must reflect ONLY
+     * its own part, else every instance mirrors every part's edits (the bug). Echoes for
+     * other parts are dropped here. */
+    bool popEcho(uint32_t myPart, uint32_t &id, float &v) {
         ParamChange c;
-        if (!echoRing_.pop(c)) return false;
-        id = c.id;
-        v = c.value;
-        return true;
+        while (echoRing_.pop(c)) {
+            if (c.part != (uint16_t)myPart) continue; /* another part's edit — not ours */
+            id = c.id;
+            v = c.value;
+            return true;
+        }
+        return false;
     }
 
 private:

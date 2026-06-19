@@ -835,7 +835,7 @@ static OSStatus au_GetParameter(void *self, AudioUnitParameterID param,
     if (au->owner() && au->runtime()) {
         uint32_t id;
         float v;
-        while (au->runtime()->popEcho(id, v)) {
+        while (au->runtime()->popEcho(au->part, id, v)) { /* only THIS instance's part (§9.4) */
             if (id >= 1 && id <= kNumAuParams)
                 au->paramShadow[id - 1] = v;
             else if (isMeterId(id))
