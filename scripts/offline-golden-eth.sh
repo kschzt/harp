@@ -89,5 +89,22 @@ else
     echo "──── CLAP: SKIP (host/bundle not built)"
 fi
 
+# ── cross-format equality ────────────────────────────────────────────────────────
+# VST3 and CLAP, given the SAME fresh-factory device + same input, render BYTE-IDENTICAL
+# (the shells are thin adapters over one runtime+device; the hosts deliver the canonical
+# sequence the same way). This is a strictly stronger gate than per-format determinism —
+# it catches a shell- or host-specific regression that determinism alone would miss (e.g.
+# clap-host establishing the session mode after the dial instead of before, which once
+# made CLAP race to free-running). It needs NO pinned value (so it survives expf/sinf not
+# being bit-reproducible across arches — both formats run on the SAME runner/arch here).
+if [ -n "${v1:-}" ] && [ -n "${c1:-}" ]; then
+    echo "──── cross-format: VST3=$v1  CLAP=$c1"
+    if [ "$v1" = "$c1" ]; then
+        ok "cross-format: VST3 and CLAP offline bounces are byte-identical ($v1)"
+    else
+        bad "cross-format: VST3 ($v1) != CLAP ($c1) — shells diverge on the same input"
+    fi
+fi
+
 echo "════ offline-golden-eth: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] && [ "$PASS" -gt 0 ]

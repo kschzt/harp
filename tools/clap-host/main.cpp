@@ -169,11 +169,16 @@ int main(int argc, char **argv) {
     const clap_plugin_t *plugin = factory->create_plugin(factory, &g_host, desc->id);
     if (!plugin) die("create_plugin failed");
     if (!plugin->init(plugin)) die("plugin init failed");
-    if (!plugin->activate(plugin, (double)rate, block, block)) die("activate failed");
 
-    /* offline render mode -> the shell blocks for the exact samples (byte-exact) */
+    /* Offline render mode is set BEFORE activate, so the shell reads it when it starts
+     * the session and comes up HOST-PACED (deterministic, byte-exact). Setting it AFTER
+     * activate races the async §8.7 session dial: on a slow runner the dial wins and the
+     * session comes up free-running (non-deterministic), which v1 does not re-dial mid-
+     * stream. (A real CLAP host that toggles render mode on a LIVE session is the
+     * mid-stream-toggle case — exercised by a separate test, not this clean bounce.) */
     auto *render = (const clap_plugin_render_t *)plugin->get_extension(plugin, CLAP_EXT_RENDER);
     if (render) render->set(plugin, CLAP_RENDER_OFFLINE);
+    if (!plugin->activate(plugin, (double)rate, block, block)) die("activate failed");
     if (!plugin->start_processing(plugin)) die("start_processing failed");
 
     /* ---- render loop: blocks of `block`, total = seconds*rate ---- */
