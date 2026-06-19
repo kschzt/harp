@@ -42,7 +42,7 @@ jobs:
           cmake --build build --target harp-deviced harp-probe -j
       - name: build the shell + host (+ AU host on macOS)
         run: |
-          cmake -B build-vst -S tools/vst3-host
+          cmake -B build-vst -S tools/vst3-host -DCMAKE_BUILD_TYPE=RelWithDebInfo  # -g for the lldb line numbers
           cmake --build build-vst --target harp-vst3-host harp-shell -j
           if [ "$RUNNER_OS" = "macOS" ]; then
             cmake --build build-vst --target harp-au au-host -j
