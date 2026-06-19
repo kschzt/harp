@@ -39,13 +39,24 @@ jobs:
       - name: build the fake-hardware device (harp-deviced)
         run: |
           cmake -B build -S .
-          cmake --build build --target harp-deviced -j
+          cmake --build build --target harp-deviced harp-probe -j
       - name: build the shell + host (+ AU host on macOS)
         run: |
           cmake -B build-vst -S tools/vst3-host
           cmake --build build-vst --target harp-vst3-host harp-shell -j
           if [ "$RUNNER_OS" = "macOS" ]; then
             cmake --build build-vst --target harp-au au-host -j
+            cmake --build build-vst --target install-au   # au-host loads the AU as an installed component
           fi
       - name: eth conformance (bit-exact, RTP audio plane, per-part demux over §8.7)
         run: scripts/eth-tests.sh
+      - name: recall round-trip + §11.4 archive over the loopback
+        run: scripts/recall-eth-test.sh
+      - name: cross-format VST3<->AU recall over the loopback (macOS — AU is macOS-only)
+        if: runner.os == 'macOS'
+        run: |
+          PLUG="$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d | head -1)"
+          ./build/harp-deviced --port 47903 --state-dir /tmp/xf-eth-state >/tmp/xf-eth-dev.log 2>&1 &
+          DP=$!; trap 'kill -9 $DP 2>/dev/null || true' EXIT
+          for _ in $(seq 1 25); do grep -q "listening on 47903" /tmp/xf-eth-dev.log && break; sleep 0.2; done
+          PLUG="$PLUG" HARP_ETH_DEVICE=127.0.0.1:47903 scripts/cross-format-recall-test.sh

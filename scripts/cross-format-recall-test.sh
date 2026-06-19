@@ -34,7 +34,15 @@
 set -u
 cd "$(dirname "$0")/.."
 
-export HARP_DEVICE_SERIAL="${HARP_DEVICE_SERIAL:-PI4B-0001}"
+# Transport: eth.yml's loopback sets HARP_ETH_DEVICE -> the fake-hardware serial
+# (SIM-0001); the hardware rigs leave it unset -> the desk board over USB. The hosts
+# (V/A) honor HARP_ETH_DEVICE automatically; only the serial + the board-present probe
+# below differ by transport.
+if [ -n "${HARP_ETH_DEVICE:-}" ]; then
+    export HARP_DEVICE_SERIAL="${HARP_DEVICE_SERIAL:-SIM-0001}"
+else
+    export HARP_DEVICE_SERIAL="${HARP_DEVICE_SERIAL:-PI4B-0001}"
+fi
 SERIAL="$HARP_DEVICE_SERIAL"
 
 V=build-vst/harp-vst3-host
@@ -70,7 +78,11 @@ cmake --build build-vst --target au-host harp-vst3-host >/dev/null 2>&1 \
 # board-present skip: without the pinned board nothing connects and the move is
 # unobservable — legitimately N/A on this rig.
 if [ -x "$PROBE" ]; then
-    if ! "$PROBE" list 2>/dev/null | grep -q "serial $SERIAL"; then
+    if [ -n "${HARP_ETH_DEVICE:-}" ]; then
+        # loopback: the fake-hardware device answers over §8.7 Ethernet, not the USB bus.
+        "$PROBE" -d "$HARP_ETH_DEVICE" identify 2>/dev/null | grep -q "$SERIAL" \
+            || { echo "XFORMAT SKIP: loopback $SERIAL not answering at $HARP_ETH_DEVICE"; exit 2; }
+    elif ! "$PROBE" list 2>/dev/null | grep -q "serial $SERIAL"; then
         echo "XFORMAT SKIP: board $SERIAL not on the bus"; exit 2
     fi
 else
