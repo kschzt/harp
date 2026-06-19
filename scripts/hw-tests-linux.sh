@@ -42,19 +42,28 @@ export SERIAL="$HARP_DEVICE_SERIAL"                # replug pins this board
 # ~20min to the job timeout). Used as the start-of-suite preflight AND, in run(), to
 # self-heal a test that reports the bus busy (rc=3). Graceful if the Pi is unreachable.
 #
-# NOTE: a host-side USBDEVFS_RESET was tried here to clear a host-side claim a daemon
-# restart can't, but on this rig (FunctionFS gadget + PCI-passthrough to the runner VM)
-# it reset the freshly-rebound gadget into a non-responsive state and HUNG the next
-# probe — net worse. Removed. The host-side wedge needs a different lever (TODO).
+# THE LEVER for the host-side wedge a bare daemon restart can't clear: the runner VM
+# (PCI-passthrough) keeps a stale USB node/claim because a restart re-creates the gadget
+# device-side but never makes the HOST see a disconnect — harp-deviced binds the UDC
+# (device/ffs.c) and a plain restart leaves it bound. The daemon now UNBINDS its UDC on
+# SIGTERM (harp-deviced.c on_term), so `systemctl stop` makes the host see a real
+# disconnect (it drops its node + stale claim); the pause lets the host settle, then
+# `start` re-binds -> the host re-enumerates a fresh device. Unlike the host-side
+# USBDEVFS_RESET tried before (which reset the passthrough into a hung state and was
+# removed), this is the gadget unplugging itself — it never touches the host controller.
+# (Done daemon-side, not via a configfs `tee`, because ci@ has sudo only for systemctl.)
 recover() {
-    ssh -o BatchMode=yes -o ConnectTimeout=8 "$PI" 'sudo -n systemctl restart harp-deviced-usb' 2>/dev/null \
+    ssh -o BatchMode=yes -o ConnectTimeout=8 "$PI" '
+        sudo -n systemctl stop harp-deviced-usb 2>/dev/null
+        sleep 2
+        sudo -n systemctl start harp-deviced-usb' 2>/dev/null \
         || { echo "   (recover skipped: $PI unreachable)"; return 0; }
     for i in $(seq 1 20); do
         timeout 8 "$PROBE" -d "usb:$SERIAL" identify >/dev/null 2>&1 && { echo "   device claimable after ~${i}s"; return 0; }
         sleep 1
     done
 }
-echo "──── preflight: device reset (daemon restart on $PI)"
+echo "──── preflight: device reset (UDC re-plug on $PI)"
 recover
 echo
 

@@ -30,12 +30,33 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include "device.h"
 #include "rtp.h"
 
 /* THE device. One per daemon; modules share it via device.h. */
 device g_dev;
+
+/* On a clean shutdown, unbind the gadget UDC so the USB host sees a real disconnect.
+ * A bare daemon restart leaves the UDC bound, so the host — especially the CI rig's
+ * PCI-passthrough VM — keeps a stale claim that wedges the next claim; unbinding forces
+ * a fresh re-enumeration. Armed only in FFS mode (g_udc_path stays empty in --port, so
+ * the handler is a no-op there). Uses only async-signal-safe calls (open/write/_exit).
+ * See scripts/hw-tests-linux.sh recover(). */
+static char g_udc_path[256];
+static void on_term(int sig) {
+    (void)sig;
+    if (g_udc_path[0]) {
+        int fd = open(g_udc_path, O_WRONLY);
+        if (fd >= 0) {
+            ssize_t w = write(fd, "\n", 1); /* empty UDC name -> unbind (host disconnect) */
+            (void)w;
+            close(fd);
+        }
+    }
+    _exit(0);
+}
 
 #ifdef __linux__
 /* FunctionFS gadget transport (device/ffs.c) */
@@ -187,6 +208,8 @@ int main(int argc, char **argv) {
         }
     }
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGTERM, on_term); /* clean shutdown unbinds the UDC (FFS mode) -> host re-enumerates */
+    signal(SIGINT, on_term);
 
     device *d = &g_dev;
     memset(d, 0, sizeof *d);
@@ -232,6 +255,7 @@ int main(int argc, char **argv) {
 
     if (ffs_dir) {
 #ifdef __linux__
+        snprintf(g_udc_path, sizeof g_udc_path, "%s/UDC", gadget); /* arm the shutdown unbind */
         fprintf(stderr, "harp-deviced: serial %s, state %s, USB gadget via %s (boot %llu)\n",
                 d->serial, state_dir, ffs_dir, (unsigned long long)d->boot_count);
         return harp_ffs_serve(ffs_dir, gadget, ffs_session_cb, d);
