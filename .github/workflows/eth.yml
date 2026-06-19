@@ -52,7 +52,7 @@ jobs:
       - name: recall round-trip + §11.4 archive over the loopback
         run: scripts/recall-eth-test.sh
       - name: cross-format VST3<->AU recall over the loopback (macOS — AU is macOS-only)
-        if: runner.os == 'macOS'
+        if: ${{ !cancelled() && runner.os == 'macOS' }}   # run even if eth-tests flaked (independent)
         run: |
           cmake --build build-vst --target install-au
           # A freshly-installed component is invisible until the AudioComponent registrar
