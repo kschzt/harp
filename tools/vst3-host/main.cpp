@@ -895,8 +895,8 @@ int main(int argc, char **argv) {
                 int32 qi = 0;
                 auto *q = pc.addParameterData(info.id, qi);
                 int32 pp = 0;
+                /* automation point to the processor only (DAW-representative; see --set) */
                 if (q) q->addPoint(0, info.defaultNormalizedValue, pp);
-                controller->setParamNormalized(info.id, info.defaultNormalizedValue);
             }
         }
         for (auto &r : ramps) { /* block-rate automation, like a DAW writes */
@@ -926,8 +926,12 @@ int main(int argc, char **argv) {
                 int32 qidx = 0;
                 auto *q = pc.addParameterData(kv.first, qidx);
                 int32 pidx = 0;
+                /* Deliver --set the way a DAW delivers automation: a sample-accurate
+                 * point to the PROCESSOR. A host does NOT call the plugin's
+                 * controller->setParamNormalized to feed the audio engine (the
+                 * processor reads inputParameterChanges; the host manages UI display
+                 * itself) — so we don't either. */
                 if (q) q->addPoint(0, kv.second, pidx);
-                if (controller) controller->setParamNormalized(kv.first, kv.second);
             }
             first_block = false;
         }
