@@ -57,6 +57,8 @@ jobs:
         run: scripts/part-filter-eth-test.sh
       - name: reconnect (§8.7 fault-injection — host survives a mid-session device disconnect)
         run: scripts/reconnect-eth-test.sh
+      - name: rtp-loss (§8.7 fault-injection — host tolerates RTP/UDP packet loss)
+        run: scripts/rtp-loss-eth-test.sh
       # cross-format VST3<->AU recall over the loopback is verified LOCALLY (XFORMAT PASS)
       # and on the desk rig, but the freshly-installed ad-hoc-signed AU won't instantiate
       # on an ephemeral hosted-macOS runner (au-host "device busy" = the AU never loaded).

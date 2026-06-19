@@ -91,10 +91,19 @@ static uint64_t bump_boot_count(const char *dir) {
 /* §8.7: send one rendered block as an RTP/UDP datagram (header + samples via
  * iovec, no copy). No-op unless --rtp-out armed this socket. Called from the
  * engine's free-running render loop; sockets live here, not in engine.c. */
+/* §8.7 fault injection: --drop-rtp-pct N deterministically drops ~N% of outgoing RTP
+ * datagrams (0 = off), to exercise the host's free-running RTP loss tolerance. */
+static int g_rtp_drop_pct = 0;
+
 void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, uint64_t msc) {
     if (a->rtp_fd < 0) return;
+    uint16_t seq = a->rtp_seq++;
+    /* drop ~N% of datagrams, but ADVANCE the seq first so the host sees a genuine gap
+     * (real loss), not a stall. Knuth multiplicative hash = reproducible (no rand) yet
+     * well-spread across the sequence. */
+    if (g_rtp_drop_pct > 0 && (seq * 2654435761u) % 100u < (uint32_t)g_rtp_drop_pct) return;
     uint8_t hdr[HARP_RTP_HDR_BYTES];
-    harp_rtp_hdr h = {96, 0, a->rtp_seq++, (uint32_t)msc, a->rtp_ssrc};
+    harp_rtp_hdr h = {96, 0, seq, (uint32_t)msc, a->rtp_ssrc};
     harp_rtp_pack(hdr, sizeof hdr, &h, NULL, 0);
     struct iovec iov[2] = {{hdr, HARP_RTP_HDR_BYTES}, {(void *)samples, payload_bytes}};
     struct msghdr m = {0};
@@ -218,6 +227,8 @@ int main(int argc, char **argv) {
             panel_sock = argv[++i];
         else if (strcmp(argv[i], "--rtp-out") == 0 && i + 1 < argc)
             rtp_out = argv[++i];
+        else if (strcmp(argv[i], "--drop-rtp-pct") == 0 && i + 1 < argc)
+            g_rtp_drop_pct = atoi(argv[++i]); /* §8.7 fault injection: drop ~N% of RTP */
         else if (strcmp(argv[i], "--tone") == 0 && i + 1 < argc)
             tone_hz = atof(argv[++i]);
         else if (strcmp(argv[i], "--no-rate-lock") == 0)
