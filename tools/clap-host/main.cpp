@@ -23,7 +23,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
 #include <fstream>
 #include <string>
 #include <sys/stat.h>
@@ -32,6 +31,27 @@
 #include <clap/clap.h>
 
 #include "render_check.h" /* harp_fnv1a, harp_write_wav16 — shared with the VST3/AU hosts */
+
+/* Cross-platform dynamic load: a .clap is a bare shared library — dlopen on POSIX,
+ * LoadLibrary on Windows. Included after the std headers, with NOMINMAX so windows.h
+ * does not clobber std::min/max. */
+#ifdef _WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+static void *harp_dlopen(const char *p) { return (void *)LoadLibraryA(p); }
+static void *harp_dlsym(void *h, const char *s) { return (void *)GetProcAddress((HMODULE)h, s); }
+static const char *harp_dlerror(void) { return "LoadLibrary/GetProcAddress failed"; }
+#else
+#  include <dlfcn.h>
+static void *harp_dlopen(const char *p) { return dlopen(p, RTLD_NOW | RTLD_LOCAL); }
+static void *harp_dlsym(void *h, const char *s) { return dlsym(h, s); }
+static const char *harp_dlerror(void) { return dlerror(); }
+#endif
 
 static void die(const std::string &m) {
     fprintf(stderr, "clap-host: %s\n", m.c_str());
@@ -165,9 +185,9 @@ int main(int argc, char **argv) {
 
     /* ---- load the .clap (bare lib on Linux/Windows, CFBundle on macOS) ---- */
     std::string binary = clap_binary_path(path); /* inner Mach-O if a bundle */
-    void *dso = dlopen(binary.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!dso) die("dlopen failed: " + std::string(dlerror() ? dlerror() : "?"));
-    auto *entry = (const clap_plugin_entry_t *)dlsym(dso, "clap_entry");
+    void *dso = harp_dlopen(binary.c_str());
+    if (!dso) die("dlopen failed: " + std::string(harp_dlerror() ? harp_dlerror() : "?"));
+    auto *entry = (const clap_plugin_entry_t *)harp_dlsym(dso, "clap_entry");
     if (!entry) die("no clap_entry symbol");
     if (!entry->init(path.c_str())) die("entry init failed"); /* init() gets the bundle path */
     auto *factory = (const clap_plugin_factory_t *)entry->get_factory(CLAP_PLUGIN_FACTORY_ID);
