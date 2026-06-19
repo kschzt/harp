@@ -66,6 +66,7 @@ jobs:
           for _ in $(seq 1 25); do grep -q "listening on 47903" /tmp/xf-eth-dev.log && break; sleep 0.2; done
           echo "── is our AU registered? (auval -a | grep rfdv/HARP):"
           auval -a 2>/dev/null | grep -iE "rfdv|HARP" || echo "   NOT listed by auval -a"
-          echo "── au-host load check (visible stderr — 'AU not found' vs 'saved to'):"
-          HARP_ETH_DEVICE=127.0.0.1:47903 ./build-vst/au-host --save-state /tmp/auprobe.state 2>&1 | head -8 || true
+          echo "── au-host under lldb (breakpoint on __cxa_throw -> backtrace at the throw site):"
+          HARP_ETH_DEVICE=127.0.0.1:47903 lldb --batch -o "b __cxa_throw" -o run -o "bt" -o quit \
+            -- ./build-vst/au-host --save-state /tmp/auprobe.state 2>&1 | tail -45 || true
           PLUG="$PLUG" HARP_ETH_DEVICE=127.0.0.1:47903 scripts/cross-format-recall-test.sh
