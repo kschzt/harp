@@ -77,6 +77,7 @@ static bool fd_write_all(harp_io *io, const void *buf, size_t n) {
 void harp_io_fd_init(harp_io_fd *f, int rfd, int wfd) {
     f->io.read_exact = fd_read_exact;
     f->io.write_all = fd_write_all;
+    f->io.corrupt_pct = 0; /* §8.7 fault injection off by default; the device opts in per-io */
     f->rfd = rfd;
     f->wfd = wfd;
 }
@@ -104,6 +105,7 @@ int harp_link_recv(harp_io *io, harp_link *l, uint8_t *stream, harp_cbuf *msg) {
 }
 
 int harp_link_send(harp_io *io, uint8_t stream, const void *data, size_t len) {
+    static unsigned cf = 0; /* deterministic frame counter for §8.7 --corrupt-ctl-pct */
     const uint8_t *p = data;
     do {
         size_t chunk = len > HARP_FRAME_MAX_PAYLOAD ? HARP_FRAME_MAX_PAYLOAD : len;
@@ -112,7 +114,22 @@ int harp_link_send(harp_io *io, uint8_t stream, const void *data, size_t len) {
         uint8_t hdr[HARP_FRAME_HDR_LEN];
         harp_frame_hdr_encode(&h, hdr);
         if (!io->write_all(io, hdr, sizeof hdr)) return -1;
-        if (chunk && !io->write_all(io, p, chunk)) return -1;
+        if (chunk) {
+            unsigned fn = cf++;
+            if (io->corrupt_pct > 0 && ((fn + 1u) * 2654435761u) % 100u < (unsigned)io->corrupt_pct) {
+                /* §8.7 fault injection (device-only --corrupt-ctl-pct): flip ONE payload byte
+                 * so the host decodes a corrupt frame and must survive (no crash/UB). The host
+                 * never sets corrupt_pct, so host->device framing is untouched. Split-write,
+                 * no copy. */
+                size_t bi = fn % chunk;
+                uint8_t bad = p[bi] ^ 0xffu;
+                if (bi && !io->write_all(io, p, bi)) return -1;
+                if (!io->write_all(io, &bad, 1)) return -1;
+                if (bi + 1 < chunk && !io->write_all(io, p + bi + 1, chunk - bi - 1)) return -1;
+            } else if (!io->write_all(io, p, chunk)) {
+                return -1;
+            }
+        }
         p += chunk;
         len -= chunk;
     } while (len);

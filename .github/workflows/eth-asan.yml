@@ -77,3 +77,7 @@ jobs:
             echo "::error::ASan/UBSan found issues in the daemon during the soak"; exit 1
           fi
           echo "daemon ASan/UBSan-clean across the soak"
+      - name: corrupt-CBOR fault injection under ASan (host survives a hostile device's bad frames)
+        # fatal (unlike recall above): a crash / over-read / UB while decoding corrupt
+        # device CBOR is a real bug, not a timing artifact. Uses the ASan build/ + build-vst/.
+        run: scripts/corrupt-cbor-eth-test.sh

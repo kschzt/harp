@@ -94,6 +94,9 @@ static uint64_t bump_boot_count(const char *dir) {
 /* §8.7 fault injection: --drop-rtp-pct N deterministically drops ~N% of outgoing RTP
  * datagrams (0 = off), to exercise the host's free-running RTP loss tolerance. */
 static int g_rtp_drop_pct = 0;
+/* §8.7 fault injection: --corrupt-ctl-pct N flips one byte in ~N% of outgoing FRAMED CBOR
+ * (ctl + echo + evt, via harp_link_send), set per-io on the device's host link only. */
+static int g_corrupt_ctl_pct = 0;
 
 void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, uint64_t msc) {
     if (a->rtp_fd < 0) return;
@@ -229,6 +232,8 @@ int main(int argc, char **argv) {
             rtp_out = argv[++i];
         else if (strcmp(argv[i], "--drop-rtp-pct") == 0 && i + 1 < argc)
             g_rtp_drop_pct = atoi(argv[++i]); /* §8.7 fault injection: drop ~N% of RTP */
+        else if (strcmp(argv[i], "--corrupt-ctl-pct") == 0 && i + 1 < argc)
+            g_corrupt_ctl_pct = atoi(argv[++i]); /* §8.7 fault injection: flip ~N% of framed CBOR */
         else if (strcmp(argv[i], "--tone") == 0 && i + 1 < argc)
             tone_hz = atof(argv[++i]);
         else if (strcmp(argv[i], "--no-rate-lock") == 0)
@@ -332,6 +337,7 @@ int main(int argc, char **argv) {
                              : 0;
         harp_io_fd tio;
         harp_io_fd_init(&tio, cfd, cfd);
+        tio.io.corrupt_pct = g_corrupt_ctl_pct; /* §8.7 fault injection: device->host frames only */
         harp_deviced_run_session(d, &tio.io);
         d->rtp_peer_ip = 0; /* session over — forget the peer */
         close(cfd);

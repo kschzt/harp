@@ -22,6 +22,10 @@ struct harp_io {
     /* Both block until satisfied; false = EOF/error (session over). */
     bool (*read_exact)(harp_io *io, void *buf, size_t n);
     bool (*write_all)(harp_io *io, const void *buf, size_t n);
+    /* §8.7 fault injection: when >0, harp_link_send flips one byte in ~corrupt_pct% of
+     * outgoing payload frames. Set ONLY by the device (--corrupt-ctl-pct); the host
+     * leaves it 0, so host->device framing is never corrupted. */
+    int corrupt_pct;
 };
 
 /* fd-backed transport (sockets, pipes, FunctionFS endpoints).
