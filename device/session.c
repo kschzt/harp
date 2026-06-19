@@ -10,7 +10,9 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/statvfs.h>
+#ifndef _WIN32
+#include <sys/statvfs.h> /* free-space checks; Windows skips them (see handle_* below) */
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -535,6 +537,7 @@ static void handle_state_send(device *d, const harp_env *e) {
             }
         }
     }
+#ifndef _WIN32
     struct statvfs vs;
     if (statvfs(d->store.dir, &vs) == 0) {
         uint64_t freeb = (uint64_t)vs.f_bavail * vs.f_frsize;
@@ -543,6 +546,7 @@ static void handle_state_send(device *d, const harp_env *e) {
             return;
         }
     }
+#endif
     harp_cbuf m;
     harp_cbuf_init(&m);
     rsp_head(&m, e->rid, e->method, false);
@@ -682,12 +686,14 @@ static void handle_state_refset(device *d, const harp_env *e) {
 }
 
 static void handle_diag_counters(device *d, const harp_env *e) {
-    struct statvfs vs;
     uint64_t total = 0, freeb = 0;
+#ifndef _WIN32
+    struct statvfs vs;
     if (statvfs(d->store.dir, &vs) == 0) {
         total = (uint64_t)vs.f_blocks * vs.f_frsize;
         freeb = (uint64_t)vs.f_bavail * vs.f_frsize;
     }
+#endif
     harp_cbuf m;
     harp_cbuf_init(&m);
     rsp_head(&m, e->rid, e->method, true);

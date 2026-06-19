@@ -23,6 +23,7 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <winsock2.h>
+#  include <ws2tcpip.h> /* getaddrinfo/struct addrinfo for harp_sock_dial */
 typedef SOCKET harp_sockhandle;
 #  define HARP_SOCK_INVALID INVALID_SOCKET
 #else

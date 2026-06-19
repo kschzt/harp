@@ -17,23 +17,34 @@
  *     NOT require snapshot parent ancestry to be present (§15.3 "full
  *     closure" would otherwise mean unbounded history in every bundle).
  */
-#include <arpa/inet.h>
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  define HARP_CLOSESOCK(fd) closesocket(fd)
+#else
+#  include <arpa/inet.h>
+#  include <netdb.h>
+#  include <netinet/in.h>
+#  include <netinet/tcp.h>
+#  include <pthread.h> /* POSIX pthreads (Windows gets the shim via device.h) */
+#  include <signal.h>
+#  include <sys/socket.h>
+#  include <sys/uio.h>
+#  include <unistd.h>
+#  include <fcntl.h>
+#  define HARP_CLOSESOCK(fd) close(fd)
+#endif
 #include <errno.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <pthread.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/uio.h>
-#include <unistd.h>
-#include <fcntl.h>
 
 #include "device.h"
 #include "rtp.h"
+#include "sock_io.h" /* harp_sock_io: recv/send accept path (Winsock SOCKETs reject _read/_write) */
 
 /* THE device. One per daemon; modules share it via device.h. */
 device g_dev;
@@ -44,6 +55,7 @@ device g_dev;
  * a fresh re-enumeration. Armed only in FFS mode (g_udc_path stays empty in --port, so
  * the handler is a no-op there). Uses only async-signal-safe calls (open/write/_exit).
  * See scripts/hw-tests-linux.sh recover(). */
+#ifndef _WIN32
 static char g_udc_path[256];
 static void on_term(int sig) {
     (void)sig;
@@ -57,6 +69,7 @@ static void on_term(int sig) {
     }
     _exit(0);
 }
+#endif /* !_WIN32 — FFS UDC unbind is Linux gadget only; Windows CI exits via TerminateProcess */
 
 #ifdef __linux__
 /* FunctionFS gadget transport (device/ffs.c) */
@@ -108,11 +121,20 @@ void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, 
     uint8_t hdr[HARP_RTP_HDR_BYTES];
     harp_rtp_hdr h = {96, 0, seq, (uint32_t)msc, a->rtp_ssrc};
     harp_rtp_pack(hdr, sizeof hdr, &h, NULL, 0);
+#ifdef _WIN32
+    /* WSASend with a 2-element WSABUF gathers header+samples into ONE datagram on a
+     * connected UDP socket — the Winsock equivalent of sendmsg's 2-iovec gather. */
+    WSABUF bufs[2] = {{(ULONG)HARP_RTP_HDR_BYTES, (char *)hdr},
+                      {(ULONG)payload_bytes, (char *)samples}};
+    DWORD sent = 0;
+    (void)WSASend((SOCKET)a->rtp_fd, bufs, 2, &sent, 0, NULL, NULL);
+#else
     struct iovec iov[2] = {{hdr, HARP_RTP_HDR_BYTES}, {(void *)samples, payload_bytes}};
     struct msghdr m = {0};
     m.msg_iov = iov;
     m.msg_iovlen = 2;
     (void)sendmsg(a->rtp_fd, &m, 0);
+#endif
 }
 
 /* §8.7: open the negotiated RTP audio destination — a UDP socket connect()'d to
@@ -128,7 +150,7 @@ int audio_open_rtp_dest(uint32_t peer_ip_net, int port) {
     a.sin_port = htons((uint16_t)port);
     a.sin_addr.s_addr = peer_ip_net;
     if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
-        close(fd);
+        HARP_CLOSESOCK(fd);
         return -1;
     }
     return fd;
@@ -145,13 +167,13 @@ int audio_open_tcp_paced(uint32_t peer_ip_net, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
     struct sockaddr_in a = {0};
     a.sin_family = AF_INET;
     a.sin_port = htons((uint16_t)port);
     a.sin_addr.s_addr = peer_ip_net;
     if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
-        close(fd);
+        HARP_CLOSESOCK(fd);
         return -1;
     }
     return fd;
@@ -161,7 +183,7 @@ int audio_open_tcp_paced(uint32_t peer_ip_net, int port) {
  * audio_stop once the render thread is joined, so the fd outlives no sender. */
 void audio_rtp_close(audio_state *a) {
     if (a->rtp_fd >= 0) {
-        close(a->rtp_fd);
+        HARP_CLOSESOCK(a->rtp_fd);
         a->rtp_fd = -1;
     }
 }
@@ -246,9 +268,17 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
+#ifdef _WIN32
+    { WSADATA wsa;
+      if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+          fprintf(stderr, "harp-deviced: WSAStartup failed\n");
+          return 1;
+      } }
+#else
     signal(SIGPIPE, SIG_IGN);
     signal(SIGTERM, on_term); /* clean shutdown unbinds the UDC (FFS mode) -> host re-enumerates */
     signal(SIGINT, on_term);
+#endif
 
     device *d = &g_dev;
     memset(d, 0, sizeof *d);
@@ -265,6 +295,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&d->send_mu, NULL);
     pthread_mutex_init(&d->state_mu, NULL);
 
+#ifndef _WIN32
     if (panel_sock[0]) {
         static struct panel_args pa;
         pa.d = d;
@@ -273,6 +304,9 @@ int main(int argc, char **argv) {
         pthread_create(&pt, NULL, panel_main, &pa);
         pthread_detach(pt);
     }
+#else
+    (void)panel_sock; /* AF_UNIX front panel is POSIX-only; gated out of the Windows build */
+#endif
 
     /* Recall across power cycles: load the live ref if clean; first boot
      * snapshots the factory state so the ref is born. */
@@ -305,9 +339,9 @@ int main(int argc, char **argv) {
 #endif
     }
 
-    int sfd = socket(AF_INET, SOCK_STREAM, 0);
+    harp_sockhandle sfd = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
-    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -321,12 +355,14 @@ int main(int argc, char **argv) {
             d->serial, state_dir, port, (unsigned long long)d->boot_count);
 
     for (;;) {
-        int cfd = accept(sfd, NULL, NULL);
-        if (cfd < 0) {
+        harp_sockhandle cfd = accept(sfd, NULL, NULL);
+        if (cfd == HARP_SOCK_INVALID) {
+#ifndef _WIN32
             if (errno == EINTR) continue;
+#endif
             break;
         }
-        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
         /* §8.7: remember the peer's IP so a TCP-session audio.start can negotiate
          * an RTP audio destination (its host:port = peer-IP + key-6 port). */
         struct sockaddr_in peer;
@@ -335,12 +371,18 @@ int main(int argc, char **argv) {
                           peer.sin_family == AF_INET)
                              ? peer.sin_addr.s_addr
                              : 0;
+#ifdef _WIN32
+        /* Winsock SOCKETs reject _read/_write, so the accept path uses recv/send. */
+        harp_sock_io tio;
+        harp_sock_io_init(&tio, cfd);
+#else
         harp_io_fd tio;
         harp_io_fd_init(&tio, cfd, cfd);
+#endif
         tio.io.corrupt_pct = g_corrupt_ctl_pct; /* §8.7 fault injection: device->host frames only */
         harp_deviced_run_session(d, &tio.io);
         d->rtp_peer_ip = 0; /* session over — forget the peer */
-        close(cfd);
+        HARP_CLOSESOCK(cfd);
         fprintf(stderr, "harp-deviced: session ended; awaiting reattach\n");
     }
     return 0;

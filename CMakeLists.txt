@@ -55,20 +55,29 @@ add_library(harpcore STATIC
 target_include_directories(harpcore PUBLIC core/include)
 
 # harp-deviced is the reference device daemon — it runs on the Pi (FunctionFS
-# gadget) or any POSIX host (TCP simulator). It is pervasively pthread/POSIX and
-# the real device is the Pi, so it is not part of the Windows build.
-if(NOT WIN32)
+# gadget) or any POSIX host (TCP simulator). On Windows it builds as a localhost
+# fake-hardware target for the §8.7 IP e2e (win.yml): pthreads come from
+# device/compat_pthread.h, the POSIX-only AF_UNIX front panel is gated out, and the
+# accept path uses recv/send (host/sock_io.c) instead of fd read/write.
+add_executable(harp-deviced
+  device/harp-deviced.c # main + transports
+  device/engine.c       # synth, event queue, audio threads
+  device/state.c        # engine <-> content-addressed objects
+  device/session.c      # protocol handlers + session loop
+  host/rtp.c            # §8.7 RTP packetization (--rtp-out emit)
+)
+target_include_directories(harp-deviced PRIVATE host)
+target_link_libraries(harp-deviced harpcore ${HARP_MATH_LIB})
+if(WIN32)
+  # panel.c (AF_UNIX) gated out — POSIX-only; session.c's reconcile symbols come from
+  # the tiny panel_stub_win.c. sock_io = recv/send accept path (harp_io_fd's
+  # _read/_write don't work on Winsock SOCKETs).
+  target_sources(harp-deviced PRIVATE device/panel_stub_win.c host/sock_io.c)
+  target_link_libraries(harp-deviced ws2_32)
+else()
   find_package(Threads REQUIRED)
-  add_executable(harp-deviced
-    device/harp-deviced.c # main + transports
-    device/engine.c       # synth, event queue, audio threads
-    device/state.c        # engine <-> content-addressed objects
-    device/session.c      # protocol handlers + session loop
-    device/panel.c        # front-panel unix-socket API
-    host/rtp.c            # §8.7 RTP packetization (--rtp-out emit)
-  )
-  target_include_directories(harp-deviced PRIVATE host)
-  target_link_libraries(harp-deviced harpcore ${HARP_MATH_LIB} Threads::Threads)
+  target_sources(harp-deviced PRIVATE device/panel.c) # front-panel unix-socket API
+  target_link_libraries(harp-deviced Threads::Threads)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_sources(harp-deviced PRIVATE device/ffs.c) # USB gadget transport (§4.3)
   endif()

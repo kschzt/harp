@@ -13,6 +13,12 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h> /* the host-paced pacing channel is a Winsock SOCKET (recv/send) */
+#endif
 
 #include "device.h"
 
@@ -761,6 +767,28 @@ static uint16_t render_output(audio_state *a, float *out, uint32_t n, float rate
  * voice starts from zero at audio.start, so identical state + identical
  * pacing -> byte-identical output (audio.deterministic, T15). Pacing faster
  * than real time is automatic — there is no clock here (audio.offline-rate). */
+/* Host-paced pacing-channel I/O. On Windows that channel is a Winsock SOCKET, which
+ * rejects read()/write() — route through recv()/send(). On POSIX read()/harp_write_all
+ * work on both the TCP socket and the FunctionFS endpoint fd, so they stay verbatim. */
+#ifdef _WIN32
+static ssize_t hp_read(int fd, void *buf, size_t n) {
+    return recv((SOCKET)fd, (char *)buf, (int)(n > 0x7fffffff ? 0x7fffffff : n), 0);
+}
+static bool hp_write_all(int fd, const void *buf, size_t n) {
+    const char *p = (const char *)buf;
+    size_t off = 0;
+    while (off < n) {
+        int w = send((SOCKET)fd, p + off, (int)(n - off > 0x7fffffff ? 0x7fffffff : n - off), 0);
+        if (w <= 0) return false;
+        off += (size_t)w;
+    }
+    return true;
+}
+#else
+#define hp_read(fd, buf, n)      read((fd), (buf), (n))
+#define hp_write_all(fd, buf, n) harp_write_all((fd), (buf), (n))
+#endif
+
 static void host_paced_loop(device *d) {
     audio_state *a = &d->audio;
     /* voice starts from zero at audio.start (T15); notes/arp are reset by
@@ -786,7 +814,7 @@ static void host_paced_loop(device *d) {
                 got += take;
                 continue;
             }
-            ssize_t r = read(a->out_fd, rbuf, sizeof rbuf);
+            ssize_t r = hp_read(a->out_fd, rbuf, sizeof rbuf);
             if (r <= 0) { /* endpoint died or stop */
                 fprintf(stderr, "harp-deviced: pacing read ended: %s\n",
                         r == 0 ? "EOF" : strerror(errno));
@@ -827,7 +855,7 @@ static void host_paced_loop(device *d) {
                     fgot += take;
                     continue;
                 }
-                ssize_t r = read(a->out_fd, rbuf, sizeof rbuf);
+                ssize_t r = hp_read(a->out_fd, rbuf, sizeof rbuf);
                 if (r <= 0) return;
                 rlen = (size_t)r;
                 rpos = 0;
@@ -861,7 +889,7 @@ static void host_paced_loop(device *d) {
                 skip -= take;
                 continue;
             }
-            ssize_t r = read(a->out_fd, rbuf, sizeof rbuf);
+            ssize_t r = hp_read(a->out_fd, rbuf, sizeof rbuf);
             if (r <= 0) return;
             rlen = (size_t)r;
             rpos = 0;
@@ -879,7 +907,7 @@ static void host_paced_loop(device *d) {
         harp_audio_hdr_encode(&out, frame);
         size_t payload = (size_t)n * slots * 4;
         memcpy(frame + HARP_AUDIO_HDR_LEN, samples, payload);
-        if (!harp_write_all(a->fd, frame, HARP_AUDIO_HDR_LEN + payload)) return;
+        if (!hp_write_all(a->fd, frame, HARP_AUDIO_HDR_LEN + payload)) return;
     }
 }
 
