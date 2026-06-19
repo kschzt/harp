@@ -397,6 +397,30 @@ public:
             }
         }
 
+        /* §15.5 offline editing: replay edits made while the device was ABSENT, on the
+         * device's RECONNECT edge — "a mismatch resolved by Push". The apply loop records
+         * curVal_ for every param and flags dirtyOffline_ for ones edited during an offline
+         * gap; here we replay ONLY those, ONLY on a TRUE reconnect (everConnected_), AFTER
+         * sessionUp drained the stale event ring (connected_ flips true only then). The FIRST
+         * connect replays NOTHING — sessionUp's bundle + the live flow carry the initial
+         * state, so the goldens/recall stay byte-untouched (a blind replay-all-on-connect
+         * here clobbered recalled state with defaults — the bug this guards). */
+        if (!curValInit_) {
+            for (size_t i = 0; i < kNumParams; i++) curVal_[i] = kParams[i].defaultVal;
+            curValInit_ = true;
+        }
+        bool nowConn = rt.connected();
+        if (nowConn && !wasConnected_) {
+            if (everConnected_)
+                for (size_t i = 0; i < kNumParams; i++)
+                    if (dirtyOffline_[i]) {
+                        rt.queueParamSet(source_, (uint32_t)i + 1, curVal_[i], 0);
+                        dirtyOffline_[i] = false;
+                    }
+            everConnected_ = true;
+        }
+        wasConnected_ = nowConn;
+
         /* parameter changes -> timestamped sets; consecutive points become
          * §9.4 ramps — a DAW curve as a handful of ramps (§9.1). Thinned to
          * one emission per param per 256 samples: at 64-sample buffers a
@@ -490,6 +514,8 @@ public:
                         rt.queueParamSet(source_, id, (float)v, ts);
                         continue;
                     }
+                    curVal_[idx] = (float)v;                                   /* §15.5: track current value */
+                    if (everConnected_ && !nowConn) dirtyOffline_[idx] = true; /* edited during an offline gap -> replay on reconnect */
                     if (hasLast_[idx] && ts > lastTs_[idx] && ts - lastTs_[idx] < 256) {
                         pendHas_[idx] = true; /* too soon: fold into next ramp */
                         pendTs_[idx] = ts;
@@ -768,6 +794,16 @@ private:
     bool pendHas_[kNumParams] = {};
     uint64_t pendTs_[kNumParams] = {};
     float pendVal_[kNumParams] = {};
+    /* §15.5 offline editing: the current value of each device param, recorded by the apply
+     * loop whether or not a device is connected. On the (re)connect EDGE the process loop
+     * replays these so an edit made while the device was ABSENT reaches it — the host's live
+     * state winning, "a mismatch resolved by Push" (§11.4). Seeded to the device defaults so
+     * an unedited param re-asserts its true value (idempotent). */
+    float curVal_[kNumParams];
+    bool curValInit_ = false;
+    bool wasConnected_ = false;
+    bool everConnected_ = false;         /* gate: replay only on a TRUE reconnect, never the first connect */
+    bool dirtyOffline_[kNumParams] = {}; /* params edited during an offline gap — ONLY these get replayed */
 
 
 };
