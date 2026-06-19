@@ -59,6 +59,7 @@ static bool sock_write_all(harp_io *io, const void *buf, size_t n) {
 void harp_sock_io_init(harp_sock_io *t, harp_sockhandle s) {
     t->io.read_exact = sock_read_exact;
     t->io.write_all = sock_write_all;
+    t->io.corrupt_pct = 0; /* §8.7 fault injection is DEVICE-only; init so stack garbage never makes the host corrupt its own frames */
     t->s = s;
 }
 

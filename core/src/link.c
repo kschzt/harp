@@ -116,7 +116,7 @@ int harp_link_send(harp_io *io, uint8_t stream, const void *data, size_t len) {
         if (!io->write_all(io, hdr, sizeof hdr)) return -1;
         if (chunk) {
             unsigned fn = cf++;
-            if (io->corrupt_pct > 0 && ((fn + 1u) * 2654435761u) % 100u < (unsigned)io->corrupt_pct) {
+            if (io->corrupt_pct > 0 && io->corrupt_pct <= 100 && ((fn + 1u) * 2654435761u) % 100u < (unsigned)io->corrupt_pct) {
                 /* §8.7 fault injection (device-only --corrupt-ctl-pct): flip ONE payload byte
                  * so the host decodes a corrupt frame and must survive (no crash/UB). The host
                  * never sets corrupt_pct, so host->device framing is untouched. Split-write,

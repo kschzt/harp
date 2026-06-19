@@ -101,6 +101,7 @@ static bool sock_write_all(harp_io *io, const void *buf, size_t n) {
 static void sock_io_init(sock_io *t, sockhandle s) {
     t->io.read_exact = sock_read_exact;
     t->io.write_all = sock_write_all;
+    t->io.corrupt_pct = 0; /* §8.7 fault injection is DEVICE-only (uninit guard) */
     t->s = s;
 }
 
