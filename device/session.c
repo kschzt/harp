@@ -7,14 +7,18 @@
  */
 #include <errno.h>
 #include <math.h>
-#include <pthread.h>
+#if !defined(_WIN32) || defined(__MINGW32__)
+#include <pthread.h> /* MSVC: the pthread surface comes via device.h's shim */
+#endif
 #include <stdio.h>
 #include <string.h>
 #ifndef _WIN32
 #include <sys/statvfs.h> /* free-space checks; Windows skips them (see handle_* below) */
 #endif
 #include <time.h>
+#if !defined(_WIN32) || defined(__MINGW32__)
 #include <unistd.h>
+#endif
 
 #include "device.h"
 

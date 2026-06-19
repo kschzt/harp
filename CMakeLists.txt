@@ -74,6 +74,11 @@ if(WIN32)
   # _read/_write don't work on Winsock SOCKETs).
   target_sources(harp-deviced PRIVATE device/panel_stub_win.c host/sock_io.c)
   target_link_libraries(harp-deviced ws2_32)
+  if(MSVC)
+    # every device .c pulls C11 <stdatomic.h> via device.h; MSVC gates it behind
+    # this flag even under /std:c11 (same as host/freerun.c in tools/vst3-host).
+    target_compile_options(harp-deviced PRIVATE /experimental:c11atomics)
+  endif()
 else()
   find_package(Threads REQUIRED)
   target_sources(harp-deviced PRIVATE device/panel.c) # front-panel unix-socket API
