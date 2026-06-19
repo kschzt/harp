@@ -131,7 +131,13 @@ bool HarpRuntime::audioStart(uint32_t rate) {
         harp_cbor_uint(&req, 6);
         harp_cbor_uint(&req, (uint64_t)transport_->audioPort()); /* RTP dest port */
     } else {
-        harp_cbor_map(&req, 6);
+        /* host-paced (deterministic). USB (audioPort7()==0): the proven byte-
+         * identical 6-key map. §8.3-over-§8.7 Ethernet offline bounce
+         * (audioPort7()>0): the SAME map PLUS key 7 = the host's TCP audio-listen
+         * port the device dials back, and NO key 6 (no RTP). The device then runs
+         * host_paced_loop verbatim over TCP. */
+        int hpPort = transport_->audioPort7();
+        harp_cbor_map(&req, hpPort ? 7 : 6);
         harp_cbor_uint(&req, 0);
         harp_cbor_uint(&req, rate);
         harp_cbor_uint(&req, 1);
@@ -152,6 +158,10 @@ bool HarpRuntime::audioStart(uint32_t rate) {
         for (uint32_t slot : unionSlots_) harp_cbor_uint(&req, slot);
         harp_cbor_uint(&req, 5);
         harp_cbor_uint(&req, 1); /* host-paced */
+        if (hpPort) { /* §8.3-over-§8.7: ascending key order, after key 5 */
+            harp_cbor_uint(&req, 7);
+            harp_cbor_uint(&req, (uint64_t)hpPort);
+        }
     }
     harp_env e;
     bool ok = request(&req, &rsp, &e);
@@ -424,7 +434,8 @@ ShellTransport *HarpRuntime::selectDevice() {
      * transport instead of USB. Unset (the default, and every golden run) falls
      * straight through to the USB path below — byte-identical. */
     if (const char *eth = getenv("HARP_ETH_DEVICE"))
-        if (eth[0]) return EthTransport::dial(eth);
+        if (eth[0]) /* host-paced (deterministic) when the DAW is rendering offline; else free-running RTP */
+            return EthTransport::dial(eth, wantHostPaced_.load(std::memory_order_relaxed));
 
     /* reconnect: pinned to the exact unit this instance already owns — the
      * same-model fallback must NOT fire here, or a replug could let this

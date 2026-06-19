@@ -122,6 +122,29 @@ int audio_open_rtp_dest(uint32_t peer_ip_net, int port) {
     return fd;
 }
 
+/* §8.3-over-§8.7: open the negotiated HOST-PACED audio channel — a TCP socket
+ * connect()'d to the TCP peer's IP on the host-chosen port (audio.start key 7).
+ * TCP (lossless, ordered) is required because host-paced delivery must be byte-
+ * exact (unlike free-running RTP, which may drop). TCP_NODELAY so a faster-than-
+ * real-time offline pull isn't Nagle-delayed. Returns the fd, or -1 on failure.
+ * Called from the AUDIO thread (engine.c), never the session thread. */
+int audio_open_tcp_paced(uint32_t peer_ip_net, int port) {
+    if (peer_ip_net == 0 || port <= 0 || port > 65535) return -1;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    a.sin_addr.s_addr = peer_ip_net;
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 /* Close a negotiated RTP destination (no-op if none / on USB). Called from
  * audio_stop once the render thread is joined, so the fd outlives no sender. */
 void audio_rtp_close(audio_state *a) {

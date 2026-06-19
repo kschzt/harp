@@ -239,6 +239,9 @@ static const clap_plugin_state_t s_state = {st_save, st_load};
 static bool rn_has_hard_realtime(const clap_plugin_t *) { return false; }
 static bool rn_set(const clap_plugin_t *p, clap_plugin_render_mode mode) {
     self(p)->offline = (mode == CLAP_RENDER_OFFLINE);
+    /* §8.3-over-§8.7: select host-paced (deterministic) for an Ethernet offline
+     * bounce before the session starts; no-op on USB / if no runtime yet. */
+    if (self(p)->rt()) self(p)->rt()->setOffline(self(p)->offline);
     return true;
 }
 static const clap_plugin_render_t s_render = {rn_has_hard_realtime, rn_set};
@@ -398,6 +401,7 @@ static bool pl_activate(const clap_plugin_t *p, double sample_rate, uint32_t /*m
         /* owner drives the session: configure -> stage project bundle -> start.
          * Byte-identical ordering to the VST3/AU single-instance path. */
         h->rt()->configure((uint32_t)h->rate, h->maxFrames);
+        h->rt()->setOffline(h->offline); /* §8.3-over-§8.7: host-paced eth if offline (before start) */
         if (!h->pendingState.empty())
             h->rt()->setStateBundle(h->pendingState.data(), h->pendingState.size());
         h->rt()->start((uint32_t)h->rate);

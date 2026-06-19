@@ -322,6 +322,7 @@ static OSStatus au_Initialize(void *self) {
          * ownerSource_ (its channel is seeded inside start() from HARP_CHANNEL —
          * byte-identical single-instance path). */
         rt->configure(rate, au->maxFrames);
+        rt->setOffline(au->offline); /* §8.3-over-§8.7: host-paced eth if offline (before start) */
         if (!au->pendingState.empty())
             rt->setStateBundle(au->pendingState.data(), au->pendingState.size());
         rt->start(rate); /* deviceless = silence */
@@ -774,6 +775,9 @@ static OSStatus au_SetProperty(void *self, AudioUnitPropertyID prop,
         }
         case kAudioUnitProperty_OfflineRender:
             au->offline = *(const UInt32 *)inData != 0;
+            /* §8.3-over-§8.7: select host-paced (deterministic) for an Ethernet
+             * offline bounce before the session starts; no-op on USB / no runtime. */
+            if (au->runtime()) au->runtime()->setOffline(au->offline);
             return noErr;
         default:
             return kAudioUnitErr_InvalidProperty;

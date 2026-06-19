@@ -226,6 +226,15 @@ typedef struct {
     int rtp_fd;
     uint16_t rtp_seq;
     uint32_t rtp_ssrc;
+    /* §8.3 host-paced render over the §8.7 Ethernet binding (deterministic
+     * offline bounce): when host_paced_port > 0 the audio_thread connect()s a TCP
+     * socket back to the peer (host_paced_sock) and points BOTH fd + out_fd at it,
+     * so host_paced_loop runs verbatim — only the byte carrier changes from the USB
+     * FFS endpoints to this socket. The connect-back is done ON the audio thread
+     * (NOT the session thread, which advances the §8.3.1 event fence — connecting
+     * there would deadlock against the host's accept). 0 / -1 = not host-paced-TCP. */
+    int host_paced_port;
+    int host_paced_sock;
     uint32_t rtp_prebuffer; /* §8.7 bit-exact: frames to emit in a startup BURST
                              * (no pacing) before settling into realtime, so the
                              * host's jitter buffer is full from the first block
@@ -330,6 +339,11 @@ void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, 
  * (no-op if a->rtp_fd < 0). Both keep socket code out of engine.c/session.c. */
 int  audio_open_rtp_dest(uint32_t peer_ip_net, int port);
 void audio_rtp_close(audio_state *a);
+/* §8.3-over-§8.7: open a TCP socket connect()'d to peer_ip_net:port (the host's
+ * host-paced audio-listen port, audio.start key 7) for a deterministic offline
+ * bounce — SOCK_STREAM + TCP_NODELAY. Returns the fd or -1. Called from the audio
+ * thread (off the session thread). The render loop uses it as both fd and out_fd. */
+int  audio_open_tcp_paced(uint32_t peer_ip_net, int port);
 void engine_meters_reset(void); /* §9.9: clear meters to the silent floor */
 
 /* ---------------- state.c ---------------- */

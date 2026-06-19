@@ -43,12 +43,14 @@ jobs:
       - name: build the shell + host (+ AU host on macOS)
         run: |
           cmake -B build-vst -S tools/vst3-host
-          cmake --build build-vst --target harp-vst3-host harp-shell -j
+          cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host -j
           if [ "$RUNNER_OS" = "macOS" ]; then
             cmake --build build-vst --target harp-au au-host -j
           fi
       - name: eth conformance (bit-exact, RTP audio plane, per-part demux over §8.7)
         run: scripts/eth-tests.sh
+      - name: offline golden (deterministic host-paced bounce over §8.7)
+        run: scripts/offline-golden-eth.sh
       - name: recall round-trip + §11.4 archive over the loopback
         run: scripts/recall-eth-test.sh
       # cross-format VST3<->AU recall over the loopback is verified LOCALLY (XFORMAT PASS)

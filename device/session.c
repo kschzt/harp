@@ -738,6 +738,7 @@ static void handle_audio_start(device *d, const harp_env *e) {
     uint64_t rate = 48000, nsamples = 256, mode = 0;
     uint64_t rtp_port = 0; /* §8.7 key 6: host's RTP audio port; 0 => USB transport */
     uint64_t prebuf = 0;   /* §8.7 key 2: RTP prefill-burst depth in frames (0 = none) */
+    uint64_t hp_port = 0;  /* §8.3-over-§8.7 key 7: host's host-paced TCP audio port */
     /* active-slots-out (§6.3, key 4): the output slots the host wants, in
      * request order. Parsed into a local array first; an absent or empty key
      * defaults to the stereo main mix {0,1} (the P2.1 byte-identical path). */
@@ -773,6 +774,8 @@ static void handle_audio_start(device *d, const harp_env *e) {
                     if (!harp_cdec_uint(&b, &rtp_port)) break;
                 } else if (key == 2) { /* §8.7: RTP prefill-burst depth, frames */
                     if (!harp_cdec_uint(&b, &prebuf)) break;
+                } else if (key == 7) { /* §8.3-over-§8.7: host-paced TCP audio port */
+                    if (!harp_cdec_uint(&b, &hp_port)) break;
                 } else if (!harp_cdec_skip(&b))
                     break;
             }
@@ -804,14 +807,24 @@ static void handle_audio_start(device *d, const harp_env *e) {
         send_error(d, e->rid, e->method, "unsupported", "RTP audio is free-running only");
         return;
     }
+    /* §8.3-over-§8.7: a host-paced TCP audio port (key 7) is the deterministic
+     * offline-bounce channel — mode MUST be host-paced (1), and it is mutually
+     * exclusive with RTP (key 6 is the free-running plane). */
+    if (hp_port && (mode != 1 || rtp_port)) {
+        send_error(d, e->rid, e->method, "unsupported",
+                   "host-paced TCP audio requires clock mode 1 and no RTP port");
+        return;
+    }
     int fd = -1, out_fd = -1;
 #ifdef __linux__
-    if (!rtp_port) { /* USB transport: the FFS audio endpoints */
+    if (!rtp_port && !hp_port) { /* USB transport: the FFS audio endpoints */
         fd = harp_ffs_audio_in_fd();
         out_fd = harp_ffs_audio_out_fd();
     }
 #endif
-    if (!rtp_port && (fd < 0 || (mode == 1 && out_fd < 0))) {
+    /* host-paced TCP (hp_port) sets fd/out_fd on the audio thread after the
+     * connect-back, so it bypasses the USB-endpoint requirement too. */
+    if (!rtp_port && !hp_port && (fd < 0 || (mode == 1 && out_fd < 0))) {
         send_error(d, e->rid, e->method, "unsupported",
                    "HARP stream requires the USB transport");
         return;
@@ -834,6 +847,11 @@ static void handle_audio_start(device *d, const harp_env *e) {
     d->audio.fd = fd;
     d->audio.out_fd = out_fd;
     d->audio.rtp_fd = rtp_fd;   /* >=0 only for RTP; USB stays <0 => emit is a no-op */
+    /* §8.3-over-§8.7: the audio thread connect()s back and points fd+out_fd at
+     * this socket when host_paced_port > 0 (off the session thread — see device.h).
+     * 0 for USB/RTP, so audio_thread takes the unchanged path there. */
+    d->audio.host_paced_port = (int)hp_port;
+    d->audio.host_paced_sock = -1;
     if (rtp_fd >= 0) {          /* fresh RTP stream identity */
         d->audio.rtp_ssrc = 0x48415250u; /* "HARP" */
         d->audio.rtp_seq = 0;

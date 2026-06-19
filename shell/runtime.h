@@ -161,6 +161,13 @@ public:
     bool start(uint32_t sampleRate);
     void stop();
     bool connected() const { return connected_.load(std::memory_order_acquire); }
+    /* §8.3-over-§8.7: the shell calls this from its offline-render hook (VST3
+     * processMode==kOffline, CLAP CLAP_RENDER_OFFLINE, AU OfflineRender) BEFORE the
+     * session starts. On an Ethernet binding it selects HOST-PACED (deterministic
+     * offline bounce over TCP) instead of free-running RTP; on USB it's a no-op
+     * (always host-paced). Read once when selectDevice builds the transport; a
+     * mid-stream toggle needs a session re-dial (v1 fixes the mode at connect). */
+    void setOffline(bool o) { wantHostPaced_.store(o, std::memory_order_relaxed); }
     /* Count of COMPLETED P5b audio re-negotiations this runtime has performed
      * (a late/removed sink changed the union -> the feeder re-streamed it). 0 on
      * the single-instance / owner-only / no-sink path, which never re-negotiates.
@@ -567,6 +574,10 @@ private:
                                 * read off the RT path): false on USB, so every existing
                                 * host-paced line is reached identically. The Ethernet
                                 * steps gate the free-running branches on this bool. */
+    std::atomic<bool> wantHostPaced_{false}; /* §8.3-over-§8.7: the DAW is rendering OFFLINE,
+                                * so select host-paced (deterministic TCP) for an Ethernet
+                                * binding instead of free-running RTP. Set by setOffline()
+                                * from the shell's offline hook; read in selectDevice. */
     bool deviceRateLock_ = false; /* §8.7: device advertised "audio.rate-lock" (it honors
                                    * audio.trim). Captured in helloAndIdentity. */
     bool bitExact_ = true; /* §8.7 clock mode (set at sessionUp): a free-running device that

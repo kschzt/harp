@@ -69,6 +69,14 @@ struct ShellTransport {
     }
     virtual int      audioPort() const { return 0; }
     virtual unsigned silentMs() const { return 0; }
+
+    /* §8.3-over-§8.7 host-paced (deterministic offline bounce): the host's TCP
+     * audio-listen port (audio.start key 7) that the device connect()s back to.
+     * Non-zero ONLY for a host-paced EthTransport (isFreeRunning()==false AND an
+     * Ethernet binding); 0 on USB (host-paced over FFS endpoints, no key 7) and on
+     * a free-running EthTransport. When non-zero, audioStart emits key 7 and NOT
+     * key 6, and audioRead/audioWrite carry the host-paced frames over TCP. */
+    virtual int      audioPort7() const { return 0; }
 };
 
 #endif /* HARP_SHELL_TRANSPORT_H */

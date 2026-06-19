@@ -151,6 +151,10 @@ public:
          * inactive (no runtime yet) for a fresh instance; if a runtime is
          * already acquired (a re-setup) and we own it, configure it now too. */
         if (runtime() && owner()) runtime()->configure(rate_, maxBlock_);
+        /* §8.3-over-§8.7: tell the runtime BEFORE the session starts whether this is
+         * an offline bounce, so an Ethernet binding negotiates host-paced
+         * (deterministic) instead of free-running RTP. No-op on USB. */
+        if (runtime()) runtime()->setOffline(offline_);
         return AudioEffect::setupProcessing(setup);
     }
 
@@ -189,6 +193,10 @@ public:
                  * in ownerSource_ (its channel is set inside start() from
                  * HARP_CHANNEL — byte-identical single-instance path). */
                 runtime()->configure(rate_, maxBlock_);
+                /* §8.3-over-§8.7: apply the offline flag captured at setupProcessing
+                 * (which runs before the runtime is acquired) BEFORE start(), so
+                 * selectDevice negotiates host-paced for an Ethernet offline bounce. */
+                runtime()->setOffline(offline_);
                 if (!pendingState_.empty())
                     runtime()->setStateBundle(pendingState_.data(), pendingState_.size());
                 runtime()->start(rate_);

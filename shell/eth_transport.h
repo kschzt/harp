@@ -36,6 +36,7 @@ extern "C" {
 #else
 #  include <arpa/inet.h>
 #  include <netinet/in.h>
+#  include <netinet/tcp.h> /* TCP_NODELAY for the host-paced audio socket */
 #  include <poll.h>
 #  include <sys/socket.h>
 #  include <unistd.h>
@@ -44,31 +45,58 @@ extern "C" {
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex> /* one-shot accept of the device's host-paced connect-back */
 #include <string>
+
+/* Suppress SIGPIPE on a send to a peer that closed: MSG_NOSIGNAL on Linux,
+ * SO_NOSIGPIPE on the accepted socket on macOS/BSD. A plugin must never take a
+ * signal from a dead device. */
+#ifdef MSG_NOSIGNAL
+#  define HARP_ETH_SENDFLAGS MSG_NOSIGNAL
+#else
+#  define HARP_ETH_SENDFLAGS 0
+#endif
 
 #include "harp/plat.h" /* monotonic clock for silentMs liveness */
 
 struct EthTransport final : ShellTransport {
-    /* Dial HOST:PORT (TCP ctl) and bind an ephemeral UDP port for the RTP audio.
+    /* Dial HOST:PORT (TCP ctl). The AUDIO plane depends on the mode:
+     *  - free-running (live, hostPaced=false): bind an ephemeral UDP port for the
+     *    RTP audio (the low-latency, non-deterministic bit-exact playback path).
+     *  - host-paced (offline bounce, hostPaced=true): LISTEN on an ephemeral TCP
+     *    port for the device's connect-back (audio.start key 7), and run NO RTP —
+     *    the device renders exact SSI ranges on demand over TCP (deterministic).
      * Returns nullptr on any failure (a plugin must reconnect, never die). */
-    static EthTransport *dial(const char *hostport) {
+    static EthTransport *dial(const char *hostport, bool hostPaced) {
         harp_sockhandle ctl = harp_sock_dial(hostport);
         if (ctl == HARP_SOCK_INVALID) return nullptr;
-        harp_sockhandle rx = ::socket(AF_INET, SOCK_DGRAM, 0);
-        if (rx == HARP_SOCK_INVALID) { harp_sock_close(ctl); return nullptr; }
         struct sockaddr_in a = {};
         a.sin_family = AF_INET;
         a.sin_addr.s_addr = htonl(INADDR_ANY);
         a.sin_port = 0; /* ephemeral */
+        socklen_t al = sizeof a;
+        if (hostPaced) {
+            harp_sockhandle ls = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (ls == HARP_SOCK_INVALID) { harp_sock_close(ctl); return nullptr; }
+            if (::bind(ls, (struct sockaddr *)&a, (socklen_t)sizeof a) != 0 ||
+                ::listen(ls, 1) != 0) {
+                harp_sock_close(ls); harp_sock_close(ctl); return nullptr;
+            }
+            int port = (::getsockname(ls, (struct sockaddr *)&a, &al) == 0) ? ntohs(a.sin_port) : 0;
+            return new EthTransport(ctl, HARP_SOCK_INVALID, 0, true, ls, port);
+        }
+        harp_sockhandle rx = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (rx == HARP_SOCK_INVALID) { harp_sock_close(ctl); return nullptr; }
         if (::bind(rx, (struct sockaddr *)&a, (socklen_t)sizeof a) != 0) {
             harp_sock_close(rx); harp_sock_close(ctl); return nullptr;
         }
-        socklen_t al = sizeof a;
         int port = (::getsockname(rx, (struct sockaddr *)&a, &al) == 0) ? ntohs(a.sin_port) : 0;
-        return new EthTransport(ctl, rx, port);
+        return new EthTransport(ctl, rx, port, false, HARP_SOCK_INVALID, 0);
     }
 
     ~EthTransport() override {
+        if (audioSock_ != HARP_SOCK_INVALID) harp_sock_close(audioSock_);
+        if (audioListen_ != HARP_SOCK_INVALID) harp_sock_close(audioListen_);
         if (rxsock_ != HARP_SOCK_INVALID) harp_sock_close(rxsock_);
         harp_sock_close(ctl_.s);
     }
@@ -81,10 +109,35 @@ struct EthTransport final : ShellTransport {
     bool linkPoll(unsigned ms) override { return readable(ctl_.s, (int)ms); }
     size_t linkPending() override { return readable(ctl_.s, 0) ? 1 : 0; }
 
-    /* ---- audio: free-running (RTP), not the host-paced endpoint ---- */
+    /* ---- audio ----
+     * free-running: RTP (recvAudio); audioRead/audioWrite stay no-op stubs exactly
+     *   as before, so the proven 127 dB live path is untouched.
+     * host-paced: the SAME raw harp_audio frames the USB FFS endpoints carry, over
+     *   the accepted TCP audio socket — so the runtime's host-paced feeder + reader
+     *   tail + pullAudioBlocking run verbatim (only the byte carrier changed). */
     bool hasAudio() override { return true; }
-    int audioRead(void *, int, unsigned) override { return 0; }  /* N/A: audio is RTP */
-    bool audioWrite(const void *, int, unsigned) override { return true; } /* no pacing writes */
+    int audioRead(void *buf, int len, unsigned ms) override {
+        if (!hostPaced_) return 0; /* free-running: audio is RTP (recvAudio), not this */
+        if (!ensureAudioAccepted(ms)) return 0; /* device not connected yet => no data (not dead) */
+        if (!readable(audioSock_, (int)ms)) return 0; /* timeout, no data */
+        int n = (int)::recv(audioSock_, (char *)buf, len, 0);
+        if (n <= 0) return -1; /* 0 = peer closed, <0 = error => device gone */
+        lastArr_.store(harp_now_ns(), std::memory_order_relaxed);
+        return n;
+    }
+    bool audioWrite(const void *buf, int len, unsigned ms) override {
+        if (!hostPaced_) return true; /* free-running: no pacing writes */
+        if (!ensureAudioAccepted(ms)) return false; /* not connected yet; feeder retries */
+        const char *p = (const char *)buf;
+        int left = len;
+        while (left > 0) {
+            int n = (int)::send(audioSock_, p, left, HARP_ETH_SENDFLAGS);
+            if (n <= 0) return false;
+            p += n;
+            left -= n;
+        }
+        return true;
+    }
 
     bool identity(harp_usb_devinfo *out) override {
         if (!out) return false;
@@ -93,8 +146,9 @@ struct EthTransport final : ShellTransport {
         snprintf(out->serial, sizeof out->serial, "eth:%s:%d", peer_.c_str(), rxport_);
         return true;
     }
-    bool isFreeRunning() const override { return true; }
-    int  audioPort() const override { return rxport_; } /* audio.start key 6 */
+    bool isFreeRunning() const override { return !hostPaced_; }
+    int  audioPort() const override { return rxport_; }        /* audio.start key 6 (RTP) */
+    int  audioPort7() const override { return audioListenPort_; } /* key 7 (host-paced TCP) */
 
     /* Reader thread: receive ONE RTP packet's slot-interleaved samples into `out`
      * (up to maxFloats), waiting up to timeout_ms. Returns FLOATS received (0 = none
@@ -126,7 +180,10 @@ struct EthTransport final : ShellTransport {
     }
 
 private:
-    EthTransport(harp_sockhandle ctl, harp_sockhandle rx, int port) : rxsock_(rx), rxport_(port) {
+    EthTransport(harp_sockhandle ctl, harp_sockhandle rx, int port,
+                 bool hostPaced, harp_sockhandle alisten, int aport)
+        : rxsock_(rx), rxport_(port), hostPaced_(hostPaced),
+          audioListen_(alisten), audioListenPort_(aport) {
         harp_sock_io_init(&ctl_, ctl);
         struct sockaddr_in pa = {};
         socklen_t pl = sizeof pa;
@@ -134,6 +191,28 @@ private:
             char b[64];
             if (inet_ntop(AF_INET, &pa.sin_addr, b, sizeof b)) peer_ = b;
         }
+    }
+
+    /* host-paced only: accept the device's ONE connect-back into audioSock_, once.
+     * Idempotent + thread-safe — the sessionUp drain (supervisor thread) normally
+     * wins the accept before the reader/feeder spawn, but the mutex covers the case
+     * where a slow connect leaves it to the reader/feeder. Returns true once the
+     * audio socket is live. TCP_NODELAY + (BSD/macOS) SO_NOSIGPIPE on the accepted fd. */
+    bool ensureAudioAccepted(unsigned ms) {
+        if (audioSock_ != HARP_SOCK_INVALID) return true;
+        std::lock_guard<std::mutex> lk(acceptMu_);
+        if (audioSock_ != HARP_SOCK_INVALID) return true;       /* another thread won */
+        if (audioListen_ == HARP_SOCK_INVALID) return false;
+        if (!readable(audioListen_, (int)ms)) return false;     /* device not connected yet */
+        harp_sockhandle s = ::accept(audioListen_, nullptr, nullptr);
+        if (s == HARP_SOCK_INVALID) return false;
+        int one = 1;
+        ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+#ifdef SO_NOSIGPIPE
+        ::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&one, sizeof one);
+#endif
+        audioSock_ = s;
+        return true;
     }
 
     /* one-fd readability poll, portable across POSIX poll() and Winsock WSAPoll() */
@@ -155,6 +234,14 @@ private:
     int             rxport_ = 0;
     std::string     peer_;
     std::atomic<unsigned long long> lastArr_{0};
+    /* §8.3-over-§8.7 host-paced: live ONLY when hostPaced_. audioListen_ is the
+     * ephemeral TCP listener (key 7) the device dials back; audioSock_ is the one
+     * accepted connection carrying H->D pacing + D->H rendered frames. */
+    bool            hostPaced_ = false;
+    harp_sockhandle audioListen_ = HARP_SOCK_INVALID;
+    int             audioListenPort_ = 0;
+    harp_sockhandle audioSock_ = HARP_SOCK_INVALID;
+    std::mutex      acceptMu_;
     /* one RTP datagram: the widest union is nsamples(256) x 34 slots x 4B ≈ 34 KB,
      * so 64 KB covers it (incl. the RTP header) with margin. Reader-thread only. */
     uint8_t rxpkt_[65536];

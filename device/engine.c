@@ -807,9 +807,14 @@ static void host_paced_loop(device *d) {
          * names how many evt messages must be consumed before its range may
          * render; ordering becomes structural instead of probabilistic.
          * The wait is wire+parse time of in-flight events (typically µs,
-         * absorbed by the host's ring cushion); the 5 ms bound keeps a
-         * stalled host from wedging the stream — a timeout means a possibly
-         * late event, and evt_late tells the truth about that. */
+         * absorbed by the host's ring cushion). It is UNBOUNDED (a true barrier):
+         * host-paced delivery is DETERMINISTIC — a faster-than-real-time offline
+         * pull (the §8.3-over-§8.7 bounce) outruns the events, and a timed-out
+         * fence would render before the event landed, making the bounce non-
+         * deterministic run-to-run. Over USB the events always keep up so this
+         * never waits long (the golden is unaffected). A genuinely stalled/dead
+         * host is caught by a->running going false (session teardown closes the
+         * link → the loop's reads return), so this can't wedge forever. */
         if (h.dirflags & HARP_AUDIO_FENCE) {
             uint8_t fb[HARP_AUDIO_FENCE_LEN];
             size_t fgot = 0;
@@ -832,18 +837,18 @@ static void host_paced_loop(device *d) {
             if ((int32_t)(want - atomic_load_explicit(&g_evt_consumed,
                                                       memory_order_acquire)) > 0) {
                 CTR_INC(g_fence_waits);
-                int spins = 0;
                 struct timespec fts = {0, 50000}; /* 50 µs */
+                /* unbounded barrier (see above): wait for the fenced events or for
+                 * the session to stop — never a fixed timeout that would race. */
                 while ((int32_t)(want - atomic_load_explicit(
                                             &g_evt_consumed,
                                             memory_order_acquire)) > 0 &&
-                       spins++ < 100 &&
                        atomic_load_explicit(&a->running, memory_order_relaxed))
                     nanosleep(&fts, NULL);
                 if ((int32_t)(want - atomic_load_explicit(
                                          &g_evt_consumed,
                                          memory_order_acquire)) > 0)
-                    CTR_INC(g_fence_timeouts);
+                    CTR_INC(g_fence_timeouts); /* aborted via stop with events pending */
             }
         }
         /* discard any input payload (this engine has no input channels) */
@@ -881,6 +886,24 @@ static void host_paced_loop(device *d) {
 void *audio_thread(void *arg) {
     device *d = arg;
     audio_state *a = &d->audio;
+    /* §8.3-over-§8.7: host-paced deterministic render over TCP (offline bounce).
+     * Connect back to the host's audio-listen port (key 7) HERE, on the audio
+     * thread — NOT in handle_audio_start, which advances the §8.3.1 event fence on
+     * the session thread (a blocking connect there deadlocks: the host accepts only
+     * at its post-audioStart drain, which waits for the audio.start response, which
+     * waits for handle_audio_start to return). connect() is a cancellation point,
+     * so audio_stop's pthread_cancel still tears this down cleanly. */
+    if (a->host_paced_port > 0) {
+        int s = audio_open_tcp_paced(d->rtp_peer_ip, a->host_paced_port);
+        if (s < 0) {
+            fprintf(stderr, "harp-deviced: host-paced TCP connect-back to :%d failed\n",
+                    a->host_paced_port);
+            return NULL;
+        }
+        a->host_paced_sock = s;
+        a->fd = s;     /* D->H rendered frames */
+        a->out_fd = s; /* H->D pacing frames   */
+    }
     fprintf(stderr, "harp-deviced: audio thread up: mode=%u fd=%d out_fd=%d\n", a->mode,
             a->fd, a->out_fd);
     if (a->mode == 1) {
@@ -1503,6 +1526,11 @@ void audio_stop(device *d) {
     pthread_join(d->audio.thread, NULL);
     atomic_store_explicit(&d->audio.thread_live, false, memory_order_relaxed);
     audio_rtp_close(&d->audio); /* §8.7: thread joined -> the RTP dest outlives no sender */
+    if (d->audio.host_paced_sock >= 0) { /* §8.3-over-§8.7: same, for the TCP host-paced channel */
+        close(d->audio.host_paced_sock);
+        d->audio.host_paced_sock = -1;
+    }
+    d->audio.host_paced_port = 0;
     /* render thread is joined: the pool is quiescent, so free every voice
      * directly (never let a note outlive its stream). Also clear any pending
      * panic signal so it cannot leak into the next stream. */
