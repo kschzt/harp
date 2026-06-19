@@ -43,14 +43,21 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <windows.h>
+#  include <sys/stat.h>
+#  ifndef S_ISDIR /* MSVC <sys/stat.h> has _S_IFDIR/_S_IFMT but not the POSIX macro */
+#    define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#  endif
 static void *harp_dlopen(const char *p) { return (void *)LoadLibraryA(p); }
 static void *harp_dlsym(void *h, const char *s) { return (void *)GetProcAddress((HMODULE)h, s); }
 static const char *harp_dlerror(void) { return "LoadLibrary/GetProcAddress failed"; }
+static void harp_dlclose(void *h) { FreeLibrary((HMODULE)h); }
+static int setenv(const char *n, const char *v, int overwrite) { (void)overwrite; return _putenv_s(n, v); }
 #else
 #  include <dlfcn.h>
 static void *harp_dlopen(const char *p) { return dlopen(p, RTLD_NOW | RTLD_LOCAL); }
 static void *harp_dlsym(void *h, const char *s) { return dlsym(h, s); }
 static const char *harp_dlerror(void) { return dlerror(); }
+static void harp_dlclose(void *h) { dlclose(h); }
 #endif
 
 static void die(const std::string &m) {
@@ -368,7 +375,7 @@ int main(int argc, char **argv) {
     plugin->deactivate(plugin);
     plugin->destroy(plugin);
     entry->deinit();
-    dlclose(dso);
+    harp_dlclose(dso);
 
     double rms = 0;
     for (float v : capture) rms += (double)v * v;
