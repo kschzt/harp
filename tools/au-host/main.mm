@@ -350,7 +350,14 @@ int main(int argc, char **argv) {
     capture.reserve(total * 2);
     std::vector<float> bufL(block), bufR(block);
 
-    AudioBufferList abl;
+    /* AudioBufferList declares mBuffers as a flexible array [1], so a bare
+     * `AudioBufferList abl` reserves room for ONE buffer only. Writing mBuffers[1]
+     * for stereo overran the stack struct and clobbered the adjacent `capture`
+     * vector's header — a layout-dependent corruption that surfaced as
+     * std::length_error in capture.push_back on the CI runner (benign locally).
+     * Back it with storage sized for two buffers. */
+    uint8_t ablStorage[sizeof(AudioBufferList) + sizeof(AudioBuffer)] = {};
+    AudioBufferList &abl = *reinterpret_cast<AudioBufferList *>(ablStorage);
     abl.mNumberBuffers = 2;
     abl.mBuffers[0] = {1, (UInt32)(block * sizeof(float)), bufL.data()};
     abl.mBuffers[1] = {1, (UInt32)(block * sizeof(float)), bufR.data()};
