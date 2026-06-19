@@ -41,10 +41,26 @@ jobs:
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
           cmake --build build-vst --target harp-vst3-host harp-shell -j
-      - name: recall round-trip under ASan
+      - name: host + shell soak under ASan (save/load/play, host stderr VISIBLE)
+        run: |
+          ./build/harp-deviced --port 47951 --state-dir /tmp/asan-h-state >/tmp/asan-h-dev.log 2>&1 &
+          DP=$!; trap 'kill -9 $DP 2>/dev/null || true' EXIT
+          for _ in $(seq 1 25); do grep -q "listening on 47951" /tmp/asan-h-dev.log && break; sleep 0.2; done
+          PLUG="$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d | head -1)"
+          echo "── save-state (the recall save render — host/shell ASan stderr is NOT swallowed here):"
+          HARP_ETH_DEVICE=127.0.0.1:47951 ./build-vst/harp-vst3-host "$PLUG" \
+            --set 3=0.81 --set 7=0.31 --set 1=0.61 --seconds 0.6 --save-state /tmp/asan-h.state
+          echo "── load-state + golden notes:"
+          HARP_ETH_DEVICE=127.0.0.1:47951 ./build-vst/harp-vst3-host "$PLUG" \
+            --load-state /tmp/asan-h.state --notes 62,69,74,65 --seconds 4
+          grep -iE "ERROR: AddressSanitizer|runtime error:|SUMMARY: (Address|Undefined)" /tmp/asan-h-dev.log \
+            && { echo "::error::daemon ASan/UBSan finding"; exit 1; } || echo "host + daemon clean over save/load/play"
+      - name: recall round-trip under ASan (device coverage; exit non-fatal — ASan slows realtime timing)
         run: |
           scripts/recall-eth-test.sh \
-            || { echo "=== device log (ASan/UBSan report?) ==="; tail -60 /tmp/recall-eth-dev.log; exit 1; }
+            || echo "recall-eth non-pass under ASan (timing-sensitive; the soak above is the host/shell oracle)"
+          grep -iE "ERROR: AddressSanitizer|runtime error:|SUMMARY: (Address|Undefined)" /tmp/recall-eth-dev.log \
+            && { echo "::error::recall-eth daemon ASan/UBSan finding"; exit 1; } || echo "recall-eth daemon clean"
       - name: sustained play soak under ASan (RTP plane + engine + repeated meter-pump start/stop)
         run: |
           ./build/harp-deviced --port 47950 --state-dir /tmp/asan-soak-state >/tmp/asan-soak-dev.log 2>&1 &
