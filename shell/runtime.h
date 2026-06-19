@@ -377,6 +377,49 @@ private:
      * ppm-limited trim takes seconds to fill from empty (startup silence). */
     static constexpr uint32_t kEthTargetFrames = 2048;
 
+    /* §8.7 latency knobs (measurement / clean-direct-link low-latency mode). The
+     * default 2048-frame setpoint + 256-frame packet is the consumer-LAN-safe pair
+     * (proven 127 dB). On a clean cable HARP_ETH_TARGET dials the buffer down toward
+     * the DAW-block floor and HARP_ETH_NSAMPLES shrinks the device RTP packet. The
+     * SAME ethTargetFrames() value flows to BOTH the trim setpoint (runtime.cpp) and
+     * the audio.start key-2 prefill, so the device prefills to exactly the setpoint
+     * (no startup transient the loop must chase). The fractional-error trim makes the
+     * loop critically/well damped at ANY target with NO retuning (see feeder()). */
+    uint32_t ethTargetFrames() const {
+        uint32_t t = kEthTargetFrames;
+        if (const char *e = getenv("HARP_ETH_TARGET")) {
+            int v = atoi(e);
+            /* env range: floor 64, ceil 12288. The ceil keeps the audioRing_
+             * (16384-frame) elastic buffer below its silent write-cap with headroom
+             * for jitter excursions and prefill. */
+            if (v >= 64 && v <= 12288) t = (uint32_t)v;
+        }
+        /* UNDERRUN-SAFE FLOOR: the setpoint must clear two DAW pull-blocks, or a
+         * single pull can drain the buffer below empty between fills (the steady
+         * loop holds it AT target; one pull then dips it by a block — with target
+         * < 2·block that dip underruns regardless of how well-damped the loop is).
+         * This is the SAME 2·maxDawBlock cushion the USB path uses (targetFramesFor).
+         * So the loop is target-invariant down to a few hundred frames, but the
+         * REACHABLE floor is bounded by the consumer's block, not by loop gain. */
+        uint32_t floor_ = 2u * maxDawBlock_;
+        return t > floor_ ? t : floor_;
+    }
+    static uint32_t ethNsamples() {
+        uint32_t n = kBlock;
+        if (const char *e = getenv("HARP_ETH_NSAMPLES")) {
+            int v = atoi(e);
+            /* [32, kBlock]: this knob only LOWERS the packet to cut latency. The
+             * device validates up to AUDIO_MAX_NSAMPLES(1024), but the reader's RTP
+             * buffers are sized kRtpBufFloats = kBlock·34 (the widest per-part union),
+             * so a packet larger than kBlock frames would truncate on a wide union and
+             * corrupt the demux. Capping at kBlock keeps every union width within the
+             * buffer with zero overflow, and a bigger packet would only raise latency
+             * anyway (the opposite of this knob's purpose). */
+            if (v >= 32 && v <= (int)kBlock) n = (uint32_t)v;
+        }
+        return n;
+    }
+
     /* Ring target depth in frames for a given DAW block — the single source
      * of the cushion math (incl. the HARP_CUSHION_BLOCKS override) shared by
      * configure() and the static latencyFor(). */

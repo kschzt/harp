@@ -71,6 +71,44 @@ else
     bad "bit-exact: conn=$conn rms=${rms:-none} (want connected + rms>0.30)"
 fi
 
+# ── small-target loop stability (target-invariant rate loop) ─────────────────────
+# The §8.7 trim loop normalizes the fill error by the LIVE target AND scales the EMA
+# with the loop bandwidth, so its DAMPING (not just gain) is target-invariant: the same
+# well-damped loop holds at the 2048 consumer-LAN default AND at a much smaller buffer
+# on a clean link. Here we drop the setpoint 4x to 512 frames (~10.6 ms — the floor the
+# direct-cable sweep reached) and require the loop to stay AS CLEAN AS the 2048 baseline:
+# connected, tone rms holds, and underruns DON'T meaningfully grow. The old fixed-Kp loop
+# hunted on its clamp rail below 512 frames (it underran CONTINUOUSLY — hundreds over 8 s);
+# the normalized loop tracks the baseline within a handful.
+#   WHY 512 AND NOT LOWER — and why this is a STABILITY guard, not a latency proof: CI
+#   runs over localhost LOOPBACK, not a cable. A sub-512 buffer (< ~11 ms) cannot absorb
+#   localhost scheduling jitter — macOS's relative-nanosleep device sim alone throws ~500
+#   false underruns at target=256 — so smaller targets are NOT honestly testable here. The
+#   real sub-10 ms / sub-512 latency (127 dB, 0 glitch) is validated on the Mac<->kria
+#   DIRECT CABLE, not in CI.
+# --block 256 => the 2*maxDawBlock underrun-safe floor is exactly 512, so the request
+# lands at 512 (not silently floored higher); HARP_ETH_NSAMPLES=128 = a smaller RTP packet.
+base_under="${under:-0}"   # the 2048-default underruns from the bit-exact section above
+echo "──── small-target stability: HARP_ETH_TARGET=512 (~10.6 ms, 4x below default; baseline underruns=$base_under)"
+start_dev --tone 440
+out=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" HARP_ETH_TARGET=512 HARP_ETH_NSAMPLES=128 \
+      "$HOSTBIN" "$PLUG" --seconds 8 --realtime --block 256 --json 2>/tmp/eth-small.err || true)
+rms=$(printf '%s' "$out" | sed -nE 's/.*"rms":([0-9.]+).*/\1/p')
+conn=$(grep -c 'connected:' /tmp/eth-small.err 2>/dev/null || true)
+under=$(grep -oE 'underruns: [0-9]+' /tmp/eth-small.err 2>/dev/null | grep -oE '[0-9]+' | tail -1)
+stop_dev
+echo "   target=512 nsamples=128  rms=${rms:-?}  underruns=${under:-?} (baseline $base_under)  conn=${conn:-0}"
+# Gate on the DELTA vs the 2048 baseline (robust: loopback jitter hits both runs, and a
+# 10.6 ms buffer legitimately absorbs a little less than 43 ms — so allow +64). A hunting
+# loop underruns continuously (hundreds-to-thousands at block 256 over 8 s), far past +64.
+if [ "${conn:-0}" -gt 0 ] && [ -n "$rms" ] \
+   && [ "$(python3 -c "print(1 if $rms > 0.30 else 0)")" = 1 ] \
+   && [ "$(python3 -c "print(1 if ${under:-99999} <= ${base_under:-0} + 64 else 0)")" = 1 ]; then
+    ok "small-target (512/128): loop stable at 4x-smaller buffer (rms $rms, underruns ${under} vs baseline $base_under)"
+else
+    bad "small-target (512/128): conn=$conn rms=${rms:-none} underruns=${under:-?} vs baseline $base_under (want connected + rms>0.30 + underruns<=baseline+64)"
+fi
+
 # ── ASRC fallback: a non-rate-lock device → host resamples to its own clock ───────
 # --no-rate-lock drops the audio.rate-lock capability from hello, so the host CANNOT
 # host-lock (no audio.trim) and must take the §8.7 ASRC path (host/freerun): recover

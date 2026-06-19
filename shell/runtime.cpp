@@ -120,9 +120,9 @@ bool HarpRuntime::audioStart(uint32_t rate) {
         harp_cbor_uint(&req, 0);
         harp_cbor_uint(&req, rate);
         harp_cbor_uint(&req, 1);
-        harp_cbor_uint(&req, kBlock);
+        harp_cbor_uint(&req, ethNsamples()); /* device RTP packet (HARP_ETH_NSAMPLES; default kBlock=256) */
         harp_cbor_uint(&req, 2);
-        harp_cbor_uint(&req, kEthTargetFrames); /* prefill-burst depth (avoids startup silence) */
+        harp_cbor_uint(&req, ethTargetFrames()); /* prefill-burst depth = trim setpoint (avoids startup silence) */
         harp_cbor_uint(&req, 4); /* active-slots-out union (main + per-part pairs) */
         harp_cbor_array(&req, unionSlots_.size());
         for (uint32_t slot : unionSlots_) harp_cbor_uint(&req, slot);
@@ -1256,10 +1256,38 @@ void HarpRuntime::feeder() {
             uint64_t nowNs = harp_now_ns();
             if (nowNs - ethLastTrimNs >= 50000000ull) {
                 ethLastTrimNs = nowNs;
+                const double target = (double)ethTargetFrames();
                 unsigned fill = (unsigned)(audioRing_.readAvailable() / 2); /* the reader fills this */
+                /* EMA-smooth the fill measurement. alpha SCALES with the loop bandwidth
+                 * so the smoother's pole stays a fixed ratio above the (target-dependent)
+                 * crossover ω_c = rate·1e-9·K/target — keeping the PHASE MARGIN, hence the
+                 * DAMPING, target-invariant too. (The gain normalization below makes only
+                 * the clamp-rail band + steady-state offset invariant; a FIXED alpha would
+                 * let the EMA lag erode phase margin as ω_c rises at small targets — the
+                 * loop rings just below ~256 frames.) At target=2048 alpha=0.03 EXACTLY
+                 * (byte-identical to the proven loop); clamped to [0.03, 0.5] so a large-
+                 * block default stays at the proven 0.03 and the tiniest buffer never
+                 * chases raw measurement jitter. */
+                double alpha = 0.03 * 2048.0 / target;
+                if (alpha < 0.03) alpha = 0.03;
+                else if (alpha > 0.5) alpha = 0.5;
                 if (!ethPrimed) { ethSmFill = fill; ethPrimed = true; }
-                else ethSmFill += 0.03 * ((double)fill - ethSmFill);
-                double trim = -2000.0 * (ethSmFill - (double)kEthTargetFrames);
+                else ethSmFill += alpha * ((double)fill - ethSmFill);
+                /* TARGET-INVARIANT proportional trim on the FRACTIONAL fill error.
+                 * The buffer is a pure integrator, so a single gain on the error is
+                 * first-order => unconditionally stable. The old loop used an ABSOLUTE
+                 * error with a fixed Kp=2000 ppb/frame: its ±200000-ppb clamp railed at
+                 * a fixed ±100 frames of error — 4.9% of a 2048 buffer (linear, proven
+                 * 127 dB) but ±39% of a 256 buffer, so a small target spent its time on
+                 * the rail and hunted. Normalizing by the live target makes the rail
+                 * band a CONSTANT 4.9% of the buffer at EVERY setpoint: the loop stays
+                 * linear (no retune) from 2048 down to a few hundred frames. The closed-
+                 * loop time constant τ = target/(rate·1e-9·K) shrinks with target, so a
+                 * small buffer self-corrects faster — exactly what a tight buffer needs.
+                 * K = 2000·2048 = 4.096e6 reproduces Kp_eff = K/target = 2000 EXACTLY at
+                 * target=2048, i.e. the default path is byte-for-byte the proven loop. */
+                static constexpr double kEthNormGain = 2000.0 * 2048.0; /* ppb per unit fractional error */
+                double trim = -kEthNormGain * ((ethSmFill - target) / target);
                 if (trim > 200000.0) trim = 200000.0;
                 else if (trim < -200000.0) trim = -200000.0;
                 harp_cbuf tm;
@@ -1633,8 +1661,8 @@ void HarpRuntime::reader() {
             cfg.channels = width;
             cfg.host_rate_hz = (double)rate_;
             cfg.dev_rate_hz = (double)rate_; /* nominal seed; recovered from RTP timestamps */
-            cfg.target_frames = kEthTargetFrames;
-            cfg.capacity_frames = kEthTargetFrames * 4;
+            cfg.target_frames = ethTargetFrames();
+            cfg.capacity_frames = ethTargetFrames() * 4;
             cfg.quality = SRC_SINC_FASTEST; /* still exceeds the §8.3 stopband floor */
             harp_freerun *fr = harp_freerun_new(&cfg);
             if (!fr) {
@@ -1644,7 +1672,7 @@ void HarpRuntime::reader() {
             }
             uint64_t prevTs = 0;
             float resamp[kRtpBufFloats];
-            const unsigned target = kEthTargetFrames; /* keep audioRing_ near here */
+            const unsigned target = ethTargetFrames(); /* keep audioRing_ near here */
             while (running_.load(std::memory_order_relaxed) &&
                    !readerStop_.load(std::memory_order_acquire)) {
 #ifdef __APPLE__
