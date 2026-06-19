@@ -51,9 +51,21 @@ jobs:
         run: scripts/eth-tests.sh
       - name: recall round-trip + §11.4 archive over the loopback
         run: scripts/recall-eth-test.sh
-      # cross-format VST3<->AU recall over the loopback is verified LOCALLY (XFORMAT PASS)
-      # and on the desk rig, but the freshly-installed ad-hoc-signed AU won't instantiate
-      # on an ephemeral hosted-macOS runner (au-host "device busy" = the AU never loaded).
-      # Bringing it up in CI needs the AudioComponent registration/validation sorted out
-      # first; tracked as a follow-up so main stays green. cross-format-recall-test.sh
-      # already honors HARP_ETH_DEVICE, so re-enabling here is a one-step change.
+      - name: cross-format VST3<->AU recall over the loopback (macOS — AU is macOS-only)
+        if: runner.os == 'macOS'
+        run: |
+          cmake --build build-vst --target install-au
+          # A freshly-installed component is invisible until the AudioComponent registrar
+          # re-scans; au-host's AudioComponentFindNext then returns null ("AU not found",
+          # which cross-format misreports as "device busy"). Force a scan.
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          auval -a >/dev/null 2>&1 || true
+          PLUG="$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d | head -1)"
+          ./build/harp-deviced --port 47903 --state-dir /tmp/xf-eth-state >/tmp/xf-eth-dev.log 2>&1 &
+          DP=$!; trap 'kill -9 $DP 2>/dev/null || true' EXIT
+          for _ in $(seq 1 25); do grep -q "listening on 47903" /tmp/xf-eth-dev.log && break; sleep 0.2; done
+          echo "── is our AU registered? (auval -a | grep rfdv/HARP):"
+          auval -a 2>/dev/null | grep -iE "rfdv|HARP" || echo "   NOT listed by auval -a"
+          echo "── au-host load check (visible stderr — 'AU not found' vs 'saved to'):"
+          HARP_ETH_DEVICE=127.0.0.1:47903 ./build-vst/au-host --save-state /tmp/auprobe.state 2>&1 | head -8 || true
+          PLUG="$PLUG" HARP_ETH_DEVICE=127.0.0.1:47903 scripts/cross-format-recall-test.sh
