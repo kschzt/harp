@@ -397,6 +397,22 @@ public:
             }
         }
 
+        /* §15.5 offline editing: on the device (re)connect EDGE, replay the host's current
+         * device-param values so any edit made while the device was ABSENT reaches it — the
+         * per-param analogue of sessionUp re-asserting the bundle ("Live wins"). curVal_ is
+         * recorded by the apply loop below regardless of connection, and the replay lands
+         * AFTER sessionUp has drained the stale event ring (connected_ flips true only then),
+         * so these sets are not discarded. */
+        if (!curValInit_) {
+            for (size_t i = 0; i < kNumParams; i++) curVal_[i] = kParams[i].defaultVal;
+            curValInit_ = true;
+        }
+        bool nowConn = rt.connected();
+        if (nowConn && !wasConnected_)
+            for (size_t i = 0; i < kNumParams; i++)
+                rt.queueParamSet(source_, (uint32_t)i + 1, curVal_[i], 0);
+        wasConnected_ = nowConn;
+
         /* parameter changes -> timestamped sets; consecutive points become
          * §9.4 ramps — a DAW curve as a handful of ramps (§9.1). Thinned to
          * one emission per param per 256 samples: at 64-sample buffers a
@@ -490,6 +506,7 @@ public:
                         rt.queueParamSet(source_, id, (float)v, ts);
                         continue;
                     }
+                    curVal_[idx] = (float)v; /* §15.5: track current value for reconnect replay (offline edits too) */
                     if (hasLast_[idx] && ts > lastTs_[idx] && ts - lastTs_[idx] < 256) {
                         pendHas_[idx] = true; /* too soon: fold into next ramp */
                         pendTs_[idx] = ts;
@@ -768,6 +785,14 @@ private:
     bool pendHas_[kNumParams] = {};
     uint64_t pendTs_[kNumParams] = {};
     float pendVal_[kNumParams] = {};
+    /* §15.5 offline editing: the current value of each device param, recorded by the apply
+     * loop whether or not a device is connected. On the (re)connect EDGE the process loop
+     * replays these so an edit made while the device was ABSENT reaches it — the host's live
+     * state winning, "a mismatch resolved by Push" (§11.4). Seeded to the device defaults so
+     * an unedited param re-asserts its true value (idempotent). */
+    float curVal_[kNumParams];
+    bool curValInit_ = false;
+    bool wasConnected_ = false;
 
 
 };

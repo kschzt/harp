@@ -428,6 +428,11 @@ int main(int argc, char **argv) {
     std::string input_kind = "silence", out_path, save_state_path, load_state_path;
     double sine_hz = 440.0;
     std::vector<std::pair<uint32_t, double>> sets;
+    /* §15.5 offline-edit hook: --set-at SEC:ID=V applies a param mid-render (vs --set at
+     * t=0), so a param can be edited AFTER a mid-render device disconnect and we can prove
+     * the edit reaches the device on reattach. */
+    struct SetAt { double sec; uint32_t id; double v; };
+    std::vector<SetAt> setAts;
     std::vector<int> notes;    /* played sequentially at note_period spacing */
     std::vector<int> chord;    /* held from 0.1 s to the end (arp fodder) */
     /* --brightness V: §9.4 per-voice demo. Sends a VST3 Brightness Note
@@ -601,6 +606,15 @@ int main(int argc, char **argv) {
             if (eq == std::string::npos) die("--set wants ID=VALUE");
             sets.push_back({(uint32_t)strtoul(kv.substr(0, eq).c_str(), nullptr, 0),
                             atof(kv.substr(eq + 1).c_str())});
+        } else if (a == "--set-at") { /* SEC:ID=V — apply a param mid-render (§15.5 offline edit) */
+            std::string kv = next();
+            auto colon = kv.find(':');
+            auto eq = kv.find('=');
+            if (colon == std::string::npos || eq == std::string::npos || eq < colon)
+                die("--set-at wants SEC:ID=VALUE");
+            setAts.push_back({atof(kv.substr(0, colon).c_str()),
+                              (uint32_t)strtoul(kv.substr(colon + 1, eq - colon - 1).c_str(), nullptr, 0),
+                              atof(kv.substr(eq + 1).c_str())});
         } else if (a == "--lfo") { /* ID=HZ[:POINTS_PER_BLOCK[:SHAPE]] */
             std::string kv = next();
             LfoSpec l{};
@@ -934,6 +948,15 @@ int main(int argc, char **argv) {
                 if (q) q->addPoint(0, kv.second, pidx);
             }
             first_block = false;
+        }
+        for (auto &sa : setAts) { /* §15.5: sample-accurate param edit mid-render (e.g. while the device is unplugged) */
+            size_t at = (size_t)(sa.sec * rate);
+            if (at >= done && at < done + n) {
+                int32 qidx = 0;
+                auto *q = pc.addParameterData(sa.id, qidx);
+                int32 pidx = 0;
+                if (q) q->addPoint((int32)(at - done), sa.v, pidx);
+            }
         }
         pd.inputParameterChanges = &pc;
         ParameterChanges opc; /* plugin-originated changes (e.g. HARP echo) */
