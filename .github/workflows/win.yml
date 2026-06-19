@@ -1,14 +1,11 @@
 name: win
 
-# §8.7 Windows first-class end-to-end: a NATIVE MSVC build of the localhost
-# fake-hardware stack (harp-deviced + the shell/host) running the deterministic
-# offline-golden bounce over TCP — the Windows analogue of eth.yml. Built up
-# incrementally so main stays green: this first lands the device build under MSVC,
-# then adds the host shells (libusb-win) and the e2e steps.
-#
-# windows-2022 (not -latest) for the "Visual Studio 17 2022" generator, matching
-# ci.yml's shell-windows job (windows-latest rolled to a VS the generator can't find).
-# push+dispatch only for now (no pull_request) while the port iterates to green.
+# §8.7 Windows first-class end-to-end. The fake-hardware device daemon is a NATIVE
+# MinGW build (it's gnu11 + winpthreads + winsock, not MSVC); the shell/plugin and
+# the test host are the MSVC target (VST3 SDK). Both run on one windows-2022 runner
+# and talk over localhost TCP — the Windows analogue of eth.yml. The device daemon
+# is statically linked so it runs in Git Bash (outside the MSYS2 shell), beside the
+# MSVC host. push+dispatch only while the e2e iterates to green.
 on:
   push:
     branches: [main]
@@ -19,7 +16,56 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: build the fake-hardware device (harp-deviced, MSVC)
+
+      # ---- device: native MinGW (gnu11/winpthreads/winsock), statically linked ----
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
+      - name: build harp-deviced (MinGW, static)
+        shell: msys2 {0}
         run: |
-          cmake -B build -G "Visual Studio 17 2022" -A x64
-          cmake --build build --config RelWithDebInfo --target harp-deviced
+          cmake -B build-dev -G Ninja -DHARP_FUZZ=OFF \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc"
+          cmake --build build-dev --target harp-deviced
+          ./build-dev/harp-deviced.exe --bogus 2>&1 | head -3 || true   # smoke: it starts
+
+      # ---- shell + host + clap host: MSVC (mirrors ci.yml's shell-windows) ----
+      - name: clone VST3 SDK
+        run: git clone --depth 1 --recursive
+             https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
+      - name: clone CLAP SDK (header-only)
+        run: git clone --depth 1 --branch 1.2.8
+             https://github.com/free-audio/clap.git external/clap
+      - name: fetch libusb (prebuilt MSVC binaries)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ver = '1.0.27'
+          Invoke-WebRequest -UseBasicParsing `
+            "https://github.com/libusb/libusb/releases/download/v$ver/libusb-$ver.7z" `
+            -OutFile libusb.7z
+          New-Item -ItemType Directory -Force external/libusb-win | Out-Null
+          7z x libusb.7z -oexternal/libusb-win -y
+      - name: build shell + hosts (MSVC)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake -B build-vst -S tools/vst3-host -G "Visual Studio 17 2022" -A x64
+          cmake --build build-vst --config Release `
+            --target harp-vst3-host harp-shell harp-clap clap-host
+
+      # ---- e2e: deterministic offline-golden bounce, device(MinGW) <-> host(MSVC) ----
+      - name: offline golden (deterministic host-paced bounce over §8.7)
+        shell: bash
+        run: |
+          export DEVICED="build-dev/harp-deviced.exe"
+          export VHOST="$(find build-vst -name 'harp-vst3-host.exe' | head -1)"
+          export CHOST="$(find build-vst -name 'clap-host.exe' | head -1)"
+          echo "device=$DEVICED  vhost=$VHOST  chost=$CHOST"
+          scripts/offline-golden-eth.sh

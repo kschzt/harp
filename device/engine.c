@@ -8,15 +8,11 @@
  */
 #include <errno.h>
 #include <math.h>
-#if !defined(_WIN32) || defined(__MINGW32__)
-#include <pthread.h> /* MSVC: the pthread surface comes via device.h's shim */
-#endif
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#if !defined(_WIN32) || defined(__MINGW32__)
 #include <unistd.h>
-#endif
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
 #    define WIN32_LEAN_AND_MEAN

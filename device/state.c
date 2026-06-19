@@ -6,9 +6,7 @@
  * snapshot capture (§11.2), and the refset closure walk (§11.3).
  */
 #include <assert.h>
-#if !defined(_WIN32) || defined(__MINGW32__)
-#include <pthread.h> /* MSVC: the pthread surface comes via device.h's shim */
-#endif
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
