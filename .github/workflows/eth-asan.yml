@@ -1,0 +1,63 @@
+name: eth-asan
+
+# The §8.7 loopback under AddressSanitizer + UBSan on Linux x86_64 — the daemon's
+# first-ever sanitizer coverage (its state store, bundle codec, RTP/engine, the meter
+# pump start/stop). Linux-only on purpose: macOS/arm64e ASan mis-instruments the
+# pthread create/join interceptors under pointer-authentication (a false SEGV in the
+# join wrapper that does NOT reproduce without ASan), so the local Mac run isn't a
+# valid oracle. This job IS the oracle: a real memory/UB bug in the daemon will fire
+# here (and would crash without ASan too); a clean green confirms the Mac SEGV was the
+# tooling artifact. Manual for now; promote to scheduled once it's reliably green.
+on:
+  workflow_dispatch:
+
+jobs:
+  asan:
+    runs-on: ubuntu-latest
+    env:
+      ASAN_OPTIONS: detect_leaks=0:print_stacktrace=1:abort_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: clone VST3 SDK
+        run: git clone --depth 1 --recursive
+             https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
+      - name: clone CLAP SDK (header-only)
+        run: git clone --depth 1 --branch 1.2.8
+             https://github.com/free-audio/clap.git external/clap
+      - name: install deps (libusb + libsamplerate)
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libsamplerate0-dev
+      - name: build harp-deviced + harp-probe (ASan + UBSan)
+        run: |
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build --target harp-deviced harp-probe -j
+      - name: build the shell + host (ASan + UBSan)
+        run: |
+          cmake -B build-vst -S tools/vst3-host -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build-vst --target harp-vst3-host harp-shell -j
+      - name: recall round-trip under ASan (the exact flow that SEGV'd on macOS — the oracle)
+        run: |
+          scripts/recall-eth-test.sh \
+            || { echo "=== device log (ASan/UBSan report?) ==="; tail -60 /tmp/recall-eth-dev.log; exit 1; }
+      - name: sustained play soak under ASan (RTP plane + engine + repeated meter-pump start/stop)
+        run: |
+          ./build/harp-deviced --port 47950 --state-dir /tmp/asan-soak-state >/tmp/asan-soak-dev.log 2>&1 &
+          DP=$!; trap 'kill -9 $DP 2>/dev/null || true' EXIT
+          for _ in $(seq 1 25); do grep -q "listening on 47950" /tmp/asan-soak-dev.log && break; sleep 0.2; done
+          PLUG="$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d | head -1)"
+          for i in 1 2 3 4; do
+            echo "── soak cycle $i (notes + 8s play -> engine + meter-pump start/stop)"
+            HARP_ETH_DEVICE=127.0.0.1:47950 ./build-vst/harp-vst3-host "$PLUG" \
+              --notes 60,64,67,72 --seconds 8 --realtime || true
+          done
+          echo "── device-side ASan/UBSan reports over the soak:"
+          if grep -iE "ERROR: AddressSanitizer|runtime error:|SUMMARY: (Address|Undefined)" /tmp/asan-soak-dev.log; then
+            echo "::error::ASan/UBSan found issues in the daemon during the soak"; exit 1
+          fi
+          echo "daemon ASan/UBSan-clean across the soak"
