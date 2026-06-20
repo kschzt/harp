@@ -773,8 +773,22 @@ static uint16_t render_output(audio_state *a, float *out, uint32_t n, float rate
  * rejects read()/write() — route through recv()/send(). On POSIX read()/harp_write_all
  * work on both the TCP socket and the FunctionFS endpoint fd, so they stay verbatim. */
 #ifdef _WIN32
-static ssize_t hp_read(int fd, void *buf, size_t n) {
-    return recv((SOCKET)fd, (char *)buf, (int)(n > 0x7fffffff ? 0x7fffffff : n), 0);
+/* The pacing recv carries a SO_RCVTIMEO (set at connect-back) so it returns periodically
+ * even with no data: a stop (audio.running=false) then unwinds the loop within one tick.
+ * This is the ONLY reliable wakeup on Windows — a blocking Winsock recv pending in the
+ * audio thread is NOT interruptible from audio_stop's thread by pthread_cancel OR by
+ * shutdown()/closesocket() (they leave the recv parked until the peer closes), so the
+ * thread must poll its own running flag. While streaming, a timeout just means "no pacing
+ * yet" — retry; the host paces continuously so this never spuriously ends a live stream. */
+static ssize_t hp_read(audio_state *a, void *buf, size_t n) {
+    for (;;) {
+        int r = recv((SOCKET)a->out_fd, (char *)buf, (int)(n > 0x7fffffff ? 0x7fffffff : n), 0);
+        if (r >= 0) return r;
+        if (WSAGetLastError() == WSAETIMEDOUT &&
+            atomic_load_explicit(&a->running, memory_order_relaxed))
+            continue; /* poll tick, still streaming */
+        return -1; /* real error, or a stop (running=false) — unwind host_paced_loop */
+    }
 }
 static bool hp_write_all(int fd, const void *buf, size_t n) {
     const char *p = (const char *)buf;
@@ -787,7 +801,7 @@ static bool hp_write_all(int fd, const void *buf, size_t n) {
     return true;
 }
 #else
-#define hp_read(fd, buf, n)      read((fd), (buf), (n))
+#define hp_read(a, buf, n)       read((a)->out_fd, (buf), (n))
 #define hp_write_all(fd, buf, n) harp_write_all((fd), (buf), (n))
 #endif
 
@@ -820,7 +834,7 @@ static void host_paced_loop(device *d) {
                 got += take;
                 continue;
             }
-            ssize_t r = hp_read(a->out_fd, rbuf, sizeof rbuf);
+            ssize_t r = hp_read(a, rbuf, sizeof rbuf);
             if (r <= 0) { /* endpoint died or stop */
 #ifdef _WIN32
                 int werr = WSAGetLastError(); /* capture BEFORE any other socket call clobbers it */
@@ -875,7 +889,7 @@ static void host_paced_loop(device *d) {
                     fgot += take;
                     continue;
                 }
-                ssize_t r = hp_read(a->out_fd, rbuf, sizeof rbuf);
+                ssize_t r = hp_read(a, rbuf, sizeof rbuf);
                 if (r <= 0) return;
                 rlen = (size_t)r;
                 rpos = 0;
@@ -909,7 +923,7 @@ static void host_paced_loop(device *d) {
                 skip -= take;
                 continue;
             }
-            ssize_t r = hp_read(a->out_fd, rbuf, sizeof rbuf);
+            ssize_t r = hp_read(a, rbuf, sizeof rbuf);
             if (r <= 0) return;
             rlen = (size_t)r;
             rpos = 0;
@@ -967,6 +981,10 @@ void *audio_thread(void *arg) {
         a->fd = s;     /* D->H rendered frames */
         a->out_fd = s; /* H->D pacing frames   */
 #ifdef _WIN32
+        /* SO_RCVTIMEO so the pacing recv self-terminates on stop (see hp_read): a
+         * blocking Winsock recv pending here cannot be woken from audio_stop's thread
+         * by pthread_cancel or shutdown()/closesocket, so it must poll a->running. */
+        { DWORD tmo = 200; setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof tmo); }
         { struct sockaddr_in la = {0}, pa = {0}; int ll = sizeof la, pl = sizeof pa;
           getsockname(s, (struct sockaddr *)&la, &ll); getpeername(s, (struct sockaddr *)&pa, &pl);
           int soe = 0, sl = sizeof soe; getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&soe, &sl);
