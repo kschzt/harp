@@ -1185,26 +1185,7 @@ void HarpRuntime::syncSinkEpoch(AudioSink &sink) {
         sink.epochSeen = ep;
         sink.padDebt = 0;
         sink.ring.clear();
-        /* enter PRIMING: the respawned reader has not written this sink's first
-         * real wide-union frame yet (it lands hundreds of ms after this epoch bump).
-         * Forgive the gap silence — pad without accruing debt — until the ring first
-         * delivers, so a single-shot padDebt=0 here can't be undone by a runaway debt
-         * re-accrued across that gap. See accrueSinkPadDebt + the AudioSink comment. */
-        sink.priming = true;
     }
-}
-
-/* Per-sink underrun accounting, shared by both sink pulls (RT pullAudio + offline
- * pullAudioBlocking). While PRIMING (just (re)negotiated, reader not yet delivering),
- * an empty-ring pull is FORGIVEN: pad silence but accrue NO debt — those SSI positions
- * are not owed real frames, the new union's frames are fresh content. The first pull
- * that reads real data clears priming; thereafter a genuine mid-stream underrun accrues
- * debt normally (a late arrival for a spent position is still dropped). `got` is the
- * floats actually read this pull; `deficit` is want-got. */
-void HarpRuntime::accrueSinkPadDebt(AudioSink &sink, size_t got, size_t deficit) {
-    if (got > 0) sink.priming = false; /* real audio flowing => normal semantics resume */
-    if (sink.priming) return;          /* gap silence forgiven (no runaway debt) */
-    sink.padDebt += deficit;
 }
 
 size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
@@ -1247,7 +1228,7 @@ size_t HarpRuntime::pullAudio(AudioSink *sink, float *dst, size_t nFrames) {
     size_t got = sink->ring.read(dst, want);
     if (got < want) {
         memset(dst + got, 0, (want - got) * sizeof(float));
-        accrueSinkPadDebt(*sink, got, want - got); /* forgive gap silence while priming */
+        sink->padDebt += want - got;
         if (connected_.load(std::memory_order_acquire)) {
             underruns_.fetch_add(1, std::memory_order_relaxed);
             padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
@@ -1327,7 +1308,7 @@ size_t HarpRuntime::pullAudioBlocking(AudioSink *sink, float *dst, size_t nFrame
         }
         if ((!flipping && !connected_.load(std::memory_order_acquire)) || waited >= timeoutMs) {
             memset(dst + got, 0, (want - got) * sizeof(float));
-            accrueSinkPadDebt(*sink, got, want - got); /* forgive gap silence while priming */
+            sink->padDebt += want - got;
             underruns_.fetch_add(1, std::memory_order_relaxed);
             padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
             return (want - got) / 2;
