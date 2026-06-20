@@ -18,6 +18,8 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <winsock2.h> /* the host-paced pacing channel is a Winsock SOCKET (recv/send) */
+#else
+#  include <sys/socket.h> /* shutdown()/SHUT_RDWR to wake the parked host-paced recv on stop */
 #endif
 
 #include "device.h"
@@ -1589,10 +1591,22 @@ void audio_stop(device *d) {
     fprintf(stderr, "harp-deviced: audio_stop ENTER (thread_live=1) — tearing down host-paced stream\n");
 #endif
     d->audio.running = false;
-    /* The thread may be parked in a blocking endpoint read (mode 1 pacing,
-     * or a stalled write); read/write are cancellation points, and the loop
-     * holds no resources that outlive it. A production device would use AIO
-     * with a wakeup — for the refdev, cancel is honest and simple. */
+    /* The audio thread may be parked in a blocking endpoint read (mode 1 pacing).
+     * On POSIX, recv()/read() are pthread cancellation points, so pthread_cancel
+     * interrupts the park and the loop unwinds. On Windows/winpthreads a blocking
+     * Winsock recv() is NOT a cancellation point — pthread_cancel does not wake it,
+     * so the join below would hang FOREVER on the §8.3-over-§8.7 host-paced TCP
+     * channel (and the host, blocked in audio.stop's request/response, never gets a
+     * reply -> the offline bounce hangs until its watchdog). So for the host-paced
+     * socket we SHUTDOWN it first: that forces the parked recv to return, the loop
+     * sees running==false and exits, and the join completes. Harmless on POSIX
+     * (the cancel still does the work; shutdown just races it to the same wakeup). */
+    if (d->audio.host_paced_sock >= 0)
+#ifdef _WIN32
+        shutdown(d->audio.host_paced_sock, SD_BOTH);
+#else
+        shutdown(d->audio.host_paced_sock, SHUT_RDWR);
+#endif
     pthread_cancel(d->audio.thread);
     pthread_join(d->audio.thread, NULL);
     atomic_store_explicit(&d->audio.thread_live, false, memory_order_relaxed);
