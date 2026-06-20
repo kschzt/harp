@@ -810,8 +810,11 @@ static void host_paced_loop(device *d) {
       for (int i = 0; i < 5; i++) {
           WSAPOLLFD p; p.fd = a->out_fd; p.events = POLLRDNORM; p.revents = 0;
           int r = WSAPoll(&p, 1, 100);
+          u_long avail = 0; ioctlsocket(a->out_fd, FIONREAD, &avail); /* bytes ACTUALLY in the recv buffer */
           int soe = 0, sl = sizeof soe; getsockopt(a->out_fd, SOL_SOCKET, SO_ERROR, (char *)&soe, &sl);
-          fprintf(stderr, "harp-deviced: poll[%d] WSAPoll=%d revents=0x%x SO_ERROR=%d\n", i, r, p.revents, soe);
+          fprintf(stderr, "harp-deviced: poll[%d] WSAPoll=%d revents=0x%x FIONREAD=%lu SO_ERROR=%d\n",
+                  i, r, p.revents, avail, soe);
+          Sleep(50);
       } }
 #endif
 
