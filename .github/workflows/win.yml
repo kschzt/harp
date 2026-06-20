@@ -80,3 +80,17 @@ jobs:
           export HOSTBIN="$(find build-vst -name 'harp-vst3-host.exe' | head -1)"
           echo "device=$DEVICED  host=$HOSTBIN"
           scripts/eth-tests.sh
+
+      # ---- §8.7 fault-injection against the MinGW device: the host survives a mid-session
+      #      disconnect/reconnect, RTP/UDP packet loss, and corrupt device->host CBOR.
+      #      The Windows analogue of the eth.yml fault-injection steps (the device port's
+      #      newest path); each script bounds itself with a perl-alarm watchdog. ----
+      - name: eth fault-injection (reconnect + RTP loss + corrupt CBOR over §8.7)
+        shell: bash
+        run: |
+          export DEVICED="build-dev/harp-deviced.exe"
+          export HOSTBIN="$(find build-vst -name 'harp-vst3-host.exe' | head -1)"
+          echo "device=$DEVICED  host=$HOSTBIN"
+          scripts/reconnect-eth-test.sh
+          scripts/rtp-loss-eth-test.sh
+          scripts/corrupt-cbor-eth-test.sh

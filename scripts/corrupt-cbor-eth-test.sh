@@ -16,7 +16,7 @@ HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$(find build-vst build-asan build -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
 PORT="${PORT:-47975}"
 CORRUPT="${CORRUPT:-8}"
-DEVDIR=/tmp/corrupt-eth-state
+DEVDIR=corrupt-eth-state   # workspace-RELATIVE (Git Bash /tmp->C:\ trips the device mkdir; see eth-tests.sh)
 DEVLOG=/tmp/corrupt-eth-dev.log
 HOSTLOG=/tmp/corrupt-eth-host.log
 fail() { echo "CORRUPT-CBOR FAIL: $1"; exit 1; }
@@ -46,4 +46,9 @@ grep -iE "AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:|heap-buffer
 [ "$rc" -eq 142 ] && fail "host HUNG on corrupt CBOR (perl-alarm watchdog fired)"
 [ "$rc" -eq 139 ] && fail "host SEGV on corrupt CBOR (exit 139)"
 [ "$rc" -eq 134 ] && fail "host aborted on corrupt CBOR (exit 134)"
+# Catch-all (also covers Windows, where a crash is not 139/134 but some other code): a
+# survival run renders its --seconds and exits 0; ANY non-zero exit is abnormal. The host
+# must also have connected at least once (it decoded device-trusted bytes — the real test).
+[ "$rc" -ne 0 ] && fail "host exited abnormally (rc=$rc) decoding corrupt CBOR"
+[ "$conn" -ge 1 ] || fail "host never connected — corruption blocked the session (no decode exercised)"
 echo "CORRUPT-CBOR PASS (host survived ~${CORRUPT}% framed-CBOR corruption: exit rc=$rc, $conn connect(s), no crash/UB/hang)"

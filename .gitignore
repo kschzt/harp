@@ -7,3 +7,10 @@ external/
 build-vst/
 build-*/
 __pycache__/
+# workspace-relative state dirs the §8.7 loopback test scripts create (Git Bash can't
+# path-convert an absolute /tmp dir for the device's mkdir — see eth-tests.sh)
+eth-dev-state/
+ogeth-*/
+reconnect-eth-state/
+rtploss-eth-state/
+corrupt-eth-state/
