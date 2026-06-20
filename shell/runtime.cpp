@@ -32,6 +32,50 @@ static void log_msg(const char *fmt, ...) {
     va_end(ap);
 }
 
+/* §14.4 host-context-B: record a §12.1 state-machine transition into the
+ * SessionHistory ring (control-path). Stamps wall-clock epoch + the current
+ * stream MSC; copies a bounded `detail`. NOT on the audio path — see the ring's
+ * thread-safety note. */
+void HarpRuntime::recordTransition(uint8_t from, uint8_t to, uint8_t reason,
+                                   const char *detail) {
+    StateTransition t;
+    t.tstamp_epoch = (uint64_t)time(nullptr);
+    t.tstamp_msc = ssiRead_.load(std::memory_order_relaxed); /* stream-domain "now", 0 pre-stream */
+    t.from_state = from;
+    t.to_state = to;
+    t.reason_code = reason;
+    if (detail && detail[0]) {
+        size_t n = strlen(detail);
+        if (n >= sizeof t.detail) n = sizeof t.detail - 1;
+        memcpy(t.detail, detail, n);
+        t.detail[n] = '\0';
+    }
+    sessionHistory_.record(t);
+}
+
+/* §14.4 host-context-B: push a runtime log into the lock-free RuntimeLog ring.
+ * WAIT-FREE — safe from any thread incl. audio. The stderr copy stays with
+ * log_msg at the call site; this is the machine-readable copy for the bundle. */
+void HarpRuntime::recordLog(uint8_t level, const char *tag, const char *msg) {
+    LogRecord r;
+    r.msc = ssiRead_.load(std::memory_order_relaxed);
+    r.tstamp_epoch = (uint64_t)time(nullptr);
+    r.level = level;
+    if (tag && tag[0]) {
+        size_t n = strlen(tag);
+        if (n >= sizeof r.tag) n = sizeof r.tag - 1;
+        memcpy(r.tag, tag, n);
+        r.tag[n] = '\0';
+    }
+    if (msg && msg[0]) {
+        size_t n = strlen(msg);
+        if (n >= sizeof r.msg) n = sizeof r.msg - 1;
+        memcpy(r.msg, msg, n);
+        r.msg[n] = '\0';
+    }
+    runtimeLog_.push(r);
+}
+
 void HarpRuntime::defaultStoreDir(char *out, size_t n) {
 #ifdef _WIN32
     /* %LOCALAPPDATA%\HARP\store. Forward slashes for the parts we append so the
@@ -316,6 +360,11 @@ void HarpRuntime::audioRenegotiateLocked() {
      * arrive. Draining with no concurrent reader is what makes audio.start reliable
      * under the instrumented host (the device's session loop is never write-blocked). */
     audioStopLocked();
+    /* §12.1: intra-STREAMING re-negotiation — record the audio.stop leg (the
+     * temporary stop) keeping the STREAMING state; the audio.start leg below
+     * pairs with it. Control-path (feeder thread, under ctlMutex_). */
+    recordTransition(HARP_ST_STREAMING, HARP_ST_STREAMING, HARP_TR_AUDIO_STOP,
+                     "re-negotiation: audio.stop");
     if (transport_) {
         uint8_t junk[16384];
         int quiet = 0;
@@ -341,10 +390,17 @@ void HarpRuntime::audioRenegotiateLocked() {
 
     if (!ok) {
         log_msg("re-negotiation: audio.start failed (sink reads silence until it recovers)");
+        recordTransition(HARP_ST_STREAMING, HARP_ST_STREAMING, HARP_TR_AUDIO_START,
+                         "re-negotiation: audio.start failed");
+        recordLog(HARP_LOG_WARN, "reneg", "re-negotiation: audio.start failed");
     } else {
         renegCount_.fetch_add(1, std::memory_order_release);
         log_msg("re-negotiated audio stream: %zu union slot(s) now streamed",
                 unionSlots_.size());
+        char d[96];
+        snprintf(d, sizeof d, "re-negotiated: %zu union slot(s) streamed", unionSlots_.size());
+        recordTransition(HARP_ST_STREAMING, HARP_ST_STREAMING, HARP_TR_AUDIO_START, d);
+        recordLog(HARP_LOG_INFO, "reneg", d);
     }
 }
 
@@ -1049,6 +1105,15 @@ bool HarpRuntime::sessionUp() {
         log_msg("connected: %s %s (serial %s, engine %s %s)", vendorName_.c_str(),
                 productName_.c_str(), serial_.c_str(), engineId_.c_str(),
                 engineVer_.c_str());
+        /* §12.1: hello-ok — the device identified, the session is ATTACHED. */
+        {
+            char d[256];
+            snprintf(d, sizeof d, "%s %s (serial %s, engine %s %s)", vendorName_.c_str(),
+                     productName_.c_str(), serial_.c_str(), engineId_.c_str(),
+                     engineVer_.c_str());
+            recordTransition(HARP_ST_DETACHED, HARP_ST_ATTACHED, HARP_TR_HELLO_OK, d);
+            recordLog(HARP_LOG_INFO, "session", d);
+        }
         /* §8.7 clock mode (auto-select): a free-running (Ethernet/RTP) device that
          * advertises audio.rate-lock honors our audio.trim, so the feeder closes the
          * rate loop and pullAudio plays 1:1 = bit-exact. One that does NOT must be
@@ -1069,18 +1134,30 @@ bool HarpRuntime::sessionUp() {
             target = bundleTarget_;
         }
         if (haveBundle) {
-            if (pushStateLocked(target))
+            if (pushStateLocked(target)) {
                 log_msg("project state re-asserted");
-            else
+                recordLog(HARP_LOG_INFO, "recall", "project state re-asserted");
+            } else {
                 log_msg("project state apply failed (will retry on reconnect)");
+                recordLog(HARP_LOG_WARN, "recall",
+                          "project state apply failed (will retry on reconnect)");
+            }
         }
         if (!audioStart(rate_)) {
             log_msg("audio.start failed");
+            /* §12.1: ATTACHED but the stream never came up -> back to DETACHED. */
+            recordTransition(HARP_ST_ATTACHED, HARP_ST_DETACHED, HARP_TR_AUDIO_START,
+                             "audio.start failed");
+            recordLog(HARP_LOG_ERROR, "audio.start", "audio.start failed");
             harp_client_free(&client_);
             delete transport_;
             transport_ = nullptr;
             return false;
         }
+        /* §12.1: audio.start accepted -> SYNCED (stream negotiated, clock locked). */
+        recordTransition(HARP_ST_ATTACHED, HARP_ST_SYNCED, HARP_TR_AUDIO_START,
+                         bitExact_ ? "audio.start ok (bit-exact)" : "audio.start ok (ASRC)");
+        recordLog(HARP_LOG_INFO, "audio.start", "audio stream negotiated");
         /* §14.3 LoopbackMeasurer SAFETY (review MINOR). A prior probe that crashed /
          * was killed mid-measurement (or a device that survived a host restart) could
          * leave the device's loopback_on engaged — it would then keep overwriting the
@@ -1155,6 +1232,10 @@ bool HarpRuntime::sessionUp() {
      * thread (which touches only audioRing_) clear of transport_ teardown. */
     readerThread_ = std::thread([this] { reader(); });
     eventPumpThread_ = std::thread([this] { eventPump(); });
+    /* §12.1: reader + event pump are live, connected_ is true -> STREAMING. */
+    recordTransition(HARP_ST_SYNCED, HARP_ST_STREAMING, HARP_TR_AUDIO_START,
+                     "reader + event pump up; streaming");
+    recordLog(HARP_LOG_INFO, "session", "streaming");
     return true;
 }
 
@@ -1162,6 +1243,13 @@ bool HarpRuntime::sessionUp() {
  * is still talking to us, release the claim. Safe on a dead transport. */
 void HarpRuntime::sessionDown() {
     bool wasConnected = connected_.exchange(false, std::memory_order_acq_rel);
+    /* §12.1: orderly detach. Record the transition off the audio path (this runs
+     * on the supervisor thread). A device-gone teardown reaches here too, but the
+     * transport-error transition was already filed by the reader (below) — this
+     * detach record marks the lifecycle close either way. */
+    if (wasConnected)
+        recordTransition(HARP_ST_STREAMING, HARP_ST_DETACHED, HARP_TR_DETACH,
+                         "session torn down");
     /* QUIESCE the reader before joining it. On a mid-stream live<->offline flip the
      * transport is STILL ALIVE, so the free-running reader's recvAudio keeps returning
      * data and its loop (running_ && !readerStop_) never exits on its own — connected_
@@ -2286,6 +2374,12 @@ void HarpRuntime::reader() {
                     demuxUnionFrame(buf, floats / width, (uint16_t)width);
                 else if (floats == 0 && transport_->silentMs() > 1000) {
                     log_msg("RTP stream silent >1s; device gone?");
+                    /* §12.1: implicit STREAMING -> DETACHED (transport-error). On
+                     * the reader thread; the rings are reader-safe (history mutex,
+                     * lock-free log) and off the render path. */
+                    recordTransition(HARP_ST_STREAMING, HARP_ST_DETACHED,
+                                     HARP_TR_TRANSPORT_ERROR, "RTP stream silent >1s");
+                    recordLog(HARP_LOG_ERROR, "transport", "RTP stream silent >1s; device gone?");
                     connected_.store(false, std::memory_order_release);
                     break;
                 }
@@ -2344,6 +2438,10 @@ void HarpRuntime::reader() {
                     }
                 } else if (floats == 0 && transport_->silentMs() > 1000) {
                     log_msg("RTP stream silent >1s; device gone?");
+                    /* §12.1: implicit STREAMING -> DETACHED (transport-error), ASRC path. */
+                    recordTransition(HARP_ST_STREAMING, HARP_ST_DETACHED,
+                                     HARP_TR_TRANSPORT_ERROR, "RTP stream silent >1s (ASRC)");
+                    recordLog(HARP_LOG_ERROR, "transport", "RTP stream silent >1s; device gone?");
                     connected_.store(false, std::memory_order_release);
                     break;
                 }
@@ -2369,6 +2467,10 @@ void HarpRuntime::reader() {
         int r = transport_->audioRead(acc + accLen, (int)(sizeof acc - accLen), 100);
         if (r < 0) {
             log_msg("audio stream read failed; device gone?");
+            /* §12.1: implicit STREAMING -> DETACHED (transport-error), USB path. */
+            recordTransition(HARP_ST_STREAMING, HARP_ST_DETACHED, HARP_TR_TRANSPORT_ERROR,
+                             "audio stream read failed");
+            recordLog(HARP_LOG_ERROR, "transport", "audio stream read failed; device gone?");
             connected_.store(false, std::memory_order_release);
             break;
         }
@@ -2437,6 +2539,7 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
     if (!refsLocked(&live)) return false;
     if (!live.unborn && !live.dirty && harp_hash_eq(&live.hash, &target)) {
         log_msg("recall: hash match, clean -> SYNCED silently");
+        recordLog(HARP_LOG_INFO, "reconcile", "hash match, clean -> SYNCED silently");
         return true;
     }
     harp_hash deviceHead = live.hash;
@@ -2478,10 +2581,18 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
 
     if (choice == 1) { /* Pull to DAW: the host adopts the device state; device untouched */
         log_msg("recall: reconcile -> Pull (host adopts the device state)");
+        /* §11.4 safe action — SYNCED -> SYNCED (state class unchanged; the
+         * reconcile resolved how, not whether). */
+        recordTransition(HARP_ST_SYNCED, HARP_ST_SYNCED, HARP_TR_RECONCILE_PULL,
+                         "reconcile -> Pull (host adopts the device state)");
+        recordLog(HARP_LOG_INFO, "reconcile", "Pull (host adopts the device state)");
         return fetchClosureLocked(deviceHead);
     }
     if (choice == 2) { /* Read-only: observe, no writes either way */
         log_msg("recall: reconcile -> Read-only (no writes)");
+        recordTransition(HARP_ST_SYNCED, HARP_ST_SYNCED, HARP_TR_RECONCILE_OPEN_RO,
+                         "reconcile -> Read-only (no writes)");
+        recordLog(HARP_LOG_INFO, "reconcile", "Read-only (no writes)");
         return true;
     }
 
@@ -2489,10 +2600,20 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
      * it visibly as duplicate/<ts>, Push as archive/<ts>), push the target's closure,
      * CAS the live ref to the target. */
     const char *prefix = (choice == 3) ? "duplicate" : "archive";
-    if (choice == 3)
+    if (choice == 3) {
         log_msg("recall: reconcile -> Duplicate (displaced state kept as duplicate/<ts>)");
-    else
+        recordTransition(HARP_ST_SYNCED, HARP_ST_SYNCED, HARP_TR_RECONCILE_DUPLICATE_PUSH,
+                         "reconcile -> Duplicate (displaced state kept as duplicate/<ts>)");
+        recordLog(HARP_LOG_INFO, "reconcile",
+                  "Duplicate (displaced state kept as duplicate/<ts>)");
+    } else {
         log_msg("recall: %s -> Push (archive-then-CAS)", live.unborn ? "first push" : "reconcile");
+        recordTransition(HARP_ST_SYNCED, HARP_ST_SYNCED, HARP_TR_RECONCILE_PUSH,
+                         live.unborn ? "first push (archive-then-CAS)"
+                                     : "reconcile -> Push (archive-then-CAS)");
+        recordLog(HARP_LOG_INFO, "reconcile",
+                  live.unborn ? "first push (archive-then-CAS)" : "Push (archive-then-CAS)");
+    }
     /* The archive is loss-prevention for the interactive Push/Duplicate. Headless
      * (timeout 0) skips it: under the per-part-audio stress a per-push archive/<ts>
      * ref (5x/s across the whole cluster) is pure churn that can wedge the gadget,
@@ -2754,23 +2875,35 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
     harp_env de = {};
     bool haveDev = connected() && request(&devReq, &devRsp, &de) && de.has_body;
 
+    /* §14.4 host-context-B: snapshot the instrumentation rings under ctlMutex_
+     * (control-path read; both snapshots are non-destructive, so a later bundle
+     * re-observes the same recent window). Done BEFORE the map header so the
+     * key 6 / key 8 presence can size the definite-length map deterministically. */
+    std::vector<StateTransition> history = sessionHistory_.snapshot(kDiagHistoryMax);
+    std::vector<LogRecord> logs = runtimeLog_.snapshot(kDiagLogMax);
+
     harp_cbuf out;
     harp_cbuf_init(&out);
 
-    /* Top-level diag-bundle map. v1 fills keys 0-5 + 9; keys 6/7/8/10-13 are
-     * later sub-steps (a vN writer omits unfilled sections), and key 9 is only
-     * present when a session is up (audio-config is meaningless otherwise). The
-     * map size is declared upfront (definite length, deterministic CBOR). */
+    /* Top-level diag-bundle map. v2 fills keys 0-6, 8, 9; keys 7/10-13 are later
+     * sub-steps (a vN writer omits unfilled sections). key 9 is present only when
+     * a session is up (audio-config is meaningless otherwise); keys 6 (session-
+     * history) + 8 (runtime logs) are present only when their ring has records.
+     * The map size is declared upfront (definite length, deterministic CBOR). */
     bool haveAudio = connected_.load(std::memory_order_acquire);
-    harp_cbor_map(&out, haveAudio ? 7 : 6); /* 0,1,2,3,4,5 [+9] */
+    uint64_t nkeys = 6; /* 0,1,2,3,4,5 */
+    if (!history.empty()) nkeys++; /* key 6 */
+    if (!logs.empty()) nkeys++;    /* key 8 */
+    if (haveAudio) nkeys++;        /* key 9 */
+    harp_cbor_map(&out, nkeys);
 
     /* KEY 0: magic. */
     harp_cbor_uint(&out, 0);
     harp_cbor_text(&out, "harpd");
 
-    /* KEY 1: version. */
+    /* KEY 1: version. v2 adds session-history (key 6) + runtime logs (key 8). */
     harp_cbor_uint(&out, 1);
-    harp_cbor_uint(&out, 1);
+    harp_cbor_uint(&out, 2);
 
     /* KEY 2: bundle-meta { 0 => tstamp [epoch, msc], 1 => tool }. */
     harp_cbor_uint(&out, 2);
@@ -2823,6 +2956,56 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
     harp_cbor_uint(&out, sessionGen_.load(std::memory_order_relaxed)); /* session_generation */
     harp_cbor_uint(&out, 6);
     harp_cbor_uint(&out, renegCount_.load(std::memory_order_acquire)); /* audio_renegotiations */
+
+    /* KEY 6: session-history — the §12.1 state-machine transition ring. Each
+     * record is { 0 => [epoch, msc], 1 => from-state, 2 => to-state, 3 =>
+     * reason, ?4 => detail }. §16: with anonymize the free-text detail (key 4)
+     * is cleared to "" IN PLACE — the numeric tstamp/from/to/reason are RETAINED
+     * (reveal whether, not what). Emitted only when the ring has records. */
+    if (!history.empty()) {
+        harp_cbor_uint(&out, 6);
+        harp_cbor_array(&out, history.size());
+        for (const StateTransition &t : history) {
+            harp_cbor_map(&out, 5); /* keys 0,1,2,3,4 — detail always present (""=redacted) */
+            harp_cbor_uint(&out, 0);
+            harp_cbor_array(&out, 2);
+            harp_cbor_uint(&out, t.tstamp_epoch);
+            harp_cbor_uint(&out, t.tstamp_msc);
+            harp_cbor_uint(&out, 1);
+            harp_cbor_uint(&out, t.from_state);
+            harp_cbor_uint(&out, 2);
+            harp_cbor_uint(&out, t.to_state);
+            harp_cbor_uint(&out, 3);
+            harp_cbor_uint(&out, t.reason_code);
+            harp_cbor_uint(&out, 4);
+            harp_cbor_text(&out, anonymize ? "" : t.detail); /* §16: clear detail in place */
+        }
+    }
+
+    /* KEY 8: runtime logs — the §14.4 RuntimeLog ring. Each record is { 0 =>
+     * msc, 1 => level, 2 => tag, 3 => msg, ?4 => [epoch, msc] wall-stamp }. §16:
+     * with anonymize the free-text msg (key 3) is cleared to "" IN PLACE; the
+     * tag (key 2), level, msc and wall-stamp are RETAINED. Emitted only when the
+     * ring has records. */
+    if (!logs.empty()) {
+        harp_cbor_uint(&out, 8);
+        harp_cbor_array(&out, logs.size());
+        for (const LogRecord &l : logs) {
+            harp_cbor_map(&out, 5); /* keys 0,1,2,3,4 */
+            harp_cbor_uint(&out, 0);
+            harp_cbor_uint(&out, l.msc);
+            harp_cbor_uint(&out, 1);
+            harp_cbor_uint(&out, l.level);
+            harp_cbor_uint(&out, 2);
+            harp_cbor_text(&out, l.tag); /* §16: tag RETAINED (reveal whether, not what) */
+            harp_cbor_uint(&out, 3);
+            harp_cbor_text(&out, anonymize ? "" : l.msg); /* §16: clear msg in place */
+            harp_cbor_uint(&out, 4);
+            harp_cbor_array(&out, 2); /* tstamp [epoch, msc] (wall-clock correlation) */
+            harp_cbor_uint(&out, l.tstamp_epoch);
+            harp_cbor_uint(&out, l.msc);
+        }
+    }
 
     /* KEY 9: audio-config (host-owned DAW view; keys 0-11). Only when a session
      * is up (otherwise these read defaults that misdescribe a dead session). Key

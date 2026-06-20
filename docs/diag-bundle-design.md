@@ -52,7 +52,8 @@ The diag-bundle CDDL fills the Appendix A gap (§14.4 calls the schema normative
 
 diag-bundle = {
     0  => "harpd",               ; magic (parallels recall-bundle "harpb")
-    1  => uint,                  ; bundle schema version (this rev = 1)
+    1  => uint,                  ; bundle schema version (runtime now emits 2:
+                                 ;   + session-history(6) + logs-runtime(8))
     2  => bundle-meta,           ; [host] capture provenance (when/by-what)
     3  => bool,                  ; [host] anonymized? — true => §16 pass applied.
                                  ;   FIRST-class top-level flag so a reader knows

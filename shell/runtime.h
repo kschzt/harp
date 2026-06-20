@@ -30,6 +30,7 @@
 #include <thread>
 #include <vector>
 
+#include "diag_rings.h" /* §14.4 host-context-B: SessionHistory + RuntimeLog rings */
 #include "ring.h"
 
 /* §9.4 multitimbral event MERGE (P5). One physical HARP unit is one session
@@ -337,8 +338,11 @@ public:
      * own counters (key 5) and audio-config (key 9) on top. With anonymize=true
      * the device-section is decode-reencoded with the §16 PII leaves cleared to ""
      * (mirroring host/harp-probe.c anonymize_device_section); the host sections
-     * are numeric (no tstr leaves) so they pass through unchanged. v1 omits the
-     * later sub-step keys 6/7/8/10-13 (a vN writer omits unfilled sections).
+     * are numeric except keys 6/8 (§14.4 host-context-B): the §16 pass clears
+     * state-transition.4 (detail) + log-record.3 (msg) to "" in place, retaining
+     * tag/level/states/tstamps. v2 adds key 6 (session-history, §12.1) + key 8
+     * (recent runtime logs) drained from the SessionHistory/RuntimeLog rings;
+     * keys 7/10-13 remain later sub-steps (a vN writer omits unfilled sections).
      * Returns the CBOR bytes (always a valid bundle, even with no device). */
     std::vector<uint8_t> getDiagBundle(bool anonymize = false);
 
@@ -687,6 +691,27 @@ private:
     /* event-dormant (null-source) drop: raise the flag the pump logs. Audio
      * thread only — no allocation, no I/O. */
     void noteDormant() { dormantSrcSeen_.store(true, std::memory_order_relaxed); }
+
+    /* §14.4 host-context-B instrumentation rings. SessionHistory is CONTROL-PATH
+     * (recorded at the §12.1 transition sites on the supervisor/feeder/reader
+     * control threads); RuntimeLog is LOCK-FREE so a producer MAY be the audio
+     * thread. NEITHER is touched by pullAudio/feeder pacing — recording here adds
+     * nothing to the render (the offline-golden gate). getDiagBundle snapshots
+     * both under ctlMutex_ into top keys 6 + 8. */
+    SessionHistoryRing sessionHistory_;
+    RuntimeLogRing runtimeLog_;
+    /* Record a §12.1 state transition. tstamp[epoch] is filled from wall-clock,
+     * tstamp[msc] from the current stream position; `detail` may be nullptr.
+     * Control-path only (its callers run off the audio thread). */
+    void recordTransition(uint8_t from, uint8_t to, uint8_t reason, const char *detail);
+    /* Route a runtime log into the RuntimeLog ring (lock-free push). Mirrors the
+     * stderr log_msg so an operator still sees it; the ring is the machine copy.
+     * `tag` is a stable greppable id (NOT anonymized); `msg` is free-text (anon
+     * => ""). Safe on any thread, including the audio thread. */
+    void recordLog(uint8_t level, const char *tag, const char *msg);
+    /* recent-window snapshot bound for the diag bundle (keys 6 + 8). */
+    static constexpr size_t kDiagHistoryMax = 64;
+    static constexpr size_t kDiagLogMax = 64;
 
     /* §9.7 transport change detection (audio-thread-owned) */
     bool tpLastPlaying_ = false;
