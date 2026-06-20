@@ -122,7 +122,12 @@ struct EthTransport final : ShellTransport {
         if (!ensureAudioAccepted(ms)) return 0; /* device not connected yet => no data (not dead) */
         if (!readable(audioSock_, (int)ms)) return 0; /* timeout, no data */
         int n = (int)::recv(audioSock_, (char *)buf, len, 0);
-        if (n <= 0) return -1; /* 0 = peer closed, <0 = error => device gone */
+        if (n <= 0) {
+#ifdef _WIN32
+            static int rd = 0; if (rd < 3) { rd++; fprintf(stderr, "harp-shell: audioRead recv=%d WSA=%d\n", n, n < 0 ? WSAGetLastError() : 0); }
+#endif
+            return -1; /* 0 = peer closed, <0 = error => device gone */
+        }
         lastArr_.store(harp_now_ns(), std::memory_order_relaxed);
         return n;
     }
@@ -137,6 +142,9 @@ struct EthTransport final : ShellTransport {
         int left = len;
         while (left > 0) {
             int n = (int)::send(audioSock_, p, left, HARP_ETH_SENDFLAGS);
+#ifdef _WIN32
+            { static int wr = 0; if (wr < 3) { wr++; fprintf(stderr, "harp-shell: audioWrite send=%d/%d WSA=%d\n", n, left, n <= 0 ? WSAGetLastError() : 0); } }
+#endif
             if (n <= 0) return false;
             p += n;
             left -= n;
