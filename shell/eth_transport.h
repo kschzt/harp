@@ -150,6 +150,18 @@ struct EthTransport final : ShellTransport {
             p += n;
             left -= n;
         }
+#ifdef _WIN32
+        /* DIAG: after each pacing send, sample SO_ERROR on BOTH sockets — catches the
+         * instant (and which socket) the host stack flags an error, vs feeder activity. */
+        { static int dn = 0;
+          int ce = 0, ae = 0, l = (int)sizeof(int);
+          ::getsockopt(ctl_.s, SOL_SOCKET, SO_ERROR, (char *)&ce, &l);
+          l = (int)sizeof(int);
+          if (audioSock_ != HARP_SOCK_INVALID)
+              ::getsockopt(audioSock_, SOL_SOCKET, SO_ERROR, (char *)&ae, &l);
+          if ((ce || ae) && dn < 4) { dn++;
+              fprintf(stderr, "harp-shell: DIAG post-pacing-send sockerr ctl=%d audio=%d\n", ce, ae); } }
+#endif
         return true;
     }
 
