@@ -9,6 +9,11 @@ name: hw
 on:
   push:
   workflow_dispatch:
+    inputs:
+      late_sink_runs:
+        description: 'RUNS for the P5b late-sink reliability test (blank = default 5). Set high (e.g. 40) to statistically validate the re-neg padDebt fix against the ~1/5 flake.'
+        required: false
+        default: ''
 
 # One hardware run at a time: the device is exclusive, and a half-finished
 # run can leave the USB bus mid-stream. Queue, never cancel in flight.
@@ -71,6 +76,11 @@ jobs:
              && sudo -n systemctl restart harp-deviced-usb'
 
       - name: hardware conformance suite (PI4B-0002 over USB)
+        # late_sink_runs (workflow_dispatch only) bumps RUNS for the P5b late-sink
+        # test; blank on push -> the test's own default (5). Only late-sink-test.sh
+        # reads RUNS, so this targets that test alone.
+        env:
+          RUNS: ${{ inputs.late_sink_runs }}
         run: scripts/hw-tests-linux.sh
 
       - name: IDM-flood event-plane stress (PI4B-0002 over USB)

@@ -104,16 +104,27 @@ struct AudioSink {
     size_t padDebt = 0;
     /* STREAM EPOCH — bumped (off the audio path, under sinksMutex_) by audioStart
      * each time this sink's slots are present in the union it just (re)negotiated.
-     * A LATE sink registered mid-session pulls silence (accruing padDebt) for the
-     * whole gap before the re-neg streams its slots; without correction
-     * settleSinkPadDebt would then DROP the first real post-re-neg samples to pay
-     * that bogus debt, leaving the sink silent (the B3 1-in-8 failure). On its
-     * first pull after the epoch advances, pullAudio (the SOLE consumer, so no
-     * race) ZEROES padDebt and clear()s the stale ring — consumer-side ops, safe
-     * against the reader's producer writes — so real audio plays from the first
-     * demuxed frame. epochSeen is consumer-private (pullAudio only). */
+     * A LATE sink registered mid-session pulls silence for the whole gap before the
+     * re-neg streams its slots; without correction settleSinkPadDebt would DROP the
+     * first real post-re-neg samples to pay that bogus debt, leaving the sink silent.
+     *
+     * The epoch is bumped INSIDE audioStart while the reader is quiesced, but the
+     * respawned reader only writes the sink's first real frame hundreds of ms LATER
+     * (audio.stop + drain + audio.start round-trip + reader spinup). Zeroing padDebt
+     * ONCE at epoch-change (the old B3 fix) is therefore insufficient: the consumer
+     * keeps pulling across that gap and RE-ACCRUES padDebt on every empty-ring pull,
+     * with no further epoch bump to cancel it. Once that re-accrued debt exceeds the
+     * sink ring's small steady-state cushion, settleSinkPadDebt drains the whole ring
+     * each pull and the real read starves — a self-sustaining, full-run silence (the
+     * ~1-in-5 hw late-sink flake). FIX: epoch-change enters a PRIMING state that
+     * FORGIVES gap silence (pad without accruing debt) until the ring first delivers
+     * real audio; priming clears on the first non-empty read, after which normal
+     * pad-debt semantics resume. A sink whose slots are never actually streamed (a
+     * true regression) never leaves priming -> reads silence -> still fails its test.
+     * epochSeen + priming are consumer-private (the sink's sole pull toucher). */
     std::atomic<uint32_t> epoch{0};
     uint32_t epochSeen = 0;
+    bool priming = false; /* forgiving gap silence until the first real post-epoch frame */
     explicit AudioSink(const std::vector<uint32_t> &s) : slots(s) {}
 };
 
@@ -495,10 +506,14 @@ private:
     void settlePadDebt(); /* drop late arrivals for already-padded SSIs */
     /* the per-sink analogue: drop late arrivals owed to a sink's padded SSIs. */
     void settleSinkPadDebt(AudioSink &sink);
+    /* per-sink underrun accrual, shared by both sink pulls: forgive gap silence
+     * while priming (no runaway debt), accrue normally once real audio flows. */
+    void accrueSinkPadDebt(AudioSink &sink, size_t got, size_t deficit);
     /* B3: on a sink's first pull after its slots (re)entered the union, drop the
      * pad debt + stale ring it accrued while waiting for the re-negotiation, so
-     * the first real demuxed frame is not eaten paying that bogus debt. Consumer-
-     * side (pullAudio) only. */
+     * the first real demuxed frame is not eaten paying that bogus debt, and enter
+     * PRIMING so the gap before the reader resumes accrues no debt. Consumer-side
+     * (the sink's pull) only. */
     void syncSinkEpoch(AudioSink &sink);
     bool helloAndIdentity();
     /* Build unionSlots_ = owner outSlots_ then every registered sink's slots
