@@ -3,6 +3,8 @@
  * they can run in CI without a board:
  *   - harp_voice_pick   (device/voice_alloc.h): §9.5 voice allocation / steal.
  *   - harp_arp_select   (device/arp_select.h):  §9.7 arp note selection, 4 modes.
+ *   - harp_evt_part / harp_mod_target / harp_mod_targets_voice (device/evq_mod.h):
+ *     §P2.1 event routing + §9.4/§9.5 modulation target + per-voice addressing.
  *
  * These are exactly the functions engine.c calls on the real note-on / arp-step
  * path (so this is the real logic, not a parallel copy). The chord/voice-pool and
@@ -15,6 +17,7 @@
 #include <stdio.h>
 
 #include "arp_select.h"
+#include "evq_mod.h"
 #include "voice_alloc.h"
 
 static int g_fail = 0, g_pass = 0;
@@ -111,9 +114,39 @@ static void test_arp_select(void) {
     CHECK(harp_arp_select(3, 1, one, 1, 0, order).note == 72);
 }
 
+/* §P2.1 event routing + §9.4/§9.5 modulation target + per-voice addressing. These are
+ * exactly the helpers engine.c's evq_apply_due() routing + DEV_EV_MOD case call. */
+static void test_evq_mod(void) {
+    /* channel -> part: modulo the part count; ch0 -> part 0; wraps past nparts */
+    CHECK(harp_evt_part(0, 16) == 0);
+    CHECK(harp_evt_part(5, 16) == 5);
+    CHECK(harp_evt_part(16, 16) == 0);  /* wrap */
+    CHECK(harp_evt_part(17, 16) == 1);
+
+    /* §9.5 per-voice addressing. ev_voice==0 = whole-part: every ACTIVE voice. */
+    CHECK(harp_mod_targets_voice(0, true, 12345) == true);   /* active, whole-part */
+    CHECK(harp_mod_targets_voice(0, false, 12345) == false); /* inactive never takes a mod */
+    /* ev_voice != 0: ONLY the active voice whose key matches (gone voice ignored) */
+    CHECK(harp_mod_targets_voice(777, true, 777) == true);   /* exact match */
+    CHECK(harp_mod_targets_voice(777, true, 778) == false);  /* active but wrong key */
+    CHECK(harp_mod_targets_voice(777, false, 777) == false); /* matching key but voice gone */
+
+    /* §9.5 target classification. bend/pressure ids route to dedicated axes; else a
+     * real param idx (>=0) is the §9.4 mod[] layer; any other id is ignored. The wire
+     * ids are passed in — here distinct placeholders so the test is header-pure. */
+    const uint32_t BEND_ID = 0xE000u, PRESS_ID = 0xD000u;
+    CHECK(harp_mod_target(BEND_ID, -1, BEND_ID, PRESS_ID) == HARP_MODT_BEND);
+    CHECK(harp_mod_target(PRESS_ID, -1, BEND_ID, PRESS_ID) == HARP_MODT_PRESSURE);
+    CHECK(harp_mod_target(0x42, 3, BEND_ID, PRESS_ID) == HARP_MODT_PARAM);   /* real param */
+    CHECK(harp_mod_target(0x42, -1, BEND_ID, PRESS_ID) == HARP_MODT_IGNORE); /* unknown id */
+    /* a dedicated axis wins even if a param index were also resolvable */
+    CHECK(harp_mod_target(BEND_ID, 5, BEND_ID, PRESS_ID) == HARP_MODT_BEND);
+}
+
 int main(void) {
     test_voice_pick();
     test_arp_select();
+    test_evq_mod();
     printf("harp-engine-logic-tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

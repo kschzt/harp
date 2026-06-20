@@ -26,6 +26,7 @@
 
 #include "arp_select.h"  /* pure §9.7 arp note-selection (host-unit-tested) */
 #include "voice_alloc.h" /* pure §9.5 voice-allocation policy (host-unit-tested) */
+#include "evq_mod.h"     /* pure §9.4/§9.5 mod routing + addressing (host-unit-tested) */
 
 static const char *const ARP_MODES[] = {"Off", "Up", "Down", "Up-Down", "As Played"};
 static const char *const ARP_DIVS[] = {"1/4", "1/8", "1/8T", "1/16", "1/16T", "1/32"};
@@ -1213,7 +1214,7 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
              * ROUTED part's pval/ramps (per-part params on the wire — channel
              * 0 -> part 0, so the golden's --set ch0 still hits part 0). ALL_OFF
              * / TRANSPORT act across ALL parts (see below). */
-            part *p = &g_parts[ev->channel % NPARTS];
+            part *p = &g_parts[harp_evt_part(ev->channel, NPARTS)]; /* §P2.1 routing (pure) */
             switch (ev->kind) {
                 case DEV_EV_NOTE_ON:
                     /* arp engaged: notes feed the latch; the step clock
@@ -1314,16 +1315,17 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                      * z_gain (loudness). A normalized param id -> the mod[] layer.
                      * Unknown id: ignored. */
                     int idx = param_index(ev->a); /* >=0 = real param; <0 = expr/unknown */
-                    bool is_bend = ev->a == HARP_MOD_PITCH_BEND;
-                    bool is_press = ev->a == HARP_MOD_PRESSURE;
-                    if (idx < 0 && !is_bend && !is_press) break; /* unknown id: ignore */
+                    /* §9.5 target + addressing via the pure helpers (device/evq_mod.h,
+                     * host-unit-tested). Byte-identical to the prior inline checks. */
+                    harp_mod_target_kind tk = harp_mod_target(ev->a, idx,
+                                                              HARP_MOD_PITCH_BEND, HARP_MOD_PRESSURE);
+                    if (tk == HARP_MODT_IGNORE) break; /* unknown id: ignore */
                     for (int vi = 0; vi < NVOICES; vi++) {
                         synth_voice *mv = &p->voices[vi];
-                        if (!mv->active) continue;
-                        if (ev->voice != 0 && mv->voice_id != ev->voice) continue;
-                        if (is_bend) mv->bend_semis = (float)ev->v;     /* X: semitones */
-                        else if (is_press) mv->z_gain = (float)ev->v;   /* Z: loudness gain */
-                        else { mv->mod[idx] = ev->v; mv->has_mod = true; } /* §9.4 param mod */
+                        if (!harp_mod_targets_voice(ev->voice, mv->active, mv->voice_id)) continue;
+                        if (tk == HARP_MODT_BEND) mv->bend_semis = (float)ev->v;   /* X: semitones */
+                        else if (tk == HARP_MODT_PRESSURE) mv->z_gain = (float)ev->v; /* Z: loudness gain */
+                        else { mv->mod[idx] = ev->v; mv->has_mod = true; }         /* §9.4 param mod */
                     }
                     break;
                 }
