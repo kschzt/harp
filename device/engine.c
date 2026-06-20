@@ -803,6 +803,16 @@ static void host_paced_loop(device *d) {
     size_t rlen = 0, rpos = 0;
 #ifdef _WIN32
     struct timespec t0w; clock_gettime(CLOCK_MONOTONIC, &t0w); /* DIAG: how long does the first recv block? */
+    { struct sockaddr_in la = {0}, pa = {0}; int ll = sizeof la, pl = sizeof pa;
+      getsockname(a->out_fd, (struct sockaddr *)&la, &ll); getpeername(a->out_fd, (struct sockaddr *)&pa, &pl);
+      fprintf(stderr, "harp-deviced: host_paced_loop fd=%d local=:%d peer=:%d — polling for pacing\n",
+              a->out_fd, ntohs(la.sin_port), ntohs(pa.sin_port));
+      for (int i = 0; i < 5; i++) {
+          WSAPOLLFD p; p.fd = a->out_fd; p.events = POLLRDNORM; p.revents = 0;
+          int r = WSAPoll(&p, 1, 100);
+          int soe = 0, sl = sizeof soe; getsockopt(a->out_fd, SOL_SOCKET, SO_ERROR, (char *)&soe, &sl);
+          fprintf(stderr, "harp-deviced: poll[%d] WSAPoll=%d revents=0x%x SO_ERROR=%d\n", i, r, p.revents, soe);
+      } }
 #endif
 
     while (atomic_load_explicit(&a->running, memory_order_relaxed)) {
