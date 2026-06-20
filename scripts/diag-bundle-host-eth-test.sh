@@ -111,6 +111,27 @@ if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then
     ref $b->{4} eq "HASH" or die "device-section is not a map\n";
     exists $b->{4}{1}  or die "device-section key 1 (counters) absent\n";
     exists $b->{4}{1}{usb_errors} or die "device-section counters missing usb_errors\n";
+    # §16 device-section identity (key 4 -> 0): the PLAIN bundle carries every PII
+    # leaf with its real value. Assert each is PRESENT and non-empty so the anon
+    # pass below has something concrete to clear (the §16 gate is plain-PRESENT +
+    # anon-CLEARED on the SAME leaf). The retained leaves (engine, vid/pid, hash,
+    # caps) are spot-checked here and re-checked unchanged in the anon block.
+    my $id = $b->{4}{0};
+    ref $id eq "HASH" or die "device-section identity (key 4.0) is not a map\n";
+    length($id->{2} // "") or die "identity serial (key 2) empty in PLAIN bundle\n";
+    length($id->{0}{1} // "") or die "identity vendor name (vendor.1) empty in PLAIN bundle\n";
+    length($id->{1}{1} // "") or die "identity product name (product.1) empty in PLAIN bundle\n";
+    length($id->{9} // "") or die "identity build-id (key 9) empty in PLAIN bundle\n";
+    ref $id->{7} eq "ARRAY" && @{$id->{7}} or die "identity channel-map (key 7) empty in PLAIN bundle\n";
+    length($id->{7}[0]{2} // "") or die "channel-map entry name (7[0].2) empty in PLAIN bundle\n";
+    # RETAINED-leaf baseline: engine sub-map (key 4) incl. engine-id (4.0) +
+    # param-map-hash (4.2), and the numeric VID/PID live in usb-topology — but on
+    # the Ethernet loopback usb-topology is absent, so the device-section identity
+    # vendor/product sub-maps carry the numeric VID/PID (vendor.0 / product.0).
+    ref $id->{4} eq "HASH" or die "identity engine (key 4) is not a map\n";
+    length($id->{4}{0} // "") or die "identity engine-id (4.0) empty — must be RETAINED\n";
+    defined $id->{0}{0} or die "identity vendor VID (vendor.0) absent — must be RETAINED\n";
+    defined $id->{1}{0} or die "identity product PID (product.0) absent — must be RETAINED\n";
     # key 5: host-counters — keys 0..6 present, all numeric
     exists $b->{5}     or die "key 5 (host-counters) absent\n";
     ref $b->{5} eq "HASH" or die "host-counters is not a map\n";
@@ -176,47 +197,157 @@ if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then
 
     print "   decode OK: key0 harpd, key1 v3, key4.device-section(usb_errors+serial), key5.host-counters(0..6), key6.session-history(", scalar(@{$b->{6}}), " transitions ->STREAMING), key8.runtime-logs(", scalar(@{$b->{8}}), " records), key9.audio-config(rate=48000,block=256,transport=ethernet,out-slots=[@{$b->{9}{3}}]), key11.clock-stats(recovery=$rec,drift=$b->{11}{0}), key13.net-topology(host:port=$b->{13}{0},jitter=$b->{13}{2}), key10.usb-topology ABSENT(eth)\n";
 
-    # §16 anon assertion: the SECOND bundle must clear every state-transition.4
-    # (detail) and log-record.3 (msg) to "" while RETAINING tags/levels/states.
+    # ── COMPREHENSIVE §16 anon assertion ──────────────────────────────────────
+    # The SECOND bundle must clear EVERY emitted PII leaf to "" IN PLACE while
+    # RETAINING the numeric/tag/hash structure. We re-decode the anon bundle and
+    # walk the SAME leaves the plain block asserted PRESENT, demanding each is now
+    # cleared — and every retained leaf is byte-for-meaning unchanged.
     open my $afh, "<:raw", $ARGV[1] or die "open anon: $!";
     my $a = CBOR::XS->new->decode(<$afh>);
     $a->{3} or die "anon bundle key 3 (anonymized flag) not true\n";
+
+    # (1) device-section identity (key 4.0): serial(2), vendor name(0.1), product
+    # name(1.1), build-id(9), channel-map per-entry name/group/path(7[*].{2,3,4})
+    # ALL cleared to ""; engine(4) incl. engine-id(4.0) + param-map-hash(4.2),
+    # numeric VID(0.0)/PID(1.0), caps(6), firmware(3) RETAINED unchanged.
+    my $aid = $a->{4}{0};
+    ref $aid eq "HASH" or die "anon: device-section identity (key 4.0) is not a map\n";
+    $aid->{2} eq "" or die "anon: identity serial (key 2) not cleared to \"\" (§16)\n";
+    $aid->{0}{1} eq "" or die "anon: identity vendor name (vendor.1) not cleared to \"\" (§16)\n";
+    $aid->{1}{1} eq "" or die "anon: identity product name (product.1) not cleared to \"\" (§16)\n";
+    $aid->{9} eq "" or die "anon: identity build-id (key 9) not cleared to \"\" (§16)\n";
+    ref $aid->{7} eq "ARRAY" && @{$aid->{7}} == @{$id->{7}} or die "anon: channel-map (key 7) length changed — structure not preserved\n";
+    for my $e (@{$aid->{7}}) {
+      $e->{2} eq "" or die "anon: channel-map entry name (7[*].2) not cleared to \"\" (§16)\n";
+      $e->{3} eq "" or die "anon: channel-map entry group (7[*].3) not cleared to \"\" (§16)\n";
+      $e->{4} eq "" or die "anon: channel-map entry path (7[*].4) not cleared to \"\" (§16)\n";
+      defined $e->{0} or die "anon: channel-map entry slot (7[*].0) dropped — must be RETAINED\n";
+    }
+    # RETAINED identity leaves unchanged (reveal device class/type, not its name):
+    $aid->{4}{0} eq $id->{4}{0} or die "anon: engine-id (4.0) was altered — must be RETAINED verbatim\n";
+    $aid->{4}{2} eq $id->{4}{2} or die "anon: param-map-hash (4.2) was altered — must be RETAINED verbatim (§16)\n";
+    $aid->{0}{0} == $id->{0}{0} or die "anon: vendor VID (vendor.0) was altered — must be RETAINED\n";
+    $aid->{1}{0} == $id->{1}{0} or die "anon: product PID (product.0) was altered — must be RETAINED\n";
+    $aid->{3} eq $id->{3} or die "anon: firmware (key 3) was altered — must be RETAINED\n";
+    # device-section counters (key 4.1): the anon pass copies key 1 verbatim (no
+    # PII), so the SAME set of counter keys must survive — but these are LIVE
+    # numeric gauges captured from two independent sessions, so assert KEY-SET +
+    # numeric-TYPE retention, NOT cross-capture value-equality (evt_late et al.
+    # legitimately differ between the plain and anon captures). A text value here
+    # would be the leak signal.
+    my $numlike = sub { my $v = shift; defined $v && !ref($v) && $v =~ /^-?\d+(?:\.\d+)?$/ };
+    for my $k (keys %{$b->{4}{1}}) {
+      exists $a->{4}{1}{$k} or die "anon: device-section counter '$k' (key 4.1) was dropped — must be RETAINED\n";
+      $numlike->($a->{4}{1}{$k}) or die "anon: device-section counter '$k' (key 4.1) is non-numeric after anon — must be RETAINED verbatim\n";
+    }
+    keys %{$a->{4}{1}} == keys %{$b->{4}{1}} or die "anon: device-section counters (key 4.1) key-set changed — must be RETAINED verbatim\n";
+
+    # (2) host rings: state-transition.4 (detail) + log-record.3 (msg) cleared;
+    # tstamp/from/to/reason + tag/level/wall-stamp RETAINED.
     my $retainedTag = 0;
+    @{$a->{6}} == @{$b->{6}} or die "anon: session-history (key 6) length changed — structure not preserved\n";
     for my $t (@{$a->{6}}) {
       defined $t->{4} && $t->{4} eq "" or die "anon: state-transition detail (key 4) not cleared to empty string\n";
       exists $t->{1} && exists $t->{2} && exists $t->{3} or die "anon: transition lost states/reason (over-redacted)\n";
+      ref $t->{0} eq "ARRAY" && @{$t->{0}} == 2 or die "anon: transition tstamp (key 0) dropped — must be RETAINED\n";
     }
+    @{$a->{8}} == @{$b->{8}} or die "anon: runtime-logs (key 8) length changed — structure not preserved\n";
     for my $l (@{$a->{8}}) {
       defined $l->{3} && $l->{3} eq "" or die "anon: log-record msg (key 3) not cleared to empty string\n";
       defined $l->{2} && length $l->{2} or die "anon: log-record tag (key 2) was cleared — tag MUST be retained (§16)\n";
+      defined $l->{1} or die "anon: log-record level (key 1) dropped — must be RETAINED\n";
+      ref $l->{4} eq "ARRAY" && @{$l->{4}} == 2 or die "anon: log-record wall-stamp (key 4) dropped — must be RETAINED\n";
       $retainedTag = 1;
     }
     $retainedTag or die "anon: no log record to prove tag retention\n";
-    # §14.4 host-context-C / §16: the anon pass clears net-topology host:port (key 13.0)
-    # to "" IN PLACE while RETAINING the clock-stats drift + recovery + jitter depth.
+
+    # (3) net-topology (key 13): host:port(0) cleared; jitter depth(2) + net.offline(5) RETAINED.
     exists $a->{13} or die "anon: key 13 (net-topology) absent — anon must preserve structure\n";
     defined $a->{13}{0} && $a->{13}{0} eq "" or die "anon: net-topology host:port (key 0) not cleared to \"\" (§16)\n";
-    exists $a->{13}{2} or die "anon: net-topology jitter depth (key 2) was dropped — must be RETAINED\n";
+    $a->{13}{2} == $b->{13}{2} or die "anon: net-topology jitter depth (key 2) changed — must be RETAINED\n";
+    exists $a->{13}{5} or die "anon: net-topology net.offline (key 5) dropped — must be RETAINED\n";
+
+    # (4) clock-stats (key 11): NO PII — the anon pass leaves it untouched. Its
+    # leaves are LIVE numeric gauges (drift, recovery, asrc/ratelock sub-stats), so
+    # assert the key-set + numeric type survive, NOT cross-capture value-equality.
     exists $a->{11} or die "anon: key 11 (clock-stats) absent — anon must preserve it (no PII)\n";
     exists $a->{11}{0} or die "anon: clock-stats drift (key 0) dropped — must be RETAINED (§16: reveal whether, not what)\n";
     exists $a->{11}{3} or die "anon: clock-stats recovery mode (key 3) dropped — must be RETAINED\n";
-    print "   anon OK: every transition.4 detail + log.3 msg cleared to \"\"; net-topology.0 host:port cleared to \"\"; tags/levels/states + clock-stats(drift/recovery) + net jitter RETAINED\n";
+    for my $k (keys %{$b->{11}}) {
+      exists $a->{11}{$k} or die "anon: clock-stats key $k dropped — no PII, must be RETAINED\n";
+      ref $b->{11}{$k} eq "HASH"
+        ? (ref $a->{11}{$k} eq "HASH" or die "anon: clock-stats sub-map (key $k) flattened — must be RETAINED\n")
+        : ($numlike->($a->{11}{$k}) or die "anon: clock-stats key $k is non-numeric after anon — must be RETAINED\n");
+    }
+
+    # (5) host-counters (key 5): all numeric, no PII — anon leaves them untouched.
+    # Live session gauges, so assert key-set 0..6 + numeric type, not value-equality.
+    for my $k (0..6) {
+      exists $a->{5}{$k} or die "anon: host-counter key $k dropped — must be RETAINED\n";
+      $numlike->($a->{5}{$k}) or die "anon: host-counter key $k non-numeric after anon — must be RETAINED\n";
+    }
+
+    print "   anon OK: identity{serial,vendor.name,product.name,build-id,chan-map name/group/path}=\"\"; transition.4 detail + log.3 msg + net.host:port=\"\"; RETAINED verbatim: engine-id, param-map-hash, VID/PID, caps, firmware, counters, tags/levels/states/wall-stamps, clock-stats(drift/recovery), net jitter/offline\n";
   ' "$BUNDLE" "$BUNDLE_ANON" || fail "CBOR decode/assert failed"
 else
-  echo "   (CBOR::XS not installed — structural grep only; CI runs the full decode)"
-  # Structural fallback for the §16 anon clearing without a CBOR decoder: the
-  # PLAIN bundle carries the descriptive detail/msg text ("streaming",
-  # "audio stream negotiated"); the ANON bundle must NOT — while BOTH keep the
-  # greppable "session" tag. (Token-level, but proves the leaf clearing ran.)
-  grep -aq "streaming"            "$BUNDLE"      || fail "plain bundle missing 'streaming' detail/msg (rings not drained?)"
-  grep -aq "audio stream negotiated" "$BUNDLE"   || fail "plain bundle missing 'audio stream negotiated' log msg"
-  grep -aq "session"              "$BUNDLE_ANON" || fail "anon bundle lost the 'session' tag — tag MUST be retained (§16)"
-  grep -aq "audio stream negotiated" "$BUNDLE_ANON" && fail "anon bundle still carries the log msg 'audio stream negotiated' — §16 msg clearing did not run"
-  # §14.4 host-context-C: net-topology key 13.0 carries the loopback dial target in the
-  # plain bundle (Ethernet binding) and must be GONE after --diag-bundle-anon (§16).
-  grep -aq "127.0.0.1:$PORT"      "$BUNDLE"      || fail "plain bundle missing net-topology host:port '127.0.0.1:$PORT' (key 13 not emitted on Ethernet binding?)"
-  grep -aq "127.0.0.1:$PORT"      "$BUNDLE_ANON" && fail "anon bundle still carries net-topology host:port '127.0.0.1:$PORT' — §16 host:port clearing did not run"
-  echo "   anon grep OK: 'session' tag retained, descriptive detail/msg + net host:port gone after --diag-bundle-anon"
+  echo "   (CBOR::XS not installed — EXHAUSTIVE §16 grep gate; CI also runs the full decode)"
+  # ── COMPREHENSIVE §16 grep gate (no CBOR::XS dependency) ───────────────────
+  # Walk EVERY PII string the refdev actually emits over the §8.7 loopback and
+  # assert PRESENT-in-plain / ABSENT-in-anon, then assert the RETAINED tokens are
+  # PRESENT-in-BOTH. CBOR text leaves are stored literally, so `grep -aF` (fixed
+  # string, binary-as-text) finds them by raw bytes.
+  #
+  # Tokens are SUBSTRING-COLLISION-SAFE — each is unique to its leaf and never a
+  # substring of a RETAINED token (which would make an ABSENT assertion a false
+  # pass). Notably the bare product name "harp-refdev" is a substring of the
+  # RETAINED counter keys "x.harp-refdev.*" and the cap "x.harp-refdev.sim", so it
+  # CANNOT prove product-name clearing; instead we grep the host transition/log
+  # context "harp-refdev (serial" (produced only by the hello-ok detail/msg, which
+  # the anon pass clears). Likewise the channel-map name uses the full "Part 1 L"
+  # (not "part1"), and the engine-id "refdev-null" (retained, hyphen) does not
+  # collide with the build-id "refdev sim " (cleared, space).
+  #
+  # EMITTED PII (device-section identity + host rings + net-topology), PRESENT in
+  # plain, ABSENT in anon:
+  #   serial                 SIM-0001                         (identity key 2)
+  #   vendor name            HARP Reference Project           (identity vendor.1)
+  #   product name           harp-refdev (serial              (identity product.1, via hello detail/msg)
+  #   channel-map name       Part 1 L                         (identity key 7 entry.2)
+  #   build-id               refdev sim                       (identity key 9)
+  #   host:port              127.0.0.1:$PORT                  (net-topology key 0)
+  #   log msg                audio stream negotiated          (key 8 log-record.3)
+  #   transition detail      reader + event pump up           (key 6 state-transition.4)
+  pii_present_absent() { # $1 = token, $2 = human label
+    grep -aqF "$1" "$BUNDLE"      || fail "plain bundle missing PII '$1' ($2) — ring/section not emitted?"
+    grep -aqF "$1" "$BUNDLE_ANON" && fail "anon bundle STILL carries PII '$1' ($2) — §16 clearing did not run"
+    echo "   §16 PII cleared: $2 ('$1') — PRESENT in plain, ABSENT in anon"
+  }
+  pii_present_absent "SIM-0001"                "device serial (identity key 2)"
+  pii_present_absent "HARP Reference Project"  "vendor name (identity vendor.1)"
+  pii_present_absent "harp-refdev (serial"     "product name (identity product.1, via hello detail/msg)"
+  pii_present_absent "Part 1 L"                "channel-map name (identity key 7 entry.2)"
+  pii_present_absent "refdev sim "             "build-id (identity key 9)"
+  pii_present_absent "127.0.0.1:$PORT"         "net-topology host:port (key 13.0)"
+  pii_present_absent "audio stream negotiated" "runtime-log msg (key 8 log-record.3)"
+  pii_present_absent "reader + event pump up"  "state-transition detail (key 6 transition.4)"
+  # RETAINED tokens (reveal whether/type, NOT value) — PRESENT in BOTH bundles:
+  #   session            log-record tag (key 8 log-record.2) — greppable identifier
+  #   usb_errors         device-section counter key (key 4 -> device-section key 1)
+  #   refdev-null        engine-id (identity key 4.0) — class id, the "vid/pid"-grade
+  #                      device-section text token (the numeric VID 0x1209 is not
+  #                      ASCII-greppable; the decode path asserts vid/pid + clock
+  #                      recovery numerics)
+  #   x.harp-refdev.sim  capability token (identity key 6) — also retained
+  retained_both() { # $1 = token, $2 = human label
+    grep -aqF "$1" "$BUNDLE"      || fail "plain bundle missing RETAINED token '$1' ($2)"
+    grep -aqF "$1" "$BUNDLE_ANON" || fail "anon bundle dropped RETAINED token '$1' ($2) — over-redacted (§16: reveal whether, not what)"
+    echo "   §16 retained: $2 ('$1') — PRESENT in BOTH"
+  }
+  retained_both "session"           "log tag (key 8 log-record.2)"
+  retained_both "usb_errors"        "device counter key (key 4 device-section.1)"
+  retained_both "refdev-null"       "engine-id (identity key 4.0, vid/pid-grade text token)"
+  retained_both "x.harp-refdev.sim" "capability token (identity key 6)"
+  echo "   anon grep OK: all 8 emitted PII strings cleared in anon; all 4 retained tokens kept in both"
 fi
 
 kill -9 "$DP" 2>/dev/null; DP=""
