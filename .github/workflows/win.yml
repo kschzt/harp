@@ -5,10 +5,11 @@ name: win
 # the test host are the MSVC target (VST3 SDK). Both run on one windows-2022 runner
 # and talk over localhost TCP — the Windows analogue of eth.yml. The device daemon
 # is statically linked so it runs in Git Bash (outside the MSYS2 shell), beside the
-# MSVC host. push+dispatch only while the e2e iterates to green.
+# MSVC host. Green, so it gates PRs (pull_request) like ci/eth/hw.
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -18,7 +19,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # ---- device: native MinGW (gnu11/winpthreads/winsock), statically linked ----
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: MINGW64
           update: false
