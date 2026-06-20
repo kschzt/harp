@@ -537,6 +537,8 @@ bool HarpRuntime::sessionUp() {
     /* cache the binding mode once, off the RT path (review m2). USB => false,
      * so every host-paced branch below is reached exactly as before. */
     freeRunning_ = transport_->isFreeRunning();
+    fprintf(stderr, "harp-shell: sessionUp freeRunning=%d wantHostPaced=%d\n",
+            (int)freeRunning_, (int)wantHostPaced_.load(std::memory_order_relaxed));
     {
         std::lock_guard<std::mutex> lk(ctlMutex_);
         /* capture the bound device's USB identity (vid:pid:serial) UNDER

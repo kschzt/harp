@@ -56,7 +56,7 @@ render() {
     h=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" perl -e 'alarm 30; exec @ARGV' "$1" "$3" $SETTLE $SEQ 2>>"$sd.err" | sed -nE 's/output-hash: //p')
     kill -9 "$dpid" 2>/dev/null
     wait "$dpid" 2>/dev/null
-    [ -n "$h" ] || { echo "  render($2): NO output-hash (alarm-killed/hung) — host err + device log:" >&2; tail -10 "$sd.err" 2>/dev/null | sed 's/^/    /' >&2; tail -6 "$sd.log" 2>/dev/null | sed 's/^/    /' >&2; }
+    [ -n "$h" ] || { echo "  render($2): NO output-hash (alarm-killed/hung) — host err + device log:" >&2; tail -30 "$sd.err" 2>/dev/null | sed 's/^/    /' >&2; tail -8 "$sd.log" 2>/dev/null | sed 's/^/    /' >&2; }
     PORT=$((PORT + 1))   # fresh port per render (TIME_WAIT-safe)
     printf '%s' "$h"
 }
