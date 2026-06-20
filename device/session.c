@@ -1395,6 +1395,11 @@ void harp_deviced_run_session(device *d, harp_io *io) {
     for (;;) {
         uint8_t stream;
         int rc = harp_link_recv(io, &d->link, &stream, &msg);
+#ifdef _WIN32
+        if (rc < 0)
+            fprintf(stderr, "harp-deviced: control session loop break rc=%d (%s)\n", rc,
+                    rc == -1 ? "read_exact failed / EOF" : "protocol violation (bad frame hdr)");
+#endif
         if (rc == -1) break; /* peer gone */
         if (rc == -2) {      /* protocol violation: session reset (§12.4) */
             CTR_INC(d->session_resets);

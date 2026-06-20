@@ -24,13 +24,20 @@ static bool sock_read_exact(harp_io *io, void *buf, size_t n) {
         int r = recv(t->s, (char *)p, (int)(n > 0x7fffffff ? 0x7fffffff : n), 0);
         if (r < 0) {
 #ifdef _WIN32
-            if (WSAGetLastError() == WSAEINTR) continue;
+            int werr = WSAGetLastError();
+            if (werr == WSAEINTR) continue;
+            fprintf(stderr, "harp: sock_read_exact recv ERROR r=%d WSA=%d (still needed %zu)\n", r, werr, n);
 #else
             if (errno == EINTR) continue;
 #endif
             return false;
         }
-        if (r == 0) return false; /* peer closed */
+        if (r == 0) {
+#ifdef _WIN32
+            fprintf(stderr, "harp: sock_read_exact recv EOF r=0 (peer closed, still needed %zu)\n", n);
+#endif
+            return false; /* peer closed */
+        }
         p += r;
         n -= (size_t)r;
     }
