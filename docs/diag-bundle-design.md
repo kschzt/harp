@@ -494,3 +494,19 @@ CI-GREEN PATH: every script is hang-proofed (unique port, kill-by-pid, perl alar
 1. clock_drift_ppb appears in three places — device counters (canonical gauge), clock-stats key 0 (host-measured), and clock-stats key 4 mirrors stream_reanchors. These can disagree if sampled at different instants. I treat the device counters value as canonical; confirm that precedence and whether the host-measured clock-stats.0 should instead be the authority when present.
 1. DEVICE EMITS HARDCODED ZEROS today (audio_underruns, audio_late_frames, msc_discontinuities, evt_stale_epoch, usb_errors, clock_drift_ppb all 0 at device/session.c:706-722). The CDDL requires the KEYS (correct) but v0 bundles will look suspiciously clean. CI bundle tests must assert on keys present, not on real values for these, until the refdev TODOs are filled.
 1. TEXT-KEYED vs INTEGER-KEYED inconsistency: counters and log-record use text/integer keys faithful to their existing wire formats, while every other map is integer-keyed. A reviewer will notice the mix. It is deliberate (changing counters to integer keys breaks the live diag.counters method and the harp-probe parser), but confirm the spec editor accepts documenting it as an intentional exception.
+
+## Post-review resolution — v0 host-synthesis
+
+The v0 schema-conformance review flagged a contradiction: the device-section.identity CDDL
+says "reuse Appendix A identity verbatim" (mandatory keys 0-8), but the v0 emits only the
+hello-available subset (keys 0-4,6 — no protocol[5]/channel-map[7]/latency-profile[8],
+which are device-assembled, not in `harp_client_identity`).
+
+**Resolved:** the v0's device-section is **host-synthesized** — a host stand-in, not the
+device's verbatim `rsp diag.bundle`. v0 marks this in **bundle-meta key 1** (the tool string
+`"harp-probe v0 (host-synthesized device-section)"`); a consumer keys off it. eth-agent's
+device-assembled section supersedes the v0 one with the full identity once `diag.bundle`
+lands. So: device-section.identity is the full Appendix A identity when **device**-assembled;
+a **host-synthesized** v0 emits the subset + the bundle-meta marker. The §16 anonymize and
+counters-verbatim invariants are unchanged. (The byte-identical device-section conformance
+gate is therefore defined only on the device-assembled path, per the seam note above.)

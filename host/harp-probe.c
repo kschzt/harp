@@ -676,6 +676,117 @@ static void cmd_counters(probe *p) {
     harp_cbuf_free(&rsp);
 }
 
+/* §14.4 diag-bundle v0 — host-only export, ZERO device changes. Reuses the
+ * EXISTING do_hello (identity) + diag.counters (device counters) to assemble
+ * the required-from-day-one bundle (top-level keys 0..4) per the Design-v0
+ * section of docs/diag-bundle-design.md. The device-section counters are
+ * embedded VERBATIM (the byte-identical embed is the device conformance gate);
+ * identity is re-encoded from harp_client_identity mirroring encode_identity's
+ * key shape (device/session.c:176). --anonymize runs the §16 host pass in
+ * miniature: it clears identity serial / vendor-name / product-name to the
+ * empty string IN PLACE (not omission, not "[redacted]") and sets key 3=true,
+ * retaining vid/pid/param-map-hash/engine-id/caps (reveal whether, not what). */
+static void cmd_diag_bundle(probe *p, const char *outfile, bool anon) {
+    harp_client_identity id = do_hello(p);
+
+    /* device-section counters: round-trip diag.counters EXACTLY like
+     * cmd_counters, but DON'T decode — keep e.body/e.body_len, the verbatim
+     * encoded text-keyed map, and embed it byte-for-byte below. */
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    req_head(p, &req, "diag.counters", false);
+    harp_env e = request(p, &req, &rsp);
+
+    harp_cbuf out;
+    harp_cbuf_init(&out);
+
+    /* --- top map: 0 magic, 1 version, 2 bundle-meta, 3 anonymized?, 4 device-section --- */
+    harp_cbor_map(&out, 5);
+
+    harp_cbor_uint(&out, 0); /* magic (parallels recall-bundle "harpb") */
+    harp_cbor_text(&out, "harpd");
+
+    harp_cbor_uint(&out, 1); /* bundle schema version */
+    harp_cbor_uint(&out, 1);
+
+    harp_cbor_uint(&out, 2); /* bundle-meta: capture provenance */
+    harp_cbor_map(&out, 2);
+    harp_cbor_uint(&out, 0); /* tstamp: [epoch, msc-or-0] */
+    harp_cbor_array(&out, 2);
+    harp_cbor_uint(&out, (uint64_t)time(NULL)); /* wall-clock epoch */
+    harp_cbor_uint(&out, 0);                    /* host MSC: 0 in v0 (no stream) */
+    harp_cbor_uint(&out, 1); /* tool + provenance. Marks the v0 HOST-SYNTHESIZED device-section:
+                              * the hello carries only a SUBSET of identity (keys 0-4,6 — no
+                              * channel-map/latency-profile/protocol, which are device-assembled),
+                              * so v0's device-section is a host stand-in, NOT the device's verbatim
+                              * rsp diag.bundle. eth-agent's device-assembled section (full identity)
+                              * supersedes it once it lands. Consumers key off this string. */
+    harp_cbor_text(&out, "harp-probe v0 (host-synthesized device-section)");
+
+    harp_cbor_uint(&out, 3); /* anonymized? — first-class privacy-state flag */
+    harp_cbor_bool(&out, anon);
+
+    harp_cbor_uint(&out, 4); /* device-section: identity + counters */
+    harp_cbor_map(&out, 2);
+
+    /* device-section key 0 => identity, re-encoded mirroring encode_identity
+     * (device/session.c:176) key shape. Under --anonymize the serial / vendor
+     * name / product name become "" IN PLACE (§16); vid/pid/hash/engine-id/caps
+     * are retained. */
+    harp_cbor_uint(&out, 0);
+    harp_cbor_map(&out, 6);
+    harp_cbor_uint(&out, 0); /* vendor { 0 => vid, 1 => name } */
+    harp_cbor_map(&out, 2);
+    harp_cbor_uint(&out, 0);
+    harp_cbor_uint(&out, id.vendor_id);
+    harp_cbor_uint(&out, 1);
+    harp_cbor_text(&out, anon ? "" : id.vendor);
+    harp_cbor_uint(&out, 1); /* product { 0 => pid, 1 => name } */
+    harp_cbor_map(&out, 2);
+    harp_cbor_uint(&out, 0);
+    harp_cbor_uint(&out, id.product_id);
+    harp_cbor_uint(&out, 1);
+    harp_cbor_text(&out, anon ? "" : id.product);
+    harp_cbor_uint(&out, 2); /* serial (§16: cleared to "" under anon) */
+    harp_cbor_text(&out, anon ? "" : id.serial);
+    harp_cbor_uint(&out, 3); /* firmware */
+    harp_cbor_text(&out, id.fw);
+    harp_cbor_uint(&out, 4); /* engine { 0 => id, 1 => ver, 2 => param-map-hash } */
+    harp_cbor_map(&out, 3);
+    harp_cbor_uint(&out, 0);
+    harp_cbor_text(&out, id.engine_id); /* engine-id retained (class id, not a name) */
+    harp_cbor_uint(&out, 1);
+    harp_cbor_text(&out, id.engine_ver);
+    harp_cbor_uint(&out, 2);
+    harp_cbor_bytes(&out, id.param_map_hash.b, HARP_HASH_LEN); /* hash always retained */
+    harp_cbor_uint(&out, 6); /* capabilities array (retained) */
+    harp_cbor_array(&out, id.ncaps);
+    for (size_t k = 0; k < id.ncaps; k++) harp_cbor_text(&out, id.caps[k]);
+
+    /* device-section key 1 => counters, embedded VERBATIM (the byte-identical
+     * device conformance gate). Counters carry no PII, so they stay verbatim
+     * under --anonymize too — only identity leaves change. */
+    harp_cbor_uint(&out, 1);
+    if (e.has_body && e.body_len)
+        harp_cbuf_put(&out, e.body, e.body_len);
+    else
+        harp_cbor_map(&out, 0); /* device returned no counters body */
+
+    if (out.oom) die("oom assembling diag bundle");
+
+    /* --- write the bundle (write_wav16's fopen/fwrite/fclose pattern) --- */
+    FILE *f = fopen(outfile, "wb");
+    if (!f) die("cannot write diag bundle");
+    fwrite(out.buf, 1, out.len, f);
+    fclose(f);
+    printf("wrote %zu bytes to %s%s\n", out.len, outfile, anon ? " (anonymized)" : "");
+
+    harp_cbuf_free(&out);
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+}
+
 static void cmd_params(probe *p) {
     do_hello(p);
     harp_cbuf req, rsp;
@@ -962,7 +1073,7 @@ int main(int argc, char **argv) {
     if (i >= argc) {
         fprintf(stderr,
                 "usage: harp-probe [-d HOST:PORT|usb|usb:SERIAL] [-s STOREDIR] "
-                "identify|refs|counters|params|meters|knob ID V|save|restore|record SECS WAV|demo\n");
+                "identify|refs|counters|diag-bundle [--anonymize] [OUT.cbor]|params|meters|knob ID V|save|restore|record SECS WAV|demo\n");
         return 2;
     }
     const char *cmd = argv[i];
@@ -1006,7 +1117,18 @@ int main(int argc, char **argv) {
         cmd_refs(&p);
     else if (strcmp(cmd, "counters") == 0)
         cmd_counters(&p);
-    else if (strcmp(cmd, "params") == 0)
+    else if (strcmp(cmd, "diag-bundle") == 0) {
+        /* diag-bundle [--anonymize] [outfile.cbor] — §14.4 v0 export */
+        bool anon = false;
+        const char *outfile = "harp-diag.cbor";
+        int j = i + 1;
+        if (j < argc && strcmp(argv[j], "--anonymize") == 0) {
+            anon = true;
+            j++;
+        }
+        if (j < argc) outfile = argv[j];
+        cmd_diag_bundle(&p, outfile, anon);
+    } else if (strcmp(cmd, "params") == 0)
         cmd_params(&p);
     else if (strcmp(cmd, "meters") == 0)
         cmd_meters(&p);

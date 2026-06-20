@@ -61,6 +61,8 @@ jobs:
         run: scripts/rtp-loss-eth-test.sh
       - name: offline-edit (§15.5 — a param edited while the device is absent reaches it on reattach)
         run: scripts/offline-edit-eth-test.sh
+      - name: diag-bundle (§14.4 v0 export + §16 anonymization — identity + verbatim counters)
+        run: scripts/diag-bundle-eth-test.sh
       # cross-format VST3<->AU recall over the loopback is verified LOCALLY (XFORMAT PASS)
       # and on the desk rig, but the freshly-installed ad-hoc-signed AU won't instantiate
       # on an ephemeral hosted-macOS runner (au-host "device busy" = the AU never loaded).
