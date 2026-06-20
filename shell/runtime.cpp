@@ -2119,6 +2119,226 @@ bool HarpRuntime::getStateBundle(std::vector<uint8_t> &out) {
     return true;
 }
 
+/* §14.4 diag-bundle / §16 anonymization. DECODE the device-section map
+ * { 0 => identity, 1 => counters } and RE-ENCODE it into `out`, clearing the
+ * identity PII leaves to "" IN PLACE while preserving everything else byte-for-
+ * meaning. This MIRRORS host/harp-probe.c:anonymize_device_section (the
+ * authoritative §16 leaf list) so the host's two diag-bundle producers (the
+ * out-of-process harp-probe and the in-shell runtime) clear the SAME leaves
+ * identically. Cleared: identity key 2 (serial); vendor (key 0)/product (key 1)
+ * sub-map key 1 (name); identity key 9 (build-id); channel-map (key 7) per-entry
+ * keys 2/3/4 (name/group/path). PRESERVED verbatim: vid/pid, firmware, engine
+ * (incl. engine-id + param-map-hash), protocol, latency-profile, boot count,
+ * ump-group-map, part count, caps, per-entry slot/direction/host-paced flag, the
+ * array length/order, and the whole counters map (no PII). Subtrees needing no
+ * edit are copied via harp_cdec_span (byte-for-byte). Returns false on a
+ * malformed section so the caller can fall back. */
+static bool anon_device_section(harp_cbuf *out, const uint8_t *sec, size_t len) {
+    harp_cdec d;
+    harp_cdec_init(&d, sec, len);
+    uint64_t nsec;
+    if (!harp_cdec_map(&d, &nsec)) return false;
+    harp_cbor_map(out, nsec);
+    for (uint64_t i = 0; i < nsec; i++) {
+        uint64_t key;
+        if (!harp_cdec_uint(&d, &key)) return false;
+        harp_cbor_uint(out, key);
+        if (key != 0) { /* counters (key 1) + any future member: no PII, verbatim */
+            const uint8_t *span;
+            size_t sl;
+            if (!harp_cdec_span(&d, &span, &sl)) return false;
+            harp_cbuf_put(out, span, sl);
+            continue;
+        }
+        /* key 0 => identity: re-encode, clearing serial + vendor/product names. */
+        uint64_t nid;
+        if (!harp_cdec_map(&d, &nid)) return false;
+        harp_cbor_map(out, nid);
+        for (uint64_t j = 0; j < nid; j++) {
+            uint64_t ik;
+            if (!harp_cdec_uint(&d, &ik)) return false;
+            harp_cbor_uint(out, ik);
+            if (ik == 0 || ik == 1) { /* vendor/product { 0 => id, 1 => name } */
+                uint64_t nsub;
+                if (!harp_cdec_map(&d, &nsub)) return false;
+                harp_cbor_map(out, nsub);
+                for (uint64_t s = 0; s < nsub; s++) {
+                    uint64_t sk;
+                    if (!harp_cdec_uint(&d, &sk)) return false;
+                    harp_cbor_uint(out, sk);
+                    if (sk == 1) {
+                        if (!harp_cdec_skip(&d)) return false; /* drop the name */
+                        harp_cbor_text(out, "");               /* "" in place (§16) */
+                    } else {
+                        const uint8_t *span;
+                        size_t sl;
+                        if (!harp_cdec_span(&d, &span, &sl)) return false;
+                        harp_cbuf_put(out, span, sl);
+                    }
+                }
+            } else if (ik == 2 || ik == 9) { /* serial / build-id -> "" (§16) */
+                if (!harp_cdec_skip(&d)) return false;
+                harp_cbor_text(out, "");
+            } else if (ik == 7) { /* channel-map: clear per-entry name/group/path */
+                uint64_t nent;
+                if (!harp_cdec_array(&d, &nent)) return false;
+                harp_cbor_array(out, nent);
+                for (uint64_t en = 0; en < nent; en++) {
+                    uint64_t nek;
+                    if (!harp_cdec_map(&d, &nek)) return false;
+                    harp_cbor_map(out, nek);
+                    for (uint64_t ek = 0; ek < nek; ek++) {
+                        uint64_t ekey;
+                        if (!harp_cdec_uint(&d, &ekey)) return false;
+                        harp_cbor_uint(out, ekey);
+                        if (ekey == 2 || ekey == 3 || ekey == 4) {
+                            if (!harp_cdec_skip(&d)) return false; /* name/group/path */
+                            harp_cbor_text(out, "");               /* "" in place */
+                        } else {
+                            const uint8_t *span;
+                            size_t sl;
+                            if (!harp_cdec_span(&d, &span, &sl)) return false;
+                            harp_cbuf_put(out, span, sl);
+                        }
+                    }
+                }
+            } else { /* fw/engine/protocol/latency/boot/ump-map/parts: verbatim */
+                const uint8_t *span;
+                size_t sl;
+                if (!harp_cdec_span(&d, &span, &sl)) return false;
+                harp_cbuf_put(out, span, sl);
+            }
+        }
+    }
+    return !d.err;
+}
+
+/* §14.4 host-context-A — see the runtime.h doc. MIRRORS getStateBundle: a
+ * deterministic CBOR map assembled under ctlMutex_, off the control path, with
+ * no audio-path side effects (golden gate). */
+std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
+    /* Serialize with feeder/control ops (the request() the device-section needs
+     * is always issued under ctlMutex_, like every other control op). */
+    std::lock_guard<std::mutex> lk(ctlMutex_);
+
+    /* Fetch the device-section FIRST (its bytes are embedded verbatim at key 4):
+     * issue `req diag.bundle` and keep the response body. A failure (device gone,
+     * or no diag.bundle cap) leaves an empty section — the bundle stays valid. */
+    harp_cbuf devReq, devRsp;
+    harp_cbuf_init(&devReq);
+    harp_cbuf_init(&devRsp);
+    harp_client_req_head(&client_, &devReq, "diag.bundle", false); /* no body */
+    harp_env de = {};
+    bool haveDev = connected() && request(&devReq, &devRsp, &de) && de.has_body;
+
+    harp_cbuf out;
+    harp_cbuf_init(&out);
+
+    /* Top-level diag-bundle map. v1 fills keys 0-5 + 9; keys 6/7/8/10-13 are
+     * later sub-steps (a vN writer omits unfilled sections), and key 9 is only
+     * present when a session is up (audio-config is meaningless otherwise). The
+     * map size is declared upfront (definite length, deterministic CBOR). */
+    bool haveAudio = connected_.load(std::memory_order_acquire);
+    harp_cbor_map(&out, haveAudio ? 7 : 6); /* 0,1,2,3,4,5 [+9] */
+
+    /* KEY 0: magic. */
+    harp_cbor_uint(&out, 0);
+    harp_cbor_text(&out, "harpd");
+
+    /* KEY 1: version. */
+    harp_cbor_uint(&out, 1);
+    harp_cbor_uint(&out, 1);
+
+    /* KEY 2: bundle-meta { 0 => tstamp [epoch, msc], 1 => tool }. */
+    harp_cbor_uint(&out, 2);
+    harp_cbor_map(&out, 2);
+    harp_cbor_uint(&out, 0);
+    harp_cbor_array(&out, 2);
+    harp_cbor_uint(&out, (uint64_t)time(nullptr)); /* epoch seconds */
+    /* current MSC if streaming, else 0 — streamPos() is the stream-domain SSI. */
+    harp_cbor_uint(&out, haveAudio ? streamPos() : 0);
+    harp_cbor_uint(&out, 1);
+    harp_cbor_text(&out, "harp-runtime (device-assembled device-section)");
+
+    /* KEY 3: anonymized flag. */
+    harp_cbor_uint(&out, 3);
+    harp_cbor_bool(&out, anonymize);
+
+    /* KEY 4: device-section. Non-anon: the device's response body VERBATIM (the
+     * byte-identical conformance gate). Anon: decode-reencode with §16 leaves
+     * cleared (the seam exception — NOT kept verbatim). harp_cbuf_put COPIES the
+     * bytes, so de.body can be freed after this. */
+    harp_cbor_uint(&out, 4);
+    if (haveDev) {
+        if (anonymize) {
+            if (!anon_device_section(&out, de.body, de.body_len))
+                harp_cbor_map(&out, 0); /* malformed -> empty (still valid CBOR) */
+        } else {
+            harp_cbuf_put(&out, de.body, de.body_len);
+        }
+    } else {
+        harp_cbor_map(&out, 0); /* device not ready / no cap -> empty device-section */
+    }
+    harp_cbuf_free(&devReq);
+    harp_cbuf_free(&devRsp);
+
+    /* KEY 5: host-counters (keys 0-6). Numeric leaves — no PII, unchanged by the
+     * anon pass. All read here under ctlMutex_. */
+    harp_cbor_uint(&out, 5);
+    harp_cbor_map(&out, 7);
+    harp_cbor_uint(&out, 0);
+    harp_cbor_uint(&out, underruns_.load(std::memory_order_relaxed)); /* host_underruns */
+    harp_cbor_uint(&out, 1);
+    harp_cbor_uint(&out, padSamples_.load(std::memory_order_relaxed)); /* pad_debt_samples */
+    harp_cbor_uint(&out, 2);
+    harp_cbor_uint(&out, evDrops_.load(std::memory_order_relaxed)); /* event_drops */
+    harp_cbor_uint(&out, 3);
+    harp_cbor_uint(&out, framesSent_); /* frames_sent (audio-thread member, read off-path) */
+    harp_cbor_uint(&out, 4);
+    harp_cbor_uint(&out, framesRecvAtomic_.load(std::memory_order_relaxed)); /* frames_recv */
+    harp_cbor_uint(&out, 5);
+    harp_cbor_uint(&out, sessionGen_.load(std::memory_order_relaxed)); /* session_generation */
+    harp_cbor_uint(&out, 6);
+    harp_cbor_uint(&out, renegCount_.load(std::memory_order_acquire)); /* audio_renegotiations */
+
+    /* KEY 9: audio-config (host-owned DAW view; keys 0-11). Only when a session
+     * is up (otherwise these read defaults that misdescribe a dead session). Key
+     * 12 transport is a later enrichment (omitted in v1). */
+    if (haveAudio) {
+        harp_cbor_uint(&out, 9);
+        harp_cbor_map(&out, 12);
+        harp_cbor_uint(&out, 0);
+        harp_cbor_uint(&out, rate_); /* DAW sample rate */
+        harp_cbor_uint(&out, 1);
+        harp_cbor_uint(&out, kBlock); /* DAW pacing block (256) */
+        harp_cbor_uint(&out, 2);
+        harp_cbor_uint(&out, freeRunning_.load(std::memory_order_relaxed) ? 0 : 1); /* clock-mode */
+        harp_cbor_uint(&out, 3); /* active out-slots (the audio.start union) */
+        harp_cbor_array(&out, unionSlots_.size());
+        for (uint32_t slot : unionSlots_) harp_cbor_uint(&out, slot);
+        harp_cbor_uint(&out, 4); /* active in-slots: H->D only, empty */
+        harp_cbor_array(&out, 0);
+        harp_cbor_uint(&out, 5);
+        harp_cbor_uint(&out, targetFrames_); /* target ring depth (frames) */
+        harp_cbor_uint(&out, 6);
+        harp_cbor_uint(&out, 0); /* DAW PDC latency (not reported in v1) */
+        harp_cbor_uint(&out, 7);
+        harp_cbor_bool(&out, bitExact_); /* 1:1 rate-lock vs ASRC */
+        harp_cbor_uint(&out, 8);
+        harp_cbor_bool(&out, freeRunning_.load(std::memory_order_relaxed)); /* free-running */
+        harp_cbor_uint(&out, 9);
+        harp_cbor_bool(&out, wantHostPaced_.load(std::memory_order_relaxed)); /* offline */
+        harp_cbor_uint(&out, 10);
+        harp_cbor_uint(&out, 0); /* sample format (0 = float32) */
+        harp_cbor_uint(&out, 11);
+        harp_cbor_uint(&out, unionWidth_.load(std::memory_order_relaxed)); /* RTP columns */
+    }
+
+    std::vector<uint8_t> result(out.buf, out.buf + out.len);
+    harp_cbuf_free(&out);
+    return result;
+}
+
 /* Decode a flat { id => float } param map at the decoder's cursor into out. */
 static void decode_param_map(harp_cdec *pd,
                              std::vector<std::pair<uint32_t, float>> *out) {

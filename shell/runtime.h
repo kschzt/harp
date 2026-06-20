@@ -310,6 +310,20 @@ public:
     /* Pull (§11.4): snapshot-if-dirty, fetch closure, serialize a Recall
      * Bundle (§15.3). False if not connected and nothing staged. */
     bool getStateBundle(std::vector<uint8_t> &out);
+    /* §14.4 host-context-A: assemble the DIAG bundle (a debug snapshot, NOT
+     * project state). MIRRORS getStateBundle's shape — deterministic CBOR built
+     * under ctlMutex_ off the control path, READ-ONLY: it never touches the audio
+     * ring, event rings, padding debt, or any session-mutable state, so it has
+     * ZERO effect on the render (the golden gate). It issues `req diag.bundle`
+     * under the lock and embeds the device's response body VERBATIM as device-
+     * section key 4 (the byte-identical conformance gate), then layers the HOST's
+     * own counters (key 5) and audio-config (key 9) on top. With anonymize=true
+     * the device-section is decode-reencoded with the §16 PII leaves cleared to ""
+     * (mirroring host/harp-probe.c anonymize_device_section); the host sections
+     * are numeric (no tstr leaves) so they pass through unchanged. v1 omits the
+     * later sub-step keys 6/7/8/10-13 (a vN writer omits unfilled sections).
+     * Returns the CBOR bytes (always a valid bundle, even with no device). */
+    std::vector<uint8_t> getDiagBundle(bool anonymize = false);
     /* Parse a bundle; stage it; if connected, reconcile now (§12.2).
      * v0 policy deviation: mismatch auto-resolves by Push-with-archive
      * (spec wants a user choice; the shell has no UI yet — the archive

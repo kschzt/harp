@@ -255,6 +255,27 @@ public:
              * touch a freed runtime. Then drop the reference: the LAST holder of
              * a shared runtime stops+destroys it (joining its threads); a
              * private (unshared) runtime is torn down outright. */
+            /* §14.4 host-context-A TRIGGER (test/diagnostic, OPT-IN by env): the
+             * out-of-process host's --diag-bundle flag sets HARP_DIAG_BUNDLE_OUT
+             * to a file path. We capture the runtime's diag bundle HERE — after
+             * the render is complete (the host calls setActive(false) post-
+             * process) and while the session is still up — and write the bytes.
+             * getDiagBundle() is READ-ONLY off the control path (no audio-path
+             * effect), so this is invisible to the render. Only the OWNER (which
+             * drives the live session) captures; an unset env is the no-op golden
+             * path. The runtime reaches this from the in-process plugin module,
+             * since the registry it owns lives inside this .vst3, not the host. */
+            if (const char *p = getenv("HARP_DIAG_BUNDLE_OUT");
+                p && p[0] && owner() && runtime()) {
+                bool anon = false;
+                if (const char *a = getenv("HARP_DIAG_BUNDLE_ANON"); a && a[0] && a[0] != '0')
+                    anon = true;
+                std::vector<uint8_t> db = runtime()->getDiagBundle(anon);
+                if (FILE *f = fopen(p, "wb")) {
+                    if (!db.empty()) fwrite(db.data(), 1, db.size(), f);
+                    fclose(f);
+                }
+            }
             releaseSource();
             runtime_release(handle_);
             handle_ = RuntimeHandle{};

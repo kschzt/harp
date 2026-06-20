@@ -401,7 +401,12 @@ int main(int argc, char **argv) {
                 "       [--channel N] [--loop STARTPPQ:ENDPPQ]\n"
                 "       [--part N] [--realtime] [--out FILE.wav] [--hash] [--json]\n"
                 "       [--expect-hash HEX] [--save-state FILE] [--load-state FILE]\n"
+                "       [--diag-bundle FILE | --diag-bundle-anon FILE]\n"
                 "       [--instances N | --aliases ch0,ch1,..] [--serial SERIAL]\n"
+                "  --diag-bundle FILE   §14.4 host-context-A: after the render, capture\n"
+                "             the runtime's diag bundle (device-section + host counters +\n"
+                "             audio-config) and write the CBOR to FILE (read-only, no\n"
+                "             audio-path effect). --diag-bundle-anon adds the §16 PII pass.\n"
                 "  --part N   pull device part N's (0..15) stereo output instead of the\n"
                 "             main mix (slots {2+2N,3+2N}); default = main mix\n"
                 "  --part-audio   multi-instance: attached aliases pull their OWN part\n"
@@ -469,6 +474,15 @@ int main(int argc, char **argv) {
      * single-instance, the byte-identical golden/timing/recall path. */
     std::vector<int> alias_channels; /* one entry per instance; channel == device part */
     std::string mt_serial;           /* serial to pin for the shared claim */
+    /* §14.4 host-context-A: --diag-bundle OUTFILE captures the runtime's diag
+     * bundle after the render and writes the CBOR bytes to OUTFILE. The runtime
+     * lives inside the dlopen'd plugin (not this host), so we reach it the way
+     * the rest of the harness reaches it — an env var the plugin reads when it
+     * tears the session down (HARP_DIAG_BUNDLE_OUT), at which point the bundle is
+     * captured READ-ONLY off the control path (no audio-path effect). Empty =
+     * off, the byte-identical golden path. */
+    std::string diag_bundle_path;
+    bool diag_bundle_anon = false; /* --diag-bundle-anon: run the §16 anon pass */
     double bpm = 0;            /* >0: emit a playing transport (tempo, PPQ) */
     double loop_a = -1, loop_b = -1; /* PPQ loop region: jump b -> a */
     double note_period = 0.6;  /* s between note-ons; gate = 75% of period */
@@ -500,6 +514,11 @@ int main(int argc, char **argv) {
         else if (a == "--out") out_path = next();
         else if (a == "--save-state") save_state_path = next();
         else if (a == "--load-state") load_state_path = next();
+        else if (a == "--diag-bundle") diag_bundle_path = next(); /* §14.4 host-context-A */
+        else if (a == "--diag-bundle-anon") { /* + §16 anon pass */
+            diag_bundle_path = next();
+            diag_bundle_anon = true;
+        }
         else if (a == "--input") {
             input_kind = next();
             auto colon = input_kind.find(':');
@@ -724,6 +743,26 @@ int main(int argc, char **argv) {
         setenv("HARP_CHANNEL", chbuf, 1);
 #endif
         printf("channel: %d (notes + params -> part %d)\n", channel, channel);
+    }
+
+    /* §14.4 host-context-A: hand the diag-bundle output path to the plugin via an
+     * env var (the runtime lives inside the dlopen'd plugin module). The plugin
+     * captures getDiagBundle() and writes it at session teardown — after this
+     * render, off the audio path. MUST be set before setActive(true)/(false).
+     * The single-instance path reaches the runtime ONLY when a serial is pinned
+     * (HARP_DEVICE_SERIAL), so the plugin's owner registers a runtime the capture
+     * can read; with no serial the runtime is private and still captured by the
+     * SAME owner instance at teardown. Unset env (no flag) is the golden no-op. */
+    if (!diag_bundle_path.empty()) {
+#ifdef _WIN32
+        _putenv_s("HARP_DIAG_BUNDLE_OUT", diag_bundle_path.c_str());
+        if (diag_bundle_anon) _putenv_s("HARP_DIAG_BUNDLE_ANON", "1");
+#else
+        setenv("HARP_DIAG_BUNDLE_OUT", diag_bundle_path.c_str(), 1);
+        if (diag_bundle_anon) setenv("HARP_DIAG_BUNDLE_ANON", "1", 1);
+#endif
+        printf("diag-bundle: -> %s%s\n", diag_bundle_path.c_str(),
+               diag_bundle_anon ? " (anonymized, §16)" : "");
     }
 
     /* ---- host context + module ---- */
