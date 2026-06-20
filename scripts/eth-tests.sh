@@ -33,9 +33,14 @@ bad() { FAIL=$((FAIL + 1)); echo "   ✗ FAIL: $1"; }
 # that the §8.7 path connects and carries non-silent audio, with lenient floors. The
 # real low-latency / sub-512-frame behaviour is the DIRECT CABLE, not either runner.
 case "$(uname -s)" in Darwin) MAC=1;; *) MAC=0;; esac
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WIN=1;; *) WIN=0;; esac
 RMS_BITEXACT=0.30; RMS_ASRC=0.25       # Linux: strict (ideal tone rms 0.3536)
-[ "$MAC" = 1 ] && { RMS_BITEXACT=0.18; RMS_ASRC=0.12; }  # macOS: non-silent floor only
-gt() { [ "$(python3 -c "print(1 if $1 > $2 else 0)")" = 1 ]; }  # float >
+# macOS AND Windows get the non-silent floor only: the device sim paces RTP with
+# RELATIVE nanosleep (macOS has no clock_nanosleep(TIMER_ABSTIME); the Windows device
+# is a MinGW build, same #else path), which jitters under cloud-runner load and lowers
+# rms. Linux (TIMER_ABSTIME, deterministic) stays the STRICT fidelity/stability oracle.
+{ [ "$MAC" = 1 ] || [ "$WIN" = 1 ]; } && { RMS_BITEXACT=0.18; RMS_ASRC=0.12; }
+gt() { awk "BEGIN{exit !($1 > $2)}"; }  # float > (awk: portable, no python3-on-git-bash)
 
 DEVPID=""
 stop_dev() { [ -n "$DEVPID" ] && kill "$DEVPID" 2>/dev/null; wait "$DEVPID" 2>/dev/null; DEVPID=""; }
@@ -104,8 +109,8 @@ fi
 # runner (observed ~400 underruns) — that's the runner's timing, not the loop — so it would
 # false-fail. The damping is exercised here on Linux; the real tight-buffer behaviour is
 # the direct cable.
-if [ "$MAC" = 1 ]; then
-    echo "──── small-target stability: SKIP on macOS (no clock_nanosleep; loop damping is asserted on Linux + the cable)"
+if [ "$MAC" = 1 ] || [ "$WIN" = 1 ]; then
+    echo "──── small-target stability: SKIP on macOS/Windows (relative-nanosleep device sim can't sustain a 10.6 ms buffer under runner jitter; loop damping is asserted on Linux + the cable)"
 else
     base_under="${under:-0}"   # the 2048-default underruns from the bit-exact section above
     echo "──── small-target stability: HARP_ETH_TARGET=512 (~10.6 ms, 4x below default; baseline underruns=$base_under)"
@@ -121,7 +126,7 @@ else
     # 10.6 ms buffer legitimately absorbs a little less than 43 ms — so allow +64). A hunting
     # loop underruns continuously (hundreds-to-thousands at block 256 over 8 s), far past +64.
     if [ "${conn:-0}" -gt 0 ] && [ -n "$rms" ] && gt "$rms" 0.30 \
-       && [ "$(python3 -c "print(1 if ${under:-99999} <= ${base_under:-0} + 64 else 0)")" = 1 ]; then
+       && [ "${under:-99999}" -le "$(( ${base_under:-0} + 64 ))" ]; then
         ok "small-target (512/128): loop stable at 4x-smaller buffer (rms $rms, underruns ${under} vs baseline $base_under)"
     else
         bad "small-target (512/128): conn=$conn rms=${rms:-none} underruns=${under:-?} vs baseline $base_under (want connected + rms>0.30 + underruns<=baseline+64)"
@@ -161,6 +166,9 @@ fi
 #   alias-part-audio = the main mix is RICHER than a demuxed part (a strict subset),
 #   part-param-iso   = a part's level routes to ITS audio and stays out of the others.
 # A normal-synth device (no --tone) so the aliases' injected per-part notes render.
+if [ "$WIN" = 1 ]; then
+    echo "──── multi-output demux: SKIP on Windows v1 (the alias-part-audio harness builds the multi-instance shell -DHARP_TSAN=ON; TSan isn't supported on the MinGW/MSVC Windows toolchains — tracked as a follow-up; the per-part demux is covered on Linux/macOS)"
+else
 export HARP_DEVICE_SERIAL="SIM-0001"   # the --port daemon's serial (the connect-check matches it)
 export HARP_ETH_DEVICE="127.0.0.1:$PORT"
 for mode in "bit-exact:" "ASRC:--no-rate-lock"; do
@@ -175,6 +183,7 @@ for mode in "bit-exact:" "ASRC:--no-rate-lock"; do
     stop_dev
 done
 unset HARP_ETH_DEVICE
+fi
 
 echo "════ eth-tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

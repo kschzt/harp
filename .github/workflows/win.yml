@@ -70,3 +70,13 @@ jobs:
           export CHOST="$(find build-vst -name 'clap-host.exe' | head -1)"
           echo "device=$DEVICED  vhost=$VHOST  chost=$CHOST"
           scripts/offline-golden-eth.sh
+
+      # ---- eth conformance over the live RTP plane (bit-exact + ASRC); small-target
+      #      and the TSan multi-output harness are gated off on Windows (see eth-tests.sh) ----
+      - name: eth conformance (bit-exact + ASRC over §8.7 RTP)
+        shell: bash
+        run: |
+          export DEVICED="build-dev/harp-deviced.exe"
+          export HOSTBIN="$(find build-vst -name 'harp-vst3-host.exe' | head -1)"
+          echo "device=$DEVICED  host=$HOSTBIN"
+          scripts/eth-tests.sh
