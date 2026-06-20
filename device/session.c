@@ -212,9 +212,10 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, PROTO_MAJOR);
     harp_cbor_uint(m, PROTO_MINOR);
     harp_cbor_uint(m, 6); /* capabilities */
-    harp_cbor_array(m, d->no_rate_lock ? 15 : 16); /* P3: +evt.multitimbral; §9.9: +evt.param.meter;
+    harp_cbor_array(m, d->no_rate_lock ? 16 : 17); /* P3: +evt.multitimbral; §9.9: +evt.param.meter;
                                +evt.param.mod; §8.7: +audio.rate-lock (dropped under
-                               --no-rate-lock to force the host ASRC fallback) */
+                               --no-rate-lock to force the host ASRC fallback);
+                               §14.4: +diag.bundle */
     harp_cbor_text(m, "harp-core");
     harp_cbor_text(m, "harp-recall");
     harp_cbor_text(m, "harp-stream");
@@ -244,6 +245,8 @@ static void encode_identity(device *d, harp_cbuf *m) {
                                              params (per-part + main peak/RMS)
                                              streamed via evt.param.echo at the
                                              descriptor's meter-rate hint */
+    harp_cbor_text(m, "diag.bundle"); /* §14.4: rsp diag.bundle returns the device-section
+                                         (identity + counters) the host embeds verbatim */
     harp_cbor_text(m, "x.harp-refdev.sim");
     harp_cbor_uint(m, 7); /* channel map (§6.3): 34 slots, all D→H. §P2.2
                              exposes per-part outputs: slots 0/1 are the stereo
@@ -685,7 +688,11 @@ static void handle_state_refset(device *d, const harp_env *e) {
     ntf_state_changed(d, &r);
 }
 
-static void handle_diag_counters(device *d, const harp_env *e) {
+/* §14.2 counters MAP (the 16-pair, text-keyed map), emitted into `m`. SHARED by
+ * handle_diag_counters (as the rsp body) and handle_diag_bundle (device-section key
+ * 1) so both emit BYTE-IDENTICAL counters — the §14.4 diag.bundle conformance gate
+ * is the device-section round-tripping verbatim, which requires one emitter. */
+static void emit_counters(device *d, harp_cbuf *m) {
     uint64_t total = 0, freeb = 0;
 #ifndef _WIN32
     struct statvfs vs;
@@ -694,42 +701,67 @@ static void handle_diag_counters(device *d, const harp_env *e) {
         freeb = (uint64_t)vs.f_bavail * vs.f_frsize;
     }
 #endif
+    harp_cbor_map(m, 16);
+    harp_cbor_text(m, "x.harp-refdev.fence_waits");
+    harp_cbor_uint(m, CTR_GET(g_fence_waits));
+    harp_cbor_text(m, "x.harp-refdev.fence_timeouts");
+    harp_cbor_uint(m, CTR_GET(g_fence_timeouts));
+    harp_cbor_text(m, "usb_errors");
+    harp_cbor_uint(m, 0);
+    harp_cbor_text(m, "frame_errors");
+    harp_cbor_uint(m, CTR_GET(d->frame_errors));
+    harp_cbor_text(m, "audio_underruns");
+    harp_cbor_uint(m, 0);
+    harp_cbor_text(m, "audio_overruns");
+    harp_cbor_uint(m, CTR_GET(d->audio_overruns));
+    harp_cbor_text(m, "audio_late_frames");
+    harp_cbor_uint(m, 0);
+    harp_cbor_text(m, "msc_discontinuities");
+    harp_cbor_uint(m, 0);
+    harp_cbor_text(m, "clock_drift_ppb");
+    harp_cbor_int(m, 0);
+    harp_cbor_text(m, "evt_late");
+    harp_cbor_uint(m, CTR_GET(g_evt_late));
+    harp_cbor_text(m, "evt_stale_epoch");
+    harp_cbor_uint(m, 0);
+    harp_cbor_text(m, "x.harp-refdev.evq_drops");
+    harp_cbor_uint(m, CTR_GET(g_evq_drops));
+    harp_cbor_text(m, "x.harp-refdev.ramp_late");
+    harp_cbor_uint(m, CTR_GET(g_ramp_late));
+    harp_cbor_text(m, "session_resets");
+    harp_cbor_uint(m, CTR_GET(d->session_resets));
+    harp_cbor_text(m, "storage_bytes_total");
+    harp_cbor_uint(m, total);
+    harp_cbor_text(m, "storage_bytes_free");
+    harp_cbor_uint(m, freeb);
+}
+
+static void handle_diag_counters(device *d, const harp_env *e) {
     harp_cbuf m;
     harp_cbuf_init(&m);
     rsp_head(&m, e->rid, e->method, true);
-    harp_cbor_map(&m, 16);
-    harp_cbor_text(&m, "x.harp-refdev.fence_waits");
-    harp_cbor_uint(&m, CTR_GET(g_fence_waits));
-    harp_cbor_text(&m, "x.harp-refdev.fence_timeouts");
-    harp_cbor_uint(&m, CTR_GET(g_fence_timeouts));
-    harp_cbor_text(&m, "usb_errors");
+    emit_counters(d, &m);
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+
+/* diag.bundle (§14.4): the DEVICE-SECTION the host embeds VERBATIM at bundle key 4.
+ * Integer-keyed map { 0 => identity (encode_identity — byte-identical to hello),
+ *                     1 => counters (emit_counters — byte-identical to diag.counters) }.
+ * device-section keys 2 (device logs) and 3 (audio-config) are OPTIONAL and omitted
+ * for now: the refdev has no drainable §4.2 log ring yet, and audio-config is a later
+ * enrichment. The byte-identical round-trip of THIS map is the device conformance gate
+ * (host stores it verbatim under key 4 in the non-anonymized path). See
+ * docs/diag-bundle-design.md. §16 anonymization stays HOST-side (host re-encodes). */
+static void handle_diag_bundle(device *d, const harp_env *e) {
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, true);
+    harp_cbor_map(&m, 2); /* device-section: 0 identity, 1 counters */
     harp_cbor_uint(&m, 0);
-    harp_cbor_text(&m, "frame_errors");
-    harp_cbor_uint(&m, CTR_GET(d->frame_errors));
-    harp_cbor_text(&m, "audio_underruns");
-    harp_cbor_uint(&m, 0);
-    harp_cbor_text(&m, "audio_overruns");
-    harp_cbor_uint(&m, CTR_GET(d->audio_overruns));
-    harp_cbor_text(&m, "audio_late_frames");
-    harp_cbor_uint(&m, 0);
-    harp_cbor_text(&m, "msc_discontinuities");
-    harp_cbor_uint(&m, 0);
-    harp_cbor_text(&m, "clock_drift_ppb");
-    harp_cbor_int(&m, 0);
-    harp_cbor_text(&m, "evt_late");
-    harp_cbor_uint(&m, CTR_GET(g_evt_late));
-    harp_cbor_text(&m, "evt_stale_epoch");
-    harp_cbor_uint(&m, 0);
-    harp_cbor_text(&m, "x.harp-refdev.evq_drops");
-    harp_cbor_uint(&m, CTR_GET(g_evq_drops));
-    harp_cbor_text(&m, "x.harp-refdev.ramp_late");
-    harp_cbor_uint(&m, CTR_GET(g_ramp_late));
-    harp_cbor_text(&m, "session_resets");
-    harp_cbor_uint(&m, CTR_GET(d->session_resets));
-    harp_cbor_text(&m, "storage_bytes_total");
-    harp_cbor_uint(&m, total);
-    harp_cbor_text(&m, "storage_bytes_free");
-    harp_cbor_uint(&m, freeb);
+    encode_identity(d, &m);
+    harp_cbor_uint(&m, 1);
+    emit_counters(d, &m);
     send_ctl(d, &m);
     harp_cbuf_free(&m);
 }
@@ -1345,6 +1377,8 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
         handle_audio_trim(d, &e);
     else if (strcmp(e.method, "diag.counters") == 0)
         handle_diag_counters(d, &e);
+    else if (strcmp(e.method, "diag.bundle") == 0)
+        handle_diag_bundle(d, &e); /* §14.4: device-section embedded verbatim host-side */
     else if (strcmp(e.method, "x.harp-refdev.knob") == 0)
         handle_knob(d, &e);
     else if (strcmp(e.method, "x.harp.reconcile.offer") == 0)
