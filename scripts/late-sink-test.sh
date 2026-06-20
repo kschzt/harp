@@ -69,8 +69,15 @@ cmake --build "$BUILD" --target tsan-host -j >/dev/null
 capture() {
     for try in 1 2 3 4; do
         out=$(mktemp /tmp/late-sink.XXXXXX)
-        "$BUILD/tsan-host" --instances "$INSTANCES" --late-sink --seconds "$SECONDS_RUN" \
-            --block 256 --out "/tmp/late-sink-$1.wav" >"$out" 2>&1 || true
+        # --no-state-stress (as alias-part-audio-test.sh does): the owner's periodic
+        # getState/setState CAS-to-store Push starves the stream into underrun, and the
+        # SINK is captured only over the armed (post-re-neg) window — so a setState
+        # starvation landing in that window reads the late sink as FULL silence while
+        # the whole-run main mix stays audible (the residual ~1/13 flake). State-churn
+        # resilience is a SEPARATE concern (tsan-shell.sh's race configs); this test
+        # isolates the re-neg DELIVERING the part, so it opts out of the churn.
+        "$BUILD/tsan-host" --instances "$INSTANCES" --late-sink --no-state-stress \
+            --seconds "$SECONDS_RUN" --block 256 --out "/tmp/late-sink-$1.wav" >"$out" 2>&1 || true
         s=$(grep '^sink-rms:' "$out" | awk '{print $2}')
         m=$(grep '^main-rms:' "$out" | awk '{print $2}')
         conn=$(grep -c "harp-shell: connected:.*serial $SERIAL" "$out" || true)
