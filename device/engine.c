@@ -815,6 +815,11 @@ static void host_paced_loop(device *d) {
      * default stereo main mix uses only the first 2 channels */
     uint8_t frame[HARP_AUDIO_HDR_LEN + AUDIO_MAX_NSAMPLES * 34 * 4];
     float samples[AUDIO_MAX_NSAMPLES * 34];
+    /* §14.3 digital loopback: the single H->D in-slot column extracted from the
+     * pacing-frame input payload, copied onto the rendered out-slot column below.
+     * Only the one looped channel is kept (not the whole multi-slot payload), so
+     * the audio thread's stack stays small. Untouched unless loopback_on. */
+    float lpb_col[AUDIO_MAX_NSAMPLES];
     /* buffered endpoint reads (packet-multiple, see ffs.c) */
     uint8_t rbuf[16384];
     size_t rlen = 0, rpos = 0;
@@ -899,12 +904,36 @@ static void host_paced_loop(device *d) {
                     CTR_INC(g_fence_timeouts); /* aborted via stop with events pending */
             }
         }
-        /* discard any input payload (this engine has no input channels) */
+        /* Input payload: normally discarded (this engine has no input channels), so the
+         * golden/offline-bounce path is byte-identical. §14.3: when the digital loopback
+         * is armed, instead pick out the looped in-slot's column (payload is slot-
+         * interleaved floats, columns in a->in_slots order) into lpb_col, to be copied
+         * onto the rendered out-slot column after render_output. */
+        bool lpb = atomic_load_explicit(&a->loopback_on, memory_order_acquire);
+        int in_col = -1;
+        if (lpb)
+            for (uint8_t c = 0; c < a->n_in_slots; c++)
+                if (a->in_slots[c] == a->loopback_in_slot) { in_col = c; break; }
+        bool keep = lpb && in_col >= 0 && h.slots > 0 && (size_t)in_col < h.slots &&
+                    h.nsamples <= AUDIO_MAX_NSAMPLES;
+        size_t stride = (size_t)h.slots * 4; /* bytes per interleaved sample-row */
+        size_t base = (size_t)in_col * 4;    /* first byte of in_col within a row  */
+        size_t pcur = 0;                     /* absolute byte offset within payload */
         size_t skip = harp_audio_payload_len(&h);
         while (skip) {
             if (rpos < rlen) {
                 size_t take = rlen - rpos;
                 if (take > skip) take = skip;
+                if (keep) {
+                    /* copy only the bytes that fall in the in_col float of each row */
+                    for (size_t i = 0; i < take; i++) {
+                        size_t inrow = (pcur + i) % stride;
+                        if (inrow >= base && inrow < base + 4)
+                            ((uint8_t *)lpb_col)[((pcur + i) / stride) * 4 +
+                                                 (inrow - base)] = rbuf[rpos + i];
+                    }
+                }
+                pcur += take;
                 rpos += take;
                 skip -= take;
                 continue;
@@ -922,6 +951,20 @@ static void host_paced_loop(device *d) {
         /* §P2.2: render the requested output slots; `slots` carries the count.
          * Default {0,1} is the unchanged 2-channel main mix (golden holds). */
         uint16_t slots = render_output(a, samples, n, (float)a->rate, h.ts);
+        /* §14.3 digital loopback: overwrite the rendered out-slot column with the kept
+         * in-slot column — a same-frame copy, so device-internal loop latency is 0 (the
+         * start-rsp reports key5=0). `keep` implies the host declared both slots (in via
+         * audio.start key3, out via key4); if the out-slot was not rendered we no-op and
+         * the host's round-trip measurement fails loudly. Gated on loopback_on, so off
+         * the golden path this is never entered and output stays byte-identical. */
+        if (keep) {
+            int out_col = -1;
+            for (uint16_t c = 0; c < slots; c++)
+                if (a->out_slots[c] == a->loopback_out_slot) { out_col = c; break; }
+            if (out_col >= 0)
+                for (uint32_t s = 0; s < n; s++)
+                    samples[(size_t)s * slots + out_col] = lpb_col[s];
+        }
         harp_audio_hdr out = {HARP_AUDIO_FVER, 0, slots, h.epoch, h.ts, (uint16_t)n,
                               HARP_AUDIO_FMT_F32};
         harp_audio_hdr_encode(&out, frame);

@@ -265,6 +265,20 @@ typedef struct {
     uint8_t out_slots[34];
     uint8_t n_out_slots;
 
+    /* §14.3 diag.loopback. in_slots[] = active INPUT slots (audio.start key 3, H->D),
+     * parsed so a digital loopback can copy a host-sent input column back to an output
+     * column; empty for a normal synth stream (no input channels). loopback_on (default
+     * OFF — the golden / offline-bounce path never touches it) makes host_paced_loop copy
+     * the H->D input payload column for loopback_in_slot into the D->H rendered column for
+     * loopback_out_slot (a pure same-segment copy; device-internal loop latency 0). The
+     * slots are set by diag.loopback.start (session thread) BEFORE loopback_on is raised;
+     * the audio thread polls loopback_on each frame and then reads the slots. */
+    uint8_t in_slots[34];
+    uint8_t n_in_slots;
+    _Atomic bool loopback_on;
+    uint8_t loopback_in_slot;
+    uint8_t loopback_out_slot;
+
     /* §9.9 meter echo pump: a control-thread emitter that streams readonly
      * meter params via evt_echo_param at METER_RATE_HZ, ONLY while streaming.
      * Owned/managed by session.c (meter_pump_start/stop); never the render

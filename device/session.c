@@ -212,10 +212,10 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, PROTO_MAJOR);
     harp_cbor_uint(m, PROTO_MINOR);
     harp_cbor_uint(m, 6); /* capabilities */
-    harp_cbor_array(m, d->no_rate_lock ? 16 : 17); /* P3: +evt.multitimbral; §9.9: +evt.param.meter;
+    harp_cbor_array(m, d->no_rate_lock ? 17 : 18); /* P3: +evt.multitimbral; §9.9: +evt.param.meter;
                                +evt.param.mod; §8.7: +audio.rate-lock (dropped under
                                --no-rate-lock to force the host ASRC fallback);
-                               §14.4: +diag.bundle */
+                               §14.4: +diag.bundle; §14.3: +diag.loopback.digital */
     harp_cbor_text(m, "harp-core");
     harp_cbor_text(m, "harp-recall");
     harp_cbor_text(m, "harp-stream");
@@ -247,6 +247,8 @@ static void encode_identity(device *d, harp_cbuf *m) {
                                              descriptor's meter-rate hint */
     harp_cbor_text(m, "diag.bundle"); /* §14.4: rsp diag.bundle returns the device-section
                                          (identity + counters) the host embeds verbatim */
+    harp_cbor_text(m, "diag.loopback.digital"); /* §14.3: pure-DSP H->D-in -> D->H-out echo
+                                                   (no analog stage) for round-trip latency */
     harp_cbor_text(m, "x.harp-refdev.sim");
     harp_cbor_uint(m, 7); /* channel map (§6.3): 34 slots, all D→H. §P2.2
                              exposes per-part outputs: slots 0/1 are the stereo
@@ -766,6 +768,98 @@ static void handle_diag_bundle(device *d, const harp_env *e) {
     harp_cbuf_free(&m);
 }
 
+/* diag.loopback.start (§14.3): arm the digital round-trip loop. Body {0=>in-slot (H->D
+ * the device reads the host stimulus from), 1=>out-slot (D->H it writes the echo to),
+ * 2=>"digital"|"analog", ?3=>rate}. The refdev does DIGITAL only (a pure same-segment
+ * copy in host_paced_loop, gated on loopback_on so the golden path is untouched) and
+ * requires a live host-paced stream. Replies {0 armed,1 mode,2 eff-in,3 eff-out,4 eff-rate,
+ * 5 device-internal-loop-latency=0 (the host subtracts it in T11)}. See evq/engine copy +
+ * docs/diag-bundle-design.md. */
+static void handle_diag_loopback_start(device *d, const harp_env *e) {
+    uint64_t in_slot = 0, out_slot = 0, rate_hint = 0;
+    char mode[16] = {0};
+    bool have_mode = false;
+    if (e->has_body) {
+        harp_cdec b;
+        harp_cdec_init(&b, e->body, e->body_len);
+        uint64_t n;
+        if (harp_cdec_map(&b, &n)) {
+            for (uint64_t i = 0; i < n; i++) {
+                uint64_t key;
+                if (!harp_cdec_uint(&b, &key)) break;
+                if (key == 0) {
+                    if (!harp_cdec_uint(&b, &in_slot)) break;
+                } else if (key == 1) {
+                    if (!harp_cdec_uint(&b, &out_slot)) break;
+                } else if (key == 2) {
+                    const char *s = NULL;
+                    size_t sl = 0;
+                    if (!harp_cdec_text(&b, &s, &sl)) break;
+                    size_t c = sl < sizeof mode - 1 ? sl : sizeof mode - 1;
+                    if (s) memcpy(mode, s, c);
+                    mode[c] = 0;
+                    have_mode = true;
+                } else if (key == 3) {
+                    if (!harp_cdec_uint(&b, &rate_hint)) break;
+                } else if (!harp_cdec_skip(&b))
+                    break;
+            }
+        }
+    }
+    (void)rate_hint; /* the refdev loops at the live stream rate; the hint is informational */
+    if (!have_mode || strcmp(mode, "digital") != 0) {
+        send_error(d, e->rid, e->method, "unsupported", "refdev supports diag.loopback.digital only");
+        return;
+    }
+    if (in_slot > 33 || out_slot > 33) {
+        send_error(d, e->rid, e->method, "bad-slot", "in/out slot outside the channel map");
+        return;
+    }
+    if (!atomic_load_explicit(&d->audio.thread_live, memory_order_relaxed) || d->audio.mode != 1) {
+        send_error(d, e->rid, e->method, "state",
+                   "diag.loopback.digital requires a live host-paced stream");
+        return;
+    }
+    /* publish the slots BEFORE raising the flag — the audio thread reads them only after
+     * it observes loopback_on (release/acquire pairs the two). */
+    d->audio.loopback_in_slot = (uint8_t)in_slot;
+    d->audio.loopback_out_slot = (uint8_t)out_slot;
+    atomic_store_explicit(&d->audio.loopback_on, true, memory_order_release);
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, true);
+    harp_cbor_map(&m, 6);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_bool(&m, true);              /* armed */
+    harp_cbor_uint(&m, 1);
+    harp_cbor_text(&m, "digital");         /* mode actually engaged */
+    harp_cbor_uint(&m, 2);
+    harp_cbor_uint(&m, in_slot);           /* effective in-slot */
+    harp_cbor_uint(&m, 3);
+    harp_cbor_uint(&m, out_slot);          /* effective out-slot */
+    harp_cbor_uint(&m, 4);
+    harp_cbor_uint(&m, d->audio.rate);     /* effective rate */
+    harp_cbor_uint(&m, 5);
+    harp_cbor_uint(&m, 0);                 /* device-internal loop latency: 0 (same-segment copy) */
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+
+/* diag.loopback.stop (§14.3): disengage the loop, restore normal routing. No request
+ * body. Replies {0 stopped} (the host's cross-correlation is the oracle; the refdev does
+ * not self-measure, so device-rtt/frames-echoed are omitted). */
+static void handle_diag_loopback_stop(device *d, const harp_env *e) {
+    atomic_store_explicit(&d->audio.loopback_on, false, memory_order_release);
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, true);
+    harp_cbor_map(&m, 1);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_bool(&m, true); /* stopped */
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+
 #ifdef __linux__
 int harp_ffs_audio_in_fd(void);  /* device/ffs.c */
 int harp_ffs_audio_out_fd(void); /* device/ffs.c */
@@ -782,6 +876,8 @@ static void handle_audio_start(device *d, const harp_env *e) {
      * defaults to the stereo main mix {0,1} (the P2.1 byte-identical path). */
     uint8_t out_slots[34];
     uint8_t n_out_slots = 0;
+    uint8_t in_slots[34]; /* §14.3: active-slots-IN (key 3, H->D) — parsed for diag.loopback */
+    uint8_t n_in_slots = 0;
     if (e->has_body) {
         harp_cdec b;
         harp_cdec_init(&b, e->body, e->body_len);
@@ -794,10 +890,23 @@ static void handle_audio_start(device *d, const harp_env *e) {
                     if (!harp_cdec_uint(&b, &rate)) break;
                 } else if (key == 1) {
                     if (!harp_cdec_uint(&b, &nsamples)) break;
+                } else if (key == 3) {
+                    /* §14.3 active-slots-IN (H->D): the engine has no audio input on the
+                     * golden path, but a digital loopback (diag.loopback) reads one of
+                     * these columns from the pacing-frame input payload and copies it to
+                     * an output slot. Parsed (clamped 0..33, capped 34) so the loopback
+                     * can resolve its in-slot's column; unused by the normal render. */
+                    uint64_t alen;
+                    if (!harp_cdec_array(&b, &alen)) break;
+                    for (uint64_t j = 0; j < alen; j++) {
+                        uint64_t slot;
+                        if (!harp_cdec_uint(&b, &slot)) break;
+                        if (slot > 33) slot = 33;
+                        if (n_in_slots < 34) in_slots[n_in_slots++] = (uint8_t)slot;
+                    }
                 } else if (key == 4) {
                     /* CBOR array of uint slot indices: clamp each to 0..33,
-                     * cap the count at 34. (key 3 active-slots-IN is left to
-                     * the skip branch — this engine has no input channels.) */
+                     * cap the count at 34. */
                     uint64_t alen;
                     if (!harp_cdec_array(&b, &alen)) break;
                     for (uint64_t j = 0; j < alen; j++) {
@@ -902,6 +1011,11 @@ static void handle_audio_start(device *d, const harp_env *e) {
     /* publish the requested output slots for the render thread (§P2.2) */
     memcpy(d->audio.out_slots, out_slots, n_out_slots);
     d->audio.n_out_slots = n_out_slots;
+    /* §14.3: publish the input slots; a fresh stream starts with loopback OFF (a prior
+     * diag.loopback does not survive a stop/start — set BEFORE the audio thread spawns). */
+    memcpy(d->audio.in_slots, in_slots, n_in_slots);
+    d->audio.n_in_slots = n_in_slots;
+    atomic_store_explicit(&d->audio.loopback_on, false, memory_order_relaxed);
     atomic_store_explicit(&d->audio.running, true, memory_order_relaxed);
     if (pthread_create(&d->audio.thread, NULL, audio_thread, d) != 0) {
         atomic_store_explicit(&d->audio.running, false, memory_order_relaxed);
@@ -1379,6 +1493,10 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
         handle_diag_counters(d, &e);
     else if (strcmp(e.method, "diag.bundle") == 0)
         handle_diag_bundle(d, &e); /* §14.4: device-section embedded verbatim host-side */
+    else if (strcmp(e.method, "diag.loopback.start") == 0)
+        handle_diag_loopback_start(d, &e); /* §14.3 round-trip: arm the digital loop */
+    else if (strcmp(e.method, "diag.loopback.stop") == 0)
+        handle_diag_loopback_stop(d, &e);
     else if (strcmp(e.method, "x.harp-refdev.knob") == 0)
         handle_knob(d, &e);
     else if (strcmp(e.method, "x.harp.reconcile.offer") == 0)
