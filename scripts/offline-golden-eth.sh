@@ -53,9 +53,10 @@ render() {
     i=0
     while [ $i -lt 25 ]; do grep -q "listening on $PORT" "$sd.log" 2>/dev/null && break; sleep 0.2; i=$((i + 1)); done
     grep -q "listening on $PORT" "$sd.log" 2>/dev/null || { echo "OFFLINE-GOLDEN: device did NOT start on $PORT — render would be SILENCE" >&2; cat "$sd.log" >&2; }
-    h=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" "$1" "$3" $SETTLE $SEQ 2>>"$sd.err" | sed -nE 's/output-hash: //p')
+    h=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" perl -e 'alarm 30; exec @ARGV' "$1" "$3" $SETTLE $SEQ 2>>"$sd.err" | sed -nE 's/output-hash: //p')
     kill -9 "$dpid" 2>/dev/null
     wait "$dpid" 2>/dev/null
+    [ -n "$h" ] || { echo "  render($2): NO output-hash (alarm-killed/hung) — host err + device log:" >&2; tail -10 "$sd.err" 2>/dev/null | sed 's/^/    /' >&2; tail -6 "$sd.log" 2>/dev/null | sed 's/^/    /' >&2; }
     PORT=$((PORT + 1))   # fresh port per render (TIME_WAIT-safe)
     printf '%s' "$h"
 }
@@ -71,7 +72,7 @@ toggle_tail() {
     dpid=$!
     i=0
     while [ $i -lt 25 ]; do grep -q "listening on $PORT" "$sd.log" 2>/dev/null && break; sleep 0.2; i=$((i + 1)); done
-    h=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" "$CHOST" "$CPLUG" \
+    h=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" perl -e 'alarm 30; exec @ARGV' "$CHOST" "$CPLUG" \
         --notes 60,64,67,72,60,64,67,72 --seconds 5 --toggle-offline-at 2 --hash \
         2>>"$sd.err" | sed -nE 's/tail-hash: //p')
     kill -9 "$dpid" 2>/dev/null
@@ -139,7 +140,7 @@ if [ -n "${VPLUG:-}" ] && [ -d "$VPLUG" ] && [ -x "$VHOST" ]; then
     "$DEVICED" --port "$PORT" --state-dir "$sd" --panel-sock "" > "$sd.log" 2>&1 &
     dpid=$!; i=0
     while [ $i -lt 25 ]; do grep -q "listening on $PORT" "$sd.log" 2>/dev/null && break; sleep 0.2; i=$((i + 1)); done
-    vr=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" "$VHOST" "$VPLUG" $SETTLE --notes 62,69,74,65 --seconds 2.6 --json 2>>"$sd.err" | sed -nE 's/.*"rms":([0-9.]+).*/\1/p')
+    vr=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" perl -e 'alarm 30; exec @ARGV' "$VHOST" "$VPLUG" $SETTLE --notes 62,69,74,65 --seconds 2.6 --json 2>>"$sd.err" | sed -nE 's/.*"rms":([0-9.]+).*/\1/p')
     kill -9 "$dpid" 2>/dev/null; wait "$dpid" 2>/dev/null; PORT=$((PORT + 1))
     echo "──── non-silent: VST3 offline-bounce rms=${vr:-<none>}  (silence=0 sails through determinism)"
     if [ -n "$vr" ] && awk "BEGIN{exit !($vr > 0.02)}"; then
