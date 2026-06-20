@@ -676,26 +676,140 @@ static void cmd_counters(probe *p) {
     harp_cbuf_free(&rsp);
 }
 
-/* §14.4 diag-bundle v0 — host-only export, ZERO device changes. Reuses the
- * EXISTING do_hello (identity) + diag.counters (device counters) to assemble
- * the required-from-day-one bundle (top-level keys 0..4) per the Design-v0
- * section of docs/diag-bundle-design.md. The device-section counters are
- * embedded VERBATIM (the byte-identical embed is the device conformance gate);
- * identity is re-encoded from harp_client_identity mirroring encode_identity's
- * key shape (device/session.c:176). --anonymize runs the §16 host pass in
- * miniature: it clears identity serial / vendor-name / product-name to the
- * empty string IN PLACE (not omission, not "[redacted]") and sets key 3=true,
- * retaining vid/pid/param-map-hash/engine-id/caps (reveal whether, not what). */
+/* §16 SEAM EXCEPTION (the host re-encodes device-section ONLY when anonymizing).
+ * DECODE the device's device-section map {0 => identity, 1 => counters} and
+ * RE-ENCODE it into `out`, clearing the identity PII leaves to "" IN PLACE while
+ * preserving everything else byte-for-meaning. Cleared (per docs/diag-bundle-
+ * design.md §16, lines 313-316/422 — the authoritative leaf list): identity key 2
+ * (serial); vendor (key 0) key 1 (vendor name); product (key 1) key 1 (product
+ * name); identity key 9 (build-id; may embed host/date); identity channel-map
+ * (key 7) — for EACH entry map, keys 2/3/4 (name/group/path). PRESERVED verbatim:
+ * vid/pid, firmware, engine (incl. engine-id + param-map-hash), protocol,
+ * latency-profile, boot count, ump-group-map, part count, caps, and per
+ * channel-map entry the slot index (key 0) / direction (key 1) / host-paced flag
+ * (key 5) plus the array length and order — and the entire counters map
+ * (device-section key 1: no PII). Subtrees that need no editing are copied via
+ * harp_cdec_span so they survive byte-for-byte; only the listed leaf texts are
+ * rewritten to "". Returns false on a malformed section (caller falls back). */
+static bool anonymize_device_section(harp_cbuf *out, const uint8_t *sec, size_t len) {
+    harp_cdec d;
+    harp_cdec_init(&d, sec, len);
+    uint64_t nsec;
+    if (!harp_cdec_map(&d, &nsec)) return false;
+    harp_cbor_map(out, nsec);
+    for (uint64_t i = 0; i < nsec; i++) {
+        uint64_t key;
+        if (!harp_cdec_uint(&d, &key)) return false;
+        harp_cbor_uint(out, key);
+        if (key != 0) {
+            /* counters (key 1) + any future device-section member: no PII,
+             * copy the value verbatim. */
+            const uint8_t *span;
+            size_t sl;
+            if (!harp_cdec_span(&d, &span, &sl)) return false;
+            harp_cbuf_put(out, span, sl);
+            continue;
+        }
+        /* key 0 => identity: re-encode, clearing serial + vendor/product names. */
+        uint64_t nid;
+        if (!harp_cdec_map(&d, &nid)) return false;
+        harp_cbor_map(out, nid);
+        for (uint64_t j = 0; j < nid; j++) {
+            uint64_t ik;
+            if (!harp_cdec_uint(&d, &ik)) return false;
+            harp_cbor_uint(out, ik);
+            if (ik == 0 || ik == 1) {
+                /* vendor (key 0) / product (key 1) sub-map { 0 => id, 1 => name };
+                 * clear key 1 (name) to "", preserve key 0 (vid/pid) and any
+                 * other member verbatim. */
+                uint64_t nsub;
+                if (!harp_cdec_map(&d, &nsub)) return false;
+                harp_cbor_map(out, nsub);
+                for (uint64_t s = 0; s < nsub; s++) {
+                    uint64_t sk;
+                    if (!harp_cdec_uint(&d, &sk)) return false;
+                    harp_cbor_uint(out, sk);
+                    if (sk == 1) {
+                        if (!harp_cdec_skip(&d)) return false; /* drop the name */
+                        harp_cbor_text(out, "");               /* "" in place (§16) */
+                    } else {
+                        const uint8_t *span;
+                        size_t sl;
+                        if (!harp_cdec_span(&d, &span, &sl)) return false;
+                        harp_cbuf_put(out, span, sl);
+                    }
+                }
+            } else if (ik == 2 || ik == 9) {
+                /* serial (key 2) and build-id (key 9, may embed host/date):
+                 * cleared to "" in place (§16). */
+                if (!harp_cdec_skip(&d)) return false;
+                harp_cbor_text(out, "");
+            } else if (ik == 7) {
+                /* channel-map (key 7): an array of entry maps. For EACH entry,
+                 * clear keys 2 (name) / 3 (group) / 4 (path) to "" in place,
+                 * preserving the slot index (key 0), direction (key 1), host-
+                 * paced flag (key 5), and the array length + order (§16). */
+                uint64_t nent;
+                if (!harp_cdec_array(&d, &nent)) return false;
+                harp_cbor_array(out, nent);
+                for (uint64_t en = 0; en < nent; en++) {
+                    uint64_t nek;
+                    if (!harp_cdec_map(&d, &nek)) return false;
+                    harp_cbor_map(out, nek);
+                    for (uint64_t ek = 0; ek < nek; ek++) {
+                        uint64_t ekey;
+                        if (!harp_cdec_uint(&d, &ekey)) return false;
+                        harp_cbor_uint(out, ekey);
+                        if (ekey == 2 || ekey == 3 || ekey == 4) {
+                            if (!harp_cdec_skip(&d)) return false; /* drop name/group/path */
+                            harp_cbor_text(out, "");               /* "" in place (§16) */
+                        } else {
+                            const uint8_t *span;
+                            size_t sl;
+                            if (!harp_cdec_span(&d, &span, &sl)) return false;
+                            harp_cbuf_put(out, span, sl);
+                        }
+                    }
+                }
+            } else {
+                /* fw/engine/protocol/latency-profile/boot/ump-map/part-count:
+                 * preserved byte-for-meaning. */
+                const uint8_t *span;
+                size_t sl;
+                if (!harp_cdec_span(&d, &span, &sl)) return false;
+                harp_cbuf_put(out, span, sl);
+            }
+        }
+    }
+    return !d.err;
+}
+
+/* §14.4 diag-bundle — CAP-GATED. After do_hello the host scans the identity
+ * capabilities for "diag.bundle". IF PRESENT (the eth-agent device-assembled
+ * path): the host issues `req diag.bundle` and embeds the device's response body
+ * — the FULL device-section (identity keys 0-12 incl channel-map + latency-
+ * profile, plus counters) — VERBATIM under top key 4 (the byte-identical embed
+ * is the device conformance gate). IF ABSENT: the v0 host-synth path below
+ * re-encodes a SUBSET identity (keys 0-4,6) from harp_client_identity and marks
+ * it host-synthesized in bundle-meta key 1. --anonymize runs the §16 host pass:
+ * it clears identity serial / vendor-name / product-name to the empty string IN
+ * PLACE (not omission, not "[redacted]") and sets key 3=true, retaining
+ * vid/pid/param-map-hash/engine-id/caps (reveal whether, not what). On the
+ * device-assembled path anonymize is the seam exception: the host DECODES and
+ * re-encodes the device-section (anonymize_device_section) instead of embedding
+ * verbatim — the byte-identical gate holds only on the non-anonymized bundle. */
 static void cmd_diag_bundle(probe *p, const char *outfile, bool anon) {
     harp_client_identity id = do_hello(p);
+    bool device_assembled = harp_client_has_cap(&id, "diag.bundle");
 
-    /* device-section counters: round-trip diag.counters EXACTLY like
-     * cmd_counters, but DON'T decode — keep e.body/e.body_len, the verbatim
-     * encoded text-keyed map, and embed it byte-for-byte below. */
+    /* The device-section. On the device-assembled path it is the device's verbatim
+     * `rsp diag.bundle` body (full identity + counters). On the v0 host-synth path
+     * we instead round-trip diag.counters and keep its body as device-section key 1
+     * counters, re-encoding a subset identity ourselves below. */
     harp_cbuf req, rsp;
     harp_cbuf_init(&req);
     harp_cbuf_init(&rsp);
-    req_head(p, &req, "diag.counters", false);
+    req_head(p, &req, device_assembled ? "diag.bundle" : "diag.counters", false);
     harp_env e = request(p, &req, &rsp);
 
     harp_cbuf out;
@@ -716,62 +830,80 @@ static void cmd_diag_bundle(probe *p, const char *outfile, bool anon) {
     harp_cbor_array(&out, 2);
     harp_cbor_uint(&out, (uint64_t)time(NULL)); /* wall-clock epoch */
     harp_cbor_uint(&out, 0);                    /* host MSC: 0 in v0 (no stream) */
-    harp_cbor_uint(&out, 1); /* tool + provenance. Marks the v0 HOST-SYNTHESIZED device-section:
-                              * the hello carries only a SUBSET of identity (keys 0-4,6 — no
-                              * channel-map/latency-profile/protocol, which are device-assembled),
-                              * so v0's device-section is a host stand-in, NOT the device's verbatim
-                              * rsp diag.bundle. eth-agent's device-assembled section (full identity)
-                              * supersedes it once it lands. Consumers key off this string. */
-    harp_cbor_text(&out, "harp-probe v0 (host-synthesized device-section)");
+    harp_cbor_uint(&out, 1); /* tool + provenance. The marker distinguishes the two paths:
+                              * the DEVICE-ASSEMBLED section is the device's verbatim rsp
+                              * diag.bundle (full identity, keys 0-12); the HOST-SYNTHESIZED
+                              * one is a host stand-in carrying only the hello subset (keys
+                              * 0-4,6 — no channel-map/latency-profile/protocol). Consumers
+                              * key off this string. */
+    harp_cbor_text(&out, device_assembled
+                             ? "harp-probe (device-assembled device-section)"
+                             : "harp-probe v0 (host-synthesized device-section)");
 
     harp_cbor_uint(&out, 3); /* anonymized? — first-class privacy-state flag */
     harp_cbor_bool(&out, anon);
 
-    harp_cbor_uint(&out, 4); /* device-section: identity + counters */
-    harp_cbor_map(&out, 2);
+    harp_cbor_uint(&out, 4); /* device-section */
+    if (device_assembled) {
+        /* The device assembled the full device-section. Non-anonymized: embed the
+         * rsp body VERBATIM (byte-identical — the conformance gate; do NOT
+         * re-encode). Anonymized: the §16 seam exception — decode + re-encode,
+         * clearing the identity PII leaves while preserving structure + counters. */
+        if (!(e.has_body && e.body_len))
+            die("device advertised diag.bundle but returned no device-section");
+        if (anon) {
+            if (!anonymize_device_section(&out, e.body, e.body_len))
+                die("malformed device-section (anonymize decode failed)");
+        } else {
+            harp_cbuf_put(&out, e.body, e.body_len);
+        }
+    } else {
+        /* v0 HOST-SYNTH path (unchanged): identity (subset) + counters. */
+        harp_cbor_map(&out, 2);
 
-    /* device-section key 0 => identity, re-encoded mirroring encode_identity
-     * (device/session.c:176) key shape. Under --anonymize the serial / vendor
-     * name / product name become "" IN PLACE (§16); vid/pid/hash/engine-id/caps
-     * are retained. */
-    harp_cbor_uint(&out, 0);
-    harp_cbor_map(&out, 6);
-    harp_cbor_uint(&out, 0); /* vendor { 0 => vid, 1 => name } */
-    harp_cbor_map(&out, 2);
-    harp_cbor_uint(&out, 0);
-    harp_cbor_uint(&out, id.vendor_id);
-    harp_cbor_uint(&out, 1);
-    harp_cbor_text(&out, anon ? "" : id.vendor);
-    harp_cbor_uint(&out, 1); /* product { 0 => pid, 1 => name } */
-    harp_cbor_map(&out, 2);
-    harp_cbor_uint(&out, 0);
-    harp_cbor_uint(&out, id.product_id);
-    harp_cbor_uint(&out, 1);
-    harp_cbor_text(&out, anon ? "" : id.product);
-    harp_cbor_uint(&out, 2); /* serial (§16: cleared to "" under anon) */
-    harp_cbor_text(&out, anon ? "" : id.serial);
-    harp_cbor_uint(&out, 3); /* firmware */
-    harp_cbor_text(&out, id.fw);
-    harp_cbor_uint(&out, 4); /* engine { 0 => id, 1 => ver, 2 => param-map-hash } */
-    harp_cbor_map(&out, 3);
-    harp_cbor_uint(&out, 0);
-    harp_cbor_text(&out, id.engine_id); /* engine-id retained (class id, not a name) */
-    harp_cbor_uint(&out, 1);
-    harp_cbor_text(&out, id.engine_ver);
-    harp_cbor_uint(&out, 2);
-    harp_cbor_bytes(&out, id.param_map_hash.b, HARP_HASH_LEN); /* hash always retained */
-    harp_cbor_uint(&out, 6); /* capabilities array (retained) */
-    harp_cbor_array(&out, id.ncaps);
-    for (size_t k = 0; k < id.ncaps; k++) harp_cbor_text(&out, id.caps[k]);
+        /* device-section key 0 => identity, re-encoded mirroring encode_identity
+         * (device/session.c:176) key shape. Under --anonymize the serial / vendor
+         * name / product name become "" IN PLACE (§16); vid/pid/hash/engine-id/caps
+         * are retained. */
+        harp_cbor_uint(&out, 0);
+        harp_cbor_map(&out, 6);
+        harp_cbor_uint(&out, 0); /* vendor { 0 => vid, 1 => name } */
+        harp_cbor_map(&out, 2);
+        harp_cbor_uint(&out, 0);
+        harp_cbor_uint(&out, id.vendor_id);
+        harp_cbor_uint(&out, 1);
+        harp_cbor_text(&out, anon ? "" : id.vendor);
+        harp_cbor_uint(&out, 1); /* product { 0 => pid, 1 => name } */
+        harp_cbor_map(&out, 2);
+        harp_cbor_uint(&out, 0);
+        harp_cbor_uint(&out, id.product_id);
+        harp_cbor_uint(&out, 1);
+        harp_cbor_text(&out, anon ? "" : id.product);
+        harp_cbor_uint(&out, 2); /* serial (§16: cleared to "" under anon) */
+        harp_cbor_text(&out, anon ? "" : id.serial);
+        harp_cbor_uint(&out, 3); /* firmware */
+        harp_cbor_text(&out, id.fw);
+        harp_cbor_uint(&out, 4); /* engine { 0 => id, 1 => ver, 2 => param-map-hash } */
+        harp_cbor_map(&out, 3);
+        harp_cbor_uint(&out, 0);
+        harp_cbor_text(&out, id.engine_id); /* engine-id retained (class id, not a name) */
+        harp_cbor_uint(&out, 1);
+        harp_cbor_text(&out, id.engine_ver);
+        harp_cbor_uint(&out, 2);
+        harp_cbor_bytes(&out, id.param_map_hash.b, HARP_HASH_LEN); /* hash always retained */
+        harp_cbor_uint(&out, 6); /* capabilities array (retained) */
+        harp_cbor_array(&out, id.ncaps);
+        for (size_t k = 0; k < id.ncaps; k++) harp_cbor_text(&out, id.caps[k]);
 
-    /* device-section key 1 => counters, embedded VERBATIM (the byte-identical
-     * device conformance gate). Counters carry no PII, so they stay verbatim
-     * under --anonymize too — only identity leaves change. */
-    harp_cbor_uint(&out, 1);
-    if (e.has_body && e.body_len)
-        harp_cbuf_put(&out, e.body, e.body_len);
-    else
-        harp_cbor_map(&out, 0); /* device returned no counters body */
+        /* device-section key 1 => counters, embedded VERBATIM (the byte-identical
+         * device conformance gate). Counters carry no PII, so they stay verbatim
+         * under --anonymize too — only identity leaves change. */
+        harp_cbor_uint(&out, 1);
+        if (e.has_body && e.body_len)
+            harp_cbuf_put(&out, e.body, e.body_len);
+        else
+            harp_cbor_map(&out, 0); /* device returned no counters body */
+    }
 
     if (out.oom) die("oom assembling diag bundle");
 
@@ -780,7 +912,9 @@ static void cmd_diag_bundle(probe *p, const char *outfile, bool anon) {
     if (!f) die("cannot write diag bundle");
     fwrite(out.buf, 1, out.len, f);
     fclose(f);
-    printf("wrote %zu bytes to %s%s\n", out.len, outfile, anon ? " (anonymized)" : "");
+    printf("wrote %zu bytes to %s%s (%s device-section)\n", out.len, outfile,
+           anon ? " (anonymized)" : "",
+           device_assembled ? "device-assembled" : "host-synthesized");
 
     harp_cbuf_free(&out);
     harp_cbuf_free(&req);
