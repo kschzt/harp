@@ -56,9 +56,10 @@ target_include_directories(harpcore PUBLIC core/include)
 
 # harp-deviced is the reference device daemon — it runs on the Pi (FunctionFS
 # gadget) or any POSIX host (TCP simulator). On Windows it builds as a localhost
-# fake-hardware target for the §8.7 IP e2e (win.yml): pthreads come from
-# device/compat_pthread.h, the POSIX-only AF_UNIX front panel is gated out, and the
-# accept path uses recv/send (host/sock_io.c) instead of fd read/write.
+# fake-hardware target for the §8.7 IP e2e (win.yml), compiled with MinGW so its
+# gnu11 dialect + pthreads (winpthreads) and clock_gettime are native: the POSIX-only
+# AF_UNIX front panel is gated out, and the accept/audio paths use recv/send
+# (host/sock_io.c) since Winsock SOCKETs reject fd read/write.
 add_executable(harp-deviced
   device/harp-deviced.c # main + transports
   device/engine.c       # synth, event queue, audio threads

@@ -225,21 +225,34 @@ private:
         ::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&one, sizeof one);
 #endif
         audioSock_ = s;
+#ifdef _WIN32
+        { struct sockaddr_in la = {}, pa = {}; socklen_t ll = sizeof la, pl = sizeof pa;
+          ::getsockname(s, (struct sockaddr *)&la, &ll); ::getpeername(s, (struct sockaddr *)&pa, &pl);
+          fprintf(stderr, "harp-shell: accepted audioSock=%lld local=:%d peer=:%d\n",
+                  (long long)s, ntohs(la.sin_port), ntohs(pa.sin_port)); }
+#endif
         fprintf(stderr, "harp-shell: host-paced audio connect-back accepted (key 7)\n");
         return true;
     }
 
-    /* one-fd readability poll, portable across POSIX poll() and Winsock WSAPoll() */
+    /* one-fd readability poll, portable across POSIX poll() and Winsock WSAPoll().
+     * "Readable" INCLUDES the error/hangup conditions (POLLERR/POLLHUP/POLLNVAL):
+     * a reset or half-closed peer must let the subsequent recv() RUN so it returns
+     * 0/-1 and the caller sees "device gone" — NOT silently report "no data, still
+     * alive", which on Windows (WSAPoll signals a RST as POLLERR/POLLHUP, never
+     * POLLRDNORM) would spin the reader forever on a dead host-paced socket. */
     static bool readable(harp_sockhandle s, int timeout_ms) {
 #ifdef _WIN32
         WSAPOLLFD p;
         p.fd = s;
         p.events = POLLRDNORM;
         p.revents = 0;
-        return WSAPoll(&p, 1, timeout_ms) > 0 && (p.revents & POLLRDNORM);
+        return WSAPoll(&p, 1, timeout_ms) > 0 &&
+               (p.revents & (POLLRDNORM | POLLHUP | POLLERR | POLLNVAL));
 #else
         struct pollfd p = {s, POLLIN, 0};
-        return ::poll(&p, 1, timeout_ms) > 0 && (p.revents & POLLIN);
+        return ::poll(&p, 1, timeout_ms) > 0 &&
+               (p.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL));
 #endif
     }
 
