@@ -127,7 +127,11 @@ struct EthTransport final : ShellTransport {
     }
     bool audioWrite(const void *buf, int len, unsigned ms) override {
         if (!hostPaced_) return true; /* free-running: no pacing writes */
-        if (!ensureAudioAccepted(ms)) return false; /* not connected yet; feeder retries */
+        if (!ensureAudioAccepted(ms)) {
+            static bool warned = false;
+            if (!warned) { warned = true; fprintf(stderr, "harp-shell: host-paced pacing deferred — device connect-back not yet accepted\n"); }
+            return false; /* not connected yet; feeder retries */
+        }
         const char *p = (const char *)buf;
         int left = len;
         while (left > 0) {
@@ -212,6 +216,7 @@ private:
         ::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&one, sizeof one);
 #endif
         audioSock_ = s;
+        fprintf(stderr, "harp-shell: host-paced audio connect-back accepted (key 7)\n");
         return true;
     }
 
