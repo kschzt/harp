@@ -1248,6 +1248,15 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
     size_t got = 0;
     unsigned waited = 0;
     bool settled = false; /* settlePadDebt + ssiRead_ advance run ONCE, after any flip clears */
+#ifdef _WIN32
+    /* DIAG: does the host main thread actually reach + loop process()->pull? */
+    { static int pd = 0; if (pd < 8) { pd++;
+        bool flipping = modeFlipPending_.load(std::memory_order_acquire) &&
+                        sessionGen_.load(std::memory_order_acquire) < flipTargetGen_.load(std::memory_order_acquire);
+        fprintf(stderr, "harp-shell: DIAG pullAudioBlocking ENTER nFrames=%zu ringAvail=%zu ssiRead=%llu flipping=%d connected=%d timeoutMs=%u\n",
+                nFrames, audioRing_.readAvailable(), (unsigned long long)ssiRead_.load(std::memory_order_relaxed),
+                flipping, (int)connected_.load(std::memory_order_acquire), timeoutMs); } }
+#endif
     while (got < want) {
         /* §8.3-over-§8.7 mid-stream toggle fence: while a live<->offline re-dial is in
          * flight, the OLD session's ring holds stale samples and ssiRead_/padDebt belong
@@ -1450,6 +1459,21 @@ void HarpRuntime::feeder() {
          * delivery was perfect, the math wasn't). */
         uint64_t frontierCap = ssiRead_.load(std::memory_order_relaxed) +
                                targetFrames_ + (eventHeadroom() - maxDawBlock_);
+#ifdef _WIN32
+        /* DIAG: snapshot the three pacing gates so we see WHICH one freezes the feeder
+         * (and whether ssiRead_ ever advances => whether the host actually pulls). */
+        { static int fd = 0;
+          bool g_ring = ringFrames < (size_t)targetFrames_;
+          bool g_inf  = inFlight < ahead_;
+          bool g_front = (uint64_t)ssi_ + kBlock <= frontierCap;
+          if (fd < 12) { fd++;
+              fprintf(stderr, "harp-shell: DIAG feeder gates ring=%zu<%u:%d inFlight=%llu<%llu:%d ssi=%llu+%u<=cap%llu:%d sent=%llu recv=%llu ssiRead=%llu\n",
+                      ringFrames, (unsigned)targetFrames_, g_ring,
+                      (unsigned long long)inFlight, (unsigned long long)ahead_, g_inf,
+                      (unsigned long long)ssi_, (unsigned)kBlock, (unsigned long long)frontierCap, g_front,
+                      (unsigned long long)framesSent_, (unsigned long long)framesRecv_,
+                      (unsigned long long)ssiRead_.load(std::memory_order_relaxed)); } }
+#endif
         /* the cap bounds the frame END: a frame starting under the cap but
          * extending past it would cover timestamps the current block can
          * still mint (measured: mid-frame note-ons applied a frame late) */
