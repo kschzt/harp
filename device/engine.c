@@ -938,8 +938,9 @@ void *audio_thread(void *arg) {
      * thread — NOT in handle_audio_start, which advances the §8.3.1 event fence on
      * the session thread (a blocking connect there deadlocks: the host accepts only
      * at its post-audioStart drain, which waits for the audio.start response, which
-     * waits for handle_audio_start to return). connect() is a cancellation point,
-     * so audio_stop's pthread_cancel still tears this down cleanly. */
+     * waits for handle_audio_start to return). The steady-state pacing recv is torn
+     * down by SO_RCVTIMEO + the a->running poll (see hp_read / audio_stop), not by
+     * pthread_cancel — a blocking Winsock recv is not cancellable from another thread. */
     if (a->host_paced_port > 0) {
         int s = audio_open_tcp_paced(d->rtp_peer_ip, a->host_paced_port);
         if (s < 0) {
