@@ -1268,6 +1268,11 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
     }
     if (e.msgtype != HARP_MSG_REQUEST) return;
 
+#ifdef _WIN32
+    fprintf(stderr, "harp-deviced: CTL request method='%s' rid=%llu\n",
+            e.method ? e.method : "(null)", (unsigned long long)e.rid);
+#endif
+
     if (!atomic_load_explicit(&d->hello_done, memory_order_acquire) &&
         strcmp(e.method, "core.hello") != 0) {
         send_error(d, e.rid, e.method, "denied", "core.hello required first");
