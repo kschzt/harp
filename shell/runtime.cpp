@@ -738,6 +738,18 @@ void HarpRuntime::supervisor() {
 bool HarpRuntime::start(uint32_t sampleRate) {
     if (running_.load(std::memory_order_acquire)) return connected();
     harp_plat_init(); /* hi-res timers for the sub-ms pacing/idle waits (Windows) */
+#ifdef _WIN32
+    /* Winsock MUST be started before any getaddrinfo/socket (the §8.7 dial) — without
+     * it harp_sock_dial fails "cannot resolve" and the host never connects, silently
+     * rendering silence. The host process owns WSAStartup (sock_io.h); the runtime is
+     * that owner. Process-once (refcounted; we never WSACleanup — process exit reclaims). */
+    static std::once_flag harp_wsa_once;
+    std::call_once(harp_wsa_once, [] {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+            fprintf(stderr, "harp-shell: WSAStartup failed — §8.7 networking unavailable\n");
+    });
+#endif
     rate_ = sampleRate;
     /* test/field override: HARP_OUT_SLOTS="a,b,..." forces the active-slots-out
      * subscription regardless of any setOutSlots() call. This is how an
