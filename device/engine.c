@@ -816,8 +816,13 @@ static void host_paced_loop(device *d) {
             }
             ssize_t r = hp_read(a->out_fd, rbuf, sizeof rbuf);
             if (r <= 0) { /* endpoint died or stop */
+#ifdef _WIN32
+                fprintf(stderr, "harp-deviced: pacing read ended: %s (fd=%d WSA=%d)\n",
+                        r == 0 ? "EOF" : "recv error", a->out_fd, r == 0 ? 0 : WSAGetLastError());
+#else
                 fprintf(stderr, "harp-deviced: pacing read ended: %s\n",
                         r == 0 ? "EOF" : strerror(errno));
+#endif
                 return;
             }
             rlen = (size_t)r;

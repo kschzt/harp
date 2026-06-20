@@ -95,6 +95,7 @@ struct EthTransport final : ShellTransport {
     }
 
     ~EthTransport() override {
+        if (hostPaced_) fprintf(stderr, "harp-shell: ~EthTransport (host-paced) closing audioSock=%lld\n", (long long)audioSock_);
         if (audioSock_ != HARP_SOCK_INVALID) harp_sock_close(audioSock_);
         if (audioListen_ != HARP_SOCK_INVALID) harp_sock_close(audioListen_);
         if (rxsock_ != HARP_SOCK_INVALID) harp_sock_close(rxsock_);
