@@ -44,6 +44,28 @@ struct ShellTransport {
     /* ---- bound device identity (vid:pid:serial), read back after open. */
     virtual bool identity(harp_usb_devinfo *out) = 0;
 
+    /* §14.4 host-context-C — the binding KIND, the decisive selector the
+     * diag-bundle assembler uses to emit key 10 (usb-topology, USB ONLY) vs key
+     * 13 (net-topology, Ethernet ONLY) and audio-config key 12 (transport enum).
+     * isFreeRunning() cannot distinguish them: a host-paced Ethernet binding
+     * (offline bounce) is also non-free-running. USB returns 0, Ethernet 1
+     * (matching the design CDDL `transport` enum). */
+    enum class Kind { Usb = 0, Ethernet = 1 };
+    virtual Kind kind() const = 0;
+
+    /* §14.4 host-context-C — USB topology of the bound device (diag-bundle key
+     * 10). USB fills it from libusb; the base (and Ethernet) leaves out->ok false
+     * so the assembler omits key 10. Read-only, off the control path. */
+    virtual bool usbTopology(harp_usb_topology *out) {
+        if (out) out->ok = false;
+        return false;
+    }
+
+    /* §14.4 host-context-C — the resolved Ethernet peer (diag-bundle key 13.0,
+     * "host:port"). Non-empty ONLY for an Ethernet binding; "" on USB so the
+     * assembler omits key 13. Read-only. */
+    virtual const char *netEndpoint() const { return ""; }
+
     /* ---- binding mode. USB is host-paced (false); Ethernet/RTP is device
      * free-running (true). Cached into HarpRuntime::freeRunning_ at sessionUp
      * so the audio thread never pays a virtual call to branch on it. */

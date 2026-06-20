@@ -32,6 +32,10 @@ struct UsbTransport final : ShellTransport {
     }
     bool identity(harp_usb_devinfo *out) override { return harp_usb_devident(io_, out); }
     bool isFreeRunning() const override { return false; }
+    Kind kind() const override { return Kind::Usb; }
+    /* §14.4 host-context-C: the bound device's USB topology (diag-bundle key 10),
+     * read off the control path. Forwards to host/usb_io.c (libusb topology walk). */
+    bool usbTopology(harp_usb_topology *out) override { return harp_usb_get_topology(io_, out); }
 
 private:
     harp_io *io_ = nullptr;

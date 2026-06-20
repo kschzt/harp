@@ -19,6 +19,27 @@ typedef struct {
     char serial[64];
 } harp_usb_devinfo;
 
+/* §14.4 host-context-C: USB topology as the host sees it (diag-bundle key 10).
+ * Filled from libusb for the BOUND device (harp_usb_topology, after open). The
+ * controller/root id (key 0) and serial (key 8) are §16-anonymizable PII; bus,
+ * addr, the port-number chain, speed, and VID/PID are RETAINED. `speed` uses the
+ * usb-speed enum of the design CDDL: 0 unknown,1 low,2 full,3 high,4 super,5
+ * super-plus (it maps the LIBUSB_SPEED_* constants, so callers need not include
+ * libusb.h). `ok` is false when libusb could not resolve the device (e.g. a
+ * synthetic/loopback transport that is not a real USB device). */
+#define HARP_USB_MAX_PORTS 7 /* USB 3 caps the hub depth at 7 */
+typedef struct {
+    bool     ok;
+    char     controller[64]; /* root-hub / controller id (anonymized => "") */
+    uint8_t  bus;
+    uint8_t  addr;
+    uint8_t  ports[HARP_USB_MAX_PORTS]; /* port-number chain root->device */
+    int      nports;
+    int      speed;          /* usb-speed enum (0..5), see above */
+    uint16_t vendor_id, product_id;
+    char     serial[64];     /* USB descriptor serial (anonymized => "") */
+} harp_usb_topology;
+
 harp_io *harp_usb_open(void);
 /* Open a specific device by USB serial (NULL = first match). */
 harp_io *harp_usb_open_serial(const char *serial);
@@ -41,6 +62,12 @@ harp_io *harp_usb_open_match_ctx(void *ctx, const char *want_serial, bool want_v
                                  uint16_t want_vid, uint16_t want_pid);
 /* Read the bound device's USB identity back out (after open). */
 bool harp_usb_devident(harp_io *io, harp_usb_devinfo *out);
+/* §14.4 host-context-C: read the bound device's USB topology (bus/addr/port
+ * chain/speed/VID/PID/serial) for diag-bundle key 10. Returns false (and sets
+ * out->ok = false) if the topology cannot be resolved from libusb. Read-only:
+ * it touches NO transfer state, so it is safe to call off the control path while
+ * the session streams. */
+bool harp_usb_get_topology(harp_io *io, harp_usb_topology *out);
 /* Read-only enumeration of all HARP devices on the bus (no claim). Fills
  * up to cap entries; returns total count (may exceed cap). */
 size_t harp_usb_enumerate(harp_usb_devinfo *out, size_t cap);

@@ -11,6 +11,7 @@ extern "C" {
 #include <pthread/qos.h>
 #endif
 #include <algorithm> /* §14.3: std::sort for the per-cycle RTT median */
+#include <cmath>     /* §14.4 host-context-C: llround for est_ppm -> ppb */
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -1202,6 +1203,12 @@ bool HarpRuntime::sessionUp() {
     framesRecvAtomic_.store(0, std::memory_order_relaxed);
     ssiRead_.store(0, std::memory_order_relaxed);
     padDebtFloats_ = 0;
+    /* §14.4 host-context-C: reset the clock-stats snapshot for the new session
+     * (trimCount_/lastTrimPpb_ are per-session, like framesSent_; asrcLive_ flips
+     * true only when the ASRC reader branch runs). Off the render path. */
+    lastTrimPpb_.store(0, std::memory_order_relaxed);
+    trimCount_.store(0, std::memory_order_relaxed);
+    asrcLive_.store(false, std::memory_order_relaxed);
     ahead_ = 2; /* small fixed pipeline; the reader thread keeps RTT short */
     audioRing_.clear();
     /* P5b: clear every per-part sink's ring + pad debt for the new SSI domain,
@@ -2035,6 +2042,10 @@ void HarpRuntime::feeder() {
                     harp_client_send(&client_, &tm); /* fire-and-forget */
                 }
                 harp_cbuf_free(&tm);
+                /* §14.4 host-context-C: snapshot the trim for clock-stats (key 11.6,
+                 * ratelock-stats). Plain relaxed atomics, off the RT path. */
+                lastTrimPpb_.store((int32_t)trim, std::memory_order_relaxed);
+                trimCount_.fetch_add(1, std::memory_order_relaxed);
                 didWork = true;
             }
         }
@@ -2413,6 +2424,11 @@ void HarpRuntime::reader() {
             uint64_t prevTs = 0;
             float resamp[kRtpBufFloats];
             const unsigned target = ethTargetFrames(); /* keep audioRing_ near here */
+            /* §14.4 host-context-C: this reader IS the ASRC clock-recovery, so it is
+             * the authoritative source for clock-stats.5 (asrc-stats). Mark the
+             * snapshot live; the cleanup below clears it when the reader exits (the
+             * ASRC instance is reader-local and freed there). */
+            asrcLive_.store(true, std::memory_order_relaxed);
             while (running_.load(std::memory_order_relaxed) &&
                    !readerStop_.load(std::memory_order_acquire)) {
 #ifdef __APPLE__
@@ -2436,6 +2452,20 @@ void HarpRuntime::reader() {
                         if (got) demuxUnionFrame(resamp, got, (uint16_t)width);
                         if (got < kBlock) break; /* dry — don't spin on silence */
                     }
+                    /* §14.4 host-context-C: publish the recovery state for clock-stats
+                     * (key 11.5). Off the audio path — get_stats only reads atomics, so
+                     * it adds nothing to the render and getDiagBundle reads the flat
+                     * snapshot without ever touching the reader-local `fr`. */
+                    harp_freerun_stats st;
+                    harp_freerun_get_stats(fr, &st);
+                    uint64_t rb; memcpy(&rb, &st.ratio, sizeof rb);
+                    uint64_t jb; memcpy(&jb, &st.jitter_us, sizeof jb);
+                    asrcRatioBits_.store(rb, std::memory_order_relaxed);
+                    asrcJitterBits_.store(jb, std::memory_order_relaxed);
+                    asrcEstPpm_.store(st.est_ppm, std::memory_order_relaxed);
+                    asrcFill_.store(st.fill_frames, std::memory_order_relaxed);
+                    asrcUnderflow_.store(st.underflow_frames, std::memory_order_relaxed);
+                    asrcOverflow_.store(st.overflow_frames, std::memory_order_relaxed);
                 } else if (floats == 0 && transport_->silentMs() > 1000) {
                     log_msg("RTP stream silent >1s; device gone?");
                     /* §12.1: implicit STREAMING -> DETACHED (transport-error), ASRC path. */
@@ -2446,6 +2476,7 @@ void HarpRuntime::reader() {
                     break;
                 }
             }
+            asrcLive_.store(false, std::memory_order_relaxed); /* fr about to be freed */
             harp_freerun_free(fr);
         }
         return;
@@ -2857,6 +2888,122 @@ static bool anon_device_section(harp_cbuf *out, const uint8_t *sec, size_t len) 
     return !d.err;
 }
 
+/* §14.4 host-context-C: clock-stats (top key 11). ALWAYS emitted. Deterministic
+ * CBOR per the design CDDL: { 0 => clock_drift_ppb, 3 => clock-recovery, ?4 =>
+ * reanchors, ?5 => asrc-stats (iff recovery==asrc), ?6 => ratelock-stats (iff
+ * recovery==rate-lock) }. NO PII — the §16 pass does not touch it; it is a pure
+ * numeric snapshot of the runtime's recovery state. The recovery enum (CDDL
+ * clock-recovery) is decided exactly as bitExact_ is at sessionUp:
+ *   host-paced (0): USB / not free-running — SSI-driven, no recovery.
+ *   asrc (1):       free-running device with NO audio.rate-lock (host resamples).
+ *   rate-lock (2):  free-running + rate-lock (bit-exact; the feeder trims).
+ * Called under ctlMutex_ from getDiagBundle (reads the snapshot atomics only). */
+void HarpRuntime::emitClockStats(harp_cbuf *out) {
+    bool freeRun = freeRunning_.load(std::memory_order_relaxed);
+    /* recovery: 0 host-paced, 1 asrc, 2 rate-lock. */
+    int recovery = !freeRun ? 0 : (bitExact_ ? 2 : 1);
+    bool haveAsrc = (recovery == 1) && asrcLive_.load(std::memory_order_relaxed);
+    bool haveRatelock = (recovery == 2);
+    /* host-measured drift gauge (key 0): the ASRC recovers it from the RTP
+     * timestamps (est_ppm -> ppb); rate-lock/host-paced have no host estimate -> 0. */
+    int64_t driftPpb = haveAsrc
+        ? (int64_t)llround(asrcEstPpm_.load(std::memory_order_relaxed) * 1000.0)
+        : 0;
+    uint64_t nkeys = 2; /* key 0 (drift) + key 3 (recovery) always */
+    if (haveAsrc || haveRatelock) nkeys++; /* key 5 or key 6 */
+    harp_cbor_uint(out, 11);
+    harp_cbor_map(out, nkeys);
+    harp_cbor_uint(out, 0);
+    harp_cbor_int(out, driftPpb);            /* clock_drift_ppb (host-measured gauge) */
+    harp_cbor_uint(out, 3);
+    harp_cbor_uint(out, (uint64_t)recovery); /* clock-recovery enum */
+    if (haveAsrc) {
+        /* asrc-stats (CDDL): { 0 => ratio, ?3 => phase/fill error vs setpoint, ?4 =>
+         * converter quality }. The ratio is the recovered out/in; the fill error is
+         * the signed frame deviation from the setpoint (the loop's phase). Quality is
+         * the reader's SRC_SINC_FASTEST. (Keys 1/2 — input/output sample totals — are
+         * not snapshotted by the freerun core, so a vN writer omits them.) */
+        uint64_t rb = asrcRatioBits_.load(std::memory_order_relaxed);
+        double ratio; memcpy(&ratio, &rb, sizeof ratio);
+        double fillErr = (double)asrcFill_.load(std::memory_order_relaxed) -
+                         (double)ethTargetFrames();
+        harp_cbor_uint(out, 5);
+        harp_cbor_map(out, 3); /* keys 0,3,4 */
+        harp_cbor_uint(out, 0);
+        harp_cbor_float(out, ratio);
+        harp_cbor_uint(out, 3);
+        harp_cbor_float(out, fillErr);
+        harp_cbor_uint(out, 4);
+        harp_cbor_uint(out, 2 /* SRC_SINC_FASTEST */);
+    } else if (haveRatelock) {
+        /* ratelock-stats: { 0 => last audio.trim ppb, 1 => fill, 2 => setpoint,
+         * 3 => trim messages sent this session }. */
+        harp_cbor_uint(out, 6);
+        harp_cbor_map(out, 4);
+        harp_cbor_uint(out, 0);
+        harp_cbor_int(out, lastTrimPpb_.load(std::memory_order_relaxed));
+        harp_cbor_uint(out, 1);
+        harp_cbor_uint(out, (uint64_t)(audioRing_.readAvailable() / 2)); /* current fill, frames */
+        harp_cbor_uint(out, 2);
+        harp_cbor_uint(out, ethTargetFrames());                          /* setpoint, frames */
+        harp_cbor_uint(out, 3);
+        harp_cbor_uint(out, trimCount_.load(std::memory_order_relaxed));
+    }
+}
+
+/* §14.4 host-context-C: usb-topology (top key 10), USB binding ONLY. Reads the
+ * libusb topology of the bound device off the control path (transport_->usbTopology
+ * -> host/usb_io.c). Returns false (emitting NOTHING) when the binding is not USB
+ * or libusb could not resolve the device, so the assembler can size its map. §16:
+ * with anonymize the controller-id (key 0) + serial (key 8) are cleared to "" IN
+ * PLACE; bus/addr/port-chain/speed/VID/PID are RETAINED. CDDL usb-topology:
+ * { 0 controller, 1 bus, 2 addr, 3 [port-chain], 4 speed, 6 VID, 7 PID, 8 serial }.
+ * The caller pre-fetches the topology (so presence can size the bundle map upfront,
+ * for deterministic definite-length CBOR) and only calls this when t.ok. */
+void HarpRuntime::emitUsbTopology(harp_cbuf *out, const harp_usb_topology &t,
+                                  bool anonymize) {
+    harp_cbor_uint(out, 10);
+    harp_cbor_map(out, 8); /* keys 0,1,2,3,4,6,7,8 */
+    harp_cbor_uint(out, 0);
+    harp_cbor_text(out, anonymize ? "" : t.controller); /* §16: controller id */
+    harp_cbor_uint(out, 1);
+    harp_cbor_uint(out, t.bus);
+    harp_cbor_uint(out, 2);
+    harp_cbor_uint(out, t.addr);
+    harp_cbor_uint(out, 3);
+    harp_cbor_array(out, (uint64_t)(t.nports > 0 ? t.nports : 0));
+    for (int i = 0; i < t.nports; i++) harp_cbor_uint(out, t.ports[i]);
+    harp_cbor_uint(out, 4);
+    harp_cbor_uint(out, (uint64_t)t.speed); /* usb-speed enum */
+    harp_cbor_uint(out, 6);
+    harp_cbor_uint(out, t.vendor_id);       /* VID RETAINED */
+    harp_cbor_uint(out, 7);
+    harp_cbor_uint(out, t.product_id);      /* PID RETAINED */
+    harp_cbor_uint(out, 8);
+    harp_cbor_text(out, anonymize ? "" : t.serial); /* §16: serial */
+}
+
+/* §14.4 host-context-C: net-topology (top key 13), Ethernet binding ONLY. CDDL
+ * net-topology: { ?0 host:port, ?1 mDNS, ?2 jitter-frames, ?3 net.ptp, ?4
+ * net.ptp.hw, ?5 net.offline }. The host learned the dial target (key 0) and the
+ * live ring occupancy (key 2 jitter depth); mDNS/PTP are device-announced and not
+ * yet learned host-side, so keys 1/3/4 are omitted (a vN writer omits what it
+ * cannot fill). §16: with anonymize host:port (key 0) is cleared to "" IN PLACE;
+ * the jitter depth + net.offline flag are RETAINED. Returns false (emitting
+ * NOTHING) on a non-Ethernet binding — the caller only calls it on Ethernet. */
+void HarpRuntime::emitNetTopology(harp_cbuf *out, bool anonymize) {
+    const char *hostport = transport_ ? transport_->netEndpoint() : "";
+    bool offline = wantHostPaced_.load(std::memory_order_relaxed);
+    harp_cbor_uint(out, 13);
+    harp_cbor_map(out, 3); /* keys 0,2,5 */
+    harp_cbor_uint(out, 0);
+    harp_cbor_text(out, anonymize ? "" : (hostport ? hostport : "")); /* §16: host:port */
+    harp_cbor_uint(out, 2);
+    harp_cbor_uint(out, ethTargetFrames()); /* RTP jitter-buffer depth (setpoint), frames */
+    harp_cbor_uint(out, 5);
+    harp_cbor_bool(out, offline);           /* net.offline (host-paced TCP bounce) RETAINED */
+}
+
 /* §14.4 host-context-A — see the runtime.h doc. MIRRORS getStateBundle: a
  * deterministic CBOR map assembled under ctlMutex_, off the control path, with
  * no audio-path side effects (golden gate). */
@@ -2885,25 +3032,46 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
     harp_cbuf out;
     harp_cbuf_init(&out);
 
-    /* Top-level diag-bundle map. v2 fills keys 0-6, 8, 9; keys 7/10-13 are later
-     * sub-steps (a vN writer omits unfilled sections). key 9 is present only when
-     * a session is up (audio-config is meaningless otherwise); keys 6 (session-
-     * history) + 8 (runtime logs) are present only when their ring has records.
-     * The map size is declared upfront (definite length, deterministic CBOR). */
+    /* §14.4 host-context-C: pre-resolve the binding-conditional sections so the
+     * top map can size upfront (definite length, deterministic CBOR). key 11
+     * (clock-stats) is ALWAYS present. key 10 (usb-topology) is present iff the
+     * binding is USB AND libusb resolved the topology; key 13 (net-topology) iff
+     * the binding is Ethernet. The two are mutually exclusive (a binding is one or
+     * the other). On the §8.7 loopback the binding is Ethernet, so the test sees
+     * key 13 + key 11 and NOT key 10. usbTopology() is fetched ONCE here and reused
+     * by emitUsbTopology — a read-only libusb query, off the control path. */
+    harp_usb_topology usbTopo;
+    usbTopo.ok = false;
+    bool isEth = transport_ && transport_->kind() == ShellTransport::Kind::Ethernet;
+    bool haveUsbTopo = transport_ &&
+                       transport_->kind() == ShellTransport::Kind::Usb &&
+                       transport_->usbTopology(&usbTopo) && usbTopo.ok;
+
+    /* Top-level diag-bundle map. v3 fills keys 0-6, 8, 9, 11 + (10 USB | 13 Eth);
+     * key 7/12 (loopback-results) is a later sub-step (a vN writer omits unfilled
+     * sections). key 9 is present only when a session is up (audio-config is
+     * meaningless otherwise); keys 6 (session-history) + 8 (runtime logs) are
+     * present only when their ring has records. The map size is declared upfront
+     * (definite length, deterministic CBOR). */
     bool haveAudio = connected_.load(std::memory_order_acquire);
     uint64_t nkeys = 6; /* 0,1,2,3,4,5 */
     if (!history.empty()) nkeys++; /* key 6 */
     if (!logs.empty()) nkeys++;    /* key 8 */
     if (haveAudio) nkeys++;        /* key 9 */
+    nkeys++;                       /* key 11 clock-stats (ALWAYS) */
+    if (haveUsbTopo) nkeys++;      /* key 10 usb-topology (USB binding) */
+    if (isEth) nkeys++;            /* key 13 net-topology (Ethernet binding) */
     harp_cbor_map(&out, nkeys);
 
     /* KEY 0: magic. */
     harp_cbor_uint(&out, 0);
     harp_cbor_text(&out, "harpd");
 
-    /* KEY 1: version. v2 adds session-history (key 6) + runtime logs (key 8). */
+    /* KEY 1: version. v2 added session-history (key 6) + runtime logs (key 8); v3
+     * adds host-context-C: clock-stats (key 11, always) + usb-topology (key 10,
+     * USB) | net-topology (key 13, Ethernet) + transport enum (audio-config key 12). */
     harp_cbor_uint(&out, 1);
-    harp_cbor_uint(&out, 2);
+    harp_cbor_uint(&out, 3);
 
     /* KEY 2: bundle-meta { 0 => tstamp [epoch, msc], 1 => tool }. */
     harp_cbor_uint(&out, 2);
@@ -3007,12 +3175,14 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
         }
     }
 
-    /* KEY 9: audio-config (host-owned DAW view; keys 0-11). Only when a session
-     * is up (otherwise these read defaults that misdescribe a dead session). Key
-     * 12 transport is a later enrichment (omitted in v1). */
+    /* KEY 9: audio-config (host-owned DAW view; keys 0-12). Only when a session
+     * is up (otherwise these read defaults that misdescribe a dead session). v3
+     * adds key 12 (transport enum: 0 usb, 1 ethernet) — the EXPLICIT binding
+     * selector so a decoder can tell a USB v3 bundle from an Ethernet one (the v2
+     * ambiguity the design flagged); it pairs with key 10 (USB) vs key 13 (Eth). */
     if (haveAudio) {
         harp_cbor_uint(&out, 9);
-        harp_cbor_map(&out, 12);
+        harp_cbor_map(&out, 13);
         harp_cbor_uint(&out, 0);
         harp_cbor_uint(&out, rate_); /* DAW sample rate */
         harp_cbor_uint(&out, 1);
@@ -3038,7 +3208,24 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
         harp_cbor_uint(&out, 0); /* sample format (0 = float32) */
         harp_cbor_uint(&out, 11);
         harp_cbor_uint(&out, unionWidth_.load(std::memory_order_relaxed)); /* RTP columns */
+        harp_cbor_uint(&out, 12);
+        harp_cbor_uint(&out, isEth ? 1u : 0u); /* transport enum: 0 usb, 1 ethernet (§4.4) */
     }
+
+    /* KEY 10: usb-topology — USB binding ONLY (absent on the §8.7 Ethernet
+     * loopback). Emitted from the topology fetched once above. §16 clears the
+     * controller-id (0) + serial (8); bus/addr/port-chain/speed/VID/PID RETAINED. */
+    if (haveUsbTopo) emitUsbTopology(&out, usbTopo, anonymize);
+
+    /* KEY 11: clock-stats — ALWAYS. The host's recovery/correlation snapshot
+     * (recovery mode + drift + asrc-stats|ratelock-stats). No PII (the §16 pass
+     * leaves it untouched). MUST sit AFTER key 10 and BEFORE key 13 (integer keys
+     * ascending — deterministic CBOR). */
+    emitClockStats(&out);
+
+    /* KEY 13: net-topology — Ethernet binding ONLY (the §8.7 loopback path). §16
+     * clears host:port (key 0); the jitter depth + net.offline flag RETAINED. */
+    if (isEth) emitNetTopology(&out, anonymize);
 
     std::vector<uint8_t> result(out.buf, out.buf + out.len);
     harp_cbuf_free(&out);

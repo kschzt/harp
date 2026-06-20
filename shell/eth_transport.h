@@ -83,7 +83,7 @@ struct EthTransport final : ShellTransport {
                 harp_sock_close(ls); harp_sock_close(ctl); return nullptr;
             }
             int port = (::getsockname(ls, (struct sockaddr *)&a, &al) == 0) ? ntohs(a.sin_port) : 0;
-            return new EthTransport(ctl, HARP_SOCK_INVALID, 0, true, ls, port);
+            return new EthTransport(ctl, HARP_SOCK_INVALID, 0, true, ls, port, hostport);
         }
         harp_sockhandle rx = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (rx == HARP_SOCK_INVALID) { harp_sock_close(ctl); return nullptr; }
@@ -91,7 +91,7 @@ struct EthTransport final : ShellTransport {
             harp_sock_close(rx); harp_sock_close(ctl); return nullptr;
         }
         int port = (::getsockname(rx, (struct sockaddr *)&a, &al) == 0) ? ntohs(a.sin_port) : 0;
-        return new EthTransport(ctl, rx, port, false, HARP_SOCK_INVALID, 0);
+        return new EthTransport(ctl, rx, port, false, HARP_SOCK_INVALID, 0, hostport);
     }
 
     ~EthTransport() override {
@@ -149,6 +149,12 @@ struct EthTransport final : ShellTransport {
     bool isFreeRunning() const override { return !hostPaced_; }
     int  audioPort() const override { return rxport_; }        /* audio.start key 6 (RTP) */
     int  audioPort7() const override { return audioListenPort_; } /* key 7 (host-paced TCP) */
+    /* §14.4 host-context-C: this is the Ethernet binding, so the diag-bundle
+     * assembler emits net-topology (key 13) and NOT usb-topology (key 10). */
+    Kind kind() const override { return Kind::Ethernet; }
+    /* The device host:port the host resolved (diag-bundle key 13.0 = HARP_ETH_DEVICE,
+     * the dial target). §16-anonymizable. usbTopology() stays the base no-op stub. */
+    const char *netEndpoint() const override { return hostport_.c_str(); }
 
     /* Reader thread: receive ONE RTP packet's slot-interleaved samples into `out`
      * (up to maxFloats), waiting up to timeout_ms. Returns FLOATS received (0 = none
@@ -181,9 +187,11 @@ struct EthTransport final : ShellTransport {
 
 private:
     EthTransport(harp_sockhandle ctl, harp_sockhandle rx, int port,
-                 bool hostPaced, harp_sockhandle alisten, int aport)
+                 bool hostPaced, harp_sockhandle alisten, int aport,
+                 const char *hostport)
         : rxsock_(rx), rxport_(port), hostPaced_(hostPaced),
-          audioListen_(alisten), audioListenPort_(aport) {
+          audioListen_(alisten), audioListenPort_(aport),
+          hostport_(hostport ? hostport : "") {
         harp_sock_io_init(&ctl_, ctl);
         struct sockaddr_in pa = {};
         socklen_t pl = sizeof pa;
@@ -240,6 +248,7 @@ private:
     harp_sockhandle rxsock_ = HARP_SOCK_INVALID;
     int             rxport_ = 0;
     std::string     peer_;
+    std::string     hostport_; /* the dial target (HARP_ETH_DEVICE) — diag-bundle key 13.0 */
     std::atomic<unsigned long long> lastArr_{0};
     /* §8.3-over-§8.7 host-paced: live ONLY when hostPaced_. audioListen_ is the
      * ephemeral TCP listener (key 7) the device dials back; audioSock_ is the one

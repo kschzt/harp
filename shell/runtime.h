@@ -656,6 +656,34 @@ private:
     std::atomic<uint16_t> unionWidth_{2}; /* §8.7: slot columns per RTP frame (the audio.start
                             * key-4 union the reader demuxes by). Set at audioStart, read per
                             * packet on the reader thread. USB carries it in the frame header. */
+
+    /* §14.4 host-context-C clock-stats snapshot (diag-bundle key 11). These are
+     * READ-ONLY observability atomics: the ASRC reader publishes its harp_freerun
+     * stats here once per drain, and the feeder publishes the last audio.trim it
+     * sent — both off the RT path, NEITHER ever read by pullAudio/the feeder
+     * pacing (so the render — the offline-golden gate — is untouched). getDiagBundle
+     * reads them under ctlMutex_ to fill clock-stats.5 (asrc-stats) / .6 (ratelock-
+     * stats). The ASRC instance (harp_freerun *fr) is reader-LOCAL and freed when
+     * the reader exits, so it is NEVER exposed across threads; only this flat
+     * snapshot crosses. asrcLive_ is the presence gate (an ASRC session is up). */
+    std::atomic<bool>     asrcLive_{false};   /* an ASRC (free-running, non-rate-lock) reader is running */
+    std::atomic<uint64_t> asrcRatioBits_{0};  /* harp_freerun_stats.ratio (double, bit-punned) */
+    std::atomic<uint64_t> asrcJitterBits_{0}; /* harp_freerun_stats.jitter_us (double, bit-punned) */
+    std::atomic<double>   asrcEstPpm_{0.0};   /* harp_freerun_stats.est_ppm (recovered drift) */
+    std::atomic<uint32_t> asrcFill_{0};       /* harp_freerun_stats.fill_frames */
+    std::atomic<uint32_t> asrcUnderflow_{0};  /* harp_freerun_stats.underflow_frames */
+    std::atomic<uint32_t> asrcOverflow_{0};   /* harp_freerun_stats.overflow_frames */
+    std::atomic<int32_t>  lastTrimPpb_{0};    /* last audio.trim ppb the feeder sent (rate-lock) */
+    std::atomic<uint64_t> trimCount_{0};      /* audio.trim messages sent this session */
+    /* §14.4 host-context-C assembler helpers (getDiagBundle, under ctlMutex_).
+     * Each emits its top-level bundle key into `out` in deterministic CBOR per the
+     * design CDDL. Read-only: they snapshot the atomics above + the transport, never
+     * mutate session state. emitClockStats is ALWAYS called; emitUsbTopology runs
+     * only on a USB binding (returns false / emits nothing on Ethernet), emitNetTopology
+     * only on an Ethernet binding. `anonymize` clears the §16 PII leaves IN PLACE. */
+    void emitClockStats(harp_cbuf *out);
+    void emitUsbTopology(harp_cbuf *out, const harp_usb_topology &t, bool anonymize);
+    void emitNetTopology(harp_cbuf *out, bool anonymize);
     harp_link link_;   /* rx reassembly: shared by client_ and pollEcho */
     harp_cbuf msg_;    /* pollEcho rx scratch */
     harp_client client_{};

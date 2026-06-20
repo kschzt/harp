@@ -676,6 +676,55 @@ bool harp_usb_devident(harp_io *io, harp_usb_devinfo *out) {
     return true;
 }
 
+/* Map a LIBUSB_SPEED_* constant to the design CDDL usb-speed enum (so callers
+ * need not include libusb.h to interpret harp_usb_topology.speed):
+ *   0 unknown, 1 low, 2 full, 3 high, 4 super, 5 super-plus. */
+static int map_usb_speed(int libusb_speed) {
+    switch (libusb_speed) {
+    case LIBUSB_SPEED_LOW:       return 1;
+    case LIBUSB_SPEED_FULL:      return 2;
+    case LIBUSB_SPEED_HIGH:      return 3;
+    case LIBUSB_SPEED_SUPER:     return 4;
+#ifdef LIBUSB_SPEED_SUPER_PLUS
+    case LIBUSB_SPEED_SUPER_PLUS: return 5;
+#endif
+    default:                     return 0; /* LIBUSB_SPEED_UNKNOWN */
+    }
+}
+
+/* §14.4 host-context-C: USB topology of the bound device (diag-bundle key 10).
+ * READ-ONLY — only descriptor/topology queries against the already-open handle,
+ * no transfer or FIFO state is touched, so the diag-bundle assembler can call it
+ * off the control path while the audio threads stream. */
+bool harp_usb_get_topology(harp_io *io, harp_usb_topology *out) {
+    if (!io || !out) return false;
+    usb_io *u = (usb_io *)io;
+    memset(out, 0, sizeof *out);
+    /* identity (VID/PID/serial) is always available from the bound descriptor. */
+    out->vendor_id = u->vendor_id;
+    out->product_id = u->product_id;
+    snprintf(out->serial, sizeof out->serial, "%s", u->dev_serial);
+    if (!u->h) return false; /* no live handle (should not happen post-open) */
+    libusb_device *dev = libusb_get_device(u->h);
+    if (!dev) return false;
+    out->bus = libusb_get_bus_number(dev);
+    out->addr = libusb_get_device_address(dev);
+    out->speed = map_usb_speed(libusb_get_device_speed(dev));
+    uint8_t ports[HARP_USB_MAX_PORTS];
+    int n = libusb_get_port_numbers(dev, ports, (int)sizeof ports);
+    if (n > 0) {
+        out->nports = n;
+        for (int i = 0; i < n && i < HARP_USB_MAX_PORTS; i++) out->ports[i] = ports[i];
+    }
+    /* Controller / root id: libusb has no portable controller-name API, so we
+     * synthesize a stable per-host root identifier from the bus the device sits
+     * on ("usb-bus-N"). It is the §16-anonymizable controller field (cleared to
+     * "" in the anon pass); bus/addr/ports stay as the retained topology. */
+    snprintf(out->controller, sizeof out->controller, "usb-bus-%u", (unsigned)out->bus);
+    out->ok = true;
+    return true;
+}
+
 /* Read-only scan of every HARP device on the bus. Opens each briefly to
  * read its serial string, then closes WITHOUT claiming — so it sees
  * devices already owned by other instances too (a claimed interface does
