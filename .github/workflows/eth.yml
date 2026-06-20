@@ -63,7 +63,7 @@ jobs:
         run: scripts/offline-edit-eth-test.sh
       - name: diag-bundle (§14.4 v0 export + §16 anonymization — identity + verbatim counters)
         run: scripts/diag-bundle-eth-test.sh
-      - name: diag-bundle-host (§14.4 host-context-A — runtime getDiagBundle: verbatim device-section + host counters + audio-config)
+      - name: "diag-bundle-host (§14.4 host-context-A — runtime getDiagBundle: verbatim device-section + host counters + audio-config)"
         run: scripts/diag-bundle-host-eth-test.sh
       # cross-format VST3<->AU recall over the loopback is verified LOCALLY (XFORMAT PASS)
       # and on the desk rig, but the freshly-installed ad-hoc-signed AU won't instantiate
