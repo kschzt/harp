@@ -91,6 +91,8 @@ if [ "${conn:-0}" -gt 0 ] && [ -n "$rms" ] && gt "$rms" "$RMS_BITEXACT"; then
     ok "bit-exact: connected, RTP audio flowing 1:1 (rms $rms, floor $RMS_BITEXACT)"
 else
     bad "bit-exact: conn=$conn rms=${rms:-none} (want connected + rms>$RMS_BITEXACT)"
+    echo "   ── host stderr (why no connect?) ──"; tail -12 /tmp/eth-host.err 2>/dev/null | sed 's/^/     /'
+    echo "   ── device log ──"; tail -12 /tmp/eth-dev.log 2>/dev/null | sed 's/^/     /'
 fi
 
 # ── small-target loop stability (target-invariant rate loop) ─────────────────────
