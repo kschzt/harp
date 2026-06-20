@@ -817,12 +817,12 @@ static void host_paced_loop(device *d) {
             ssize_t r = hp_read(a->out_fd, rbuf, sizeof rbuf);
             if (r <= 0) { /* endpoint died or stop */
 #ifdef _WIN32
-                { int soe = 0; int sl = sizeof soe;
-                  getsockopt(a->out_fd, SOL_SOCKET, SO_ERROR, (char *)&soe, &sl);
-                  fprintf(stderr, "harp-deviced: pacing read SO_ERROR=%d running=%d\n", soe,
-                          (int)atomic_load_explicit(&a->running, memory_order_relaxed)); }
-                fprintf(stderr, "harp-deviced: pacing read ended: %s (fd=%d WSA=%d)\n",
-                        r == 0 ? "EOF" : "recv error", a->out_fd, r == 0 ? 0 : WSAGetLastError());
+                int werr = WSAGetLastError(); /* capture BEFORE any other socket call clobbers it */
+                int soe = 0, sl = sizeof soe;
+                getsockopt(a->out_fd, SOL_SOCKET, SO_ERROR, (char *)&soe, &sl);
+                fprintf(stderr, "harp-deviced: pacing read ended: %s (fd=%d WSA=%d SO_ERROR=%d running=%d gotbytes=%zu)\n",
+                        r == 0 ? "EOF" : "recv error", a->out_fd, r == 0 ? 0 : werr, soe,
+                        (int)atomic_load_explicit(&a->running, memory_order_relaxed), got);
 #else
                 fprintf(stderr, "harp-deviced: pacing read ended: %s\n",
                         r == 0 ? "EOF" : strerror(errno));
@@ -943,8 +943,9 @@ void *audio_thread(void *arg) {
 #ifdef _WIN32
         { struct sockaddr_in la = {0}, pa = {0}; int ll = sizeof la, pl = sizeof pa;
           getsockname(s, (struct sockaddr *)&la, &ll); getpeername(s, (struct sockaddr *)&pa, &pl);
-          fprintf(stderr, "harp-deviced: connect-back sock=%d local=:%d peer=:%d\n",
-                  s, ntohs(la.sin_port), ntohs(pa.sin_port)); }
+          int soe = 0, sl = sizeof soe; getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&soe, &sl);
+          fprintf(stderr, "harp-deviced: connect-back sock=%d local=:%d peer=:%d post-connect SO_ERROR=%d\n",
+                  s, ntohs(la.sin_port), ntohs(pa.sin_port), soe); }
 #endif
     }
     fprintf(stderr, "harp-deviced: audio thread up: mode=%u fd=%d out_fd=%d\n", a->mode,
@@ -1560,6 +1561,9 @@ void audio_stop(device *d) {
      * tearing down the render thread so no echo races a half-stopped stream. */
     meter_pump_stop(d);
     if (!atomic_load_explicit(&d->audio.thread_live, memory_order_relaxed)) return;
+#ifdef _WIN32
+    fprintf(stderr, "harp-deviced: audio_stop ENTER (thread_live=1) — tearing down host-paced stream\n");
+#endif
     d->audio.running = false;
     /* The thread may be parked in a blocking endpoint read (mode 1 pacing,
      * or a stalled write); read/write are cancellation points, and the loop
@@ -1570,7 +1574,11 @@ void audio_stop(device *d) {
     atomic_store_explicit(&d->audio.thread_live, false, memory_order_relaxed);
     audio_rtp_close(&d->audio); /* §8.7: thread joined -> the RTP dest outlives no sender */
     if (d->audio.host_paced_sock >= 0) { /* §8.3-over-§8.7: same, for the TCP host-paced channel */
+#ifdef _WIN32
+        closesocket(d->audio.host_paced_sock); /* Winsock SOCKET: POSIX close() is the wrong handle table */
+#else
         close(d->audio.host_paced_sock);
+#endif
         d->audio.host_paced_sock = -1;
     }
     d->audio.host_paced_port = 0;
