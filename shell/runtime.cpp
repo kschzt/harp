@@ -665,6 +665,10 @@ bool HarpRuntime::sessionUp() {
  * is still talking to us, release the claim. Safe on a dead transport. */
 void HarpRuntime::sessionDown() {
     bool wasConnected = connected_.exchange(false, std::memory_order_acq_rel);
+#ifdef _WIN32
+    fprintf(stderr, "harp-shell: DIAG sessionDown ENTER wasConnected=%d t=%llums\n",
+            (int)wasConnected, (unsigned long long)(harp_now_ns() / 1000000ull));
+#endif
     /* QUIESCE the reader before joining it. On a mid-stream live<->offline flip the
      * transport is STILL ALIVE, so the free-running reader's recvAudio keeps returning
      * data and its loop (running_ && !readerStop_) never exits on its own — connected_
@@ -679,11 +683,23 @@ void HarpRuntime::sessionDown() {
     readerStop_.store(true, std::memory_order_release);
     if (readerThread_.joinable()) readerThread_.join();
     readerStop_.store(false, std::memory_order_release);
+#ifdef _WIN32
+    fprintf(stderr, "harp-shell: DIAG sessionDown reader joined t=%llums\n", (unsigned long long)(harp_now_ns()/1000000ull));
+#endif
     if (eventPumpThread_.joinable()) eventPumpThread_.join();
+#ifdef _WIN32
+    fprintf(stderr, "harp-shell: DIAG sessionDown eventPump joined t=%llums\n", (unsigned long long)(harp_now_ns()/1000000ull));
+#endif
     if (!transport_) return;
     std::lock_guard<std::mutex> lk(ctlMutex_);
+#ifdef _WIN32
+    fprintf(stderr, "harp-shell: DIAG sessionDown got ctlMutex t=%llums\n", (unsigned long long)(harp_now_ns()/1000000ull));
+#endif
     if (wasConnected) {
         audioStopLocked();
+#ifdef _WIN32
+        fprintf(stderr, "harp-shell: DIAG sessionDown audioStopLocked returned t=%llums\n", (unsigned long long)(harp_now_ns()/1000000ull));
+#endif
         /* drain the tail of the stream so the device thread can park */
         uint8_t junk[16384];
         int quiet = 0;
@@ -817,7 +833,13 @@ void HarpRuntime::stop() {
         }
     }
     if (!running_.exchange(false)) return;
+#ifdef _WIN32
+    fprintf(stderr, "harp-shell: DIAG stop() running=false, joining supervisor t=%llums\n", (unsigned long long)(harp_now_ns()/1000000ull));
+#endif
     if (supervisorThread_.joinable()) supervisorThread_.join(); /* final sessionDown */
+#ifdef _WIN32
+    fprintf(stderr, "harp-shell: DIAG stop() supervisor joined t=%llums\n", (unsigned long long)(harp_now_ns()/1000000ull));
+#endif
     /* Supervisor is joined: no thread can touch the context now. Tear it down
      * here, while ~HarpRuntime still runs — i.e. before the DLL can unload, so
      * no libusb backend thread outlives our module. */

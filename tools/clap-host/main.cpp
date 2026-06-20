@@ -371,11 +371,16 @@ int main(int argc, char **argv) {
         first = false;
     }
 
+    fprintf(stderr, "clap-host: DIAG render loop done; stop_processing...\n");
     plugin->stop_processing(plugin);
+    fprintf(stderr, "clap-host: DIAG stop_processing done; deactivate...\n");
     plugin->deactivate(plugin);
+    fprintf(stderr, "clap-host: DIAG deactivate done; destroy...\n");
     plugin->destroy(plugin);
+    fprintf(stderr, "clap-host: DIAG destroy done; deinit...\n");
     entry->deinit();
     harp_dlclose(dso);
+    fprintf(stderr, "clap-host: DIAG teardown complete; computing hash\n");
 
     double rms = 0;
     for (float v : capture) rms += (double)v * v;
