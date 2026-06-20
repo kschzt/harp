@@ -161,9 +161,21 @@ static void part_audio_thread(HarpRuntime *rt, AudioSink *sink, uint32_t block, 
  * every source onto the one session. */
 static void control_thread(HarpRuntime *rt, EventSource *src, bool isOwner,
                            int seconds) {
+    (void)seconds; /* flood for the whole RUN lifetime (gate on g_run), not a fixed
+                    * seconds*1000 counter — see the loop note below. */
     uint32_t n = 0;
     std::vector<uint8_t> bundle;
-    for (int t = 0; t < seconds * 1000 && g_run.load(); t++) {
+    /* Flood until the run ends (g_run cleared after the capture). The old
+     * `t < seconds*1000` bound made the flood stop after a fixed wall time, but the
+     * --late-sink CAPTURE is armed only AFTER connect + settle + the re-neg-stable
+     * poll (up to ~6 s) + armSettle — so on a slow re-neg the flood could EXPIRE
+     * before/under the armed window, leaving the captured part undriven. The device
+     * clears every part voice on each re-neg's audio.start (evq_reset_for_new_stream),
+     * so an undriven part renders pure zeros => the captured late sink reads FULL
+     * silence (the ~1-in-5 hw flake). Gating purely on g_run keeps the captured part
+     * receiving note-ons across the entire capture, so it is reliably non-silent;
+     * the thread is joined at run end, so g_run always bounds it. */
+    while (g_run.load(std::memory_order_relaxed)) {
         uint64_t base = rt->streamPos() + rt->latencySamples();
         uint8_t chan = src->chan.load(std::memory_order_relaxed) & 0xf;
         float iso = chan < g_iso_levels.size() ? g_iso_levels[chan] : -1.f;
