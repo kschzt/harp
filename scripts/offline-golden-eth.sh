@@ -46,12 +46,13 @@ bad() { FAIL=$((FAIL + 1)); echo "   ✗ FAIL: $1"; }
 # render NAME HOST PLUG: start a fresh-state daemon, render the canonical sequence in
 # DEFAULT (kOffline / CLAP_RENDER_OFFLINE) mode over §8.7 host-paced TCP, echo the hash.
 render() {
-    sd="/tmp/ogeth-$2.$$"
-    rm -rf "$sd"; : > "$sd.log"
-    "$DEVICED" --port "$PORT" --state-dir "$sd" --panel-sock "" > "$sd.log" 2>&1 &
+    sd="ogeth-$2.$$"   # workspace-RELATIVE: Git Bash path-converts an absolute /tmp arg to
+    rm -rf "$sd"; : > "$sd.log"   # C:/Users/.../Temp/..., whose drive component trips the
+    "$DEVICED" --port "$PORT" --state-dir "$sd" --panel-sock "" > "$sd.log" 2>&1 &  # device's recursive mkdir
     dpid=$!
     i=0
     while [ $i -lt 25 ]; do grep -q "listening on $PORT" "$sd.log" 2>/dev/null && break; sleep 0.2; i=$((i + 1)); done
+    grep -q "listening on $PORT" "$sd.log" 2>/dev/null || { echo "OFFLINE-GOLDEN: device did NOT start on $PORT — render would be SILENCE" >&2; cat "$sd.log" >&2; }
     h=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" "$1" "$3" $SETTLE $SEQ 2>>"$sd.err" | sed -nE 's/output-hash: //p')
     kill -9 "$dpid" 2>/dev/null
     wait "$dpid" 2>/dev/null
@@ -64,7 +65,7 @@ render() {
 # tail-hash = the POST-toggle window only (the pre-toggle free-running portion is non-
 # deterministic and excluded). Notes span the toggle so the tail carries real audio.
 toggle_tail() {
-    sd="/tmp/ogeth-tg$PORT"
+    sd="ogeth-tg$PORT"   # workspace-relative (dodges the /tmp -> C:\ mkdir choke, see render)
     rm -rf "$sd"; : > "$sd.log"
     "$DEVICED" --port "$PORT" --state-dir "$sd" --panel-sock "" > "$sd.log" 2>&1 &
     dpid=$!
@@ -123,6 +124,28 @@ if [ -n "${v1:-}" ] && [ -n "${c1:-}" ]; then
         ok "cross-format: VST3 and CLAP offline bounces are byte-identical ($v1)"
     else
         bad "cross-format: VST3 ($v1) != CLAP ($c1) — shells diverge on the same input"
+    fi
+fi
+
+# ── absolute-signal floor: the offline bounce must be NON-SILENT ─────────────────
+# Determinism (#1==#2) and cross-format equality (VST3==CLAP) BOTH pass on SILENCE — a
+# device that never started or a host that never connected renders zeros, which are
+# deterministic AND byte-identical. (Exactly this hid for a while on Windows: the device
+# silently failed to start, so the golden was vacuous silence yet "4 passed".) So an
+# absolute-signal floor is required NEXT to the equality oracles: render once more with
+# rms reporting and assert the 4-note line is audibly above zero.
+if [ -n "${VPLUG:-}" ] && [ -d "$VPLUG" ] && [ -x "$VHOST" ]; then
+    sd="ogeth-rms.$$"; rm -rf "$sd"; : > "$sd.log"
+    "$DEVICED" --port "$PORT" --state-dir "$sd" --panel-sock "" > "$sd.log" 2>&1 &
+    dpid=$!; i=0
+    while [ $i -lt 25 ]; do grep -q "listening on $PORT" "$sd.log" 2>/dev/null && break; sleep 0.2; i=$((i + 1)); done
+    vr=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" "$VHOST" "$VPLUG" $SETTLE --notes 62,69,74,65 --seconds 2.6 --json 2>>"$sd.err" | sed -nE 's/.*"rms":([0-9.]+).*/\1/p')
+    kill -9 "$dpid" 2>/dev/null; wait "$dpid" 2>/dev/null; PORT=$((PORT + 1))
+    echo "──── non-silent: VST3 offline-bounce rms=${vr:-<none>}  (silence=0 sails through determinism)"
+    if [ -n "$vr" ] && awk "BEGIN{exit !($vr > 0.02)}"; then
+        ok "offline bounce is NON-SILENT (rms $vr) — the golden reflects real audio, not silence"
+    else
+        bad "offline bounce is SILENT (rms=${vr:-none}) — determinism/cross-format were passing vacuously"
     fi
 fi
 
