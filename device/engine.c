@@ -802,20 +802,8 @@ static void host_paced_loop(device *d) {
     uint8_t rbuf[16384];
     size_t rlen = 0, rpos = 0;
 #ifdef _WIN32
-    struct timespec t0w; clock_gettime(CLOCK_MONOTONIC, &t0w); /* DIAG: how long does the first recv block? */
-    { struct sockaddr_in la = {0}, pa = {0}; int ll = sizeof la, pl = sizeof pa;
-      getsockname(a->out_fd, (struct sockaddr *)&la, &ll); getpeername(a->out_fd, (struct sockaddr *)&pa, &pl);
-      fprintf(stderr, "harp-deviced: host_paced_loop fd=%d local=:%d peer=:%d — polling for pacing\n",
-              a->out_fd, ntohs(la.sin_port), ntohs(pa.sin_port));
-      for (int i = 0; i < 5; i++) {
-          WSAPOLLFD p; p.fd = a->out_fd; p.events = POLLRDNORM; p.revents = 0;
-          int r = WSAPoll(&p, 1, 100);
-          u_long avail = 0; ioctlsocket(a->out_fd, FIONREAD, &avail); /* bytes ACTUALLY in the recv buffer */
-          int soe = 0, sl = sizeof soe; getsockopt(a->out_fd, SOL_SOCKET, SO_ERROR, (char *)&soe, &sl);
-          fprintf(stderr, "harp-deviced: poll[%d] WSAPoll=%d revents=0x%x FIONREAD=%lu SO_ERROR=%d\n",
-                  i, r, p.revents, avail, soe);
-          Sleep(50);
-      } }
+    struct timespec t0w; clock_gettime(CLOCK_MONOTONIC, &t0w); /* DIAG: loop lifetime */
+    uint64_t framesRendered = 0; /* DIAG: uncapped render count to measure throughput */
 #endif
 
     while (atomic_load_explicit(&a->running, memory_order_relaxed)) {
@@ -838,9 +826,12 @@ static void host_paced_loop(device *d) {
                 getsockopt(a->out_fd, SOL_SOCKET, SO_ERROR, (char *)&soe, &sl);
                 struct timespec t1w; clock_gettime(CLOCK_MONOTONIC, &t1w);
                 long elapsed_ms = (long)((t1w.tv_sec - t0w.tv_sec) * 1000 + (t1w.tv_nsec - t0w.tv_nsec) / 1000000);
-                fprintf(stderr, "harp-deviced: pacing read ended: %s (fd=%d WSA=%d SO_ERROR=%d running=%d gotbytes=%zu elapsed=%ldms)\n",
+                fprintf(stderr, "harp-deviced: pacing read ended: %s (fd=%d WSA=%d SO_ERROR=%d running=%d gotbytes=%zu elapsed=%ldms rendered=%llu fenceWaits=%llu fenceTimeouts=%llu)\n",
                         r == 0 ? "EOF" : "recv error", a->out_fd, r == 0 ? 0 : werr, soe,
-                        (int)atomic_load_explicit(&a->running, memory_order_relaxed), got, elapsed_ms);
+                        (int)atomic_load_explicit(&a->running, memory_order_relaxed), got, elapsed_ms,
+                        (unsigned long long)framesRendered,
+                        (unsigned long long)atomic_load_explicit(&g_fence_waits, memory_order_relaxed),
+                        (unsigned long long)atomic_load_explicit(&g_fence_timeouts, memory_order_relaxed));
 #else
                 fprintf(stderr, "harp-deviced: pacing read ended: %s\n",
                         r == 0 ? "EOF" : strerror(errno));
@@ -934,17 +925,22 @@ static void host_paced_loop(device *d) {
         harp_audio_hdr_encode(&out, frame);
         size_t payload = (size_t)n * slots * 4;
         memcpy(frame + HARP_AUDIO_HDR_LEN, samples, payload);
-#ifdef _WIN32
-        { static int sn = 0; if (sn < 4) { sn++;
-              fprintf(stderr, "harp-deviced: rendered+sending audio block %d: %zu bytes on fd=%d\n",
-                      sn, (size_t)HARP_AUDIO_HDR_LEN + payload, a->fd); } }
-#endif
         if (!hp_write_all(a->fd, frame, HARP_AUDIO_HDR_LEN + payload)) {
 #ifdef _WIN32
             fprintf(stderr, "harp-deviced: audio send FAILED on fd=%d WSA=%d\n", a->fd, WSAGetLastError());
 #endif
             return;
         }
+#ifdef _WIN32
+        framesRendered++;
+        if ((framesRendered % 64) == 1) {
+            struct timespec tnw; clock_gettime(CLOCK_MONOTONIC, &tnw);
+            long ms = (long)((tnw.tv_sec - t0w.tv_sec) * 1000 + (tnw.tv_nsec - t0w.tv_nsec) / 1000000);
+            fprintf(stderr, "harp-deviced: DIAG rendered=%llu at %ldms fenceWaits=%llu\n",
+                    (unsigned long long)framesRendered, ms,
+                    (unsigned long long)atomic_load_explicit(&g_fence_waits, memory_order_relaxed));
+        }
+#endif
     }
 }
 

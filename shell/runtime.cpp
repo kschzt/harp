@@ -1249,13 +1249,16 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
     unsigned waited = 0;
     bool settled = false; /* settlePadDebt + ssiRead_ advance run ONCE, after any flip clears */
 #ifdef _WIN32
-    /* DIAG: does the host main thread actually reach + loop process()->pull? */
-    { static int pd = 0; if (pd < 8) { pd++;
-        bool flipping = modeFlipPending_.load(std::memory_order_acquire) &&
-                        sessionGen_.load(std::memory_order_acquire) < flipTargetGen_.load(std::memory_order_acquire);
-        fprintf(stderr, "harp-shell: DIAG pullAudioBlocking ENTER nFrames=%zu ringAvail=%zu ssiRead=%llu flipping=%d connected=%d timeoutMs=%u\n",
-                nFrames, audioRing_.readAvailable(), (unsigned long long)ssiRead_.load(std::memory_order_relaxed),
-                flipping, (int)connected_.load(std::memory_order_acquire), timeoutMs); } }
+    /* DIAG: heartbeat (every 32nd pull) to MEASURE the crawl rate — wall-clock + call
+     * index + ssiRead + how many pulls hit the 1000ms starvation timeout. This tells
+     * crawl-vs-stall and whether the offline timeout is the per-block cost. */
+    static std::atomic<uint64_t> s_pullCount{0}, s_pullTimeouts{0};
+    uint64_t myPullIdx = s_pullCount.fetch_add(1, std::memory_order_relaxed);
+    if (myPullIdx % 32 == 0)
+        fprintf(stderr, "harp-shell: DIAG pull#%llu now_ms=%llu ssiRead=%llu ringAvail=%zu timeouts=%llu\n",
+                (unsigned long long)myPullIdx, (unsigned long long)(harp_now_ns() / 1000000ull),
+                (unsigned long long)ssiRead_.load(std::memory_order_relaxed),
+                audioRing_.readAvailable(), (unsigned long long)s_pullTimeouts.load(std::memory_order_relaxed));
 #endif
     while (got < want) {
         /* §8.3-over-§8.7 mid-stream toggle fence: while a live<->offline re-dial is in
@@ -1278,6 +1281,9 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
             if (got >= want) break;
         }
         if ((!flipping && !connected_.load(std::memory_order_acquire)) || waited >= timeoutMs) {
+#ifdef _WIN32
+            if (waited >= timeoutMs) s_pullTimeouts.fetch_add(1, std::memory_order_relaxed);
+#endif
             if (!settled) ssiRead_.fetch_add(nFrames, std::memory_order_relaxed); /* advance EXACTLY once per call */
             memset(dst + got, 0, (want - got) * sizeof(float));
             padDebtFloats_ += want - got;
