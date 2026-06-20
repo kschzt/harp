@@ -48,20 +48,20 @@ trap stop_dev EXIT
 # start the fake-hardware synth on 127.0.0.1:$PORT; $* = extra daemon args (e.g. --tone)
 start_dev() {
     stop_dev
-    # Pre-create the store subdirs. On the Windows runner (Git Bash) the MSYS-converted
-    # /tmp -> C:/Users/.../Temp path tripped the device's recursive mkdir in harp_store_open;
-    # creating objects/ + refs/ here means the device just sees EEXIST and opens cleanly.
-    # Harmless on POSIX (the device would create them anyway).
-    rm -rf /tmp/eth-dev-state; mkdir -p /tmp/eth-dev-state/objects /tmp/eth-dev-state/refs
-    : > /tmp/eth-dev.log
-    "$DEVICED" --port "$PORT" --state-dir /tmp/eth-dev-state "$@" >/tmp/eth-dev.log 2>&1 &
+    # State dir as a WORKSPACE-RELATIVE path. On the Windows runner, Git Bash converts an
+    # absolute /tmp arg to C:/Users/.../Temp/..., and the device's recursive mkdir then
+    # bails walking the "C:" drive component (_mkdir("C:") != EEXIST) — confirmed: even with
+    # objects/+refs/ pre-created, harp_store_open still failed. A relative path (no leading
+    # /, no drive letter) isn't converted and walks cleanly. POSIX-identical (under the repo).
+    rm -rf eth-dev-state; : > /tmp/eth-dev.log
+    "$DEVICED" --port "$PORT" --state-dir eth-dev-state "$@" >/tmp/eth-dev.log 2>&1 &
     DEVPID=$!
     for _ in $(seq 1 25); do
         grep -q "listening on $PORT" /tmp/eth-dev.log 2>/dev/null && return 0
         sleep 0.2
     done
     echo "eth-tests: device failed to start on $PORT"; cat /tmp/eth-dev.log
-    ls -la /tmp/eth-dev-state 2>&1 | head; exit 1
+    ls -la eth-dev-state 2>&1 | head; exit 1
 }
 
 [ -x "$DEVICED" ] || { echo "ETH-TESTS FAIL: $DEVICED not built"; exit 1; }
