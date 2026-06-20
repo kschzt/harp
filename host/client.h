@@ -45,6 +45,15 @@ typedef struct {
     uint64_t boot_count;
     char caps[HARP_CLIENT_MAX_CAPS][32]; /* capability strings (identity key 6) */
     size_t ncaps;
+    /* §6.4 latency-profile (identity key 8): one entry per negotiated rate. Each
+     * profile is {0 rate, 1 input-latency, 2 output-latency, 3 buffer-depth} in
+     * samples. The §14.3 LoopbackMeasurer reads this to compute the expected round-
+     * trip for the negotiated rate. nlat == 0 if the device omitted key 8. */
+#define HARP_CLIENT_MAX_LAT 8
+    struct {
+        uint32_t rate, in_lat, out_lat, buf_depth;
+    } lat[HARP_CLIENT_MAX_LAT];
+    size_t nlat;
 } harp_client_identity;
 
 /* true if the device advertised `cap` */

@@ -65,6 +65,12 @@ jobs:
         run: scripts/diag-bundle-eth-test.sh
       - name: "diag-bundle-host (§14.4 host-context-A — runtime getDiagBundle: verbatim device-section + host counters + audio-config)"
         run: scripts/diag-bundle-host-eth-test.sh
+      # §14.3 host LoopbackMeasurer: digital round-trip RTT over the §8.7 host-paced loop.
+      # Median-of-cycles RTT with echo validation (frame+offset match) and outlier rejection.
+      # Strict ±1ms gate on Linux (TIMER_ABSTIME pacing); macOS/Windows assert WIRING ONLY
+      # (connected+armed+echo) because the runners' relative-nanosleep jitter inflates the RTT.
+      - name: "loopback (§14.3 host LoopbackMeasurer — digital round-trip RTT over §8.7; strict ±1ms on Linux, macOS/Windows wiring-only)"
+        run: scripts/loopback-eth-test.sh
       # cross-format VST3<->AU recall over the loopback is verified LOCALLY (XFORMAT PASS)
       # and on the desk rig, but the freshly-installed ad-hoc-signed AU won't instantiate
       # on an ephemeral hosted-macOS runner (au-host "device busy" = the AU never loaded).

@@ -189,6 +189,23 @@ public:
         if (!slots.empty()) outSlots_ = slots;
     }
 
+    /* §14.3 host LoopbackMeasurer (the digital round-trip probe). Arm the host
+     * side: `in` is the H->D slot the host injects a stimulus on, `out` is the
+     * D->H slot the device echoes it to (the device copies in->out in the same
+     * rendered frame — see device/engine.c §14.3). Must be set BEFORE start()/
+     * audioStart(): when armed, audio.start declares the in-slot in key 3 so the
+     * device parses it into d->audio.in_slots[], and measureLoopback() can later
+     * inject + locate the echo. DEFAULT off (in==out==-1) — audio.start sends the
+     * unchanged key-3 array and the feeder NEVER populates an H->D payload, so the
+     * render is byte-identical to the golden path (the §14.3 atomic-gating gate).
+     * The out-slot MUST be one the synth is NOT driving with notes, else the echo
+     * overwrites real synth output (the device overwrites, it does not mix). */
+    void setLoopbackSlots(int in, int out) {
+        loopbackIn_ = in;
+        loopbackOut_ = out;
+    }
+    bool loopbackArmed() const { return loopbackIn_ >= 0 && loopbackOut_ >= 0; }
+
     /* The multitimbral part (§9.4, key 5) the OWNER instance drives: notes
      * already carry their channel in the UMP word (the shell stamps it per-
      * event), but parameter sets/ramps had no channel — so on a multi-part
@@ -324,6 +341,36 @@ public:
      * later sub-step keys 6/7/8/10-13 (a vN writer omits unfilled sections).
      * Returns the CBOR bytes (always a valid bundle, even with no device). */
     std::vector<uint8_t> getDiagBundle(bool anonymize = false);
+
+    /* §14.3 host LoopbackMeasurer result. ok=true means the measurement ran end-
+     * to-end (armed, routed, echo found); rtt_samples is the measured round-trip in
+     * samples at `rate`; expected_samples is the §6.4 prediction (H->D + D->H queue
+     * depth); delta_ms = (measured - expected) in ms. echo_found is set even when ok
+     * is false on a soft path (so a caller can distinguish "connected+armed but the
+     * platform jittered" from "never armed"). */
+    struct LoopbackResult {
+        bool ok = false;
+        bool armed = false;
+        bool echo_found = false;
+        int in_slot = -1, out_slot = -1;
+        uint32_t rate = 0;
+        double rtt_samples = 0;
+        double expected_samples = 0;
+        double delta_ms = 0;
+        std::string detail;
+    };
+    /* Run the §14.3 digital loopback measurement on the LIVE host-paced stream.
+     * Requires loopbackArmed() (so audio.start declared the in-slot in key 3) and a
+     * live host-paced (USB or §8.7-TCP) session. It quiesces the reader (it owns the
+     * audio-IN endpoint for the probe, exactly as audioRenegotiateLocked does — NO
+     * teardown, connected_ stays true), issues diag.loopback.start, injects periodic
+     * one-sample impulses on the in-slot column in H->D pacing frames, locates the
+     * echo on the out-slot column of the D->H frames (the out-slot carries no synth
+     * notes, so the impulse dominates), computes RTT = rx_ts - tx_ts minus the start-
+     * rsp device-internal latency (key 5 = 0 for digital), sends diag.loopback.stop,
+     * then respawns the reader. NEVER touches the render path (gated on the device's
+     * loopback_on atomic + the host's own armed flag). */
+    LoopbackResult measureLoopback();
     /* Parse a bundle; stage it; if connected, reconcile now (§12.2).
      * v0 policy deviation: mismatch auto-resolves by Push-with-archive
      * (spec wants a user choice; the shell has no UI yet — the archive
@@ -710,6 +757,18 @@ private:
      * only / no-sink path (the union never changes), so that path NEVER
      * re-negotiates and stays byte-identical (the golden gate). */
     std::atomic<bool> audioRenegPending_{false};
+    /* §14.3 LoopbackMeasurer coordination. measureLoopback() (host/main thread)
+     * sets loopbackPending_ and BLOCKS until loopbackDone_; the FEEDER thread runs
+     * the probe at the SAME safe boundary the re-neg uses (under ctlMutex_, owning
+     * both audio endpoints — the reader quiesced exactly as audioRenegotiateLocked
+     * does), then publishes loopbackResult_ and raises loopbackDone_. Running it on
+     * the feeder means the probe's H->D pacing writes never race the feeder's own
+     * pacing (the feeder is doing the probe instead). NEVER set off the golden path
+     * (only an armed measureLoopback() call sets it). */
+    std::atomic<bool> loopbackPending_{false};
+    std::atomic<bool> loopbackDone_{false};
+    LoopbackResult loopbackResult_;
+    void runLoopbackProbeLocked(); /* feeder-thread body; caller holds ctlMutex_ */
     /* §8.3-over-§8.7 MID-STREAM LIVE<->OFFLINE TOGGLE. setOffline (host thread), on a
      * genuine mode flip on a LIVE Ethernet session, sets modeFlipPending_ (sticky, like
      * audioRenegPending_ — NOT a connected_ stomp an in-flight sessionUp could clobber).
@@ -838,6 +897,32 @@ private:
      * the explicit {0,1} drives the same main-mix render byte-identically).
      * setOutSlots() overrides it before start() to pull a single part. */
     std::vector<uint32_t> outSlots_{0, 1};
+
+    /* §14.3 LoopbackMeasurer arming (host side). -1/-1 = OFF, the byte-identical
+     * golden path: audio.start sends the unchanged key-3 array and the feeder never
+     * builds an H->D payload. Set via setLoopbackSlots() before audioStart(); read
+     * by audioStart() (to declare the in-slot in key 3) and by measureLoopback(). */
+    int loopbackIn_ = -1, loopbackOut_ = -1;
+
+    /* §6.4 latency-profile, cached from the hello identity (key 8) at
+     * helloAndIdentity(). Indexed implicitly by rate (matched in expectedLoopback).
+     * Used ONLY by the §14.3 measurement; unset (nLat_==0) on a device that omits
+     * key 8 (the probe then falls back to a one-block host-paced turnaround). */
+    static constexpr size_t kMaxLatProfiles = 8;
+    struct LatProfile { uint32_t rate, in_lat, out_lat, buf_depth; };
+    LatProfile latProfiles_[kMaxLatProfiles];
+    size_t nLat_ = 0;
+    /* §6.4 expected round-trip in samples for the negotiated rate: input-latency +
+     * output-latency + one buffer-depth turnaround (the pure-transport buffering the
+     * §14.3 digital loop measures, device-internal loop latency = 0). Falls back to
+     * kBlock (one host-paced pacing block) if the device omitted the profile. */
+    double expectedLoopbackSamples(uint32_t rate) const {
+        for (size_t i = 0; i < nLat_; i++)
+            if (latProfiles_[i].rate == rate)
+                return (double)latProfiles_[i].in_lat + latProfiles_[i].out_lat +
+                       latProfiles_[i].buf_depth;
+        return (double)kBlock;
+    }
 
     /* (the OWNER instance's part lives in ownerSource_.chan — see above; an
      * ATTACHED instance's part lives in the source it got from registerSource.

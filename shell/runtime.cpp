@@ -10,6 +10,7 @@ extern "C" {
 #ifdef __APPLE__
 #include <pthread/qos.h>
 #endif
+#include <algorithm> /* §14.3: std::sort for the per-cycle RTT median */
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -86,6 +87,16 @@ bool HarpRuntime::helloAndIdentity() {
     engineVer_ = id.engine_ver;
     paramMapHash_ = id.param_map_hash;
     deviceRateLock_ = harp_client_has_cap(&id, "audio.rate-lock"); /* §8.7: honors audio.trim */
+    /* §6.4 latency-profile (key 8): cache for the §14.3 LoopbackMeasurer's expected-
+     * RTT. Off the loopback path this is just stored, never read (no render effect). */
+    nLat_ = 0;
+    for (size_t i = 0; i < id.nlat && nLat_ < kMaxLatProfiles; i++) {
+        latProfiles_[nLat_].rate = id.lat[i].rate;
+        latProfiles_[nLat_].in_lat = id.lat[i].in_lat;
+        latProfiles_[nLat_].out_lat = id.lat[i].out_lat;
+        latProfiles_[nLat_].buf_depth = id.lat[i].buf_depth;
+        nLat_++;
+    }
     return true;
 }
 
@@ -145,9 +156,21 @@ bool HarpRuntime::audioStart(uint32_t rate) {
         harp_cbor_uint(&req, 2);
         harp_cbor_uint(&req, kTargetDepthFrames);
         harp_cbor_uint(&req, 3);
-        harp_cbor_array(&req, 2);
-        harp_cbor_uint(&req, 0);
-        harp_cbor_uint(&req, 1);
+        /* active-slots-IN (H->D): the engine has no input on the golden path, so
+         * the historical declaration is [0,1] and the feeder sends h.slots=0 frames
+         * (no payload) — byte-identical. §14.3: when the LoopbackMeasurer is armed,
+         * declare the SINGLE chosen in-slot here so the device resolves exactly one
+         * input column (d->audio.in_slots = {in}); the probe then injects on that one
+         * column. This only matters once diag.loopback.start arms the device — off
+         * the probe the device ignores in_slots and the render is unchanged. */
+        if (loopbackArmed()) {
+            harp_cbor_array(&req, 1);
+            harp_cbor_uint(&req, (uint64_t)loopbackIn_);
+        } else {
+            harp_cbor_array(&req, 2);
+            harp_cbor_uint(&req, 0);
+            harp_cbor_uint(&req, 1);
+        }
         harp_cbor_uint(&req, 4); /* active-slots-out: the UNION the host subscribes
                                   * to. DEFAULT (no per-part sink) = outSlots_ {0,1}
                                   * (the stereo main mix), which renders exactly as
@@ -188,6 +211,13 @@ void HarpRuntime::computeUnionSlotsLocked() {
     for (uint32_t s : outSlots_) addSlot(s);
     for (size_t i = 0; i < nSinks_; i++)
         for (uint32_t s : sinks_[i]->slots) addSlot(s);
+    /* §14.3: when the LoopbackMeasurer is armed, the device echoes the impulse onto
+     * the out-slot's column — so the host MUST subscribe to that slot (active-slots-
+     * out, key 4) or the column is never streamed back and the echo is invisible. Add
+     * it to the union (after the real outputs, so the main-mix columns 0,1 stay the
+     * contiguous prefix — the golden demux is undisturbed). Off the probe (not armed)
+     * the union is exactly the historical {0,1}+sinks set => byte-identical. */
+    if (loopbackArmed()) addSlot((uint32_t)loopbackOut_);
     /* resolve each sink's slots -> column indices within the union order */
     for (size_t i = 0; i < nSinks_; i++) {
         AudioSink *sk = sinks_[i];
@@ -316,6 +346,457 @@ void HarpRuntime::audioRenegotiateLocked() {
         log_msg("re-negotiated audio stream: %zu union slot(s) now streamed",
                 unionSlots_.size());
     }
+}
+
+/* §14.3 host LoopbackMeasurer — PUBLIC entry (host/main thread). Arms the
+ * feeder-thread probe (loopbackPending_) and BLOCKS, bounded, for its result. The
+ * actual probe runs on the FEEDER (runLoopbackProbeLocked) so its H->D pacing
+ * writes don't race the feeder's own pacing. Off the golden path entirely: only an
+ * armed measureLoopback() call sets the pending flag. */
+HarpRuntime::LoopbackResult HarpRuntime::measureLoopback() {
+    LoopbackResult r;
+    r.in_slot = loopbackIn_;
+    r.out_slot = loopbackOut_;
+    r.rate = rate_;
+    if (!loopbackArmed()) {
+        r.detail = "loopback not armed (setLoopbackSlots before start)";
+        return r;
+    }
+    if (!connected_.load(std::memory_order_acquire)) {
+        r.detail = "no live session";
+        return r;
+    }
+    if (freeRunning_.load(std::memory_order_acquire)) {
+        /* the device requires a live HOST-PACED stream (diag.loopback.digital) */
+        r.detail = "loopback needs a host-paced stream (offline/USB), not free-running RTP";
+        return r;
+    }
+    loopbackDone_.store(false, std::memory_order_release);
+    loopbackPending_.store(true, std::memory_order_release);
+    /* Wait for the feeder to run the probe. The feeder loop cycles at worst every
+     * ~1 ms idle (8 ms drain-on-stall) and the probe itself is a few hundred ms of
+     * impulse cycles, so the default 10 s bound is generous and never trips in
+     * practice. A slow rig (loaded RPi/KR260, heavy CI runner) can stretch it, so
+     * HARP_LOOPBACK_TIMEOUT_MS overrides the bound (clamped [1000, 120000] ms). We
+     * log a one-shot WARNING once the wait crosses 80 % of the bound so a near-miss
+     * is visible in the log before it actually times out. If the session dies
+     * underneath us, connected_ flips and we bail. */
+    int timeoutMs = 10000;
+    if (const char *e = getenv("HARP_LOOPBACK_TIMEOUT_MS")) {
+        int v = atoi(e);
+        if (v >= 1000 && v <= 120000) timeoutMs = v;
+    }
+    int warnAt = (timeoutMs * 8) / 10; /* 80 % of the bound */
+    bool warned = false;
+    for (int i = 0; i < timeoutMs; i++) {
+        if (loopbackDone_.load(std::memory_order_acquire)) {
+            r = loopbackResult_;
+            return r;
+        }
+        if (!connected_.load(std::memory_order_acquire)) {
+            loopbackPending_.store(false, std::memory_order_release);
+            r.detail = "session dropped during measurement";
+            return r;
+        }
+        if (!warned && i >= warnAt) {
+            warned = true;
+            log_msg("§14.3 loopback: probe still running after %d ms (%.0f%% of the %d ms "
+                    "HARP_LOOPBACK_TIMEOUT_MS bound) — approaching timeout",
+                    i, 100.0 * i / (double)timeoutMs, timeoutMs);
+        }
+        harp_sleep_ns(1000000ull); /* 1 ms */
+    }
+    loopbackPending_.store(false, std::memory_order_release);
+    r.detail = "timed out waiting for the feeder probe (HARP_LOOPBACK_TIMEOUT_MS=" +
+               std::to_string(timeoutMs) + " ms)";
+    return r;
+}
+
+/* §14.3 LoopbackMeasurer probe BODY — runs on the FEEDER thread under ctlMutex_
+ * (so it serializes with the eventPump's wire writes and getState/setState, and we
+ * are the sole pacer). Quiesces the reader so we own BOTH audio endpoints for the
+ * probe (the audioRenegotiateLocked pattern — NO teardown, connected_ stays true),
+ * arms the device loop, injects periodic one-sample impulses on the in-slot column
+ * in H->D pacing frames, locates each echo on the out-slot column of the D->H
+ * frames, and derives the round-trip in samples. NEVER mutates the render path: the
+ * device's loopback_on atomic gates the echo copy, and the impulse rides a slot the
+ * synth is not driving, so with the probe off the output is byte-identical. */
+void HarpRuntime::runLoopbackProbeLocked() {
+    LoopbackResult r;
+    r.in_slot = loopbackIn_;
+    r.out_slot = loopbackOut_;
+    r.rate = rate_;
+
+    /* 1. quiesce the reader — single owner of the audio-IN endpoint for the probe.
+     * connected_ stays TRUE (NOT a teardown), exactly as the P5b re-neg does. */
+    readerStop_.store(true, std::memory_order_release);
+    if (readerThread_.joinable()) readerThread_.join();
+    readerStop_.store(false, std::memory_order_release);
+
+    auto respawnReader = [this]() {
+        readerThread_ = std::thread([this] { reader(); });
+    };
+
+    /* 1b. OUT-SLOT PREFLIGHT (review M3). The device OVERWRITES (does not mix) the
+     * echo onto the chosen out-slot's column of the SAME rendered frame, so the
+     * out-slot MUST be one the synth is NOT generating onto — otherwise the echo
+     * stomps real synth output and corrupts the live render (and the captured mix).
+     * Two refusals, both BEFORE we arm the device (so a misconfigured probe never
+     * touches the render path):
+     *   (a) the owner MAIN-MIX pair {0,1} carries the synth's stereo output on every
+     *       session, so an out-slot of 0 or 1 would overwrite it. Refuse outright.
+     *   (b) the out-slot MUST be present in the live audio.start union (unionSlots_):
+     *       audioStart/computeUnionSlotsLocked add loopbackOut_ to the union when
+     *       armed, so a correctly-armed probe finds it. If it is absent the device
+     *       never streams that column back and the echo is unobservable — refuse
+     *       rather than scan a column the host never receives.
+     * On either refusal we publish a clear result, respawn the reader, and return
+     * without arming — connected_ stays true and the render is undisturbed. */
+    {
+        bool outInUnion = false;
+        for (uint32_t s : unionSlots_)
+            if ((int)s == loopbackOut_) { outInUnion = true; break; }
+        if (loopbackOut_ == 0 || loopbackOut_ == 1) {
+            r.detail = "loopback out-slot " + std::to_string(loopbackOut_) +
+                       " overlaps the owner main-mix pair {0,1} (would overwrite synth "
+                       "output); choose an out-slot the synth does not drive";
+            log_msg("§14.3 loopback: REFUSED — %s", r.detail.c_str());
+            loopbackResult_ = r;
+            respawnReader();
+            return;
+        }
+        if (!outInUnion) {
+            r.detail = "loopback out-slot " + std::to_string(loopbackOut_) +
+                       " is not in the active audio.start union (column never streamed "
+                       "back); arm setLoopbackSlots before start so it joins the union";
+            log_msg("§14.3 loopback: REFUSED — %s", r.detail.c_str());
+            loopbackResult_ = r;
+            respawnReader();
+            return;
+        }
+    }
+
+    /* 2. diag.loopback.start {0=>in,1=>out,2=>"digital",3=>rate}. Parse the reply:
+     * 0 armed, 2 eff-in, 3 eff-out, 4 eff-rate, 5 device-internal loop latency. */
+    harp_cbuf sreq, srsp;
+    harp_cbuf_init(&sreq);
+    harp_cbuf_init(&srsp);
+    harp_client_req_head(&client_, &sreq, "diag.loopback.start", true);
+    harp_cbor_map(&sreq, 4);
+    harp_cbor_uint(&sreq, 0);
+    harp_cbor_uint(&sreq, (uint64_t)loopbackIn_);
+    harp_cbor_uint(&sreq, 1);
+    harp_cbor_uint(&sreq, (uint64_t)loopbackOut_);
+    harp_cbor_uint(&sreq, 2);
+    harp_cbor_text(&sreq, "digital");
+    harp_cbor_uint(&sreq, 3);
+    harp_cbor_uint(&sreq, rate_);
+    harp_env se = {};
+    bool startOk = request(&sreq, &srsp, &se) && se.has_body;
+    harp_cbuf_free(&sreq);
+
+    uint64_t devLoopLatency = 0; /* start-rsp key 5: device-internal loop latency */
+    int effIn = loopbackIn_, effOut = loopbackOut_;
+    if (startOk) {
+        harp_cdec b;
+        harp_cdec_init(&b, se.body, se.body_len);
+        uint64_t n;
+        if (harp_cdec_map(&b, &n)) {
+            for (uint64_t i = 0; i < n; i++) {
+                uint64_t key;
+                if (!harp_cdec_uint(&b, &key)) break;
+                if (key == 0) {
+                    bool armed = false;
+                    if (!harp_cdec_bool(&b, &armed)) break;
+                    r.armed = armed;
+                } else if (key == 2) {
+                    uint64_t v;
+                    if (!harp_cdec_uint(&b, &v)) break;
+                    effIn = (int)v;
+                } else if (key == 3) {
+                    uint64_t v;
+                    if (!harp_cdec_uint(&b, &v)) break;
+                    effOut = (int)v;
+                } else if (key == 5) {
+                    if (!harp_cdec_uint(&b, &devLoopLatency)) break;
+                } else if (!harp_cdec_skip(&b))
+                    break;
+            }
+        }
+    }
+    harp_cbuf_free(&srsp);
+
+    if (!startOk || !r.armed) {
+        r.detail = startOk ? "device did not arm the loopback"
+                           : "diag.loopback.start failed (no cap / device error)";
+        loopbackResult_ = r;
+        respawnReader();
+        return;
+    }
+    /* §6.4 soft-fallback: if the device routed to slots OTHER than requested, note
+     * it (the device clamps/remaps); we measure against the EFFECTIVE routing. */
+    if (effIn != loopbackIn_ || effOut != loopbackOut_)
+        r.detail = "device remapped routing (eff in=" + std::to_string(effIn) +
+                   " out=" + std::to_string(effOut) + "); measuring effective";
+
+    /* 3. expected round-trip (§6.4): pure transport buffering, device-internal loop
+     * latency = 0 (the same-frame copy). Derived from the device's OWN latency-profile
+     * (identity key 8): input-latency + output-latency + one buffer-depth turnaround,
+     * matched to the negotiated rate. For the refdev (in=out=0, buf-depth=256 @ 48 kHz)
+     * this is one 256-sample host-paced block — the single-frame pacing turnaround the
+     * feeder documents ("its pacing turnaround is just render time"). A device with real
+     * analog/converter buffers reports nonzero in/out latency and this grows to match
+     * §6.4. Subtract the device-internal loop latency (start-rsp key 5 = 0 for digital)
+     * — kept in the formula so a future analog loop's nonzero key 5 is handled too. */
+    const uint64_t kImpulseFrames = 1; /* the impulse rides one pacing block */
+    r.expected_samples = expectedLoopbackSamples(rate_);
+
+    /* 4. drain any in-flight D->H tail so the probe starts from a clean read frontier
+     * (sole reader now). Up to a brief quiet window, exactly as the re-neg drain. */
+    {
+        uint8_t junk[65536];
+        int quiet = 0;
+        while (quiet < 2) {
+            int rd = transport_->audioRead(junk, sizeof junk, 40);
+            if (rd < 0) break;
+            quiet = (rd == 0) ? quiet + 1 : 0;
+        }
+    }
+
+    /* 5. impulse/echo cycles. Each cycle: inject one impulse (sample 0 = 1.0) on the
+     * in-slot's single column in an H->D pacing frame at SSI=tx, keep pacing silent
+     * frames to fill the pipeline, then read D->H frames until the impulse appears on
+     * the out-slot column. The echo frame carries the impulse frame's ts (same-frame
+     * copy), and the host's send frontier (ssi_) has advanced past it by the in-flight
+     * pipeline depth — that gap IS the round-trip in samples.
+     *
+     * ECHO VALIDATION (review BLOCKER). A peak above threshold is NOT proof of OUR
+     * impulse — a stale tail frame, a wrong-frame peak, or residual content on the
+     * out-slot column could all trip a bare peak finder and fold a spurious RTT into
+     * the result. The device echoes IN->OUT in the SAME rendered frame and stamps the
+     * echo header ts = the impulse frame's ts (engine.c §14.3: out.ts = h.ts), and the
+     * impulse rides sample offset 0 of the impulse frame — so a GENUINE echo has a
+     * peak whose absolute SSI position (h.ts + peakOffset) equals txTs + 0 EXACTLY,
+     * i.e. h.ts == txTs AND peakOffset == 0. We require all three (frame match, offset
+     * match, above threshold); any mismatch marks the cycle INVALID — no RTT folded.
+     *
+     * We collect EVERY valid cycle's RTT into rtts[] (review MAJOR), then take the
+     * MEDIAN and reject outliers in step 6, instead of a mean that one jittered cycle
+     * could skew. */
+    const int kCycles = 16;     /* impulse cycles (a few invalid ones still leave a quorum) */
+    const int kSpacing = 8;     /* silent pacing frames between impulses */
+    bool anyEcho = false;
+    int invalidCycles = 0;      /* peak seen but it failed echo validation */
+    std::vector<double> rtts;   /* one entry per VALID cycle (review MAJOR: median over these) */
+    rtts.reserve(kCycles);
+
+    /* accumulator for partial D->H frames across reads */
+    uint8_t acc[65536];
+    size_t accLen = 0;
+    /* The single declared in-slot column is column 0 of an h.slots=1 frame; the
+     * out-slot column is resolved from the D->H frame's slot count against the
+     * negotiated union order. The host knows the union: unionSlots_ (column index
+     * of loopbackOut_ within it). */
+    int outCol = -1;
+    for (size_t u = 0; u < unionSlots_.size(); u++)
+        if ((int)unionSlots_[u] == effOut) { outCol = (int)u; break; }
+
+    for (int cyc = 0; cyc < kCycles && connected_.load(std::memory_order_relaxed); cyc++) {
+        uint64_t txTs = ssi_;
+        bool sentImpulse = false;
+        bool foundThisCycle = false;
+        /* a bounded number of pacing frames per cycle: 1 impulse + kSpacing silent,
+         * then keep pacing-and-reading until the echo lands or we give up. */
+        for (int step = 0; step < kSpacing + 64 && !foundThisCycle &&
+                            connected_.load(std::memory_order_relaxed); step++) {
+            /* build an H->D pacing frame. On the FIRST step it carries the impulse
+             * (h.slots=1, payload = kBlock floats, sample 0 = 1.0); afterwards plain
+             * silent pacing (h.slots=0, the byte-identical golden frame). */
+            bool impulseFrame = !sentImpulse;
+            uint16_t slots = impulseFrame ? 1 : 0;
+            harp_audio_hdr pace = {HARP_AUDIO_FVER,
+                                   (uint8_t)(HARP_AUDIO_DIR_H2D | HARP_AUDIO_FENCE),
+                                   slots,
+                                   0,
+                                   ssi_,
+                                   (uint16_t)kBlock,
+                                   HARP_AUDIO_FMT_F32};
+            uint8_t hdr[HARP_AUDIO_HDR_LEN + HARP_AUDIO_FENCE_LEN];
+            harp_audio_hdr_encode(&pace, hdr);
+            /* event fence = the live high-water minus the epoch baseline (saturating),
+             * IDENTICAL to the feeder's pacing fence — so the device's barrier is
+             * satisfied exactly as on a normal frame (no event is left pending). */
+            uint32_t hw = evtQueuedSeq_.load(std::memory_order_acquire);
+            uint32_t base = evtEpochBase_.load(std::memory_order_acquire);
+            uint32_t seq = hw > base ? hw - base : 0;
+            hdr[HARP_AUDIO_HDR_LEN + 0] = (uint8_t)seq;
+            hdr[HARP_AUDIO_HDR_LEN + 1] = (uint8_t)(seq >> 8);
+            hdr[HARP_AUDIO_HDR_LEN + 2] = (uint8_t)(seq >> 16);
+            hdr[HARP_AUDIO_HDR_LEN + 3] = (uint8_t)(seq >> 24);
+            if (impulseFrame) {
+                /* one block of slot-interleaved (here single-column) floats: all zero
+                 * except sample 0 = 1.0 — the dominant content on the out-slot, which
+                 * the synth is not driving (the caller chose an unused out-slot). */
+                float payload[kBlock];
+                memset(payload, 0, sizeof payload);
+                payload[0] = 1.0f;
+                uint8_t frame[HARP_AUDIO_HDR_LEN + HARP_AUDIO_FENCE_LEN + sizeof payload];
+                memcpy(frame, hdr, sizeof hdr);
+                memcpy(frame + sizeof hdr, payload, sizeof payload);
+                if (!transport_->audioWrite(frame, (int)sizeof frame, 50)) break;
+                txTs = ssi_;
+                sentImpulse = true;
+            } else {
+                if (!transport_->audioWrite(hdr, (int)sizeof hdr, 50)) break;
+            }
+            ssi_ += kBlock;
+            framesSent_++;
+
+            /* read whatever D->H frames are available and scan the out-slot column. */
+            int rd = transport_->audioRead(acc + accLen, (int)(sizeof acc - accLen), 20);
+            if (rd < 0) break;
+            if (rd > 0) accLen += (size_t)rd;
+            size_t off = 0;
+            while (accLen - off >= HARP_AUDIO_HDR_LEN) {
+                harp_audio_hdr h;
+                if (!harp_audio_hdr_decode(acc + off, &h)) { accLen = 0; off = 0; break; }
+                size_t need = HARP_AUDIO_HDR_LEN + harp_audio_payload_len(&h);
+                if (accLen - off < need) break;
+                /* scan the out-slot column for the impulse peak (it dominates — the
+                 * out-slot carries no synth notes). A column index of -1 (out-slot not
+                 * in the union) means the host can't see the echo; skip — echo_found
+                 * stays false and the caller learns the routing was unobservable. */
+                if (outCol >= 0 && (uint16_t)outCol < h.slots && !foundThisCycle) {
+                    const float *pl = (const float *)(acc + off + HARP_AUDIO_HDR_LEN);
+                    uint16_t S = h.slots;
+                    int peak = -1;
+                    float peakAbs = 0.25f; /* threshold: well above synth-free noise */
+                    for (uint32_t s = 0; s < h.nsamples; s++) {
+                        float v = pl[(size_t)s * S + outCol];
+                        float a = v < 0 ? -v : v;
+                        if (a > peakAbs) { peakAbs = a; peak = (int)s; }
+                    }
+                    if (peak >= 0) {
+                        /* ECHO VALIDATION (review BLOCKER): match the located peak back
+                         * to OUR impulse before trusting it.
+                         *   - FRAME match: the device copies in->out in the SAME frame and
+                         *     stamps the echo ts = the impulse frame's ts, so a genuine
+                         *     echo has h.ts == txTs. A peak in any OTHER frame (a stale
+                         *     tail, a later silent frame) is not this impulse.
+                         *   - OFFSET match: we injected at sample 0, so the echoed peak
+                         *     must land at offset 0 (kImpulseOffset). A peak at any other
+                         *     offset is residual content, not the impulse.
+                         * Only a peak that satisfies BOTH yields a trustworthy RTT
+                         * (= ssi_ - txTs). A peak that fails either is a SPURIOUS hit:
+                         * count it as an invalid cycle and KEEP scanning this cycle's
+                         * later frames for the real echo (do NOT set foundThisCycle, so a
+                         * subsequent matching frame can still be accepted). */
+                        const uint32_t kImpulseOffset = 0; /* impulse rides sample 0 */
+                        bool frameMatch = (h.ts == txTs);
+                        bool offsetMatch = ((uint32_t)peak == kImpulseOffset);
+                        if (frameMatch && offsetMatch) {
+                            /* rx position in the SSI domain = this frame's ts + peak offset
+                             * == txTs; round-trip = how far our send frontier (ssi_) ran
+                             * past it. */
+                            uint64_t rxTs = h.ts + (uint64_t)peak;
+                            if (ssi_ > rxTs) {
+                                rtts.push_back((double)(ssi_ - rxTs));
+                                anyEcho = true;
+                                foundThisCycle = true;
+                            } else {
+                                invalidCycles++; /* frontier behind the echo: impossible */
+                            }
+                        } else {
+                            invalidCycles++; /* wrong frame or wrong offset — not our impulse */
+                        }
+                    }
+                }
+                off += need;
+            }
+            if (off) { memmove(acc, acc + off, accLen - off); accLen -= off; }
+        }
+        (void)txTs;
+        (void)kImpulseFrames;
+    }
+
+    /* 6. diag.loopback.stop — disengage the device loop, restore normal routing. */
+    {
+        harp_cbuf preq, prsp;
+        harp_cbuf_init(&preq);
+        harp_cbuf_init(&prsp);
+        harp_client_req_head(&client_, &preq, "diag.loopback.stop", false);
+        harp_env pe = {};
+        request(&preq, &prsp, &pe);
+        harp_cbuf_free(&preq);
+        harp_cbuf_free(&prsp);
+    }
+
+    r.echo_found = anyEcho;
+
+    /* 6b. AGGREGATE (review MAJOR): MEDIAN over the per-cycle RTTs with OUTLIER
+     * REJECTION, not a raw mean a single jittered cycle could skew.
+     *   1. require a QUORUM of valid cycles (kMinValidCycles) — a result drawn from
+     *      one or two echoes is not trustworthy on a jittery transport; fail loudly
+     *      rather than report a fragile number.
+     *   2. take the median of all valid RTTs (robust to a stray cycle, unlike a mean).
+     *   3. REJECT any cycle whose RTT differs from the median by more than a tight
+     *      threshold (kOutlierSamples), then re-median the survivors — so a smeared
+     *      pacing cycle is dropped instead of dragging the reported RTT off the §6.4
+     *      value. After culling, re-check the quorum on the survivors.
+     *   4. report that culled median as r.rtt_samples (minus the device-internal loop
+     *      latency, key 5 = 0 for the digital same-frame copy). */
+    const size_t kMinValidCycles = 5;   /* quorum: fewer is not a trustworthy median */
+    const double kOutlierSamples = 64.0; /* tight band around the median (1/4 pacing block) */
+    if (rtts.size() >= kMinValidCycles) {
+        std::sort(rtts.begin(), rtts.end());
+        double med = rtts[rtts.size() / 2];
+        /* cull cycles outside the tight band around the first-pass median */
+        std::vector<double> kept;
+        kept.reserve(rtts.size());
+        for (double v : rtts) {
+            double d = v - med;
+            if (d < 0) d = -d;
+            if (d <= kOutlierSamples) kept.push_back(v);
+        }
+        size_t rejected = rtts.size() - kept.size();
+        if (kept.size() >= kMinValidCycles) {
+            std::sort(kept.begin(), kept.end()); /* already sorted, but explicit */
+            double meas = kept[kept.size() / 2]; /* median of the survivors */
+            if (meas > (double)devLoopLatency) meas -= (double)devLoopLatency;
+            r.rtt_samples = meas;
+            r.delta_ms = (meas - r.expected_samples) * 1000.0 / (double)rate_;
+            r.ok = true;
+            if (r.detail.empty())
+                r.detail = "measured " + std::to_string((int)(meas + 0.5)) +
+                           " samples (median of " + std::to_string(kept.size()) +
+                           " valid cycle(s); " + std::to_string(rejected) +
+                           " outlier(s), " + std::to_string(invalidCycles) +
+                           " invalid)";
+        } else {
+            r.detail = "too few in-band cycles after outlier rejection (" +
+                       std::to_string(kept.size()) + " of " +
+                       std::to_string(rtts.size()) + " within ±" +
+                       std::to_string((int)kOutlierSamples) +
+                       " samples; need " + std::to_string(kMinValidCycles) + ")";
+        }
+    } else if (anyEcho) {
+        r.detail = "too few valid echo cycles (" + std::to_string(rtts.size()) +
+                   " of " + std::to_string(kMinValidCycles) + " required; " +
+                   std::to_string(invalidCycles) + " spurious peak(s) rejected)";
+    } else {
+        if (r.detail.empty())
+            r.detail = "armed but no echo detected on the out-slot column";
+    }
+
+    loopbackResult_ = r;
+
+    /* 7. respawn the reader on the (unchanged) union — SSI continuous, no reset. The
+     * feeder resumes pacing on its next loop iteration from the advanced ssi_. */
+    respawnReader();
+
+    log_msg("§14.3 loopback: %s (in=%d out=%d, measured=%.0f expected=%.0f delta=%.3f ms)",
+            r.ok ? "OK" : (r.echo_found ? "echo but no RTT" : "no echo"),
+            effIn, effOut, r.rtt_samples, r.expected_samples, r.delta_ms);
 }
 
 /* Param set as a §9.4 event message: fire-and-forget, no response.
@@ -600,6 +1081,27 @@ bool HarpRuntime::sessionUp() {
             transport_ = nullptr;
             return false;
         }
+        /* §14.3 LoopbackMeasurer SAFETY (review MINOR). A prior probe that crashed /
+         * was killed mid-measurement (or a device that survived a host restart) could
+         * leave the device's loopback_on engaged — it would then keep overwriting the
+         * out-slot column with stale H->D input and silently corrupt this fresh
+         * session's render. The host never persists loopback_on, so it is ALWAYS off
+         * for a clean session; assert that by sending an unconditional, idempotent
+         * diag.loopback.stop here (cheap, off the render path, under ctlMutex_) so the
+         * device is guaranteed disarmed before any audio flows. The device treats a
+         * stop with no active loop as a no-op, so this is harmless when nothing was
+         * armed. Logged so a stray engaged loop is visible in the session log. */
+        {
+            harp_cbuf lreq, lrsp;
+            harp_cbuf_init(&lreq);
+            harp_cbuf_init(&lrsp);
+            harp_client_req_head(&client_, &lreq, "diag.loopback.stop", false);
+            harp_env le = {};
+            request(&lreq, &lrsp, &le);
+            harp_cbuf_free(&lreq);
+            harp_cbuf_free(&lrsp);
+            log_msg("§14.3 loopback safety: cleared device loopback_on (=false) at session start");
+        }
     }
     /* drain any stale stream bytes before pacing */
     uint8_t junk[16384];
@@ -778,6 +1280,15 @@ bool HarpRuntime::start(uint32_t sampleRate) {
         if (e[0]) {
             int v = atoi(e);
             if (v >= 0 && v <= 15) setChannel((uint8_t)v);
+        }
+    /* §14.3 LoopbackMeasurer arming: the out-of-process host's --loopback flag sets
+     * HARP_LOOPBACK_IN / HARP_LOOPBACK_OUT (mirroring HARP_DIAG_BUNDLE_OUT). Read
+     * BEFORE the first sessionUp so audioStart declares the in-slot in key 3. UNSET
+     * (the default) leaves loopbackIn_/Out_ = -1 => the byte-identical golden wire. */
+    if (const char *ein = getenv("HARP_LOOPBACK_IN"))
+        if (const char *eout = getenv("HARP_LOOPBACK_OUT"); eout && ein[0] && eout[0]) {
+            int in = atoi(ein), out = atoi(eout);
+            if (in >= 0 && in <= 33 && out >= 0 && out <= 33) setLoopbackSlots(in, out);
         }
     running_.store(true);
     /* One libusb context for the whole active life — every connect attempt
@@ -1356,6 +1867,18 @@ void HarpRuntime::feeder() {
         if (!freeRunning_ && audioRenegPending_.exchange(false, std::memory_order_acq_rel)) {
             std::lock_guard<std::mutex> lk(ctlMutex_);
             if (connected_.load(std::memory_order_relaxed)) audioRenegotiateLocked();
+        }
+
+        /* 0b. §14.3 LoopbackMeasurer at the same SAFE boundary (between pacing
+         * cycles — never mid-frame). The host thread armed it (loopbackPending_) and
+         * is blocked waiting for the result; we run the probe here so its H->D pacing
+         * writes don't race our own pacing below (we ARE the pacer). Only the host-
+         * paced path measures (the device requires a live host-paced stream); a free-
+         * running session simply publishes a "wrong-mode" result so the caller unblocks. */
+        if (loopbackPending_.exchange(false, std::memory_order_acq_rel)) {
+            std::lock_guard<std::mutex> lk(ctlMutex_);
+            runLoopbackProbeLocked();
+            loopbackDone_.store(true, std::memory_order_release);
         }
 
         /* 1. inbound async traffic FIRST: keeping the IN direction drained

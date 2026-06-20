@@ -276,6 +276,26 @@ public:
                     fclose(f);
                 }
             }
+            /* §14.3 host LoopbackMeasurer TRIGGER (OPT-IN by env, mirrors --diag-
+             * bundle). The out-of-process host's --loopback flag set HARP_LOOPBACK_IN
+             * / HARP_LOOPBACK_OUT; the runtime armed itself at start() (so audio.start
+             * declared the in-slot in key 3). Run the measurement HERE — after the
+             * render, while the live host-paced session is still up — and print the
+             * measured RTT + the §6.4 expected + the delta. The runtime gates the
+             * impulse on the device's loopback_on atomic, so this NEVER affects the
+             * render (the offline goldens stay byte-identical). Only the OWNER (which
+             * drives the live session) measures; an unset env is the no-op golden path. */
+            if (const char *li = getenv("HARP_LOOPBACK_IN");
+                li && li[0] && owner() && runtime() && runtime()->loopbackArmed()) {
+                HarpRuntime::LoopbackResult lr = runtime()->measureLoopback();
+                fprintf(stdout,
+                        "loopback: in=%d out=%d rate=%u armed=%d echo=%d ok=%d "
+                        "rtt-samples=%.1f expected-samples=%.1f delta-ms=%.3f (%s)\n",
+                        lr.in_slot, lr.out_slot, lr.rate, lr.armed ? 1 : 0,
+                        lr.echo_found ? 1 : 0, lr.ok ? 1 : 0, lr.rtt_samples,
+                        lr.expected_samples, lr.delta_ms, lr.detail.c_str());
+                fflush(stdout);
+            }
             releaseSource();
             runtime_release(handle_);
             handle_ = RuntimeHandle{};

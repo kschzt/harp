@@ -200,6 +200,40 @@ static bool parse_identity(harp_cdec *b, harp_client_identity *id) {
                 }
                 break;
             }
+            case 8: { /* §6.4 latency-profile: [* {0 rate,1 in-lat,2 out-lat,3 buf-depth}] */
+                uint64_t pn;
+                if (!harp_cdec_array(b, &pn)) return false;
+                for (uint64_t j = 0; j < pn; j++) {
+                    uint64_t mn, mkey, v;
+                    if (!harp_cdec_map(b, &mn)) return false;
+                    uint32_t rate = 0, il = 0, ol = 0, bd = 0;
+                    for (uint64_t k = 0; k < mn; k++) {
+                        if (!harp_cdec_uint(b, &mkey)) return false;
+                        if (mkey == 0) {
+                            if (!harp_cdec_uint(b, &v)) return false;
+                            rate = (uint32_t)v;
+                        } else if (mkey == 1) {
+                            if (!harp_cdec_uint(b, &v)) return false;
+                            il = (uint32_t)v;
+                        } else if (mkey == 2) {
+                            if (!harp_cdec_uint(b, &v)) return false;
+                            ol = (uint32_t)v;
+                        } else if (mkey == 3) {
+                            if (!harp_cdec_uint(b, &v)) return false;
+                            bd = (uint32_t)v;
+                        } else if (!harp_cdec_skip(b))
+                            return false;
+                    }
+                    if (id->nlat < HARP_CLIENT_MAX_LAT) {
+                        id->lat[id->nlat].rate = rate;
+                        id->lat[id->nlat].in_lat = il;
+                        id->lat[id->nlat].out_lat = ol;
+                        id->lat[id->nlat].buf_depth = bd;
+                        id->nlat++;
+                    }
+                }
+                break;
+            }
             case 10:
                 if (!harp_cdec_uint(b, &id->boot_count)) return false;
                 break;

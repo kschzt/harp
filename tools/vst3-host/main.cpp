@@ -402,11 +402,16 @@ int main(int argc, char **argv) {
                 "       [--part N] [--realtime] [--out FILE.wav] [--hash] [--json]\n"
                 "       [--expect-hash HEX] [--save-state FILE] [--load-state FILE]\n"
                 "       [--diag-bundle FILE | --diag-bundle-anon FILE]\n"
+                "       [--loopback IN,OUT]\n"
                 "       [--instances N | --aliases ch0,ch1,..] [--serial SERIAL]\n"
                 "  --diag-bundle FILE   §14.4 host-context-A: after the render, capture\n"
                 "             the runtime's diag bundle (device-section + host counters +\n"
                 "             audio-config) and write the CBOR to FILE (read-only, no\n"
                 "             audio-path effect). --diag-bundle-anon adds the §16 PII pass.\n"
+                "  --loopback IN,OUT  §14.3 digital round-trip probe: inject an impulse on\n"
+                "             H->D slot IN, capture the echo on D->H slot OUT (the device\n"
+                "             copies IN->OUT in-frame), and print measured RTT + §6.4\n"
+                "             expected + delta. OUT must be a slot no note is driving.\n"
                 "  --part N   pull device part N's (0..15) stereo output instead of the\n"
                 "             main mix (slots {2+2N,3+2N}); default = main mix\n"
                 "  --part-audio   multi-instance: attached aliases pull their OWN part\n"
@@ -483,6 +488,14 @@ int main(int argc, char **argv) {
      * off, the byte-identical golden path. */
     std::string diag_bundle_path;
     bool diag_bundle_anon = false; /* --diag-bundle-anon: run the §16 anon pass */
+    /* §14.3 host LoopbackMeasurer: --loopback IN,OUT runs the digital round-trip
+     * probe after the render (mirrors --diag-bundle). IN = the H->D slot the host
+     * injects an impulse on, OUT = the D->H slot the device echoes it to (the device
+     * copies IN->OUT in the same rendered frame). OUT MUST be a slot the synth is NOT
+     * driving with notes (else the echo overwrites real output). -1/-1 = off, the
+     * byte-identical golden path. Reached through HARP_LOOPBACK_IN/_OUT, the same
+     * cross-plugin-boundary env mechanism --diag-bundle uses. */
+    int loopback_in = -1, loopback_out = -1;
     double bpm = 0;            /* >0: emit a playing transport (tempo, PPQ) */
     double loop_a = -1, loop_b = -1; /* PPQ loop region: jump b -> a */
     double note_period = 0.6;  /* s between note-ons; gate = 75% of period */
@@ -518,6 +531,11 @@ int main(int argc, char **argv) {
         else if (a == "--diag-bundle-anon") { /* + §16 anon pass */
             diag_bundle_path = next();
             diag_bundle_anon = true;
+        }
+        else if (a == "--loopback") { /* §14.3: --loopback IN,OUT */
+            std::string lv = next();
+            if (sscanf(lv.c_str(), "%d,%d", &loopback_in, &loopback_out) != 2)
+                die("--loopback wants IN,OUT (e.g. --loopback 5,10)");
         }
         else if (a == "--input") {
             input_kind = next();
@@ -763,6 +781,26 @@ int main(int argc, char **argv) {
 #endif
         printf("diag-bundle: -> %s%s\n", diag_bundle_path.c_str(),
                diag_bundle_anon ? " (anonymized, §16)" : "");
+    }
+
+    /* §14.3 host LoopbackMeasurer: hand the in/out slots to the plugin's runtime via
+     * env vars (same cross-plugin-boundary mechanism --diag-bundle uses). The runtime
+     * reads them at start() (arming key 3) and runs measureLoopback() at setActive
+     * (false), printing the measured RTT + §6.4 expected + delta. MUST be set before
+     * setActive(true)/(false). Unset (no flag) is the byte-identical golden no-op. */
+    if (loopback_in >= 0 && loopback_out >= 0) {
+        char lin[16], lout[16];
+        snprintf(lin, sizeof lin, "%d", loopback_in);
+        snprintf(lout, sizeof lout, "%d", loopback_out);
+#ifdef _WIN32
+        _putenv_s("HARP_LOOPBACK_IN", lin);
+        _putenv_s("HARP_LOOPBACK_OUT", lout);
+#else
+        setenv("HARP_LOOPBACK_IN", lin, 1);
+        setenv("HARP_LOOPBACK_OUT", lout, 1);
+#endif
+        printf("loopback: in-slot=%d out-slot=%d (§14.3 digital round-trip probe)\n",
+               loopback_in, loopback_out);
     }
 
     /* ---- host context + module ---- */
