@@ -801,6 +801,9 @@ static void host_paced_loop(device *d) {
     /* buffered endpoint reads (packet-multiple, see ffs.c) */
     uint8_t rbuf[16384];
     size_t rlen = 0, rpos = 0;
+#ifdef _WIN32
+    struct timespec t0w; clock_gettime(CLOCK_MONOTONIC, &t0w); /* DIAG: how long does the first recv block? */
+#endif
 
     while (atomic_load_explicit(&a->running, memory_order_relaxed)) {
         uint8_t hdr[HARP_AUDIO_HDR_LEN];
@@ -820,9 +823,11 @@ static void host_paced_loop(device *d) {
                 int werr = WSAGetLastError(); /* capture BEFORE any other socket call clobbers it */
                 int soe = 0, sl = sizeof soe;
                 getsockopt(a->out_fd, SOL_SOCKET, SO_ERROR, (char *)&soe, &sl);
-                fprintf(stderr, "harp-deviced: pacing read ended: %s (fd=%d WSA=%d SO_ERROR=%d running=%d gotbytes=%zu)\n",
+                struct timespec t1w; clock_gettime(CLOCK_MONOTONIC, &t1w);
+                long elapsed_ms = (long)((t1w.tv_sec - t0w.tv_sec) * 1000 + (t1w.tv_nsec - t0w.tv_nsec) / 1000000);
+                fprintf(stderr, "harp-deviced: pacing read ended: %s (fd=%d WSA=%d SO_ERROR=%d running=%d gotbytes=%zu elapsed=%ldms)\n",
                         r == 0 ? "EOF" : "recv error", a->out_fd, r == 0 ? 0 : werr, soe,
-                        (int)atomic_load_explicit(&a->running, memory_order_relaxed), got);
+                        (int)atomic_load_explicit(&a->running, memory_order_relaxed), got, elapsed_ms);
 #else
                 fprintf(stderr, "harp-deviced: pacing read ended: %s\n",
                         r == 0 ? "EOF" : strerror(errno));

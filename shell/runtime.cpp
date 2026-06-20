@@ -232,6 +232,9 @@ bool HarpRuntime::unionWouldChangeLocked() const {
 }
 
 void HarpRuntime::audioStopLocked() {
+#ifdef _WIN32
+    fprintf(stderr, "harp-shell: DIAG audioStopLocked — sending audio.stop\n");
+#endif
     harp_cbuf req, rsp;
     harp_cbuf_init(&req);
     harp_cbuf_init(&rsp);
