@@ -37,11 +37,9 @@ jobs:
       - name: DIAG win loopback dial-back repro (does the bare §8.7 pattern reset?)
         shell: msys2 {0}
         run: |
-          x86_64-w64-mingw32-gcc tools/win_loopback_repro.c -lws2_32 -o repro.exe -D_WIN32_WINNT=0x0601
-          echo "==== mode 0: accept audio LATE (mimics sessionUp drain window) ===="
-          ./repro.exe 0 2>&1 || true
-          echo "==== mode 1: accept audio IMMEDIATELY ===="
-          ./repro.exe 1 2>&1 || true
+          x86_64-w64-mingw32-gcc tools/win_loopback_repro.c -lws2_32 -lpthread -o repro.exe -D_WIN32_WINNT=0x0601
+          echo "==== faithful threading (winpthreads + blocking recv + dial-back) ===="
+          ./repro.exe 2>&1 || true
 
       # ---- shell + host + clap host: MSVC (mirrors ci.yml's shell-windows) ----
       - name: clone VST3 SDK
