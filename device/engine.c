@@ -934,7 +934,17 @@ static void host_paced_loop(device *d) {
         harp_audio_hdr_encode(&out, frame);
         size_t payload = (size_t)n * slots * 4;
         memcpy(frame + HARP_AUDIO_HDR_LEN, samples, payload);
-        if (!hp_write_all(a->fd, frame, HARP_AUDIO_HDR_LEN + payload)) return;
+#ifdef _WIN32
+        { static int sn = 0; if (sn < 4) { sn++;
+              fprintf(stderr, "harp-deviced: rendered+sending audio block %d: %zu bytes on fd=%d\n",
+                      sn, (size_t)HARP_AUDIO_HDR_LEN + payload, a->fd); } }
+#endif
+        if (!hp_write_all(a->fd, frame, HARP_AUDIO_HDR_LEN + payload)) {
+#ifdef _WIN32
+            fprintf(stderr, "harp-deviced: audio send FAILED on fd=%d WSA=%d\n", a->fd, WSAGetLastError());
+#endif
+            return;
+        }
     }
 }
 

@@ -1849,6 +1849,10 @@ void HarpRuntime::reader() {
         wgMaintain(wg);
 #endif
         int r = transport_->audioRead(acc + accLen, (int)(sizeof acc - accLen), 100);
+#ifdef _WIN32
+        { static int rn = 0; if (r != 0 && rn < 6) { rn++;
+              fprintf(stderr, "harp-shell: reader audioRead=%d (accLen now %zu)\n", r, accLen + (r > 0 ? (size_t)r : 0)); } }
+#endif
         if (r < 0) {
             log_msg("audio stream read failed; device gone?");
             connected_.store(false, std::memory_order_release);
