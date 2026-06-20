@@ -1268,11 +1268,6 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
     }
     if (e.msgtype != HARP_MSG_REQUEST) return;
 
-#ifdef _WIN32
-    fprintf(stderr, "harp-deviced: CTL request method='%s' rid=%llu\n",
-            e.method ? e.method : "(null)", (unsigned long long)e.rid);
-#endif
-
     if (!atomic_load_explicit(&d->hello_done, memory_order_acquire) &&
         strcmp(e.method, "core.hello") != 0) {
         send_error(d, e.rid, e.method, "denied", "core.hello required first");
@@ -1400,11 +1395,6 @@ void harp_deviced_run_session(device *d, harp_io *io) {
     for (;;) {
         uint8_t stream;
         int rc = harp_link_recv(io, &d->link, &stream, &msg);
-#ifdef _WIN32
-        if (rc < 0)
-            fprintf(stderr, "harp-deviced: control session loop break rc=%d (%s)\n", rc,
-                    rc == -1 ? "read_exact failed / EOF" : "protocol violation (bad frame hdr)");
-#endif
         if (rc == -1) break; /* peer gone */
         if (rc == -2) {      /* protocol violation: session reset (§12.4) */
             CTR_INC(d->session_resets);

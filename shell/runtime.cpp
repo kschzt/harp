@@ -232,9 +232,6 @@ bool HarpRuntime::unionWouldChangeLocked() const {
 }
 
 void HarpRuntime::audioStopLocked() {
-#ifdef _WIN32
-    fprintf(stderr, "harp-shell: DIAG audioStopLocked — sending audio.stop\n");
-#endif
     harp_cbuf req, rsp;
     harp_cbuf_init(&req);
     harp_cbuf_init(&rsp);
@@ -540,8 +537,6 @@ bool HarpRuntime::sessionUp() {
     /* cache the binding mode once, off the RT path (review m2). USB => false,
      * so every host-paced branch below is reached exactly as before. */
     freeRunning_ = transport_->isFreeRunning();
-    fprintf(stderr, "harp-shell: sessionUp freeRunning=%d wantHostPaced=%d\n",
-            (int)freeRunning_, (int)wantHostPaced_.load(std::memory_order_relaxed));
     {
         std::lock_guard<std::mutex> lk(ctlMutex_);
         /* capture the bound device's USB identity (vid:pid:serial) UNDER
@@ -665,10 +660,6 @@ bool HarpRuntime::sessionUp() {
  * is still talking to us, release the claim. Safe on a dead transport. */
 void HarpRuntime::sessionDown() {
     bool wasConnected = connected_.exchange(false, std::memory_order_acq_rel);
-#ifdef _WIN32
-    fprintf(stderr, "harp-shell: DIAG sessionDown ENTER wasConnected=%d t=%llums\n",
-            (int)wasConnected, (unsigned long long)(harp_now_ns() / 1000000ull));
-#endif
     /* QUIESCE the reader before joining it. On a mid-stream live<->offline flip the
      * transport is STILL ALIVE, so the free-running reader's recvAudio keeps returning
      * data and its loop (running_ && !readerStop_) never exits on its own — connected_
@@ -683,23 +674,11 @@ void HarpRuntime::sessionDown() {
     readerStop_.store(true, std::memory_order_release);
     if (readerThread_.joinable()) readerThread_.join();
     readerStop_.store(false, std::memory_order_release);
-#ifdef _WIN32
-    fprintf(stderr, "harp-shell: DIAG sessionDown reader joined t=%llums\n", (unsigned long long)(harp_now_ns()/1000000ull));
-#endif
     if (eventPumpThread_.joinable()) eventPumpThread_.join();
-#ifdef _WIN32
-    fprintf(stderr, "harp-shell: DIAG sessionDown eventPump joined t=%llums\n", (unsigned long long)(harp_now_ns()/1000000ull));
-#endif
     if (!transport_) return;
     std::lock_guard<std::mutex> lk(ctlMutex_);
-#ifdef _WIN32
-    fprintf(stderr, "harp-shell: DIAG sessionDown got ctlMutex t=%llums\n", (unsigned long long)(harp_now_ns()/1000000ull));
-#endif
     if (wasConnected) {
         audioStopLocked();
-#ifdef _WIN32
-        fprintf(stderr, "harp-shell: DIAG sessionDown audioStopLocked returned t=%llums\n", (unsigned long long)(harp_now_ns()/1000000ull));
-#endif
         /* drain the tail of the stream so the device thread can park */
         uint8_t junk[16384];
         int quiet = 0;
@@ -833,13 +812,7 @@ void HarpRuntime::stop() {
         }
     }
     if (!running_.exchange(false)) return;
-#ifdef _WIN32
-    fprintf(stderr, "harp-shell: DIAG stop() running=false, joining supervisor t=%llums\n", (unsigned long long)(harp_now_ns()/1000000ull));
-#endif
     if (supervisorThread_.joinable()) supervisorThread_.join(); /* final sessionDown */
-#ifdef _WIN32
-    fprintf(stderr, "harp-shell: DIAG stop() supervisor joined t=%llums\n", (unsigned long long)(harp_now_ns()/1000000ull));
-#endif
     /* Supervisor is joined: no thread can touch the context now. Tear it down
      * here, while ~HarpRuntime still runs — i.e. before the DLL can unload, so
      * no libusb backend thread outlives our module. */
@@ -1270,18 +1243,6 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
     size_t got = 0;
     unsigned waited = 0;
     bool settled = false; /* settlePadDebt + ssiRead_ advance run ONCE, after any flip clears */
-#ifdef _WIN32
-    /* DIAG: heartbeat (every 32nd pull) to MEASURE the crawl rate — wall-clock + call
-     * index + ssiRead + how many pulls hit the 1000ms starvation timeout. This tells
-     * crawl-vs-stall and whether the offline timeout is the per-block cost. */
-    static std::atomic<uint64_t> s_pullCount{0}, s_pullTimeouts{0};
-    uint64_t myPullIdx = s_pullCount.fetch_add(1, std::memory_order_relaxed);
-    if (myPullIdx % 32 == 0)
-        fprintf(stderr, "harp-shell: DIAG pull#%llu now_ms=%llu ssiRead=%llu ringAvail=%zu timeouts=%llu\n",
-                (unsigned long long)myPullIdx, (unsigned long long)(harp_now_ns() / 1000000ull),
-                (unsigned long long)ssiRead_.load(std::memory_order_relaxed),
-                audioRing_.readAvailable(), (unsigned long long)s_pullTimeouts.load(std::memory_order_relaxed));
-#endif
     while (got < want) {
         /* §8.3-over-§8.7 mid-stream toggle fence: while a live<->offline re-dial is in
          * flight, the OLD session's ring holds stale samples and ssiRead_/padDebt belong
@@ -1303,9 +1264,6 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
             if (got >= want) break;
         }
         if ((!flipping && !connected_.load(std::memory_order_acquire)) || waited >= timeoutMs) {
-#ifdef _WIN32
-            if (waited >= timeoutMs) s_pullTimeouts.fetch_add(1, std::memory_order_relaxed);
-#endif
             if (!settled) ssiRead_.fetch_add(nFrames, std::memory_order_relaxed); /* advance EXACTLY once per call */
             memset(dst + got, 0, (want - got) * sizeof(float));
             padDebtFloats_ += want - got;
@@ -1487,21 +1445,6 @@ void HarpRuntime::feeder() {
          * delivery was perfect, the math wasn't). */
         uint64_t frontierCap = ssiRead_.load(std::memory_order_relaxed) +
                                targetFrames_ + (eventHeadroom() - maxDawBlock_);
-#ifdef _WIN32
-        /* DIAG: snapshot the three pacing gates so we see WHICH one freezes the feeder
-         * (and whether ssiRead_ ever advances => whether the host actually pulls). */
-        { static int fd = 0;
-          bool g_ring = ringFrames < (size_t)targetFrames_;
-          bool g_inf  = inFlight < ahead_;
-          bool g_front = (uint64_t)ssi_ + kBlock <= frontierCap;
-          if (fd < 12) { fd++;
-              fprintf(stderr, "harp-shell: DIAG feeder gates ring=%zu<%u:%d inFlight=%llu<%llu:%d ssi=%llu+%u<=cap%llu:%d sent=%llu recv=%llu ssiRead=%llu\n",
-                      ringFrames, (unsigned)targetFrames_, g_ring,
-                      (unsigned long long)inFlight, (unsigned long long)ahead_, g_inf,
-                      (unsigned long long)ssi_, (unsigned)kBlock, (unsigned long long)frontierCap, g_front,
-                      (unsigned long long)framesSent_, (unsigned long long)framesRecv_,
-                      (unsigned long long)ssiRead_.load(std::memory_order_relaxed)); } }
-#endif
         /* the cap bounds the frame END: a frame starting under the cap but
          * extending past it would cover timestamps the current block can
          * still mint (measured: mid-frame note-ons applied a frame late) */
@@ -1901,10 +1844,6 @@ void HarpRuntime::reader() {
         wgMaintain(wg);
 #endif
         int r = transport_->audioRead(acc + accLen, (int)(sizeof acc - accLen), 100);
-#ifdef _WIN32
-        { static int rn = 0; if (r != 0 && rn < 6) { rn++;
-              fprintf(stderr, "harp-shell: reader audioRead=%d (accLen now %zu)\n", r, accLen + (r > 0 ? (size_t)r : 0)); } }
-#endif
         if (r < 0) {
             log_msg("audio stream read failed; device gone?");
             connected_.store(false, std::memory_order_release);

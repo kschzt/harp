@@ -817,10 +817,6 @@ static void host_paced_loop(device *d) {
     /* buffered endpoint reads (packet-multiple, see ffs.c) */
     uint8_t rbuf[16384];
     size_t rlen = 0, rpos = 0;
-#ifdef _WIN32
-    struct timespec t0w; clock_gettime(CLOCK_MONOTONIC, &t0w); /* DIAG: loop lifetime */
-    uint64_t framesRendered = 0; /* DIAG: uncapped render count to measure throughput */
-#endif
 
     while (atomic_load_explicit(&a->running, memory_order_relaxed)) {
         uint8_t hdr[HARP_AUDIO_HDR_LEN];
@@ -835,22 +831,11 @@ static void host_paced_loop(device *d) {
                 continue;
             }
             ssize_t r = hp_read(a, rbuf, sizeof rbuf);
-            if (r <= 0) { /* endpoint died or stop */
+            if (r <= 0) { /* endpoint died, or a stop unwound the recv (running=false) */
 #ifdef _WIN32
-                int werr = WSAGetLastError(); /* capture BEFORE any other socket call clobbers it */
-                int soe = 0, sl = sizeof soe;
-                getsockopt(a->out_fd, SOL_SOCKET, SO_ERROR, (char *)&soe, &sl);
-                struct timespec t1w; clock_gettime(CLOCK_MONOTONIC, &t1w);
-                long elapsed_ms = (long)((t1w.tv_sec - t0w.tv_sec) * 1000 + (t1w.tv_nsec - t0w.tv_nsec) / 1000000);
-                fprintf(stderr, "harp-deviced: pacing read ended: %s (fd=%d WSA=%d SO_ERROR=%d running=%d gotbytes=%zu elapsed=%ldms rendered=%llu fenceWaits=%llu fenceTimeouts=%llu)\n",
-                        r == 0 ? "EOF" : "recv error", a->out_fd, r == 0 ? 0 : werr, soe,
-                        (int)atomic_load_explicit(&a->running, memory_order_relaxed), got, elapsed_ms,
-                        (unsigned long long)framesRendered,
-                        (unsigned long long)atomic_load_explicit(&g_fence_waits, memory_order_relaxed),
-                        (unsigned long long)atomic_load_explicit(&g_fence_timeouts, memory_order_relaxed));
+                fprintf(stderr, "harp-deviced: pacing read ended (%s)\n", r == 0 ? "EOF" : "recv error");
 #else
-                fprintf(stderr, "harp-deviced: pacing read ended: %s\n",
-                        r == 0 ? "EOF" : strerror(errno));
+                fprintf(stderr, "harp-deviced: pacing read ended: %s\n", r == 0 ? "EOF" : strerror(errno));
 #endif
                 return;
             }
@@ -941,22 +926,7 @@ static void host_paced_loop(device *d) {
         harp_audio_hdr_encode(&out, frame);
         size_t payload = (size_t)n * slots * 4;
         memcpy(frame + HARP_AUDIO_HDR_LEN, samples, payload);
-        if (!hp_write_all(a->fd, frame, HARP_AUDIO_HDR_LEN + payload)) {
-#ifdef _WIN32
-            fprintf(stderr, "harp-deviced: audio send FAILED on fd=%d WSA=%d\n", a->fd, WSAGetLastError());
-#endif
-            return;
-        }
-#ifdef _WIN32
-        framesRendered++;
-        if ((framesRendered % 64) == 1) {
-            struct timespec tnw; clock_gettime(CLOCK_MONOTONIC, &tnw);
-            long ms = (long)((tnw.tv_sec - t0w.tv_sec) * 1000 + (tnw.tv_nsec - t0w.tv_nsec) / 1000000);
-            fprintf(stderr, "harp-deviced: DIAG rendered=%llu at %ldms fenceWaits=%llu\n",
-                    (unsigned long long)framesRendered, ms,
-                    (unsigned long long)atomic_load_explicit(&g_fence_waits, memory_order_relaxed));
-        }
-#endif
+        if (!hp_write_all(a->fd, frame, HARP_AUDIO_HDR_LEN + payload)) return;
     }
 }
 
@@ -985,11 +955,6 @@ void *audio_thread(void *arg) {
          * blocking Winsock recv pending here cannot be woken from audio_stop's thread
          * by pthread_cancel or shutdown()/closesocket, so it must poll a->running. */
         { DWORD tmo = 200; setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof tmo); }
-        { struct sockaddr_in la = {0}, pa = {0}; int ll = sizeof la, pl = sizeof pa;
-          getsockname(s, (struct sockaddr *)&la, &ll); getpeername(s, (struct sockaddr *)&pa, &pl);
-          int soe = 0, sl = sizeof soe; getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&soe, &sl);
-          fprintf(stderr, "harp-deviced: connect-back sock=%d local=:%d peer=:%d post-connect SO_ERROR=%d\n",
-                  s, ntohs(la.sin_port), ntohs(pa.sin_port), soe); }
 #endif
     }
     fprintf(stderr, "harp-deviced: audio thread up: mode=%u fd=%d out_fd=%d\n", a->mode,
@@ -1605,20 +1570,18 @@ void audio_stop(device *d) {
      * tearing down the render thread so no echo races a half-stopped stream. */
     meter_pump_stop(d);
     if (!atomic_load_explicit(&d->audio.thread_live, memory_order_relaxed)) return;
-#ifdef _WIN32
-    fprintf(stderr, "harp-deviced: audio_stop ENTER (thread_live=1) — tearing down host-paced stream\n");
-#endif
     d->audio.running = false;
     /* The audio thread may be parked in a blocking endpoint read (mode 1 pacing).
      * On POSIX, recv()/read() are pthread cancellation points, so pthread_cancel
-     * interrupts the park and the loop unwinds. On Windows/winpthreads a blocking
-     * Winsock recv() is NOT a cancellation point — pthread_cancel does not wake it,
-     * so the join below would hang FOREVER on the §8.3-over-§8.7 host-paced TCP
-     * channel (and the host, blocked in audio.stop's request/response, never gets a
-     * reply -> the offline bounce hangs until its watchdog). So for the host-paced
-     * socket we SHUTDOWN it first: that forces the parked recv to return, the loop
-     * sees running==false and exits, and the join completes. Harmless on POSIX
-     * (the cancel still does the work; shutdown just races it to the same wakeup). */
+     * interrupts the park and the loop unwinds at once. On Windows/winpthreads a
+     * blocking Winsock recv() is NOT interruptible from this thread — NEITHER
+     * pthread_cancel NOR shutdown()/closesocket wakes a recv pending in another
+     * thread; only the peer closing or a recv TIMEOUT does. So the host-paced recv
+     * carries SO_RCVTIMEO and polls a->running (see hp_read): running=false above
+     * makes it self-terminate within one tick (<=200 ms), so the join completes and
+     * the device can answer audio.stop instead of hanging the host's teardown.
+     * shutdown() is a best-effort faster wake on stacks that honor it (and is what
+     * the POSIX cancel races to anyway). */
     if (d->audio.host_paced_sock >= 0)
 #ifdef _WIN32
         shutdown(d->audio.host_paced_sock, SD_BOTH);

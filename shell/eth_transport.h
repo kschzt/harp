@@ -95,8 +95,6 @@ struct EthTransport final : ShellTransport {
     }
 
     ~EthTransport() override {
-        fprintf(stderr, "harp-shell: ~EthTransport dtor hostPaced=%d audioSock=%lld listen=%lld — closing\n",
-                (int)hostPaced_, (long long)audioSock_, (long long)audioListen_);
         if (audioSock_ != HARP_SOCK_INVALID) harp_sock_close(audioSock_);
         if (audioListen_ != HARP_SOCK_INVALID) harp_sock_close(audioListen_);
         if (rxsock_ != HARP_SOCK_INVALID) harp_sock_close(rxsock_);
@@ -123,45 +121,21 @@ struct EthTransport final : ShellTransport {
         if (!ensureAudioAccepted(ms)) return 0; /* device not connected yet => no data (not dead) */
         if (!readable(audioSock_, (int)ms)) return 0; /* timeout, no data */
         int n = (int)::recv(audioSock_, (char *)buf, len, 0);
-        if (n <= 0) {
-#ifdef _WIN32
-            static int rd = 0; if (rd < 3) { rd++; fprintf(stderr, "harp-shell: audioRead recv=%d WSA=%d\n", n, n < 0 ? WSAGetLastError() : 0); }
-#endif
-            return -1; /* 0 = peer closed, <0 = error => device gone */
-        }
+        if (n <= 0) return -1; /* 0 = peer closed, <0 = error => device gone */
         lastArr_.store(harp_now_ns(), std::memory_order_relaxed);
         return n;
     }
     bool audioWrite(const void *buf, int len, unsigned ms) override {
         if (!hostPaced_) return true; /* free-running: no pacing writes */
-        if (!ensureAudioAccepted(ms)) {
-            static bool warned = false;
-            if (!warned) { warned = true; fprintf(stderr, "harp-shell: host-paced pacing deferred — device connect-back not yet accepted\n"); }
-            return false; /* not connected yet; feeder retries */
-        }
+        if (!ensureAudioAccepted(ms)) return false; /* device connect-back not yet accepted; feeder retries */
         const char *p = (const char *)buf;
         int left = len;
         while (left > 0) {
             int n = (int)::send(audioSock_, p, left, HARP_ETH_SENDFLAGS);
-#ifdef _WIN32
-            { static int wr = 0; if (wr < 3) { wr++; fprintf(stderr, "harp-shell: audioWrite send=%d/%d WSA=%d\n", n, left, n <= 0 ? WSAGetLastError() : 0); } }
-#endif
             if (n <= 0) return false;
             p += n;
             left -= n;
         }
-#ifdef _WIN32
-        /* DIAG: after each pacing send, sample SO_ERROR on BOTH sockets — catches the
-         * instant (and which socket) the host stack flags an error, vs feeder activity. */
-        { static int dn = 0;
-          int ce = 0, ae = 0, l = (int)sizeof(int);
-          ::getsockopt(ctl_.s, SOL_SOCKET, SO_ERROR, (char *)&ce, &l);
-          l = (int)sizeof(int);
-          if (audioSock_ != HARP_SOCK_INVALID)
-              ::getsockopt(audioSock_, SOL_SOCKET, SO_ERROR, (char *)&ae, &l);
-          if ((ce || ae) && dn < 4) { dn++;
-              fprintf(stderr, "harp-shell: DIAG post-pacing-send sockerr ctl=%d audio=%d\n", ce, ae); } }
-#endif
         return true;
     }
 
@@ -238,13 +212,6 @@ private:
         ::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&one, sizeof one);
 #endif
         audioSock_ = s;
-#ifdef _WIN32
-        { struct sockaddr_in la = {}, pa = {}; socklen_t ll = sizeof la, pl = sizeof pa;
-          ::getsockname(s, (struct sockaddr *)&la, &ll); ::getpeername(s, (struct sockaddr *)&pa, &pl);
-          fprintf(stderr, "harp-shell: accepted audioSock=%lld local=:%d peer=:%d\n",
-                  (long long)s, ntohs(la.sin_port), ntohs(pa.sin_port)); }
-#endif
-        fprintf(stderr, "harp-shell: host-paced audio connect-back accepted (key 7)\n");
         return true;
     }
 
