@@ -912,6 +912,12 @@ int main(int argc, char **argv) {
     if (component->setActive(true) != kResultOk) die("setActive failed");
     processor->setProcessing(true);
 
+    /* §6.4 reported PDC latency the DAW sees via setLatencySamples — queried AFTER
+     * setActive(true) so it reflects the live owner runtime (audit gap #4 item 3).
+     * Invariant for the run; printed once. */
+    uint32 reported_latency = processor->getLatencySamples();
+    printf("latency: reported-samples=%u block=%u rate=%u\n", reported_latency, block, rate);
+
     ProcessContext ctx{};
     ctx.sampleRate = rate;
     ctx.state = ProcessContext::kPlaying;
@@ -1216,8 +1222,8 @@ int main(int argc, char **argv) {
     snprintf(hashhex, sizeof hashhex, "%016llx", (unsigned long long)hash);
     if (do_hash) printf("output-hash: %s\n", hashhex);
     if (do_json)
-        printf("{\"frames\":%zu,\"channels\":%d,\"rate\":%u,\"rms\":%.6f,\"hash\":\"%s\"}\n",
-               capture.size() / (size_t)(out_ch ? out_ch : 1), out_ch, rate, rms, hashhex);
+        printf("{\"frames\":%zu,\"channels\":%d,\"rate\":%u,\"rms\":%.6f,\"hash\":\"%s\",\"reported_latency_samples\":%u}\n",
+               capture.size() / (size_t)(out_ch ? out_ch : 1), out_ch, rate, rms, hashhex, reported_latency);
 
     if (!out_path.empty()) {
         if (!harp_write_wav16(out_path, capture, (uint32_t)out_ch, rate)) die("cannot write " + out_path);
