@@ -81,7 +81,7 @@ else()
   target_sources(harp-deviced PRIVATE device/panel.c) # front-panel unix-socket API
   target_link_libraries(harp-deviced Threads::Threads)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_sources(harp-deviced PRIVATE device/ffs.c) # USB gadget transport (§4.3)
+    target_sources(harp-deviced PRIVATE device/ffs.c device/ffs_link.c) # USB gadget transport (§4.3)
   endif()
 endif()
 
@@ -150,6 +150,17 @@ add_executable(harp-engine-logic-tests tests/harp_engine_logic_tests.c)
 target_include_directories(harp-engine-logic-tests PRIVATE device host)
 add_test(NAME engine_logic COMMAND harp-engine-logic-tests)
 set_tests_properties(engine_logic PROPERTIES LABELS unit)
+
+# harp-ffs-link-tests: the §4.3 FunctionFS framing I/O (device/ffs_link.c) over a
+# socketpair — the USB transport's mockable part, run in CI with no kernel gadget
+# (the descriptors / UDC / ep0 loop in ffs.c stay Pi-only). ffs_link.c is portable
+# (no functionfs.h), so this builds on Linux AND macOS; POSIX only (socketpair).
+if(NOT WIN32)
+  add_executable(harp-ffs-link-tests tests/harp_ffs_link_tests.c device/ffs_link.c)
+  target_include_directories(harp-ffs-link-tests PRIVATE device core/include)
+  add_test(NAME ffs_link COMMAND harp-ffs-link-tests)
+  set_tests_properties(ffs_link PROPERTIES LABELS unit)
+endif()
 
 # harp-device-tests: unit tests for the params-blob codec (§10 / P3 closer
 # step 3). Links the REAL pure codec from device/state.c — not a fork — so a
