@@ -4,6 +4,7 @@
 #include "client.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CREDIT_GRANT (16u << 20)
@@ -98,6 +99,17 @@ int harp_client_wait(harp_client *c, uint64_t rid, harp_cbuf *rsp, harp_env *e) 
                                    sl < sizeof c->err_msg) {
                             memcpy(c->err_msg, s, sl);
                             c->err_msg[sl] = 0;
+                        } else if (key == 2 && strcmp(c->err_code, "incompatible") == 0) {
+                            /* §5.4: device's supported major range {0 => min, 1 => max}.
+                             * Key 0 (code) precedes key 2 in the map, so err_code is set. */
+                            uint64_t dn, dk, dv;
+                            if (harp_cdec_map(&b, &dn)) {
+                                for (uint64_t j = 0; j < dn; j++) {
+                                    if (!harp_cdec_uint(&b, &dk) || !harp_cdec_uint(&b, &dv)) break;
+                                    if (dk == 0) c->incompat_major_min = (uint32_t)dv;
+                                    else if (dk == 1) c->incompat_major_max = (uint32_t)dv;
+                                }
+                            }
                         } else if (key > 1 && !harp_cdec_skip(&b))
                             break;
                     }
@@ -253,8 +265,9 @@ int harp_client_hello(harp_client *c, const char *agent, harp_client_identity *o
     harp_client_req_head(c, &req, "core.hello", true);
     harp_cbor_map(&req, 2);
     harp_cbor_uint(&req, 0);
+    const char *fmaj = getenv("HARP_FORCE_PROTO_MAJOR"); /* §5.4 test seam: force a version mismatch */
     harp_cbor_array(&req, 2);
-    harp_cbor_uint(&req, 1);
+    harp_cbor_uint(&req, fmaj && fmaj[0] ? strtoull(fmaj, NULL, 10) : 1);
     harp_cbor_uint(&req, 0);
     harp_cbor_uint(&req, 1);
     harp_cbor_text(&req, agent);
@@ -278,7 +291,11 @@ int harp_client_hello(harp_client *c, const char *agent, harp_client_identity *o
     }
     harp_cbuf_free(&req);
     harp_cbuf_free(&rsp);
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        if (rc == HARP_CLIENT_EDEV && strcmp(c->err_code, "incompatible") == 0)
+            return HARP_CLIENT_EINCOMPAT; /* §5.4: distinct signal -> host prompts a firmware/host update */
+        return rc;
+    }
     if (!ok) return HARP_CLIENT_EIO;
 
     /* grant the device obj credit so pulls can flow immediately */
