@@ -25,6 +25,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-2022]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45   # SDK clone + per-OS build + the full suite; the scripts' own
+                          # perl alarms bound individual tests, this bounds the build phase
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 

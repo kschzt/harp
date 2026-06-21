@@ -8,6 +8,17 @@ name: hw
 # fuzz jobs in ci.yml keep running on pull_request (GitHub-hosted).
 on:
   push:
+    # main only, and skip docs / non-hw-workflow-only commits: a feature-branch push or a
+    # docs/CI-only change must not seize the single exclusive Pi. Run hw on a branch via
+    # workflow_dispatch. Device/shell/core/scripts changes on main still trigger it.
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'web/**'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/eth.yml'
+      - '.github/workflows/eth-asan.yml'
   workflow_dispatch:
     inputs:
       late_sink_runs:
