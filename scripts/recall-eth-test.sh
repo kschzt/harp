@@ -59,16 +59,34 @@ echo "── recall over §8.7 loopback: device $DEVICED on 127.0.0.1:$PORT, she
     || fail "cannot connect to the loopback device (HARP_ETH_DEVICE=$HARP_ETH_DEVICE)"
 
 ARCH0=$(arch_count)
-# 1. known state, saved (DAW save)
-"$HOSTBIN" "$PLUG" --set 3=0.81 --set 7=0.31 --set 1=0.61 --seconds 0.6 \
-    --save-state "$STATEFILE" >/dev/null 2>&1 || fail "save render"
+# EXACT-HASH RECALL GATE (audit gap #4): the param check below is a 2% FLOAT tolerance — a
+# recall codec that rounds/quantizes the low bits restores 0.81->0.815 and sails through it.
+# So ALSO assert the RESTORED device renders the golden note line BYTE-IDENTICALLY to the
+# pre-mutation device. HPRE = a DIRECT --set render (ground truth, no codec); HPOST = a
+# render AFTER --load-state (through the full save->restore codec). Lossless recall =>
+# HPRE==HPOST; a lossy/rounding restore shifts the audio and fails HERE even within 2%.
+# Renders are kOffline => §8.7 host-paced => byte-exact run-to-run; the hashes live in shell
+# vars off stdout, so the Windows native-python /tmp rule doesn't apply to them.
+# Warm-up: the FIRST full note-render after a fresh device start is a one-time cold transient
+# (metering/echo settle) — discard one so HPRE (the save render) is in the stable regime
+# HPOST will also be in.
+"$HOSTBIN" "$PLUG" --set 3=0.81 --set 7=0.31 --set 1=0.61 --notes 62,69,74,65 \
+    --seconds 0.6 --hash >/dev/null 2>&1   # warm: settle the device, discard
+# 1. known state, RENDERED (HPRE = ground-truth render) + saved (DAW save)
+HPRE=$("$HOSTBIN" "$PLUG" --set 3=0.81 --set 7=0.31 --set 1=0.61 --notes 62,69,74,65 \
+       --seconds 0.6 --hash --save-state "$STATEFILE" 2>/dev/null | sed -n 's/^output-hash: //p')
+[ -n "$HPRE" ] || fail "no pre-mutation render-hash (save render produced no output-hash)"
 # 2. musician mutates the device (front-panel path, via the probe)
 "$PROBE" $PD knob 3 0.10 >/dev/null 2>&1 || fail "knob 3 mutate"
 "$PROBE" $PD knob 7 0.95 >/dev/null 2>&1 || fail "knob 7 mutate"
-# 3. DAW reopen -> recall (auto-Push-with-archive)
-"$HOSTBIN" "$PLUG" --load-state "$STATEFILE" --seconds 0.6 >/tmp/recall-eth.log 2>&1 \
-    || fail "load render"
+# 3. DAW reopen -> recall (auto-Push-with-archive); HPOST = render of the RESTORED device
+"$HOSTBIN" "$PLUG" --load-state "$STATEFILE" --notes 62,69,74,65 --seconds 0.6 --hash \
+    >/tmp/recall-eth.log 2>&1 || fail "load render"
 grep -q "restored\|SYNCED" /tmp/recall-eth.log || fail "no recall action logged"
+HPOST=$(sed -n 's/^output-hash: //p' /tmp/recall-eth.log)
+[ -n "$HPOST" ] || fail "no post-restore render-hash (load render produced no output-hash)"
+# 3'. the EXACT gate: the restored render must equal the ground-truth render byte-for-byte
+[ "$HPRE" = "$HPOST" ] || fail "EXACT-HASH mismatch: restored $HPOST != ground-truth $HPRE (params within 2% but the bounce changed — a lossy/rounding recall)"
 # 4. params restored AND the mutation was archived
 "$PROBE" $PD params 2>/dev/null | sed -nE 's/^ *\[([0-9]+)\].*[[:space:]]([0-9.]+)$/\1 \2/p' > "$PARAMS"
 PARAMS="$PARAMS" python3 -c "

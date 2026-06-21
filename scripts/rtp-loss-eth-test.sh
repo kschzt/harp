@@ -26,8 +26,11 @@ DP=""; HP=""
 trap '[ -n "$DP" ] && kill -9 "$DP" 2>/dev/null; [ -n "$HP" ] && kill -9 "$HP" 2>/dev/null' EXIT
 rm -rf "$DEVDIR"; : > "$DEVLOG"; : > "$HOSTLOG"
 
-echo "── device drops ${DROP}% of outgoing RTP; host renders 5s over the §8.7 loopback"
-"$DEVICED" --port "$PORT" --drop-rtp-pct "$DROP" --state-dir "$DEVDIR" >>"$DEVLOG" 2>&1 & DP=$!
+# Render the CALIBRATED --tone 440 (ideal rms 0.3536), not the device's default ~38 Hz
+# drone (~0.034): a known-amplitude signal is the only thing a concealment-FIDELITY floor
+# can gate. Same tone eth-tests uses for its bit-exact floor.
+echo "── device drops ${DROP}% of outgoing RTP (440Hz tone); host renders 5s over the §8.7 loopback"
+"$DEVICED" --port "$PORT" --tone 440 --drop-rtp-pct "$DROP" --state-dir "$DEVDIR" >>"$DEVLOG" 2>&1 & DP=$!
 for _ in $(seq 1 25); do grep -q "listening on $PORT" "$DEVLOG" 2>/dev/null && break; sleep 0.2; done
 grep -q "listening on $PORT" "$DEVLOG" || { cat "$DEVLOG"; fail "device didn't start on $PORT"; }
 
@@ -42,5 +45,13 @@ echo "── result: connects=$nconn  rms=${rms:-?}  host-exit=$rc  (drop=${DROP
 grep -iE "AddressSanitizer|SEGV|abort trap|terminating due to" "$HOSTLOG" && fail "host CRASHED under ${DROP}% RTP loss"
 [ "$rc" -eq 142 ] && fail "host HUNG under ${DROP}% RTP loss (perl-alarm watchdog fired)"
 grep -q "connected:" "$HOSTLOG" || fail "host never connected (no oracle)"
-awk "BEGIN{exit !(${rms:-0} > 0.001)}" || fail "host produced (near-)silence under ${DROP}% loss (rms=${rms:-0}) — loss broke the stream"
-echo "RTP-LOSS PASS (host rendered through ${DROP}% RTP loss: rms=$rms, $nconn connect(s), clean exit rc=$rc)"
+# FIDELITY floor (audit gap #4): was rms>0.001 — a bare liveness check that "0.0046-class
+# near-silence" passed. With the 440Hz tone (ideal 0.3536), §7.3 clock-recovery + rate-adaptive
+# resampling should retain most of the signal under 25% loss; assert it actually does. Floors
+# are well above the old near-silence (~20-30x) yet below the recovered tone, so a real
+# concealment collapse fails hard. mac/Windows relaxed for relative-nanosleep RTP jitter +
+# rate-locked zero-fill (same rationale as eth-tests' per-OS floors).
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*|Darwin) FLOOR=0.08 ;; *) FLOOR=0.12 ;; esac
+awk "BEGIN{exit !(${rms:-0} > $FLOOR)}" \
+  || fail "host did not recover the 440Hz tone under ${DROP}% loss (rms=${rms:-0} <= $FLOOR, ideal 0.3536) — §7.3 concealment broke the stream"
+echo "RTP-LOSS PASS (recovered the 440Hz tone through ${DROP}% RTP loss: rms=$rms > $FLOOR, $nconn connect(s), clean exit rc=$rc)"
