@@ -19,11 +19,18 @@ jobs:
         run: |
           cmake -B build-vst -S tools/vst3-host
           cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host ring-tests registry-tests mpe-zone-tests -j3
-      - name: ring + registry + mpe-zone tests (cross-thread stress; registry keying; MPE zone-collapse logic)
+      - name: shell unit tests (rings + registry + mpe-zone via ctest -L unit)
+        run: ctest --test-dir build-vst -L unit --output-on-failure
+      - name: root tree — core + engine-logic + device-codec tests (gap #3/#4; Apple-clang/arm64)
+        # macOS previously configured ONLY the shell tree (build-vst), so the pure
+        # integer policies (voice-alloc/arp/mod-routing) and the harpcore codecs never
+        # ran on Apple-clang/arm64 — yet the AU shell funnels MPE straight into them.
+        # The root configure is cheap (no SDK clone) and picks up the brew libusb/
+        # libsamplerate already installed above.
         run: |
-          ./build-vst/ring-tests
-          ./build-vst/registry-tests
-          ./build-vst/mpe-zone-tests
+          cmake -B build
+          cmake --build build --target harp-engine-logic-tests harp-tests harp-device-tests -j3
+          ctest --test-dir build -L unit --output-on-failure
       - name: AU shell + auval (Apple's own validation gate)
         run: |
           cmake --build build-vst --target harp-au au-host -j3
@@ -103,7 +110,7 @@ jobs:
           # (real Pi over USB) and local Windows runs; hosted runners have no device.
           cmake -B build-vst -S tools/vst3-host -G "Visual Studio 17 2022" -A x64
           cmake --build build-vst --config Release --target harp-vst3-host harp-shell harp-clap ring-tests mpe-zone-tests
-          ctest --test-dir build-vst -C Release --output-on-failure
+          ctest --test-dir build-vst -C Release -L unit --output-on-failure
           # CLAP: a green build + LoadLibrary does NOT prove clap_entry is in the
           # DLL export table (MSVC needs __declspec(dllexport) via CLAP_EXPORT) —
           # GetProcAddress would return NULL and every DAW would silently skip the
@@ -172,12 +179,11 @@ jobs:
       - name: clone CLAP SDK (header-only)
         run: git clone --depth 1 --branch 1.2.8
              https://github.com/free-audio/clap.git external/clap
-      - name: build shell + tools, ring + registry tests
+      - name: build shell + tools, unit tests (rings + registry + mpe-zone via ctest -L unit)
         run: |
           cmake -B build-vst -S tools/vst3-host
-          cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host ring-tests registry-tests -j
-          ./build-vst/ring-tests
-          ./build-vst/registry-tests
+          cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host ring-tests registry-tests mpe-zone-tests -j
+          ctest --test-dir build-vst -L unit --output-on-failure
       - name: pluginval (plugin-contract abuse, strictness 10)
         run: |
           curl -sL https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_Linux.zip -o pv.zip

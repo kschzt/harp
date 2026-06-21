@@ -80,8 +80,12 @@ jobs:
           # CMake libusb probe fails and usb_io.c is omitted; the eth loopback tests
           # use TCP, not USB). This is what lets recall/offline-edit/diag-bundle run
           # on Windows — the suite auto-enables them once harp-probe exists.
-          cmake --build build-dev --target harp-deviced harp-probe
+          # harp-device-tests too: the §10/P3 params-blob codec (device/state.c) the
+          # MinGW daemon ships — run it here so a MinGW-vs-clang codec divergence can't
+          # slip past (Linux/macOS already run it; gap #3/#4).
+          cmake --build build-dev --target harp-deviced harp-probe harp-device-tests
           ./build-dev/harp-deviced.exe --bogus 2>&1 | head -3 || true   # smoke: it starts
+          ./build-dev/harp-device-tests.exe   # device_codec on the production MinGW binary
       - name: fetch libusb (prebuilt MSVC binaries)
         if: runner.os == 'Windows'
         shell: pwsh

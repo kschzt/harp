@@ -139,6 +139,7 @@ enable_testing()
 add_executable(harp-tests tests/harp_tests.c)
 target_link_libraries(harp-tests harpcore ${HARP_MATH_LIB})
 add_test(NAME core COMMAND harp-tests)
+set_tests_properties(core PROPERTIES LABELS unit)
 
 # harp-engine-logic-tests: the determinism-critical PURE policies factored out of
 # engine.c (device/voice_alloc.h §9.5 allocation, device/arp_select.h §9.7 arp
@@ -148,19 +149,23 @@ add_test(NAME core COMMAND harp-tests)
 add_executable(harp-engine-logic-tests tests/harp_engine_logic_tests.c)
 target_include_directories(harp-engine-logic-tests PRIVATE device)
 add_test(NAME engine_logic COMMAND harp-engine-logic-tests)
+set_tests_properties(engine_logic PROPERTIES LABELS unit)
 
 # harp-device-tests: unit tests for the params-blob codec (§10 / P3 closer
 # step 3). Links the REAL pure codec from device/state.c — not a fork — so a
 # daemon serializer regression is caught. state.c shares its TU with engine/
 # store-coupled functions and pulls device.h (pthread/POSIX), so it can't live
 # in the cross-platform, harpcore-only harp-tests; this is a separate POSIX-only
-# device-linked test (guarded NOT WIN32, like harp-deviced). It reuses
-# fuzz/state_stubs.c — the SAME real g_params[] id table + abort-stubs the
-# fuzz-state target uses — so there's one place to track id drift, not two.
-# NOT WIN32: device/state.c (the per-part params-blob codec under test) pulls
-# pthread/POSIX, so device_codec runs on Linux/macOS CI; on Windows the codec is
-# exercised end-to-end over the live device protocol in the hw suite instead.
-if(NOT WIN32)
+# device-linked test. It reuses fuzz/state_stubs.c — the SAME real g_params[] id
+# table + abort-stubs the fuzz-state target uses — so there's one place to track
+# id drift, not two. device/state.c pulls pthread, but winpthreads provides it
+# under MinGW (harp-deviced already cross-compiles state.c on Windows), so this
+# runs on Linux, macOS, AND the MinGW Windows build — exactly so a MinGW-vs-clang
+# codec divergence in the params-blob parser the Windows daemon ships can't slip
+# by. Guard is NOT MSVC (not NOT WIN32): ci.yml's shell-windows configures this
+# root tree with MSVC and runs ctest, but state.c isn't MSVC-built there — so the
+# target must be absent under MSVC or ctest would fail on a never-built executable.
+if(NOT MSVC)
   find_package(Threads REQUIRED)
   add_executable(harp-device-tests
     tests/harp_device_tests.c
@@ -170,6 +175,7 @@ if(NOT WIN32)
   target_include_directories(harp-device-tests PRIVATE device)
   target_link_libraries(harp-device-tests harpcore ${HARP_MATH_LIB} Threads::Threads)
   add_test(NAME device_codec COMMAND harp-device-tests)
+  set_tests_properties(device_codec PROPERTIES LABELS unit)
 endif()
 
 # harp-freerun-tests: the §7.3/§8.7 free-running receiver — clock recovery +
