@@ -177,11 +177,7 @@ static bool parse_identity(harp_cdec *b, harp_client_identity *id) {
                         memcpy(id->engine_ver, s, sl);
                         id->engine_ver[sl] = 0;
                     } else if (mkey == 2) {
-                        const uint8_t *hp;
-                        size_t hl;
-                        if (!harp_cdec_bytes(b, &hp, &hl) || hl != HARP_HASH_LEN)
-                            return false;
-                        memcpy(id->param_map_hash.b, hp, HARP_HASH_LEN);
+                        if (!harp_hash_read(b, &id->param_map_hash)) return false;
                     } else if (!harp_cdec_skip(b))
                         return false;
                 }
@@ -358,11 +354,8 @@ int harp_client_snapshot(harp_client *c, const char *refname, const char *msg,
         harp_cdec b;
         harp_cdec_init(&b, e.body, e.body_len);
         uint64_t n, key;
-        const uint8_t *hp;
-        size_t hl;
         if (e.has_body && harp_cdec_map(&b, &n) && n >= 1 && harp_cdec_uint(&b, &key) &&
-            key == 0 && harp_cdec_bytes(&b, &hp, &hl) && hl == HARP_HASH_LEN) {
-            memcpy(out_hash->b, hp, HARP_HASH_LEN);
+            key == 0 && harp_hash_read(&b, out_hash)) {
             rc = 0;
         }
     }

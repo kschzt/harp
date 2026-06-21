@@ -24,6 +24,12 @@ void harp_hash_hex(const harp_hash *h, char out[2 * HARP_HASH_LEN + 1]);
 bool harp_hash_from_hex(const char *hex, harp_hash *out);
 harp_hash harp_hash_compute(const void *data, size_t len);
 
+/* §10.2: read a 33-byte hash from a CBOR byte string, rejecting any unknown
+ * algorithm byte (only 0x01 = SHA-256 is defined). Returns false on a wrong
+ * length OR an unrecognized algorithm. Every wire parse site goes through this
+ * so none can silently accept a hash it cannot verify. */
+bool harp_hash_read(harp_cdec *d, harp_hash *out);
+
 enum {
     HARP_OBJ_BLOB = 0,
     HARP_OBJ_LIST = 1,

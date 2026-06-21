@@ -26,3 +26,33 @@ Living document; items leave by being fixed, not forgotten.
 | 20 | `evq_apply_due` sample-accurate segmentation + `DEV_EV_MOD` per-voice addressing untested off-hardware | medium | deferred — extract the channel→part + mod-addressing predicate into pure helpers like `device/arp_select.h` / `device/voice_alloc.h` (both now host-unit-tested in `tests/harp_engine_logic_tests.c`), then unit-test in CI. Harder: render-thread statics |
 | 21 | hw runner (PI4B-0002) intermittent device flakiness | watch | monitoring — two pre-existing patterns: rapid-claim gadget wedge ("device not claimable after recovery") and group-underrun RMS inversion (sink-rms ≥ main-rms). Hits a DIFFERENT test each run (saw alias-part-audio, then part-param-iso); a same-code re-run goes green, so not a logic regression. The expanded mpe-test (~37 device claims across CLAP/VST3-NE/AU-raw/VST3-raw + persistence) adds claim pressure for whatever test runs next. Durable fix is in the harness's inter-test gadget recovery (or thinning mpe-test's claim burst), not any one test |
 | 18 | harp.local (PI4B-0001) harp-deviced SIGSEGV | high | FIXED 2026-06-15. NOT the FFS/USB path — a stack buffer overflow in the panel `refs` responder (`device/panel.c`). `panel_refs_cb` accumulated into a fixed 4096-byte stack `body` via `off += snprintf(...)`; snprintf returns what it WOULD write, so once the refs no longer fit, `off` ran past `sz`, `sz - off` underflowed to a huge size_t, and the next entry wrote past the buffer and smashed the stack (the saved regs in the core were JSON text). Data-dependent: overflowed at ~48 refs; harp.local the desk board had 101 (`live/project` + 100 archive snapshots), CI boards a handful -> "1 worked, CI fine, regression over time". Captured via a service-mode core dump (the systemd restart-loop reliably re-triggered macOS enumeration -> the sidecar re-polled `refs` -> crash). Fix: refs build into a growable heap buffer (`refs_appendf`, underflow-proof, returns the full list instead of truncating); deployed to harp.local, 101 refs now return as valid JSON, service stable (NRestarts=0). Unblocks #17's two-live-device run |
+
+## Spec-conformance gaps (bar §13)
+
+A separate axis from the engineering-debt table above: these are normative HARP-0.3
+MUST/SHOULD requirements found unimplemented or stubbed by the adversarial spec-vs-impl
+audit (2026-06-21; see the `harp-spec-conformance` note). The audio/state/control core
+is mature and genuinely well-tested with zero rubber-stamped stubs — what is tracked
+here is the normative *periphery*. Closed one at a time.
+
+| spec | gap | status |
+|------|-----|--------|
+| §10.2 | unknown hash-algorithm byte silently accepted on read (a 33-byte string with any leading byte was taken as a valid hash) | DONE — central `harp_hash_read()` validates length+algorithm at all 8 wire parse sites (object/store/session/client); unit (`test_hash_read`) + e2e (cas-test case d: a bad-alg expect hash -> `malformed`, before any conflict/closure check) |
+| §14.2/§8.6 | six mandatory diag counters emitted as constant 0: usb_errors, audio_underruns, audio_late_frames, msc_discontinuities, clock_drift_ppb, evt_stale_epoch | TODO |
+| §7.1/§8.6 | `time.epoch` ntf never emitted; device epoch hardcoded to 1; stale-epoch event discard + `evt_stale_epoch` missing | TODO |
+| §5.4 | host never surfaces a firmware/host-update prompt on `incompatible` (collapses all errors to EDEV); device sends only a static string, no machine-readable supported-range | TODO |
+| §5.5 | `core.changed` absent; `core.bye` handler has no sender; `core.identify`/`core.ping` have no host caller | TODO |
+| §12.1/§12.2 | NEGOTIATED state never entered; serial-differs + engine-major read-only flows are reason-code-only (enum, no path) | TODO |
+| §4.2.1 | credit/flow-control is a no-op MUST violation (16 MiB granted up front, send fires unconditionally); ≤64KiB/≤4KiB ctl/evt/log bounds unenforced | TODO |
+| §9.8 | `evt.format`/`evt.parse` RPCs absent (shell formats params from a hard-coded table) | TODO (SHOULD) |
+| §4.4.3 | mDNS/DNS-SD `_harp._tcp` discovery entirely absent (host dials a hardcoded `HARP_ETH_DEVICE`); TXT proto/port + serial-omission privacy unimplemented | TODO |
+| §8.4 | ≥8 concurrent sessions each with own correlation/ASRC (one runtime owns one transport); admission-control / refuse-with-budget | TODO |
+| §9.6 | transaction plane (etypes 2/3/4 silently skipped; no txn capability) | TODO (deprioritized) |
+| tests | untested-but-implemented: §5.2 ignore-unknown-notification, §4.2 per-stream interleave reassembly, §11.5 storage counters, §10.4 snapshot rsp hash/gen | TODO |
+
+Observed 2026-06-21 on the real KR260 over the `eth1` direct link (two genuinely
+independent clocks, which localhost loopback cannot exercise): the §8.7 free-running
+LIVE path holds transport bit-clean (0 loss / 0 underflow, 1507 pkts/run) and recovers
+2–9 ppm of real cross-clock drift, at 43–63 dB SINAD (jitter-limited, 70–175 µs). The
+host-paced bit-exact path is the fidelity path and is drift-independent by construction.
+Not a conformance gap; recorded for the §8.3 ASRC-quality (SRC_SINC_FASTEST) discussion.

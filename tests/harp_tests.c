@@ -305,6 +305,7 @@ static void test_store_crash_atomic(void) {
         hA.b[i] = (uint8_t)i;
         hB.b[i] = (uint8_t)(0xff - i);
     }
+    hA.b[0] = hB.b[0] = HARP_HASH_ALG_SHA256; /* valid algorithm byte so the ref reads back (§10.2) */
 
     /* commit ref = A */
     harp_ref r = {0};
@@ -586,6 +587,51 @@ static void test_link_fragmentation(void) {
     }
 }
 
+static void test_hash_read(void) {
+    /* §10.2: harp_hash_read is the single gate every wire parse site uses. It
+     * accepts a well-formed SHA-256 hash and rejects an unknown algorithm byte,
+     * a wrong length, or a non-bytes token. */
+    harp_hash good = harp_hash_compute("payload", 7);
+    CHECK(good.b[0] == HARP_HASH_ALG_SHA256);
+
+    harp_cbuf ok, ba, shortb, notbytes;
+    harp_cbuf_init(&ok);
+    harp_cbuf_init(&ba);
+    harp_cbuf_init(&shortb);
+    harp_cbuf_init(&notbytes);
+    harp_cdec d;
+    harp_hash got;
+
+    /* a valid 33-byte 0x01-prefixed hash round-trips */
+    harp_cbor_bytes(&ok, good.b, HARP_HASH_LEN);
+    harp_cdec_init(&d, ok.buf, ok.len);
+    CHECK(harp_hash_read(&d, &got));
+    CHECK(harp_hash_eq(&got, &good));
+
+    /* unknown algorithm byte (0x02), same 33-byte length -> rejected */
+    uint8_t bad_alg[HARP_HASH_LEN];
+    memcpy(bad_alg, good.b, HARP_HASH_LEN);
+    bad_alg[0] = 0x02;
+    harp_cbor_bytes(&ba, bad_alg, HARP_HASH_LEN);
+    harp_cdec_init(&d, ba.buf, ba.len);
+    CHECK(!harp_hash_read(&d, &got));
+
+    /* wrong length (bare 32-byte digest, no algorithm byte) -> rejected */
+    harp_cbor_bytes(&shortb, good.b + 1, HARP_HASH_LEN - 1);
+    harp_cdec_init(&d, shortb.buf, shortb.len);
+    CHECK(!harp_hash_read(&d, &got));
+
+    /* a non-bytes token (a uint) -> rejected, not misread */
+    harp_cbor_uint(&notbytes, 42);
+    harp_cdec_init(&d, notbytes.buf, notbytes.len);
+    CHECK(!harp_hash_read(&d, &got));
+
+    harp_cbuf_free(&ok);
+    harp_cbuf_free(&ba);
+    harp_cbuf_free(&shortb);
+    harp_cbuf_free(&notbytes);
+}
+
 int main(void) {
     test_sha256();
     test_link_fragmentation();
@@ -594,6 +640,7 @@ int main(void) {
     test_cbor_roundtrip();
     test_frame();
     test_objects();
+    test_hash_read();
     test_store();
     test_store_crash_atomic();
     test_store_reflist();

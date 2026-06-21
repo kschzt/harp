@@ -1092,7 +1092,7 @@ static void cmd_cas_test(probe *p) {
     /* (a) CONFLICT: a wrong `expect` (head with a flipped bit) against a valid,
      * already-pushed target must be REJECTED with code "conflict". */
     harp_hash bogus = head;
-    bogus.b[0] ^= 0xff;
+    bogus.b[HARP_HASH_LEN - 1] ^= 0xff; /* wrong digest, valid algorithm byte (§10.2) */
     int rc = harp_client_refset(&p->client, LIVE_REF, &bogus, &head, false, false, &gen);
     if (rc == 0 || strcmp(p->client.err_code, "conflict") != 0) {
         fprintf(stderr, "   FAIL (a): expected 'conflict', got rc=%d code='%s'\n", rc,
@@ -1116,6 +1116,7 @@ static void cmd_cas_test(probe *p) {
      * closure was never pushed must be REJECTED with code "not-found". */
     harp_hash absent;
     memset(absent.b, 0xab, sizeof absent.b);
+    absent.b[0] = HARP_HASH_ALG_SHA256; /* valid algorithm byte; the digest is just never pushed */
     rc = harp_client_refset(&p->client, LIVE_REF, &head, &absent, false, true, &gen);
     if (rc == 0 || strcmp(p->client.err_code, "not-found") != 0) {
         fprintf(stderr, "   FAIL (c): expected 'not-found', got rc=%d code='%s'\n", rc,
@@ -1124,11 +1125,24 @@ static void cmd_cas_test(probe *p) {
     } else
         printf("   (c) unpushed closure -> not-found: OK\n");
 
+    /* (d) MALFORMED (§10.2): an expect hash carrying an unknown algorithm byte
+     * must be rejected as "malformed" — before any conflict/closure check. */
+    harp_hash badalg = head;
+    badalg.b[0] = 0x02; /* not 0x01 = SHA-256 */
+    rc = harp_client_refset(&p->client, LIVE_REF, &badalg, &head, false, false, &gen);
+    if (rc == 0 || strcmp(p->client.err_code, "malformed") != 0) {
+        fprintf(stderr, "   FAIL (d): expected 'malformed', got rc=%d code='%s'\n", rc,
+                rc ? p->client.err_code : "ok (accepted!)");
+        fails++;
+    } else
+        printf("   (d) unknown hash-algorithm byte -> malformed: OK\n");
+
     if (fails) {
-        fprintf(stderr, "CAS-TEST FAIL (%d of 3)\n", fails);
+        fprintf(stderr, "CAS-TEST FAIL (%d of 4)\n", fails);
         exit(1);
     }
-    printf("CAS-TEST PASS: conflict rejected, force overrides, unpushed -> not-found\n");
+    printf("CAS-TEST PASS: conflict rejected, force overrides, unpushed -> not-found, "
+           "bad-alg -> malformed\n");
 }
 
 static void cmd_demo(probe *p, const char *addr) {

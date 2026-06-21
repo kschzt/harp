@@ -298,7 +298,10 @@ int main(int argc, char **argv) {
     }
     d->boot_count = bump_boot_count(state_dir);
     compute_param_map_hash(d);
-    if (pmh_flip) d->param_map_hash.b[0] ^= 0x01; /* §13.4 test seam: drift the advertised hash */
+    if (pmh_flip) d->param_map_hash.b[1] ^= 0x01; /* §13.4 test seam: drift the advertised hash.
+        Flip a DIGEST byte, not the algorithm byte b[0]: a real param-map change keeps alg=0x01,
+        and §10.2 now rejects an unknown algorithm byte at parse, so the host must be able to read
+        the identity to observe the drift. */
     pthread_mutex_init(&d->send_mu, NULL);
     pthread_mutex_init(&d->state_mu, NULL);
 

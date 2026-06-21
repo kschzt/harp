@@ -306,10 +306,7 @@ bool harp_ref_decode(harp_cdec *d, harp_ref *r) {
                     if (!harp_cdec_null(d)) return false;
                     r->unborn = true;
                 } else {
-                    const uint8_t *p;
-                    size_t pl;
-                    if (!harp_cdec_bytes(d, &p, &pl) || pl != HARP_HASH_LEN) return false;
-                    memcpy(r->hash.b, p, HARP_HASH_LEN);
+                    if (!harp_hash_read(d, &r->hash)) return false;
                     r->unborn = false;
                 }
                 break;
