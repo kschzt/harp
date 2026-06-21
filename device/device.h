@@ -242,6 +242,9 @@ typedef struct {
                              * (audio.start key 2). 0 = no burst. RTP path only. */
     uint32_t mode, rate, nsamples, epoch;
     uint64_t reanchors;
+    uint64_t msc_final; /* §7.1: free-running MSC at stream stop — written by the audio
+                         * thread before it exits, read by the session thread after join.
+                         * Reported as old-msc-final in the next time.epoch notification. */
     _Atomic int rate_trim_ppb; /* §8.7 bit-exact (host-locked): the host's rate
                                 * correction in parts-per-billion, set by the
                                 * audio.trim ctl and applied to the free-running
@@ -330,7 +333,7 @@ typedef struct {
 
     /* counters (§14.2): frame_errors has render + session writers;
      * snapshots_taken has session + panel writers; all read cross-thread */
-    _Atomic uint64_t frame_errors, session_resets, snapshots_taken, audio_overruns;
+    _Atomic uint64_t frame_errors, session_resets, snapshots_taken, audio_overruns, evt_stale_epoch;
 } device;
 
 extern device g_dev;

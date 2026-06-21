@@ -237,6 +237,9 @@ jobs:
           grep -q "VERSION-TEST PASS (control)" vt-ctl.out
           HARP_FORCE_PROTO_MAJOR=2 ./build/harp-probe -d 127.0.0.1:47800 -s /tmp/host version-test | tee vt-mis.out
           grep -q "VERSION-TEST PASS:" vt-mis.out
+          # §7.1/§8.6 time.epoch on a sample-rate change + stale-epoch event discard (evt_stale_epoch)
+          ./build/harp-probe -d 127.0.0.1:47800 -s /tmp/host epoch-test | tee epoch.out
+          grep -q "EPOCH-TEST PASS" epoch.out
       - name: reconcile relay (§11.4 four actions over the protocol, sim device + panel)
         run: ./scripts/reconcile-relay-test.sh
       - name: web panel sidecar smoke (§11 — harp-panel.py JSON endpoints over the sim daemon)

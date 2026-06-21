@@ -729,7 +729,7 @@ static void emit_counters(device *d, harp_cbuf *m) {
     harp_cbor_text(m, "evt_late");
     harp_cbor_uint(m, CTR_GET(g_evt_late));
     harp_cbor_text(m, "evt_stale_epoch");
-    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, CTR_GET(d->evt_stale_epoch));
     harp_cbor_text(m, "x.harp-refdev.evq_drops");
     harp_cbor_uint(m, CTR_GET(g_evq_drops));
     harp_cbor_text(m, "x.harp-refdev.ramp_late");
@@ -1008,6 +1008,31 @@ static void handle_audio_start(device *d, const harp_env *e) {
         d->audio.rtp_seq = 0;
     }
     d->audio.rtp_prebuffer = (rtp_fd >= 0) ? (uint32_t)prebuf : 0; /* startup burst (RTP only) */
+    /* §7.1/§8.6: a FREE-RUNNING sample-rate change opens a new clock epoch. Bump it and
+     * announce (ntf time.epoch) BEFORE the audio thread spawns, so every frame of the new
+     * stream carries the new epoch. Host-paced mode has no device-clock change, so its
+     * rate change does NOT bump the epoch (§8.6). On a spawn failure below the bump+rate
+     * are rolled back (a retry then re-detects). The host stopped the old stream first
+     * (busy gate above), so the audio thread already published its final MSC (msc_final). */
+    uint32_t old_rate = d->audio.rate, old_epoch = d->audio.epoch;
+    bool new_epoch = (mode == 0 && old_rate != 0 && (uint32_t)rate != old_rate);
+    if (new_epoch) {
+        d->audio.epoch++;
+        harp_cbuf ev;
+        harp_cbuf_init(&ev);
+        harp_env_head(&ev, HARP_MSG_NOTIFICATION, 0, "time.epoch", true);
+        harp_cbor_map(&ev, 4);
+        harp_cbor_uint(&ev, 0);
+        harp_cbor_uint(&ev, d->audio.epoch);     /* new-epoch */
+        harp_cbor_uint(&ev, 1);
+        harp_cbor_uint(&ev, rate);               /* new-rate-hz */
+        harp_cbor_uint(&ev, 2);
+        harp_cbor_uint(&ev, old_epoch);          /* old-epoch */
+        harp_cbor_uint(&ev, 3);
+        harp_cbor_uint(&ev, d->audio.msc_final); /* old-msc-final */
+        send_ctl(d, &ev);
+        harp_cbuf_free(&ev);
+    }
     d->audio.mode = (uint32_t)mode;
     d->audio.rate = (uint32_t)rate;
     d->audio.nsamples = (uint32_t)nsamples;
@@ -1024,6 +1049,7 @@ static void handle_audio_start(device *d, const harp_env *e) {
     if (pthread_create(&d->audio.thread, NULL, audio_thread, d) != 0) {
         atomic_store_explicit(&d->audio.running, false, memory_order_relaxed);
         audio_rtp_close(&d->audio); /* don't leak the RTP socket on a failed start */
+        if (new_epoch) { d->audio.epoch = old_epoch; d->audio.rate = old_rate; } /* roll back: no stream started */
         send_error(d, e->rid, e->method, "internal", "thread");
         return;
     }
@@ -1107,6 +1133,12 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
         tn != 2 || !harp_cdec_uint(&dec, &ep) || !harp_cdec_uint(&dec, &msc) ||
         !harp_cdec_uint(&dec, &etype)) {
         CTR_INC(d->frame_errors);
+        return;
+    }
+    /* §7.1: an event timestamped in a stale (older) epoch is discarded + counted.
+     * epoch 0 = "now" (always current); a future epoch shouldn't arrive but is not stale. */
+    if (ep != 0 && ep < d->audio.epoch) {
+        CTR_INC(d->evt_stale_epoch);
         return;
     }
     if (etype == 0) { /* UMP carriage (§9.10): body = one packet, words big-endian */

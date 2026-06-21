@@ -112,6 +112,10 @@ typedef struct {
     harp_client client; /* shared protocol client (host/client.h) */
     harp_store store;
     bool verbose_ntf;
+    /* §7.1 epoch-test: last time.epoch notification captured by probe_ntf */
+    bool epoch_seen;
+    uint32_t epoch_new, epoch_old, epoch_rate;
+    uint64_t epoch_old_msc;
 } probe;
 
 static void die(const char *msg) {
@@ -153,6 +157,24 @@ static sockhandle dial(const char *hostport) {
 /* verbose demo narration: surface state.changed notifications */
 static void probe_ntf(void *ud, const harp_env *e) {
     probe *p = ud;
+    if (strcmp(e->method, "time.epoch") == 0 && e->has_body) {
+        /* §7.1: {0 new-epoch, 1 new-rate-hz, 2 old-epoch, 3 old-msc-final} */
+        harp_cdec b;
+        harp_cdec_init(&b, e->body, e->body_len);
+        uint64_t n;
+        if (harp_cdec_map(&b, &n)) {
+            for (uint64_t i = 0; i < n; i++) {
+                uint64_t k, v;
+                if (!harp_cdec_uint(&b, &k) || !harp_cdec_uint(&b, &v)) break;
+                if (k == 0) p->epoch_new = (uint32_t)v;
+                else if (k == 1) p->epoch_rate = (uint32_t)v;
+                else if (k == 2) p->epoch_old = (uint32_t)v;
+                else if (k == 3) p->epoch_old_msc = v;
+            }
+            p->epoch_seen = true;
+        }
+        return;
+    }
     if (strcmp(e->method, "state.changed") != 0 || !p->verbose_ntf || !e->has_body)
         return;
     harp_cdec b;
@@ -1177,6 +1199,118 @@ static void cmd_version_test(probe *p) {
     }
 }
 
+/* --- §7.1/§8.6 time.epoch / stale-epoch test helpers --- */
+static void audio_start_rtp(probe *p, uint64_t rate) {
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    req_head(p, &req, "audio.start", true);
+    harp_cbor_map(&req, 4);
+    harp_cbor_uint(&req, 0); harp_cbor_uint(&req, rate);  /* rate */
+    harp_cbor_uint(&req, 1); harp_cbor_uint(&req, 256);   /* nsamples */
+    harp_cbor_uint(&req, 5); harp_cbor_uint(&req, 0);     /* free-running */
+    harp_cbor_uint(&req, 6); harp_cbor_uint(&req, 47900); /* RTP dest (dummy: nothing consumes it) */
+    request(p, &req, &rsp);
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+}
+
+static void audio_stop_probe(probe *p) {
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    req_head(p, &req, "audio.stop", false);
+    request(p, &req, &rsp);
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+}
+
+static uint64_t counter_u64(probe *p, const char *name) {
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    req_head(p, &req, "diag.counters", false);
+    harp_env e = request(p, &req, &rsp);
+    uint64_t out = UINT64_MAX, n;
+    harp_cdec b;
+    harp_cdec_init(&b, e.body, e.body_len);
+    if (e.has_body && harp_cdec_map(&b, &n)) {
+        for (uint64_t i = 0; i < n; i++) {
+            const char *s;
+            size_t sl;
+            if (!harp_cdec_text(&b, &s, &sl)) break;
+            uint64_t v = 0;
+            if (harp_cdec_peek(&b) == 0) {
+                harp_cdec_uint(&b, &v);
+            } else {
+                int64_t iv = 0;
+                harp_cdec_int(&b, &iv);
+                v = (uint64_t)iv;
+            }
+            if (sl == strlen(name) && memcmp(s, name, sl) == 0) out = v;
+        }
+    }
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+    return out;
+}
+
+/* epoch-test (§7.1/§8.6): a sample-rate change opens a new clock epoch — the device
+ * MUST bump it + emit ntf time.epoch {new-epoch,new-rate,old-epoch,old-msc-final}, and
+ * MUST discard + count (evt_stale_epoch) events timestamped in a stale epoch. */
+static void cmd_epoch_test(probe *p) {
+    do_hello(p);
+    printf("── epoch-test: time.epoch on rate change + stale-epoch discard (§7.1/§8.6)\n");
+
+    audio_start_rtp(p, 48000);
+    audio_stop_probe(p);
+    p->epoch_seen = false;
+    audio_start_rtp(p, 44100); /* rate change -> time.epoch (captured by probe_ntf during the request) */
+    if (!p->epoch_seen) {
+        fprintf(stderr, "EPOCH-TEST FAIL: no time.epoch notification on rate change\n");
+        exit(1);
+    }
+    if (p->epoch_new != p->epoch_old + 1 || p->epoch_rate != 44100) {
+        fprintf(stderr, "EPOCH-TEST FAIL: time.epoch new=%u old=%u rate=%u (want new=old+1, rate=44100)\n",
+                p->epoch_new, p->epoch_old, p->epoch_rate);
+        exit(1);
+    }
+    printf("   (a) rate 48000->44100 -> time.epoch new-epoch=%u old-epoch=%u new-rate=%u: OK\n",
+           p->epoch_new, p->epoch_old, p->epoch_rate);
+    /* old-msc-final MUST be the old stream's published final MSC — a positive, block-aligned
+     * count (the 48000 stream rendered >=1 block of 256). 0 would mean msc_final was lost. */
+    if (p->epoch_old_msc == 0 || p->epoch_old_msc % 256 != 0) {
+        fprintf(stderr, "EPOCH-TEST FAIL: old-msc-final %llu not a positive multiple of nsamples (256)\n",
+                (unsigned long long)p->epoch_old_msc);
+        exit(1);
+    }
+    printf("       old-msc-final=%llu (positive, block-aligned): OK\n", (unsigned long long)p->epoch_old_msc);
+
+    /* (b) an event timestamped in the OLD (now stale) epoch must be discarded + counted */
+    uint64_t before = counter_u64(p, "evt_stale_epoch");
+    harp_cbuf ev;
+    harp_cbuf_init(&ev);
+    harp_cbor_array(&ev, 3);
+    harp_cbor_array(&ev, 2);
+    harp_cbor_uint(&ev, p->epoch_old); /* stale epoch */
+    harp_cbor_uint(&ev, 0);            /* msc */
+    harp_cbor_uint(&ev, 1);            /* etype 1 = param set */
+    harp_cbor_uint(&ev, 0);            /* param id (never applied: discarded on the stale epoch) */
+    harp_link_send(p->io, HARP_STREAM_EVT, ev.buf, ev.len);
+    harp_cbuf_free(&ev);
+    uint64_t after = counter_u64(p, "evt_stale_epoch"); /* the counters request is ordered after the evt */
+    if (before == UINT64_MAX || after != before + 1) {
+        fprintf(stderr, "EPOCH-TEST FAIL: stale event not discarded+counted (evt_stale_epoch %llu -> %llu)\n",
+                (unsigned long long)before, (unsigned long long)after);
+        exit(1);
+    }
+    printf("   (b) event in stale epoch %u -> discarded + counted (evt_stale_epoch %llu -> %llu): OK\n",
+           p->epoch_old, (unsigned long long)before, (unsigned long long)after);
+
+    audio_stop_probe(p);
+    printf("EPOCH-TEST PASS: time.epoch emitted on rate change; stale-epoch events discarded + counted\n");
+}
+
 static void cmd_demo(probe *p, const char *addr) {
     (void)addr;
     p->verbose_ntf = true;
@@ -1367,6 +1501,8 @@ int main(int argc, char **argv) {
 #endif
     } else if (strcmp(cmd, "version-test") == 0)
         cmd_version_test(&p);
+    else if (strcmp(cmd, "epoch-test") == 0)
+        cmd_epoch_test(&p);
     else if (strcmp(cmd, "cas-test") == 0)
         cmd_cas_test(&p);
     else if (strcmp(cmd, "demo") == 0)

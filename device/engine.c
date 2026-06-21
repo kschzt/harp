@@ -1040,6 +1040,9 @@ void *audio_thread(void *arg) {
             break; /* endpoint died (stop/unplug) */
         audio_rtp_emit(a, samples, payload, msc);  /* §8.7: no-op unless rtp_fd set */
         msc += a->nsamples;
+        a->msc_final = msc; /* §7.1: publish each block so a mid-sleep cancel can't lose it
+                             * (read by the session thread after join) — the next time.epoch's
+                             * old-msc-final. */
 
         /* §8.7 prefill burst: while priming, emit back-to-back (skip the pace)
          * until rtp_prebuffer frames are out; then anchor realtime pacing at now
