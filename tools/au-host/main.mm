@@ -341,6 +341,12 @@ int main(int argc, char **argv) {
     AudioUnitGetProperty(au, kAudioUnitProperty_Latency, kAudioUnitScope_Global, 0,
                          &latency, &lsz);
     fprintf(stderr, "au-host: latency %.1f ms\n", latency * 1000.0);
+    /* §6.4 reported PDC latency in SAMPLES (kAudioUnitProperty_Latency is Float64 seconds)
+     * — parseable line that must agree to the sample with the VST3/CLAP shells (audit gap
+     * #4 item 3). Round seconds*rate; 16.0ms*48000 = 768 exactly for the defaults. */
+    printf("latency: reported-samples=%u block=%u rate=%u\n",
+           (unsigned)(latency * (double)rate + 0.5), block, rate);
+    fflush(stdout);
 
     for (auto &s : sets)
         AudioUnitSetParameter(au, s.first, kAudioUnitScope_Global, 0, s.second, 0);

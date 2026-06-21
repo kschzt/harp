@@ -217,6 +217,16 @@ int main(int argc, char **argv) {
     if (!plugin->activate(plugin, (double)rate, block, block)) die("activate failed");
     if (!plugin->start_processing(plugin)) die("start_processing failed");
 
+    /* §6.4 reported PDC latency the host reports via CLAP_EXT_LATENCY — queried AFTER
+     * activate so the owner runtime is configured (lt_get returns 0 before). Pure fn of
+     * block/rate; must agree to the sample with the VST3/AU shells (audit gap #4 item 3). */
+    {
+        auto *lat = (const clap_plugin_latency_t *)plugin->get_extension(plugin, CLAP_EXT_LATENCY);
+        uint32_t lat_samples = lat ? lat->get(plugin) : 0;
+        printf("latency: reported-samples=%u block=%u rate=%u\n", lat_samples, block, rate);
+        fflush(stdout);
+    }
+
     /* ---- render loop: blocks of `block`, total = seconds*rate ---- */
     size_t total = (size_t)(seconds * rate);
     std::vector<float> Lbuf(block), Rbuf(block), capture;
