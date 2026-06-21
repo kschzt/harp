@@ -183,7 +183,7 @@ bool HarpRuntime::audioStart(uint32_t rate) {
         harp_cbor_uint(&req, 0);
         harp_cbor_uint(&req, rate);
         harp_cbor_uint(&req, 1);
-        harp_cbor_uint(&req, ethNsamples()); /* device RTP packet (HARP_ETH_NSAMPLES; default kBlock=256) */
+        harp_cbor_uint(&req, ethNsamples()); /* device RTP packet (HARP_ETH_NSAMPLES; default adaptive kBlock_) */
         harp_cbor_uint(&req, 2);
         harp_cbor_uint(&req, ethTargetFrames()); /* prefill-burst depth = trim setpoint (avoids startup silence) */
         harp_cbor_uint(&req, 4); /* active-slots-out union (main + per-part pairs) */
@@ -204,7 +204,7 @@ bool HarpRuntime::audioStart(uint32_t rate) {
         harp_cbor_uint(&req, 0);
         harp_cbor_uint(&req, rate);
         harp_cbor_uint(&req, 1);
-        harp_cbor_uint(&req, kBlock);
+        harp_cbor_uint(&req, kBlock_); /* adaptive pacing block the feeder sends */
         harp_cbor_uint(&req, 2);
         harp_cbor_uint(&req, kTargetDepthFrames);
         harp_cbor_uint(&req, 3);
@@ -674,7 +674,7 @@ void HarpRuntime::runLoopbackProbeLocked() {
         for (int step = 0; step < kSpacing + 64 && !foundThisCycle &&
                             connected_.load(std::memory_order_relaxed); step++) {
             /* build an H->D pacing frame. On the FIRST step it carries the impulse
-             * (h.slots=1, payload = kBlock floats, sample 0 = 1.0); afterwards plain
+             * (h.slots=1, payload = kBlock_ floats, sample 0 = 1.0); afterwards plain
              * silent pacing (h.slots=0, the byte-identical golden frame). */
             bool impulseFrame = !sentImpulse;
             uint16_t slots = impulseFrame ? 1 : 0;
@@ -683,7 +683,7 @@ void HarpRuntime::runLoopbackProbeLocked() {
                                    slots,
                                    0,
                                    ssi_,
-                                   (uint16_t)kBlock,
+                                   (uint16_t)kBlock_, /* adaptive pacing block */
                                    HARP_AUDIO_FMT_F32};
             uint8_t hdr[HARP_AUDIO_HDR_LEN + HARP_AUDIO_FENCE_LEN];
             harp_audio_hdr_encode(&pace, hdr);
@@ -700,20 +700,24 @@ void HarpRuntime::runLoopbackProbeLocked() {
             if (impulseFrame) {
                 /* one block of slot-interleaved (here single-column) floats: all zero
                  * except sample 0 = 1.0 — the dominant content on the out-slot, which
-                 * the synth is not driving (the caller chose an unused out-slot). */
-                float payload[kBlock];
-                memset(payload, 0, sizeof payload);
+                 * the synth is not driving (the caller chose an unused out-slot). The
+                 * array is sized at the STATIC kBlockMax, but only kBlock_ floats are
+                 * sent — matching the header's nsamples=kBlock_ exactly (the device
+                 * reads kBlock_ floats from the payload). */
+                float payload[kBlockMax];
+                const size_t payloadBytes = (size_t)kBlock_ * sizeof(float);
+                memset(payload, 0, payloadBytes);
                 payload[0] = 1.0f;
                 uint8_t frame[HARP_AUDIO_HDR_LEN + HARP_AUDIO_FENCE_LEN + sizeof payload];
                 memcpy(frame, hdr, sizeof hdr);
-                memcpy(frame + sizeof hdr, payload, sizeof payload);
-                if (!transport_->audioWrite(frame, (int)sizeof frame, 50)) break;
+                memcpy(frame + sizeof hdr, payload, payloadBytes);
+                if (!transport_->audioWrite(frame, (int)(sizeof hdr + payloadBytes), 50)) break;
                 txTs = ssi_;
                 sentImpulse = true;
             } else {
                 if (!transport_->audioWrite(hdr, (int)sizeof hdr, 50)) break;
             }
-            ssi_ += kBlock;
+            ssi_ += kBlock_;
             framesSent_++;
 
             /* read whatever D->H frames are available and scan the out-slot column. */
@@ -2075,7 +2079,7 @@ void HarpRuntime::feeder() {
         uint64_t inFlight = framesSent_ - framesRecv_;
         /* The frontier cap is event-timing law, not flow control: event
          * timestamps carry target + one-pacing-block of headroom, so the
-         * pacing frontier must never advance past target + kBlock beyond
+         * pacing frontier must never advance past target + kBlock_ beyond
          * the DAW's read position — or timestamps land in already-paced
          * ranges at queue time and apply late no matter how fast the wire
          * is (measured at DAW block 64: nearly every ramp END fell behind
@@ -2087,7 +2091,7 @@ void HarpRuntime::feeder() {
          * extending past it would cover timestamps the current block can
          * still mint (measured: mid-frame note-ons applied a frame late) */
         while (ringFrames < (size_t)targetFrames_ && inFlight < ahead_ &&
-               ssi_ + kBlock <= frontierCap) {
+               ssi_ + kBlock_ <= frontierCap) {
             /* every pacing frame carries the event fence (§8.3.1): the
              * count of events queued so far this session. Any event queued
              * before this instant is guaranteed consumed device-side
@@ -2100,7 +2104,7 @@ void HarpRuntime::feeder() {
                                    0,
                                    0,
                                    ssi_,
-                                   (uint16_t)kBlock,
+                                   (uint16_t)kBlock_, /* adaptive pacing block */
                                    HARP_AUDIO_FMT_F32};
             uint8_t ph[HARP_AUDIO_HDR_LEN + HARP_AUDIO_FENCE_LEN];
             harp_audio_hdr_encode(&pace, ph);
@@ -2122,7 +2126,7 @@ void HarpRuntime::feeder() {
             ph[HARP_AUDIO_HDR_LEN + 2] = (uint8_t)(seq >> 16);
             ph[HARP_AUDIO_HDR_LEN + 3] = (uint8_t)(seq >> 24);
             if (!transport_->audioWrite(ph, sizeof ph, 8)) break;
-            ssi_ += kBlock;
+            ssi_ += kBlock_;
             framesSent_++;
             inFlight++;
             didWork = true;
@@ -2379,12 +2383,15 @@ void HarpRuntime::reader() {
 #ifdef __APPLE__
         WgState wgf;
 #endif
-        /* one RTP union packet = ns(=kBlock) frames of S(<=34) slot-interleaved
-         * floats — sized to the widest union (main {0,1} + 16 stereo part pairs).
-         * recvAudio returns the raw payload as floats; we split it by the union
-         * width the host negotiated at audio.start (key 4) and demux exactly as the
-         * USB reader does, so per-part audio lands in the same sinks. */
-        static constexpr unsigned kRtpBufFloats = kBlock * 34;
+        /* one RTP union packet = ns(<=kBlockMax) frames of S(<=34) slot-
+         * interleaved floats — sized to the widest union (main {0,1} + 16 stereo
+         * part pairs) at the STATIC max. recvAudio returns the raw payload as
+         * floats; we split it by the union width the host negotiated at
+         * audio.start (key 4) and demux exactly as the USB reader does, so
+         * per-part audio lands in the same sinks. Sized at kBlockMax (never the
+         * adaptive kBlock_) so the buffer holds the widest packet the device can
+         * send regardless of the runtime pacing block. */
+        static constexpr unsigned kRtpBufFloats = kBlockMax * 34;
         float buf[kRtpBufFloats];
         if (bitExact_) {
             /* rate-lock device: write the union 1:1 to audioRing_ + per-part sinks
@@ -2464,9 +2471,11 @@ void HarpRuntime::reader() {
                      * (not just main) keeps the fastest-draining part fed when consumer
                      * rates skew — a slower over-full ring just drops the surplus. */
                     while (harp_freerun_warm(fr) && minRingFillFrames() < target) {
-                        unsigned got = harp_freerun_pull(fr, resamp, kBlock);
+                        /* pull one adaptive pacing block at a time (kBlock_ <=
+                         * kBlockMax, so resamp[] always holds it). */
+                        unsigned got = harp_freerun_pull(fr, resamp, kBlock_);
                         if (got) demuxUnionFrame(resamp, got, (uint16_t)width);
-                        if (got < kBlock) break; /* dry — don't spin on silence */
+                        if (got < kBlock_) break; /* dry — don't spin on silence */
                     }
                     /* §14.4 host-context-C: publish the recovery state for clock-stats
                      * (key 11.5). Off the audio path — get_stats only reads atomics, so
@@ -3202,7 +3211,7 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
         harp_cbor_uint(&out, 0);
         harp_cbor_uint(&out, rate_); /* DAW sample rate */
         harp_cbor_uint(&out, 1);
-        harp_cbor_uint(&out, kBlock); /* DAW pacing block (256) */
+        harp_cbor_uint(&out, kBlock_); /* DAW pacing block (adaptive kBlock_; 256 at block >= 256) */
         harp_cbor_uint(&out, 2);
         harp_cbor_uint(&out, freeRunning_.load(std::memory_order_relaxed) ? 0 : 1); /* clock-mode */
         harp_cbor_uint(&out, 3); /* active out-slots (the audio.start union) */

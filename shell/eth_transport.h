@@ -258,8 +258,10 @@ private:
     int             audioListenPort_ = 0;
     harp_sockhandle audioSock_ = HARP_SOCK_INVALID;
     std::mutex      acceptMu_;
-    /* one RTP datagram: the widest union is nsamples(256) x 34 slots x 4B ≈ 34 KB,
-     * so 64 KB covers it (incl. the RTP header) with margin. Reader-thread only. */
+    /* one RTP datagram: the widest union is nsamples(kBlockMax=256) x 34 slots
+     * x 4B ≈ 34 KB, so 64 KB covers it (incl. the RTP header) with margin. The
+     * runtime caps every packet at the STATIC kBlockMax (the adaptive kBlock_ is
+     * always <= kBlockMax), so this stays the worst case. Reader-thread only. */
     uint8_t rxpkt_[65536];
 };
 

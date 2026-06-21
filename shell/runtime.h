@@ -139,6 +139,16 @@ public:
     void configure(uint32_t sampleRate, uint32_t maxDawBlock) {
         rate_ = sampleRate;
         maxDawBlock_ = maxDawBlock;
+        /* The adaptive RUNTIME pacing block, set ONCE here (the single point the
+         * DAW's block becomes known) and read-only thereafter. clamp into
+         * [128, kBlockMax]: a smaller DAW block can pace in smaller packets to
+         * cut latency, floored at 128 (measured: block 64 at kBlock_ 128 ->
+         * 384-sample/8.7 ms PDC, 0 underruns; at 64 it took the first late
+         * event). At maxDawBlock >= kBlockMax this is kBlockMax (256) — so at the
+         * golden/conformance block 256, kBlock_ == the old kBlock and every
+         * downstream value (eventHeadroom, ethNsamples default, targetFrames_)
+         * is byte-identical to before this change. */
+        kBlock_ = blockFor(maxDawBlock);
         targetFrames_ = targetFramesFor(maxDawBlock);
     }
 
@@ -150,8 +160,24 @@ public:
      * latencySamples(), so the value is byte-identical to a configured
      * runtime's. */
     static uint32_t latencyFor(uint32_t maxDawBlock) {
-        uint32_t headroom = maxDawBlock > kBlock ? maxDawBlock : kBlock;
+        /* Must equal a configured instance's latencySamples() for the same
+         * block: eventHeadroom() is max(maxDawBlock_, kBlock_) and kBlock_ is
+         * the adaptive clamp(maxDawBlock_, 128, kBlockMax). Compute the SAME
+         * clamp here (this static method runs pre-configure, so it has no
+         * member to read) so the PDC reported to the DAW matches the value the
+         * pacing/feeder actually uses. At maxDawBlock==kBlockMax this is
+         * max(256, 256)=256 — byte-identical to the old max(maxDawBlock,kBlock). */
+        uint32_t blk = blockFor(maxDawBlock);
+        uint32_t headroom = maxDawBlock > blk ? maxDawBlock : blk;
         return targetFramesFor(maxDawBlock) + headroom;
+    }
+    /* The adaptive pacing block for a given DAW block: clamp into
+     * [128, kBlockMax]. The single definition of the clamp, shared by the
+     * static latencyFor() (pre-configure PDC query) and configure() (which
+     * stores it in kBlock_). */
+    static uint32_t blockFor(uint32_t maxDawBlock) {
+        return maxDawBlock < 128u ? 128u
+             : (maxDawBlock > kBlockMax ? kBlockMax : maxDawBlock);
     }
 
     /* Begin supervising: claim the device, hello, start the host-paced
@@ -313,8 +339,9 @@ public:
                              unsigned timeoutMs);
 
     /* Reported latency = ring target + EVENT HEADROOM of one block — and
-     * "block" means whichever is larger, the DAW's or the 256-sample
-     * pacing block. Event timestamps are streamPos + offset + latency and
+     * "block" means whichever is larger, the DAW's or the adaptive kBlock_
+     * pacing block (clamp(maxDawBlock_,128,kBlockMax); 256 at block >= 256).
+     * Event timestamps are streamPos + offset + latency and
      * must stay ahead of the pacing frontier, which overshoots the ring
      * target by up to one PACING block; with only a 64-sample DAW block
      * of headroom, a fraction of timestamps land in already-paced
@@ -422,7 +449,14 @@ public:
 
 private:
 
-    static constexpr uint32_t kBlock = 256; /* pacing block, samples */
+    /* STATIC MAX pacing block, samples. Backs every compile-time buffer
+     * allocation (RTP receive buffer, demux/resamp scratch, the per-frame
+     * payload array) and the ethNsamples() packet cap — these are sized once
+     * at the MAX and never shrink. The RUNTIME pacing block is kBlock_ below,
+     * computed at configure() as clamp(maxDawBlock_, 128, kBlockMax); it drives
+     * pacing/latency and is always <= kBlockMax, so every adaptive packet fits
+     * the max-sized buffers with zero overflow. */
+    static constexpr uint32_t kBlockMax = 256;
 
     /* Event headroom: one block, whichever flavor is larger. Together with
      * the feeder's frontier cap (cap = read + target + headroom − dawBlock)
@@ -434,7 +468,7 @@ private:
      * note hit offset 0 and raced the cap edge — ~30% applied late until
      * the strict margin closed it.) */
     uint32_t eventHeadroom() const {
-        return maxDawBlock_ > kBlock ? maxDawBlock_ : kBlock;
+        return maxDawBlock_ > kBlock_ ? maxDawBlock_ : kBlock_;
     }
     /* Ring cushion vs host-side jitter. The sync-libusb transport needed
      * 5 blocks (26.7 ms) against its 20-25 ms completion tails; the async
@@ -478,18 +512,20 @@ private:
         uint32_t floor_ = 2u * maxDawBlock_;
         return t > floor_ ? t : floor_;
     }
-    static uint32_t ethNsamples() {
-        uint32_t n = kBlock;
+    /* Non-static: the default packet is the adaptive kBlock_ (set at
+     * configure()), so this must read the member. */
+    uint32_t ethNsamples() const {
+        uint32_t n = kBlock_; /* adaptive pacing block (<= kBlockMax) */
         if (const char *e = getenv("HARP_ETH_NSAMPLES")) {
             int v = atoi(e);
-            /* [32, kBlock]: this knob only LOWERS the packet to cut latency. The
+            /* [32, kBlock_]: this knob only LOWERS the packet to cut latency. The
              * device validates up to AUDIO_MAX_NSAMPLES(1024), but the reader's RTP
-             * buffers are sized kRtpBufFloats = kBlock·34 (the widest per-part union),
-             * so a packet larger than kBlock frames would truncate on a wide union and
-             * corrupt the demux. Capping at kBlock keeps every union width within the
-             * buffer with zero overflow, and a bigger packet would only raise latency
-             * anyway (the opposite of this knob's purpose). */
-            if (v >= 32 && v <= (int)kBlock) n = (uint32_t)v;
+             * buffers are sized kRtpBufFloats = kBlockMax·34 (the widest per-part
+             * union at the STATIC max), so a packet larger than kBlock_ frames
+             * would only raise latency (the opposite of this knob's purpose) and
+             * kBlock_ <= kBlockMax keeps every union width within the max-sized
+             * buffer with zero overflow. */
+            if (v >= 32 && v <= (int)kBlock_) n = (uint32_t)v;
         }
         return n;
     }
@@ -507,7 +543,12 @@ private:
             int v = atoi(e);
             if (v >= 2 && v <= 64) depth = (uint32_t)v;
         }
-        uint32_t floor_ = depth * kBlock;
+        /* static method (no `this`) — called pre-configure by latencyFor() AND
+         * inside configure(), so the floor must be a CONSTANT, not the adaptive
+         * kBlock_ (which only exists after configure()). kBlockMax keeps both
+         * call sites computing the identical value, and at the golden block 256
+         * the floor depth*256 is exactly what it was before this change. */
+        uint32_t floor_ = depth * kBlockMax;
         return needed > floor_ ? needed : floor_;
     }
 
@@ -912,8 +953,12 @@ private:
     uint64_t ssi_ = 0;
     uint64_t framesSent_ = 0, framesRecv_ = 0;
     uint64_t ahead_ = 2; /* fixed small pipeline; reader thread keeps RTT short */
-    uint32_t targetFrames_ = kTargetDepthFrames * kBlock; /* see configure() */
-    uint32_t maxDawBlock_ = 1024;                          /* event headroom */
+    uint32_t targetFrames_ = kTargetDepthFrames * kBlockMax; /* see configure() */
+    uint32_t maxDawBlock_ = 1024;                            /* event headroom */
+    /* Adaptive RUNTIME pacing block = clamp(maxDawBlock_, 128, kBlockMax),
+     * computed ONCE in configure() then read-only. Default kBlockMax is the
+     * conservative pre-configure value (matches the old static kBlock). */
+    uint32_t kBlock_ = kBlockMax;
     size_t padDebtFloats_ = 0; /* late arrivals owed to already-padded SSIs;
                                   audio thread only */
 
@@ -973,13 +1018,14 @@ private:
     /* §6.4 expected round-trip in samples for the negotiated rate: input-latency +
      * output-latency + one buffer-depth turnaround (the pure-transport buffering the
      * §14.3 digital loop measures, device-internal loop latency = 0). Falls back to
-     * kBlock (one host-paced pacing block) if the device omitted the profile. */
+     * kBlock_ (one host-paced pacing block, the adaptive value) if the device
+     * omitted the profile. */
     double expectedLoopbackSamples(uint32_t rate) const {
         for (size_t i = 0; i < nLat_; i++)
             if (latProfiles_[i].rate == rate)
                 return (double)latProfiles_[i].in_lat + latProfiles_[i].out_lat +
                        latProfiles_[i].buf_depth;
-        return (double)kBlock;
+        return (double)kBlock_;
     }
 
     /* (the OWNER instance's part lives in ownerSource_.chan — see above; an
