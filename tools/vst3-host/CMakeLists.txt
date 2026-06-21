@@ -128,7 +128,10 @@ if(LIBUSB_FOUND)
   # Platform shim (harp/plat.h) compiled into the shell/AU like the core .c files.
   if(WIN32)
     set(HARP_PLAT_SRC ${HARP_ROOT}/core/src/plat_win.c)
-    set(HARP_PLAT_LIBS winmm)
+    # ws2_32: the host stack (host/sock_io.c) is Winsock; harp-shell/clap get it
+    # transitively via the VST3 `sdk` target, but a host-stack exe that doesn't link
+    # `sdk` (registry-tests) needs it here — it's a plat lib the host stack requires.
+    set(HARP_PLAT_LIBS winmm ws2_32)
   else()
     set(HARP_PLAT_SRC ${HARP_ROOT}/core/src/plat_posix.c)
     set(HARP_PLAT_LIBS "")
