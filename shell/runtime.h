@@ -936,6 +936,11 @@ private:
     std::mutex bundleMutex_;
     bool hasBundle_ = false;
     harp_hash bundleTarget_{};
+    /* §9.3/§13.4: the loaded project's expected param-map-hash, retained so the
+     * drift warning fires both when state arrives while connected AND when a bundle
+     * staged offline applies on connect (paramMapHash_ is only valid once connected). */
+    bool bundleParamMapHashSet_ = false;
+    harp_hash bundleParamMapHash_{};
     std::vector<std::pair<uint32_t, float>> bundleParams_;
     /* the device the loaded bundle wants (USB identity, key 5). Empty
      * serial = no usb-identity in the bundle (fresh or pre-schema). */
