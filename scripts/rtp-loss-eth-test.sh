@@ -26,8 +26,11 @@ DP=""; HP=""
 trap '[ -n "$DP" ] && kill -9 "$DP" 2>/dev/null; [ -n "$HP" ] && kill -9 "$HP" 2>/dev/null' EXIT
 rm -rf "$DEVDIR"; : > "$DEVLOG"; : > "$HOSTLOG"
 
-echo "── device drops ${DROP}% of outgoing RTP; host renders 5s over the §8.7 loopback"
-"$DEVICED" --port "$PORT" --drop-rtp-pct "$DROP" --state-dir "$DEVDIR" >>"$DEVLOG" 2>&1 & DP=$!
+# Render the CALIBRATED --tone 440 (ideal rms 0.3536), not the device's default ~38 Hz
+# drone (~0.034): a known-amplitude signal is the only thing a concealment-FIDELITY floor
+# can gate. Same tone eth-tests uses for its bit-exact floor.
+echo "── device drops ${DROP}% of outgoing RTP (440Hz tone); host renders 5s over the §8.7 loopback"
+"$DEVICED" --port "$PORT" --tone 440 --drop-rtp-pct "$DROP" --state-dir "$DEVDIR" >>"$DEVLOG" 2>&1 & DP=$!
 for _ in $(seq 1 25); do grep -q "listening on $PORT" "$DEVLOG" 2>/dev/null && break; sleep 0.2; done
 grep -q "listening on $PORT" "$DEVLOG" || { cat "$DEVLOG"; fail "device didn't start on $PORT"; }
 
@@ -42,5 +45,17 @@ echo "── result: connects=$nconn  rms=${rms:-?}  host-exit=$rc  (drop=${DROP
 grep -iE "AddressSanitizer|SEGV|abort trap|terminating due to" "$HOSTLOG" && fail "host CRASHED under ${DROP}% RTP loss"
 [ "$rc" -eq 142 ] && fail "host HUNG under ${DROP}% RTP loss (perl-alarm watchdog fired)"
 grep -q "connected:" "$HOSTLOG" || fail "host never connected (no oracle)"
-awk "BEGIN{exit !(${rms:-0} > 0.001)}" || fail "host produced (near-)silence under ${DROP}% loss (rms=${rms:-0}) — loss broke the stream"
-echo "RTP-LOSS PASS (host rendered through ${DROP}% RTP loss: rms=$rms, $nconn connect(s), clean exit rc=$rc)"
+# FIDELITY floor (audit gap #4): was rms>0.001 — a bare liveness check that the old default
+# drone's "0.0046-class" reading passed trivially. Now we play the calibrated 440Hz tone and
+# require it to SURVIVE the loss. Calibrated to MEASURED CI values: under 25% loss the default
+# (rate-locked) live path zero-fills the dropped frames and the 5 s rms includes the prefill
+# warm-up window, so the recovered tone reads ~0.048-0.055 (ubuntu .055 / macos .048 / win
+# .052, cross-run stable) — the SAME ~14% retention the drone showed (0.0046/0.034), i.e. the
+# expected best-effort behavior of the rate-locked path, not poor concealment (§7.3 clock
+# recovery stays locked; the ASRC fallback retains ~88%). Floor 0.03 = ~16x above the old
+# liveness floor and ~1.6x below the stable recovery, so a stream that actually DIES under
+# loss (clock unlock / total dropout -> ~0) fails hard while the healthy recovery passes.
+FLOOR=0.03
+awk "BEGIN{exit !(${rms:-0} > $FLOOR)}" \
+  || fail "440Hz tone did not survive ${DROP}% loss (rms=${rms:-0} <= $FLOOR; healthy rate-locked recovery ~0.05) — §7.3 stream broke / clock unlocked"
+echo "RTP-LOSS PASS (recovered the 440Hz tone through ${DROP}% RTP loss: rms=$rms > $FLOOR, $nconn connect(s), clean exit rc=$rc)"
