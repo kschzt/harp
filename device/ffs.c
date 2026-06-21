@@ -29,8 +29,7 @@
 #include <unistd.h>
 
 #include "harp/link.h"
-
-#define FFS_READ_CHUNK 16384 /* multiple of 512 (HS wMaxPacketSize) */
+#include "ffs_link.h" /* §4.3 endpoint framing I/O (ffs_io, ffs_io_init) — unit-tested */
 
 /* ---- descriptors ---- */
 
@@ -157,15 +156,8 @@ static void bind_udc(const char *gadget_path) {
     fclose(u);
 }
 
-/* ---- buffered endpoint io ---- */
-
-typedef struct {
-    harp_io io;
-    int ep_in;  /* device -> host: we write */
-    int ep_out; /* host -> device: we read */
-    uint8_t rbuf[FFS_READ_CHUNK];
-    size_t rlen, rpos;
-} ffs_io;
+/* ---- buffered endpoint io: ffs_io + the framing read/write live in ffs_link.c
+ *      (portable, socketpair-unit-tested); ffs.c wires it to the real endpoints. ---- */
 
 /* Audio endpoint fds, valid while the interface is enabled (-1 otherwise).
  * The audio thread in harp-deviced writes/reads these directly (§8: the
@@ -174,46 +166,6 @@ static int g_audio_in_fd = -1, g_audio_out_fd = -1;
 
 int harp_ffs_audio_in_fd(void) { return g_audio_in_fd; }
 int harp_ffs_audio_out_fd(void) { return g_audio_out_fd; }
-
-static bool ffs_read_exact(harp_io *io, void *buf, size_t n) {
-    ffs_io *f = (ffs_io *)io;
-    uint8_t *p = buf;
-    while (n) {
-        if (f->rpos < f->rlen) {
-            size_t take = f->rlen - f->rpos;
-            if (take > n) take = n;
-            memcpy(p, f->rbuf + f->rpos, take);
-            f->rpos += take;
-            p += take;
-            n -= take;
-            continue;
-        }
-        ssize_t r = read(f->ep_out, f->rbuf, sizeof f->rbuf);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return false; /* -ESHUTDOWN on disable/unbind: session over */
-        }
-        if (r == 0) continue;
-        f->rlen = (size_t)r;
-        f->rpos = 0;
-    }
-    return true;
-}
-
-static bool ffs_write_all(harp_io *io, const void *buf, size_t n) {
-    ffs_io *f = (ffs_io *)io;
-    const uint8_t *p = buf;
-    while (n) {
-        ssize_t r = write(f->ep_in, p, n);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        p += r;
-        n -= (size_t)r;
-    }
-    return true;
-}
 
 /* ---- ep0 event loop ---- */
 
@@ -256,13 +208,11 @@ int harp_ffs_serve(const char *ffs_dir, const char *gadget_path,
             case FUNCTIONFS_ENABLE: {
                 fprintf(stderr, "harp-ffs: host enabled interface; session up\n");
                 ffs_io fio;
-                memset(&fio, 0, sizeof fio);
-                fio.io.read_exact = ffs_read_exact;
-                fio.io.write_all = ffs_write_all;
                 snprintf(path, sizeof path, "%s/ep1", ffs_dir);
-                fio.ep_in = open(path, O_RDWR);
+                int ep_in = open(path, O_RDWR);
                 snprintf(path, sizeof path, "%s/ep2", ffs_dir);
-                fio.ep_out = open(path, O_RDWR);
+                int ep_out = open(path, O_RDWR);
+                ffs_io_init(&fio, ep_in, ep_out); /* wires the framing onto ep1/ep2 */
                 snprintf(path, sizeof path, "%s/ep3", ffs_dir);
                 g_audio_in_fd = open(path, O_RDWR);
                 snprintf(path, sizeof path, "%s/ep4", ffs_dir);
