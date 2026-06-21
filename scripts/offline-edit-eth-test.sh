@@ -18,7 +18,8 @@ PLUG="${PLUG:-$(find build-vst build -maxdepth 5 -name harp-shell.vst3 -type d 2
 PORT="${PORT:-47977}"
 PID="${PID:-3}"        # a real device param (Filter Cutoff)
 VAL="${VAL:-0.90}"     # the offline-edit target (default is NOT this)
-DEVDIR=/tmp/offedit-eth-state
+DEVDIR=offedit-eth-state   # workspace-RELATIVE: an absolute /tmp arg is MSYS-path-converted
+                           # to a C:\...\ drive path the MinGW device can't mkdir on Windows
 DEVLOG=/tmp/offedit-eth-dev.log
 HOSTLOG=/tmp/offedit-eth-host.log
 PROBELOG=/tmp/offedit-eth-probe.log

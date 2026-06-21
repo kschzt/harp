@@ -23,6 +23,13 @@ HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PROBE="${PROBE:-./build/harp-probe}"
 PLUG="${PLUG:-$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
 PORT="${PORT:-47902}"
+# State dir + file are passed as ARGS to the native device/host exes; keep them
+# workspace-RELATIVE so MSYS doesn't path-convert an absolute /tmp arg into a
+# C:\...\ drive path the MinGW device's recursive mkdir can't create on Windows
+# (logs stay in /tmp — those are bash/python redirections, not exe args, and
+# recall-eth-dev.log is grepped by eth-asan.yml).
+STATEDIR=recall-eth-state
+STATEFILE=recall-eth.state
 fail() { echo "RECALL-ETH FAIL: $1"; exit 1; }
 [ -x "$DEVICED" ] || fail "$DEVICED not built"
 [ -x "$HOSTBIN" ] || fail "$HOSTBIN not built"
@@ -30,8 +37,8 @@ fail() { echo "RECALL-ETH FAIL: $1"; exit 1; }
 [ -n "$PLUG" ] && [ -d "$PLUG" ] || fail "harp-shell.vst3 bundle not found"
 
 # start the fake-hardware loopback device on 127.0.0.1:$PORT
-rm -rf /tmp/recall-eth-state; : > /tmp/recall-eth-dev.log
-"$DEVICED" --port "$PORT" --state-dir /tmp/recall-eth-state >/tmp/recall-eth-dev.log 2>&1 &
+rm -rf "$STATEDIR" "$STATEFILE"; : > /tmp/recall-eth-dev.log
+"$DEVICED" --port "$PORT" --state-dir "$STATEDIR" >/tmp/recall-eth-dev.log 2>&1 &
 DEVPID=$!
 trap 'kill -9 "$DEVPID" 2>/dev/null' EXIT INT TERM
 for _ in $(seq 1 25); do grep -q "listening on $PORT" /tmp/recall-eth-dev.log 2>/dev/null && break; sleep 0.2; done
@@ -49,12 +56,12 @@ echo "── recall over §8.7 loopback: device $DEVICED on 127.0.0.1:$PORT, she
 ARCH0=$(arch_count)
 # 1. known state, saved (DAW save)
 "$HOSTBIN" "$PLUG" --set 3=0.81 --set 7=0.31 --set 1=0.61 --seconds 0.6 \
-    --save-state /tmp/recall-eth.state >/dev/null 2>&1 || fail "save render"
+    --save-state "$STATEFILE" >/dev/null 2>&1 || fail "save render"
 # 2. musician mutates the device (front-panel path, via the probe)
 "$PROBE" $PD knob 3 0.10 >/dev/null 2>&1 || fail "knob 3 mutate"
 "$PROBE" $PD knob 7 0.95 >/dev/null 2>&1 || fail "knob 7 mutate"
 # 3. DAW reopen -> recall (auto-Push-with-archive)
-"$HOSTBIN" "$PLUG" --load-state /tmp/recall-eth.state --seconds 0.6 >/tmp/recall-eth.log 2>&1 \
+"$HOSTBIN" "$PLUG" --load-state "$STATEFILE" --seconds 0.6 >/tmp/recall-eth.log 2>&1 \
     || fail "load render"
 grep -q "restored\|SYNCED" /tmp/recall-eth.log || fail "no recall action logged"
 # 4. params restored AND the mutation was archived
