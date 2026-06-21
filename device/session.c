@@ -456,11 +456,8 @@ static void handle_state_have(device *d, const harp_env *e) {
             uint64_t key, alen;
             if (harp_cdec_uint(&b, &key) && key == 0 && harp_cdec_array(&b, &alen)) {
                 for (uint64_t i = 0; i < alen; i++) {
-                    const uint8_t *p;
-                    size_t pl;
-                    if (!harp_cdec_bytes(&b, &p, &pl) || pl != HARP_HASH_LEN) break;
                     harp_hash h;
-                    memcpy(h.b, p, HARP_HASH_LEN);
+                    if (!harp_hash_read(&b, &h)) break;
                     harp_cbor_bool(&bools, harp_store_have(&d->store, &h));
                     count++;
                 }
@@ -491,11 +488,10 @@ static void handle_state_want(device *d, const harp_env *e) {
             uint64_t key, alen;
             if (harp_cdec_uint(&b, &key) && key == 0 && harp_cdec_array(&b, &alen)) {
                 for (uint64_t i = 0; i < alen; i++) {
-                    const uint8_t *p;
-                    size_t pl;
-                    if (!harp_cdec_bytes(&b, &p, &pl) || pl != HARP_HASH_LEN) break;
+                    harp_hash h;
+                    if (!harp_hash_read(&b, &h)) break;
                     if (nq < 256) {
-                        memcpy(queue[nq].b, p, HARP_HASH_LEN);
+                        queue[nq] = h;
                         if (harp_store_have(&d->store, &queue[nq])) nq++;
                     }
                 }
@@ -587,24 +583,13 @@ static void handle_state_refset(device *d, const harp_env *e) {
                             harp_cdec_null(&b);
                             expect_null = true;
                             have_expect = true;
-                        } else {
-                            const uint8_t *p;
-                            size_t pl;
-                            if (harp_cdec_bytes(&b, &p, &pl) && pl == HARP_HASH_LEN) {
-                                memcpy(expect.b, p, HARP_HASH_LEN);
-                                have_expect = true;
-                            }
+                        } else if (harp_hash_read(&b, &expect)) {
+                            have_expect = true;
                         }
                         break;
-                    case 2: {
-                        const uint8_t *p;
-                        size_t pl;
-                        if (harp_cdec_bytes(&b, &p, &pl) && pl == HARP_HASH_LEN) {
-                            memcpy(newh.b, p, HARP_HASH_LEN);
-                            have_new = true;
-                        }
+                    case 2:
+                        if (harp_hash_read(&b, &newh)) have_new = true;
                         break;
-                    }
                     case 3:
                         harp_cdec_uint(&b, &flags);
                         break;

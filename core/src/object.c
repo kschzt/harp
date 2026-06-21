@@ -43,6 +43,17 @@ harp_hash harp_hash_compute(const void *data, size_t len) {
     return h;
 }
 
+bool harp_hash_read(harp_cdec *d, harp_hash *out) {
+    const uint8_t *p;
+    size_t n;
+    if (!harp_cdec_bytes(d, &p, &n) || n != HARP_HASH_LEN) return false;
+    /* §10.2: a 33-byte string with an unknown leading byte was silently accepted
+     * as a hash before this check; only SHA-256 (0x01) is a defined algorithm. */
+    if (p[0] != HARP_HASH_ALG_SHA256) return false;
+    memcpy(out->b, p, HARP_HASH_LEN);
+    return true;
+}
+
 /* ---- encoders ---- */
 
 void harp_obj_encode_blob(harp_cbuf *out, const char *media_type, const void *payload,
@@ -206,11 +217,7 @@ struct snap_out {
 };
 
 static bool read_hash(harp_cdec *d, harp_hash *h) {
-    const uint8_t *p;
-    size_t n;
-    if (!harp_cdec_bytes(d, &p, &n) || n != HARP_HASH_LEN) return false;
-    memcpy(h->b, p, HARP_HASH_LEN);
-    return true;
+    return harp_hash_read(d, h); /* §10.2 length + algorithm validation */
 }
 
 static bool snap_cb(uint64_t key, harp_cdec *d, void *ud) {
