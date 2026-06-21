@@ -18,6 +18,7 @@
 
 #include "arp_select.h"
 #include "evq_mod.h"
+#include "usb_select.h"
 #include "voice_alloc.h"
 
 static int g_fail = 0, g_pass = 0;
@@ -143,10 +144,37 @@ static void test_evq_mod(void) {
     CHECK(harp_mod_target(BEND_ID, 5, BEND_ID, PRESS_ID) == HARP_MODT_BEND);
 }
 
+/* §15.2 multi-device SELECTION (host/usb_select.h) — the "never bind a different
+ * synth" rule, the safety core of multi-device. The fallback CHAIN (try exact serial,
+ * then same-model, then any) is the caller's orchestration + the hardware
+ * multidevice/replug tests; this pins the per-device MATCH decision. */
+static void test_usb_select(void) {
+    const uint16_t V = 0x1209, P = 0x4852; /* the HARP USB id; a 2nd model differs in vid:pid */
+
+    /* fresh-any (both unset): ANY HARP device matches */
+    CHECK(harp_usb_dev_matches("PI4B-0001", V, P, NULL, false, 0, 0));
+    CHECK(harp_usb_dev_matches("PI4B-0003", V, P, NULL, false, 0, 0));
+
+    /* exact serial (want set): only that serial — reconnect pins it, a wrong serial is refused */
+    CHECK(harp_usb_dev_matches("PI4B-0001", V, P, "PI4B-0001", false, 0, 0));
+    CHECK(!harp_usb_dev_matches("PI4B-0003", V, P, "PI4B-0001", false, 0, 0));
+
+    /* same-model (want_vp): same vid:pid matches; a DIFFERENT model is NEVER bound */
+    CHECK(harp_usb_dev_matches("X", V, P, NULL, true, V, P));
+    CHECK(!harp_usb_dev_matches("X", V, (uint16_t)(P + 1), NULL, true, V, P)); /* diff product */
+    CHECK(!harp_usb_dev_matches("X", (uint16_t)(V + 1), P, NULL, true, V, P)); /* diff vendor  */
+
+    /* serial AND model both required: the exact serial of the right model */
+    CHECK(harp_usb_dev_matches("S1", V, P, "S1", true, V, P));
+    CHECK(!harp_usb_dev_matches("S2", V, P, "S1", true, V, P));                  /* wrong serial */
+    CHECK(!harp_usb_dev_matches("S1", V, (uint16_t)(P + 1), "S1", true, V, P));  /* wrong model  */
+}
+
 int main(void) {
     test_voice_pick();
     test_arp_select();
     test_evq_mod();
+    test_usb_select();
     printf("harp-engine-logic-tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
