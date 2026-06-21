@@ -29,7 +29,7 @@ jobs:
         # libsamplerate already installed above.
         run: |
           cmake -B build
-          cmake --build build --target harp-engine-logic-tests harp-tests harp-device-tests -j3
+          cmake --build build --target harp-engine-logic-tests harp-tests harp-device-tests harp-ffs-link-tests -j3
           ctest --test-dir build -L unit --output-on-failure
       - name: AU shell + auval (Apple's own validation gate)
         run: |
