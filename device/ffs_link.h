@@ -7,8 +7,15 @@
  * test wires it onto socketpairs. (The descriptors, UDC bind, and ep0 event loop stay
  * in ffs.c and remain Pi-only.) */
 #include "harp/link.h"
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/* §14.2 usb_errors: abnormal FunctionFS transport errors — read/write failures that are
+ * neither EINTR nor the clean -ESHUTDOWN disable. Lives here (not in the device struct)
+ * because the framing is deliberately decoupled from device.h; emit_counters reads it on
+ * Linux (it stays 0 on the TCP/eth dev transport, which has no FunctionFS path). */
+extern _Atomic uint64_t g_usb_errors;
 
 #define FFS_READ_CHUNK 16384 /* multiple of 512 (HS wMaxPacketSize) */
 

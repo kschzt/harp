@@ -61,9 +61,11 @@ int main(void) {
     /* 5. session-over: a dead endpoint (DISABLE/unbind closes the file) makes read_exact
      *    return false — not hang, not a torn read. Close the device's read fd so the next
      *    read() fails (-EBADF, the -ESHUTDOWN analogue). */
+    CHECK(g_usb_errors == 0); /* §14.2: the clean reads/writes above logged no transport errors */
     close(dev_ep_out);
     memset(buf, 0, sizeof buf);
     CHECK(io->read_exact(io, buf, 1) == false);
+    CHECK(g_usb_errors == 1); /* §14.2: the abnormal read error (EBADF) was counted */
 
     close(host_to_dev);
     close(dev_ep_in);
