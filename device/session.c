@@ -18,6 +18,10 @@
 
 #include "device.h"
 
+#ifdef __linux__
+extern _Atomic uint64_t g_usb_errors; /* §14.2: FunctionFS transport errors — device/ffs_link.c */
+#endif
+
 /* ---------------- wire helpers ---------------- */
 
 int send_ctl(device *d, const harp_cbuf *msg) {
@@ -713,17 +717,33 @@ static void emit_counters(device *d, harp_cbuf *m) {
     harp_cbor_text(m, "x.harp-refdev.fence_timeouts");
     harp_cbor_uint(m, CTR_GET(g_fence_timeouts));
     harp_cbor_text(m, "usb_errors");
-    harp_cbor_uint(m, 0);
+#ifdef __linux__
+    harp_cbor_uint(m, CTR_GET(g_usb_errors)); /* §14.2: abnormal FunctionFS transport errors */
+#else
+    harp_cbor_uint(m, 0); /* no FunctionFS transport on this build (TCP/eth dev link) */
+#endif
     harp_cbor_text(m, "frame_errors");
     harp_cbor_uint(m, CTR_GET(d->frame_errors));
+    /* §14.2: 0 by construction on this reference device — the refdev synthesizes every block
+     * on demand (free-run) or strictly per received pacing frame (host-paced), so it has no
+     * input-fed buffer that can starve; the transport-stall side is counted as audio_overruns. */
     harp_cbor_text(m, "audio_underruns");
     harp_cbor_uint(m, 0);
     harp_cbor_text(m, "audio_overruns");
     harp_cbor_uint(m, CTR_GET(d->audio_overruns));
+    /* §8.2 host-paced late-frame discard (frames whose ts is behind the render cursor) is
+     * wired separately; 0 until then. */
     harp_cbor_text(m, "audio_late_frames");
     harp_cbor_uint(m, 0);
+    /* §14.2: 0 by construction — the refdev's MSC is monotone (msc += nsamples each block);
+     * a transport stall sets the DISCONT header bit + audio_overruns but never gaps the MSC,
+     * so there is no unplanned MSC discontinuity to count. */
     harp_cbor_text(m, "msc_discontinuities");
     harp_cbor_uint(m, 0);
+    /* §14.2: 0 on the device side — the refdev free-runs its master clock (it IS the clock
+     * source, §8.3); drift is a host-side measurement between the DAW clock and this device's
+     * MSC (§7.3), reported in the bundle's host section. Signed: a sensing device could report
+     * negative drift. */
     harp_cbor_text(m, "clock_drift_ppb");
     harp_cbor_int(m, 0);
     harp_cbor_text(m, "evt_late");

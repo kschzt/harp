@@ -3,8 +3,11 @@
 #include "ffs_link.h"
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <unistd.h>
+
+_Atomic uint64_t g_usb_errors = 0; /* §14.2 — see ffs_link.h */
 
 static bool ffs_read_exact(harp_io *io, void *buf, size_t n) {
     ffs_io *f = (ffs_io *)io;
@@ -22,6 +25,8 @@ static bool ffs_read_exact(harp_io *io, void *buf, size_t n) {
         ssize_t r = read(f->ep_out, f->rbuf, sizeof f->rbuf);
         if (r < 0) {
             if (errno == EINTR) continue;
+            if (errno != ESHUTDOWN) /* §14.2: count abnormal errors, not the clean disable */
+                atomic_fetch_add_explicit(&g_usb_errors, 1, memory_order_relaxed);
             return false; /* -ESHUTDOWN on disable/unbind: session over */
         }
         if (r == 0) continue;
@@ -38,6 +43,8 @@ static bool ffs_write_all(harp_io *io, const void *buf, size_t n) {
         ssize_t r = write(f->ep_in, p, n);
         if (r < 0) {
             if (errno == EINTR) continue;
+            if (errno != ESHUTDOWN) /* §14.2: count abnormal errors, not the clean disable */
+                atomic_fetch_add_explicit(&g_usb_errors, 1, memory_order_relaxed);
             return false;
         }
         p += r;
