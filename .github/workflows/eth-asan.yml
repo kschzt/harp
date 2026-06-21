@@ -7,8 +7,28 @@ name: eth-asan
 # join wrapper that does NOT reproduce without ASan), so the local Mac run isn't a
 # valid oracle. This job IS the oracle: a real memory/UB bug in the daemon will fire
 # here (and would crash without ASan too); a clean green confirms the Mac SEGV was the
-# tooling artifact. Manual for now; promote to scheduled once it's reliably green.
+# tooling artifact.
+#
+# Reliably green on main (the daemon + shell — incl. the §14 diag rings/bundle codec —
+# are ASan/UBSan-clean), so it now GATES: pull_request + push to main on the code paths
+# that could carry a memory/UB bug (skips docs-only PRs), plus a nightly sweep and manual
+# dispatch. This is the daemon's only automated memory-safety gate — keep it green.
 on:
+  pull_request:
+    paths: &asan_paths
+      - 'device/**'
+      - 'host/**'
+      - 'shell/**'
+      - 'core/**'
+      - 'tools/**'
+      - 'scripts/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/eth-asan.yml'
+  push:
+    branches: [main]
+    paths: *asan_paths
+  schedule:
+    - cron: '17 7 * * *'   # nightly ASan/UBSan sweep regardless of what changed
   workflow_dispatch:
 
 jobs:
@@ -59,24 +79,40 @@ jobs:
         run: |
           scripts/recall-eth-test.sh \
             || echo "recall-eth non-pass under ASan (timing-sensitive; the soak above is the host/shell oracle)"
-          grep -iE "ERROR: AddressSanitizer|runtime error:|SUMMARY: (Address|Undefined)" /tmp/recall-eth-dev.log \
-            && { echo "::error::recall-eth daemon ASan/UBSan finding"; exit 1; } || echo "recall-eth daemon clean"
+          # grep BOTH the device log and the host load-render log (recall-eth.log) — a
+          # sanitizer finding on either side is fatal even though the test's pass/fail is
+          # tolerated for ASan timing.
+          grep -iE "ERROR: AddressSanitizer|runtime error:|SUMMARY: (Address|Undefined)" \
+                 /tmp/recall-eth-dev.log /tmp/recall-eth.log 2>/dev/null \
+            && { echo "::error::recall-eth ASan/UBSan finding (device or host)"; exit 1; } \
+            || echo "recall-eth device+host clean"
       - name: sustained play soak under ASan (RTP plane + engine + repeated meter-pump start/stop)
         run: |
           ./build/harp-deviced --port 47950 --state-dir /tmp/asan-soak-state >/tmp/asan-soak-dev.log 2>&1 &
           DP=$!; trap 'kill -9 $DP 2>/dev/null || true' EXIT
           for _ in $(seq 1 25); do grep -q "listening on 47950" /tmp/asan-soak-dev.log && break; sleep 0.2; done
           PLUG="$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d | head -1)"
+          : > /tmp/asan-soak-host.log
           for i in 1 2 3 4; do
             echo "── soak cycle $i (notes + 8s play -> engine + meter-pump start/stop)"
             HARP_ETH_DEVICE=127.0.0.1:47950 ./build-vst/harp-vst3-host "$PLUG" \
-              --notes 60,64,67,72 --seconds 8 --realtime || true
+              --notes 60,64,67,72 --seconds 8 --realtime >>/tmp/asan-soak-host.log 2>&1
+            rc=$?
+            # Was `|| true`, which swallowed a host crash. ASAN_OPTIONS abort_on_error=1
+            # makes a sanitizer finding abort the HOST (rc 134); a hard crash is 139 (SEGV).
+            # Those are real bugs and MUST fail. Any other non-zero stays tolerated: ASan
+            # slows realtime, so an underrun/timeout exit is expected and not a defect.
+            if [ $rc -eq 134 ] || [ $rc -eq 139 ]; then
+              echo "::error::host crashed under ASan/UBSan during soak cycle $i (rc=$rc)"
+              cat /tmp/asan-soak-host.log; exit 1
+            fi
           done
-          echo "── device-side ASan/UBSan reports over the soak:"
-          if grep -iE "ERROR: AddressSanitizer|runtime error:|SUMMARY: (Address|Undefined)" /tmp/asan-soak-dev.log; then
-            echo "::error::ASan/UBSan found issues in the daemon during the soak"; exit 1
+          echo "── ASan/UBSan reports over the soak (device AND host — host was previously ungrepped):"
+          if grep -iE "ERROR: AddressSanitizer|runtime error:|SUMMARY: (Address|Undefined)" \
+                 /tmp/asan-soak-dev.log /tmp/asan-soak-host.log; then
+            echo "::error::ASan/UBSan found issues during the soak"; exit 1
           fi
-          echo "daemon ASan/UBSan-clean across the soak"
+          echo "device + host ASan/UBSan-clean across the soak"
       - name: corrupt-CBOR fault injection under ASan (host survives a hostile device's bad frames)
         # fatal (unlike recall above): a crash / over-read / UB while decoding corrupt
         # device CBOR is a real bug, not a timing artifact. Uses the ASan build/ + build-vst/.
