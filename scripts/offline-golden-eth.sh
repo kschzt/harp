@@ -41,6 +41,50 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "   ✓ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "   ✗ FAIL: $1"; }
 
+# ── PINNED GROUND TRUTH (audit gap #2) ───────────────────────────────────────────
+# The relative oracles below (run-to-run ==, cross-format VST3==CLAP, RMS floor) prove
+# the bounce is DETERMINISTIC and NON-SILENT — but a deterministic-but-WRONG engine (a
+# DSP regression that changes the output yet stays reproducible) sails straight through
+# them. So we ALSO assert the bounce hash equals a PINNED value captured from known-good
+# GREEN main runs. The pin is PER-OS: ubuntu and windows are both x86-64 yet hash
+# DIFFERENTLY (glibc vs MSVCRT libm, gcc vs MSVC make expf/sinf not bit-reproducible),
+# so a shared-x86 pin is wrong — keyed on uname, same idiom as scripts/eth-suite.sh.
+#
+# *** UPDATING THE PINS — only when a DSP/render change is INTENTIONAL: ***
+#   1. Land the change; let eth.yml go GREEN on all three OSes.
+#   2. Copy the new "VST3: hash#1=" (== CLAP == cross-format) and "post-toggle tail #1="
+#      values from EACH per-OS job log.
+#   3. Replace the matching PIN_BOUNCE/PIN_TOGGLE below, and say in the commit that the
+#      DSP change was deliberate — so the pin bump is auditable, not a rubber-stamp.
+# A runner-image bump can also legitimately shift the hash with no source change (new
+# libm); re-baseline the same way and note it. An UNEXPECTED mismatch is a HARD FAILURE:
+# the engine changed silently.
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) OSID=windows ;;
+    Darwin)               OSID=macos   ;;
+    *)                    OSID=linux   ;;
+esac
+case "$OSID" in
+    linux)   PIN_BOUNCE=3c42af5bbed23919; PIN_TOGGLE=af70b91fab7cec29 ;;
+    macos)   PIN_BOUNCE=758a7d9d4b0d7dc0; PIN_TOGGLE=380ed2753cac6e6d ;;
+    windows) PIN_BOUNCE=aa8a8e71215b0b47; PIN_TOGGLE=2b1491f51f6be9a1 ;;
+esac
+# GOLDEN_PIN=0 disables the pin (for an intentional, in-progress DSP change whose new
+# value isn't captured yet). OPT-OUT and LOUD: default is enforced; a skip warns on
+# stderr so it can't hide. CI must NOT set GOLDEN_PIN.
+pin_check() {  # pin_check LABEL ACTUAL EXPECTED
+    if [ "${GOLDEN_PIN:-1}" = "0" ]; then
+        echo "   ! pin SKIPPED for $1 (GOLDEN_PIN=0) — ground truth NOT enforced" >&2
+        return
+    fi
+    [ -n "$2" ] || return   # no audio: the determinism/floor gate already failed loudly
+    if [ "$2" = "$3" ]; then
+        ok "$1 matches PINNED ground truth ($3) [$OSID]"
+    else
+        bad "$1 DRIFTED from pin: got $2 expected $3 [$OSID] — engine changed (bump the pin ONLY if intentional)"
+    fi
+}
+
 [ -x "$DEVICED" ] || { echo "OFFLINE-GOLDEN-ETH FAIL: $DEVICED not built"; exit 1; }
 
 # render NAME HOST PLUG: start a fresh-state daemon, render the canonical sequence in
@@ -93,6 +137,8 @@ if [ -n "$VPLUG" ] && [ -d "$VPLUG" ] && [ -x "$VHOST" ]; then
     else
         bad "VST3 offline bounce non-deterministic / no audio (#1=$v1 #2=$v2)"
     fi
+    # ground-truth pin: v1==CLAP (cross-format assert below) so pinning v1 pins CLAP too.
+    pin_check "VST3 offline bounce" "$v1" "$PIN_BOUNCE"
 else
     echo "──── VST3: SKIP (host/bundle not built)"
 fi
@@ -165,6 +211,7 @@ if [ -n "${CPLUG:-}" ] && [ -x "$CHOST" ]; then
     else
         bad "mid-stream toggle tail non-deterministic (#1=$g1 #2=$g2) — re-dial didn't reach host-paced"
     fi
+    pin_check "mid-stream toggle tail" "$g1" "$PIN_TOGGLE"   # second independent render path
 else
     echo "──── mid-stream toggle: SKIP (clap host/bundle not built)"
 fi
