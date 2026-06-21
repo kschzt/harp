@@ -258,12 +258,6 @@ the DAW if it was already open (the env is read at the first dial); `launchctl
 unsetenv HARP_ETH_DEVICE` returns to real USB hardware. The device may come up before
 or after the DAW — the shell's supervisor reconnects either way.
 
-At a 64-sample DAW buffer the shell reports ~768 samples of PDC latency: a 2-block
-ring cushion plus a block of event headroom, both sized by HARP's internal 256-sample
-pacing block (not your DAW buffer) and fully delay-compensated by the host. On a clean
-link the §8.7 RTP jitter buffer itself can be dialed down — see the `HARP_ETH_TARGET`
-and `HARP_ETH_NSAMPLES` knobs in `shell/runtime.h`.
-
 ## Documentation
 
 - **The specification**: [`spec/harp-spec-draft-0.3.md`](spec/harp-spec-draft-0.3.md).
