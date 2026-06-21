@@ -1,13 +1,17 @@
 name: eth
 
-# §8.7 Ethernet/IP conformance against FAKE HARDWARE: a localhost harp-deviced (the
-# real synth + protocol, not plugged in over USB) over TCP(ctl)+RTP(udp), with the
-# shell connecting via HARP_ETH_DEVICE. No physical device, so this runs on the cloud
-# runners in PARALLEL to hw.yml (the authoritative real-device USB suite). It is the
-# automated home of the Ethernet TRANSPORT coverage (bit-exact play, the host-locked
-# rate loop, the RTP audio plane) plus the transport-agnostic per-part tests the USB
-# rig can't run reliably. Cloud-sandboxed (no home hardware), so PRs are safe — unlike
-# hw.yml, which is push/dispatch-only.
+# §8.7 Ethernet/IP conformance against FAKE HARDWARE across all three host OSes. A
+# localhost harp-deviced (the real synth + protocol, not plugged in over USB) talks to
+# the shell over TCP(ctl)+RTP(udp) via HARP_ETH_DEVICE — no physical device, so it runs
+# on the cloud runners in PARALLEL to hw.yml (the authoritative real-device USB suite)
+# and is safe on PRs (unlike push/dispatch-only hw.yml).
+#
+# ONE OS-matrix [ubuntu, macos, windows]: a per-OS BUILD, then the SHARED conformance
+# suite (scripts/eth-suite.sh) — so the test set can no longer drift between platforms.
+# (This replaces the old eth.yml + win.yml split, which silently ran 5 of ~10 scripts on
+# Windows.) POSIX builds device + host with one cmake; Windows builds the device as a
+# native MinGW target (gnu11/winpthreads/winsock, statically linked) and the shell/host
+# with MSVC. The sanitizer build is an orthogonal variant and stays in eth-asan.yml.
 on:
   push:
     branches: [main]
@@ -19,61 +23,99 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # ───────── SDKs (all OSes) ─────────
       - name: clone VST3 SDK
         run: git clone --depth 1 --recursive
              https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
       - name: clone CLAP SDK (header-only)
         run: git clone --depth 1 --branch 1.2.8
              https://github.com/free-audio/clap.git external/clap
+
+      # ───────── POSIX (Linux/macOS): one cmake builds device + host ─────────
       - name: install deps (libusb + libsamplerate)
+        if: runner.os != 'Windows'
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libsamplerate0-dev
           else
             brew install libusb libsamplerate
           fi
-      - name: build the fake-hardware device (harp-deviced)
+      - name: build device (harp-deviced + harp-probe)
+        if: runner.os != 'Windows'
         run: |
           cmake -B build -S .
           cmake --build build --target harp-deviced harp-probe -j
-      - name: build the shell + host (+ AU host on macOS)
+      - name: build shell + host (+ AU host on macOS)
+        if: runner.os != 'Windows'
         run: |
           cmake -B build-vst -S tools/vst3-host
           cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host -j
           if [ "$RUNNER_OS" = "macOS" ]; then
             cmake --build build-vst --target harp-au au-host -j
           fi
-      - name: eth conformance (bit-exact, RTP audio plane, per-part demux over §8.7)
-        run: scripts/eth-tests.sh
-      - name: offline golden (deterministic host-paced bounce over §8.7)
-        run: scripts/offline-golden-eth.sh
-      - name: recall round-trip + §11.4 archive over the loopback
-        run: scripts/recall-eth-test.sh
-      - name: part-filter (§9.4 — an instance reflects only its own part's echoes)
-        run: scripts/part-filter-eth-test.sh
-      - name: reconnect (§8.7 fault-injection — host survives a mid-session device disconnect)
-        run: scripts/reconnect-eth-test.sh
-      - name: rtp-loss (§8.7 fault-injection — host tolerates RTP/UDP packet loss)
-        run: scripts/rtp-loss-eth-test.sh
-      - name: offline-edit (§15.5 — a param edited while the device is absent reaches it on reattach)
-        run: scripts/offline-edit-eth-test.sh
-      - name: diag-bundle (§14.4 v0 export + §16 anonymization — identity + verbatim counters)
-        run: scripts/diag-bundle-eth-test.sh
-      - name: "diag-bundle-host (§14.4 host-context-A — runtime getDiagBundle: verbatim device-section + host counters + audio-config)"
-        run: scripts/diag-bundle-host-eth-test.sh
-      # §14.3 host LoopbackMeasurer: digital round-trip RTT over the §8.7 host-paced loop.
-      # Median-of-cycles RTT with echo validation (frame+offset match) and outlier rejection.
-      # Strict ±1ms gate on Linux (TIMER_ABSTIME pacing); macOS/Windows assert WIRING ONLY
-      # (connected+armed+echo) because the runners' relative-nanosleep jitter inflates the RTT.
-      - name: "loopback (§14.3 host LoopbackMeasurer — digital round-trip RTT over §8.7; strict ±1ms on Linux, macOS/Windows wiring-only)"
-        run: scripts/loopback-eth-test.sh
-      # cross-format VST3<->AU recall over the loopback is verified LOCALLY (XFORMAT PASS)
-      # and on the desk rig, but the freshly-installed ad-hoc-signed AU won't instantiate
-      # on an ephemeral hosted-macOS runner (au-host "device busy" = the AU never loaded).
-      # Bringing it up in CI needs the AudioComponent registration/validation sorted out
-      # first; tracked as a follow-up so main stays green. cross-format-recall-test.sh
-      # already honors HARP_ETH_DEVICE, so re-enabling here is a one-step change.
+
+      # ───────── Windows: native MinGW device (static) + MSVC shell/host ─────────
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
+      - name: build device + probe (MinGW, static)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          cmake -B build-dev -G Ninja -DHARP_FUZZ=OFF \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc"
+          # harp-probe too (TCP transport only — no libusb in this MSYS2 env, so the
+          # CMake libusb probe fails and usb_io.c is omitted; the eth loopback tests
+          # use TCP, not USB). This is what lets recall/offline-edit/diag-bundle run
+          # on Windows — the suite auto-enables them once harp-probe exists.
+          cmake --build build-dev --target harp-deviced harp-probe
+          ./build-dev/harp-deviced.exe --bogus 2>&1 | head -3 || true   # smoke: it starts
+      - name: fetch libusb (prebuilt MSVC binaries)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ver = '1.0.27'
+          Invoke-WebRequest -UseBasicParsing `
+            "https://github.com/libusb/libusb/releases/download/v$ver/libusb-$ver.7z" `
+            -OutFile libusb.7z
+          New-Item -ItemType Directory -Force external/libusb-win | Out-Null
+          7z x libusb.7z -oexternal/libusb-win -y
+      - name: build shell + hosts (MSVC)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake -B build-vst -S tools/vst3-host -G "Visual Studio 17 2022" -A x64
+          cmake --build build-vst --config Release `
+            --target harp-vst3-host harp-shell harp-clap clap-host
+      - name: locate Windows binaries for the suite
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          {
+            echo "DEVICED=build-dev/harp-deviced.exe"
+            echo "HOSTBIN=$(find build-vst -name 'harp-vst3-host.exe' | head -1)"
+            echo "CHOST=$(find build-vst -name 'clap-host.exe' | head -1)"
+          } >> "$GITHUB_ENV"
+
+      # ───────── the shared §8.7 conformance suite (one source of truth, every OS) ─────────
+      # eth-suite.sh runs the full conformance list; per-test gating is capability-based
+      # (probe-dependent tests auto-skip where harp-probe isn't built; §9.4 part-filter is
+      # POSIX-only while the Windows panel is a stub) and every skip is logged, so adding a
+      # test makes it run on all three OSes by default — no silent per-platform drift.
+      - name: "eth conformance suite (§8.7 — bit-exact, ASRC, offline-golden, fault-injection, §11.4/§14/§15.5)"
+        shell: bash
+        run: scripts/eth-suite.sh

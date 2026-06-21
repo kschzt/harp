@@ -14,3 +14,7 @@ ogeth-*/
 reconnect-eth-state/
 rtploss-eth-state/
 corrupt-eth-state/
+recall-eth-state/
+recall-eth.state
+recall-eth.params
+offedit-eth-state/
