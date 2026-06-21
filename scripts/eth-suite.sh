@@ -83,6 +83,7 @@ run rtp-loss           scripts/rtp-loss-eth-test.sh          # §8.7 RTP/UDP pac
 run diag-bundle-host   scripts/diag-bundle-host-eth-test.sh  # §14.4 runtime getDiagBundle (probe-free)
 run loopback           scripts/loopback-eth-test.sh          # §14.3 round-trip RTT (probe-free)
 run reported-latency   scripts/reported-latency-test.sh      # §6.4 reported PDC latency (exact, all formats)
+run param-map-recall   scripts/param-map-recall-test.sh      # §13.4 recall warns on param-map drift
 
 # §9.4 per-part echo demux drives the device front panel over a unix socket; the MinGW
 # device replaces panel.c with a no-op stub, so the multi-instance path is POSIX-only
