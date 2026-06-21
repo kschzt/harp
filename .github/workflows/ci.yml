@@ -232,6 +232,8 @@ jobs:
           grep -q "CAS-TEST PASS" cas.out
       - name: reconcile relay (§11.4 four actions over the protocol, sim device + panel)
         run: ./scripts/reconcile-relay-test.sh
+      - name: web panel sidecar smoke (§11 — harp-panel.py JSON endpoints over the sim daemon)
+        run: ./scripts/web-panel-test.sh
 
   fuzz:
     runs-on: ubuntu-latest
