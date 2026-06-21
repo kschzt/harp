@@ -62,6 +62,7 @@ add_executable(ring-tests ring_tests.cpp)
 target_include_directories(ring-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../shell)
 enable_testing()
 add_test(NAME rings COMMAND ring-tests)
+set_tests_properties(rings PROPERTIES LABELS unit)
 
 # ---- mpe_zone unit tests (no SDK, no hardware): the classic-MPE zone-collapse
 # state machine the AU shell funnels raw MPE through. Pins the logic the hardware
@@ -69,6 +70,7 @@ add_test(NAME rings COMMAND ring-tests)
 add_executable(mpe-zone-tests mpe_zone_tests.cpp)
 target_include_directories(mpe-zone-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../shell)
 add_test(NAME mpe_zone COMMAND mpe-zone-tests)
+set_tests_properties(mpe_zone PROPERTIES LABELS unit)
 
 # ---- the HARP shell plugin (shell/) — needs libusb ----
 find_package(PkgConfig QUIET)
@@ -325,9 +327,13 @@ if(LIBUSB_FOUND)
   # LIBUSB_FOUND block beside tsan-host rather than in the harpcore-only
   # harp-tests. Runs in plain CI — it is the cloud-side complement to the
   # session-share HARDWARE test, which proves the same sharing on the bus.
-  # NOT WIN32: registry_tests.cpp uses POSIX mkdtemp/setenv (the registry it
-  # exercises is cross-platform, but this Unix-only harness is built and run on
-  # the Linux/macOS CI jobs, not under MSVC).
+  # NOT WIN32: the registry keying/refcount logic is cross-platform and already
+  # covered on Linux/macOS. The Windows blocker is NOT the harness's mkdtemp/setenv
+  # (those are already #ifndef _WIN32'd in registry_tests.cpp) — it is the heavy
+  # MSVC link graph this target needs: usb_io.c (vendored libusb), the full host
+  # stack over winsock, and harp_asrc (libsamplerate). Bringing that up under MSVC
+  # is its own task with low marginal value (pure logic, not a distinct Windows
+  # binary like device_codec), so registry stays Linux/macOS-only for now.
   if(NOT WIN32)
   add_executable(registry-tests
     ${HARP_ROOT}/tests/registry_tests.cpp
@@ -354,6 +360,7 @@ if(LIBUSB_FOUND)
   target_link_directories(registry-tests PRIVATE ${LIBUSB_LIBRARY_DIRS})
   target_link_libraries(registry-tests ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc)
   add_test(NAME registry COMMAND registry-tests)
+  set_tests_properties(registry PROPERTIES LABELS unit)
   message(STATUS "registry-tests: runtime registry keying/refcount unit test")
   endif() # NOT WIN32
 
