@@ -291,6 +291,50 @@ static void test_store(void) {
     harp_cbuf_free(&out);
 }
 
+/* §T10 crash-atomicity: a crash in write_atomic's torn window (after the tmp is
+ * fsync'd, before the atomic rename) MUST leave a ref old-or-new, never a hybrid.
+ * Only the happy-path CAS was covered; inject the crash with the store fault seam and
+ * prove the OLD COMPLETE ref survives + reads back cleanly (not torn/garbage). */
+static void test_store_crash_atomic(void) {
+    extern bool harp_store_fault_skip_rename;
+    harp_store s;
+    CHECK(harp_store_open(&s, "/tmp/harp-test-crashcas") == 0);
+
+    harp_hash hA, hB;
+    for (int i = 0; i < HARP_HASH_LEN; i++) {
+        hA.b[i] = (uint8_t)i;
+        hB.b[i] = (uint8_t)(0xff - i);
+    }
+
+    /* commit ref = A */
+    harp_ref r = {0};
+    snprintf(r.name, sizeof r.name, "live/proj");
+    r.unborn = false;
+    r.hash = hA;
+    r.generation = 1;
+    CHECK(harp_store_ref_write(&s, &r) == 0);
+
+    /* CRASH while writing ref = B (tmp fsync'd, rename never happens) */
+    harp_store_fault_skip_rename = true;
+    r.hash = hB;
+    r.generation = 2;
+    CHECK(harp_store_ref_write(&s, &r) != 0); /* the faulted write reports failure */
+    harp_store_fault_skip_rename = false;
+
+    /* RECOVERY: the ref reads back as the OLD COMPLETE A — never B, never torn */
+    harp_ref rr;
+    CHECK(harp_store_ref_read(&s, "live/proj", &rr) == 0); /* decodes cleanly, not garbage */
+    CHECK(!rr.unborn && harp_hash_eq(&rr.hash, &hA) && rr.generation == 1); /* OLD, intact */
+    CHECK(!harp_hash_eq(&rr.hash, &hB));                                    /* NOT the torn target */
+
+    /* positive control: a clean write DOES replace it with B */
+    r.hash = hB;
+    r.generation = 2;
+    CHECK(harp_store_ref_write(&s, &r) == 0);
+    CHECK(harp_store_ref_read(&s, "live/proj", &rr) == 0);
+    CHECK(!rr.unborn && harp_hash_eq(&rr.hash, &hB) && rr.generation == 2);
+}
+
 /* ref_list must enumerate hierarchical refs and return their LOGICAL names —
  * including the colons in archive timestamps. On Windows those colons are
  * escaped on disk (illegal in NTFS names); this proves the escape/unescape
@@ -551,6 +595,7 @@ int main(void) {
     test_frame();
     test_objects();
     test_store();
+    test_store_crash_atomic();
     test_store_reflist();
     test_envelope();
     test_audio_codec();
