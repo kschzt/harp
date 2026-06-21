@@ -32,6 +32,7 @@
 #ifdef HAVE_LIBUSB
 
 #include "usb_io.h"
+#include "usb_select.h" /* pure §15.2 device-match predicate (host-unit-tested) */
 
 #include <libusb.h>
 #include <stdio.h>
@@ -544,13 +545,9 @@ static harp_io *usb_open_core(usb_io *u, const char *want, bool want_vp,
         if (dd.iSerialNumber)
             libusb_get_string_descriptor_ascii(u->h, dd.iSerialNumber,
                                                (unsigned char *)serial, sizeof serial);
-        if (want && strcmp(want, serial) != 0) { /* wrong serial */
-            libusb_close(u->h);
-            u->h = NULL;
-            continue;
-        }
-        if (want_vp && (dd.idVendor != want_vid || dd.idProduct != want_pid)) {
-            libusb_close(u->h); /* wrong model — NEVER bind a different synth */
+        if (!harp_usb_dev_matches(serial, dd.idVendor, dd.idProduct,
+                                  want, want_vp, want_vid, want_pid)) {
+            libusb_close(u->h); /* wrong serial or wrong model — never bind a different synth */
             u->h = NULL;
             continue;
         }

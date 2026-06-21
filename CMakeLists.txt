@@ -147,7 +147,7 @@ set_tests_properties(core PROPERTIES LABELS unit)
 # every OS without a board. engine.c calls these same functions, so this is the
 # real logic; the chord/groove golden hashes pin it byte-identical on hardware.
 add_executable(harp-engine-logic-tests tests/harp_engine_logic_tests.c)
-target_include_directories(harp-engine-logic-tests PRIVATE device)
+target_include_directories(harp-engine-logic-tests PRIVATE device host)
 add_test(NAME engine_logic COMMAND harp-engine-logic-tests)
 set_tests_properties(engine_logic PROPERTIES LABELS unit)
 
