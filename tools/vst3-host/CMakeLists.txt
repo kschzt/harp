@@ -327,14 +327,16 @@ if(LIBUSB_FOUND)
   # LIBUSB_FOUND block beside tsan-host rather than in the harpcore-only
   # harp-tests. Runs in plain CI — it is the cloud-side complement to the
   # session-share HARDWARE test, which proves the same sharing on the bus.
-  # NOT WIN32: the registry keying/refcount logic is cross-platform and already
-  # covered on Linux/macOS. The Windows blocker is NOT the harness's mkdtemp/setenv
-  # (those are already #ifndef _WIN32'd in registry_tests.cpp) — it is the heavy
-  # MSVC link graph this target needs: usb_io.c (vendored libusb), the full host
-  # stack over winsock, and harp_asrc (libsamplerate). Bringing that up under MSVC
-  # is its own task with low marginal value (pure logic, not a distinct Windows
-  # binary like device_codec), so registry stays Linux/macOS-only for now.
-  if(NOT WIN32)
+  # ALL 3 OSes (incl. MSVC): the source list below is exactly what harp-shell
+  # compiles+links under MSVC — runtime.cpp + the host stack + harp_asrc, whose
+  # libsamplerate is FetchContent'd on Windows (see above) — and freerun.c's
+  # /experimental:c11atomics flag is a directory-scoped source property that applies
+  # to this target too, so it builds on Windows with no extra wiring. This is the
+  # ONLY place the registry keying/refcount runs under MSVC, whose process-global
+  # threading model is the most divergent of the three — exactly where a
+  # Windows-specific session-sharing bug could otherwise hide. (The hermetic
+  # temp-HOME's mkdtemp/setenv are #ifndef _WIN32'd; on Windows the default store
+  # dir is used — harmless on CI, and the test never reads the store.)
   add_executable(registry-tests
     ${HARP_ROOT}/tests/registry_tests.cpp
     ${HARP_ROOT}/shell/runtime.cpp
@@ -362,7 +364,6 @@ if(LIBUSB_FOUND)
   add_test(NAME registry COMMAND registry-tests)
   set_tests_properties(registry PROPERTIES LABELS unit)
   message(STATUS "registry-tests: runtime registry keying/refcount unit test")
-  endif() # NOT WIN32
 
   # SMTG emits the bundle under VST3/<config>/ ($<CONFIG> = multi-config safe).
   set(HARP_SHELL_BUNDLE ${CMAKE_BINARY_DIR}/VST3/$<CONFIG>/harp-shell.vst3)
