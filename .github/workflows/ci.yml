@@ -4,6 +4,7 @@ on: [push, pull_request]
 jobs:
   shell-macos:
     runs-on: macos-latest
+    timeout-minutes: 45   # cap a hung SDK clone/configure (no per-test alarm covers the build phase)
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: clone VST3 SDK
@@ -35,7 +36,7 @@ jobs:
           auval -v aumu rfdv HARP
       - name: pluginval (plugin-contract abuse, strictness 10)
         run: |
-          curl -sL https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_macOS.zip -o pv.zip
+          curl -sL https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_macOS.zip -o pv.zip
           unzip -q pv.zip
           # Locate the bundle by search — its config subdir (VST3/Release/…)
           # depends on the runner's default generator, which has changed before.
@@ -60,6 +61,7 @@ jobs:
     # failed configure produced nothing yet the step went green. Reproducible
     # toolchain beats latest; the pwsh steps now also fail loudly (see below).
     runs-on: windows-2022
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: clone VST3 SDK
@@ -124,7 +126,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           Invoke-WebRequest -UseBasicParsing `
-            https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Windows.zip `
+            https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_Windows.zip `
             -OutFile pv.zip
           Expand-Archive pv.zip -DestinationPath pv -Force
           $pv = (Get-ChildItem pv -Recurse -Filter pluginval.exe | Select-Object -First 1).FullName
@@ -159,6 +161,7 @@ jobs:
 
   shell-linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: clone VST3 SDK
@@ -177,7 +180,7 @@ jobs:
           ./build-vst/registry-tests
       - name: pluginval (plugin-contract abuse, strictness 10)
         run: |
-          curl -sL https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Linux.zip -o pv.zip
+          curl -sL https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_Linux.zip -o pv.zip
           unzip -q pv.zip && chmod +x pluginval
           # Locate the bundle by search — its config subdir depends on the generator.
           plug=$(find build-vst -maxdepth 4 -name 'harp-shell.vst3' -type d | head -1)
@@ -196,6 +199,7 @@ jobs:
 
   core:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: build
@@ -225,6 +229,7 @@ jobs:
 
   fuzz:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: build fuzz tree (clang, ASan everywhere, libFuzzer engines)
