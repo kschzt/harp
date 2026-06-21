@@ -42,7 +42,8 @@ fi
 [ -n "${VHOST:-}"   ] || VHOST="$HOSTBIN"
 [ -n "${CHOST:-}"   ] || CHOST="$(find1 build-vst "clap-host$EXE")"
 if [ -z "${PROBE:-}" ]; then
-  if   [ -x "./build/harp-probe" ];        then PROBE="./build/harp-probe"
+  if   [ -x "./build/harp-probe" ];         then PROBE="./build/harp-probe"
+  elif [ -x "./build-dev/harp-probe.exe" ]; then PROBE="./build-dev/harp-probe.exe"
   else PROBE="$(find1 . "harp-probe$EXE")"; fi
 fi
 export DEVICED HOSTBIN VHOST CHOST PROBE

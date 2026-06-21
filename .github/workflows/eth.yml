@@ -67,14 +67,18 @@ jobs:
           update: false
           install: >-
             mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
-      - name: build harp-deviced (MinGW, static)
+      - name: build device + probe (MinGW, static)
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
           cmake -B build-dev -G Ninja -DHARP_FUZZ=OFF \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc"
-          cmake --build build-dev --target harp-deviced
+          # harp-probe too (TCP transport only — no libusb in this MSYS2 env, so the
+          # CMake libusb probe fails and usb_io.c is omitted; the eth loopback tests
+          # use TCP, not USB). This is what lets recall/offline-edit/diag-bundle run
+          # on Windows — the suite auto-enables them once harp-probe exists.
+          cmake --build build-dev --target harp-deviced harp-probe
           ./build-dev/harp-deviced.exe --bogus 2>&1 | head -3 || true   # smoke: it starts
       - name: fetch libusb (prebuilt MSVC binaries)
         if: runner.os == 'Windows'
