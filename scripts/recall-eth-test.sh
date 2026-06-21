@@ -30,6 +30,11 @@ PORT="${PORT:-47902}"
 # recall-eth-dev.log is grepped by eth-asan.yml).
 STATEDIR=recall-eth-state
 STATEFILE=recall-eth.state
+# Also workspace-relative: written by bash sed, then read by python3 — which on the
+# Windows runner is NATIVE python, so a '/tmp/...' string inside the python code is
+# resolved against C:\ (no MSYS conversion of in-code path strings), not Git Bash's
+# /tmp. A relative path resolves to the same CWD on both sides.
+PARAMS=recall-eth.params
 fail() { echo "RECALL-ETH FAIL: $1"; exit 1; }
 [ -x "$DEVICED" ] || fail "$DEVICED not built"
 [ -x "$HOSTBIN" ] || fail "$HOSTBIN not built"
@@ -65,10 +70,11 @@ ARCH0=$(arch_count)
     || fail "load render"
 grep -q "restored\|SYNCED" /tmp/recall-eth.log || fail "no recall action logged"
 # 4. params restored AND the mutation was archived
-"$PROBE" $PD params 2>/dev/null | sed -nE 's/^ *\[([0-9]+)\].*[[:space:]]([0-9.]+)$/\1 \2/p' > /tmp/recall-eth.params
-python3 -c "
+"$PROBE" $PD params 2>/dev/null | sed -nE 's/^ *\[([0-9]+)\].*[[:space:]]([0-9.]+)$/\1 \2/p' > "$PARAMS"
+PARAMS="$PARAMS" python3 -c "
+import os
 v = {}
-for ln in open('/tmp/recall-eth.params'):
+for ln in open(os.environ['PARAMS']):
     a = ln.split()
     if len(a) == 2:
         try: v[int(a[0])] = float(a[1])
