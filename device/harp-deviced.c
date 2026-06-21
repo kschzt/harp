@@ -290,6 +290,8 @@ int main(int argc, char **argv) {
     memset(d, 0, sizeof *d);
     d->io = NULL;
     d->audio.tone_hz = tone_hz; /* test/measurement tone (render_output); 0 = engine */
+    d->audio.epoch = 1; /* §7.1: the device clock epoch starts at 1 — epoch 0 is reserved as the
+                         * (0,0)="now" event-timestamp sentinel, so a live epoch is never 0. */
     d->no_rate_lock = no_rate_lock; /* §8.7 ASRC fallback test hook (hello capability gate) */
     snprintf(d->serial, sizeof d->serial, "%s", serial);
     if (harp_store_open(&d->store, state_dir) != 0) {
