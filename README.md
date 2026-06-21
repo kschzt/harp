@@ -233,6 +233,37 @@ The shell can also be driven without any DAW, which is how it is tested:
     --set 3=0.8 --seconds 2 --out take.wav --hash
 ```
 
+### Path 4 — a DAW with no hardware (the simulated device over §8.7 Ethernet)
+
+Path 3 claims a real device over USB. To drive a DAW against the **simulated**
+device instead — no hardware, the daemon and the shell talking over the §8.7
+Ethernet/IP binding on loopback — run the device on a TCP port and point the shell
+at it with an env var:
+
+```sh
+./build/harp-deviced --port 47987 --serial SIM-0001 --state-dir /tmp/refdev
+```
+
+The shell dials `HARP_ETH_DEVICE=HOST:PORT` at its first connect (`selectDevice`).
+A GUI DAW does **not** inherit your terminal's environment, so set it where the OS
+launcher sees it, *before* launching the DAW:
+
+```sh
+launchctl setenv HARP_ETH_DEVICE 127.0.0.1:47987    # macOS; Linux/Windows: set it in the env the DAW inherits
+```
+
+Then launch the DAW, rescan plug-ins if needed, and drop **harp-shell** on a MIDI
+track — you'll see `connected: …` print in the device's terminal. Quit and relaunch
+the DAW if it was already open (the env is read at the first dial); `launchctl
+unsetenv HARP_ETH_DEVICE` returns to real USB hardware. The device may come up before
+or after the DAW — the shell's supervisor reconnects either way.
+
+At a 64-sample DAW buffer the shell reports ~768 samples of PDC latency: a 2-block
+ring cushion plus a block of event headroom, both sized by HARP's internal 256-sample
+pacing block (not your DAW buffer) and fully delay-compensated by the host. On a clean
+link the §8.7 RTP jitter buffer itself can be dialed down — see the `HARP_ETH_TARGET`
+and `HARP_ETH_NSAMPLES` knobs in `shell/runtime.h`.
+
 ## Documentation
 
 - **The specification**: [`spec/harp-spec-draft-0.3.md`](spec/harp-spec-draft-0.3.md).
