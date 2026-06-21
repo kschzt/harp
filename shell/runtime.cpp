@@ -125,7 +125,13 @@ bool HarpRuntime::helloAndIdentity() {
     harp_client_identity id;
     int rc = harp_client_hello(&client_, "harp-shell 0.1 (VST3)", &id);
     if (rc != 0) {
-        if (rc == HARP_CLIENT_EDEV)
+        if (rc == HARP_CLIENT_EINCOMPAT) {
+            /* §5.4: surface a firmware/host-update prompt with specifics — never fail silently. */
+            needsFirmwareUpdate_ = true;
+            log_msg("device protocol INCOMPATIBLE: device supports major %u..%u — a firmware or "
+                    "host update is required",
+                    client_.incompat_major_min, client_.incompat_major_max);
+        } else if (rc == HARP_CLIENT_EDEV)
             log_msg("device error on %s: %s %s", client_.err_method, client_.err_code,
                     client_.err_msg);
         return false;

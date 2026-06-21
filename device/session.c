@@ -345,7 +345,26 @@ static void handle_hello(device *d, const harp_env *e) {
         }
     }
     if (peer_major != PROTO_MAJOR) {
-        send_error(d, e->rid, e->method, "incompatible", "device supports protocol 1.x only");
+        /* §5.4: reply 'incompatible' WITH the device's supported major range
+         * (machine-readable, details key 2 = {0 min-major, 1 max-major}) so the
+         * host can surface a firmware/host-update prompt with specifics instead
+         * of an opaque failure. */
+        harp_cbuf m;
+        harp_cbuf_init(&m);
+        harp_env_head(&m, HARP_MSG_ERROR, e->rid, e->method, true);
+        harp_cbor_map(&m, 3);
+        harp_cbor_uint(&m, 0);
+        harp_cbor_text(&m, "incompatible");
+        harp_cbor_uint(&m, 1);
+        harp_cbor_text(&m, "device supports protocol 1.x only");
+        harp_cbor_uint(&m, 2);
+        harp_cbor_map(&m, 2);
+        harp_cbor_uint(&m, 0);
+        harp_cbor_uint(&m, PROTO_MAJOR); /* min supported major */
+        harp_cbor_uint(&m, 1);
+        harp_cbor_uint(&m, PROTO_MAJOR); /* max supported major */
+        send_ctl(d, &m);
+        harp_cbuf_free(&m);
         return;
     }
     /* §5.4: hello resets all per-session state — including a running stream */

@@ -162,6 +162,7 @@ public:
     bool start(uint32_t sampleRate);
     void stop();
     bool connected() const { return connected_.load(std::memory_order_acquire); }
+    bool needsFirmwareUpdate() const { return needsFirmwareUpdate_; } /* §5.4: device protocol too old */
     /* §8.3-over-§8.7: the shell calls this from its offline-render hook (VST3
      * processMode==kOffline, CLAP CLAP_RENDER_OFFLINE, AU OfflineRender). On an
      * Ethernet binding it selects HOST-PACED (deterministic offline bounce over TCP)
@@ -649,6 +650,8 @@ private:
                                 * from the shell's offline hook; read in selectDevice. */
     bool deviceRateLock_ = false; /* §8.7: device advertised "audio.rate-lock" (it honors
                                    * audio.trim). Captured in helloAndIdentity. */
+    bool needsFirmwareUpdate_ = false; /* §5.4: device rejected hello as 'incompatible' — set in
+                                        * helloAndIdentity so the UI can prompt for a firmware/host update. */
     bool bitExact_ = true; /* §8.7 clock mode (set at sessionUp): a free-running device that
                             * rate-locks => play 1:1 + audio.trim (bit-exact). One that does
                             * NOT => host ASRC-resample. Always true on USB (host-paced;

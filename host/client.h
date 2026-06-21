@@ -29,6 +29,7 @@
 
 #define HARP_CLIENT_EIO (-1)
 #define HARP_CLIENT_EDEV (-2)
+#define HARP_CLIENT_EINCOMPAT (-3) /* §5.4: hello rejected 'incompatible'; supported range in incompat_major_* */
 
 /* closure walks are bounded: a refdev-class state tree is < 10 objects;
  * 512 leaves room for real devices (wavetables, per-pad kits) */
@@ -78,6 +79,9 @@ typedef struct {
     char err_method[64];
     char err_code[64];
     char err_msg[128];
+
+    /* §5.4: device's supported protocol major range, valid after HARP_CLIENT_EINCOMPAT */
+    uint32_t incompat_major_min, incompat_major_max;
 } harp_client;
 
 void harp_client_init(harp_client *c, harp_io *io, harp_link *link, harp_store *store,

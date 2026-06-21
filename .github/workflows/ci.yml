@@ -230,6 +230,13 @@ jobs:
           # unpushed-closure target -> not-found.
           ./build/harp-probe -d 127.0.0.1:47800 -s /tmp/host cas-test | tee cas.out
           grep -q "CAS-TEST PASS" cas.out
+          # §5.4 graceful version negotiation: a current-major hello succeeds, and a
+          # forced major mismatch yields 'incompatible' WITH the device's supported
+          # range (so a host can prompt for a firmware/host update, not fail opaquely).
+          ./build/harp-probe -d 127.0.0.1:47800 -s /tmp/host version-test | tee vt-ctl.out
+          grep -q "VERSION-TEST PASS (control)" vt-ctl.out
+          HARP_FORCE_PROTO_MAJOR=2 ./build/harp-probe -d 127.0.0.1:47800 -s /tmp/host version-test | tee vt-mis.out
+          grep -q "VERSION-TEST PASS:" vt-mis.out
       - name: reconcile relay (§11.4 four actions over the protocol, sim device + panel)
         run: ./scripts/reconcile-relay-test.sh
       - name: web panel sidecar smoke (§11 — harp-panel.py JSON endpoints over the sim daemon)

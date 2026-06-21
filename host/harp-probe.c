@@ -1145,6 +1145,38 @@ static void cmd_cas_test(probe *p) {
            "bad-alg -> malformed\n");
 }
 
+/* version-test (§5.4): force a protocol-major mismatch and assert the device
+ * replies 'incompatible' WITH its supported range, so a host can prompt for a
+ * firmware/host update instead of failing opaquely. Driven by HARP_FORCE_PROTO_MAJOR
+ * (set => expect rejection; unset => negative control: a current-major hello succeeds). */
+static void cmd_version_test(probe *p) {
+    const char *fm = getenv("HARP_FORCE_PROTO_MAJOR");
+    printf("── version-test: protocol-major negotiation (§5.4)\n");
+    harp_client_identity id;
+    int rc = harp_client_hello(&p->client, "version-test 0.1", &id);
+    if (fm && fm[0]) {
+        if (rc != HARP_CLIENT_EINCOMPAT || strcmp(p->client.err_code, "incompatible") != 0) {
+            fprintf(stderr, "VERSION-TEST FAIL: forced major %s -> expected incompatible, got rc=%d code='%s'\n",
+                    fm, rc, rc ? p->client.err_code : "ok (accepted!)");
+            exit(1);
+        }
+        if (p->client.incompat_major_min == 0 && p->client.incompat_major_max == 0) {
+            fprintf(stderr, "VERSION-TEST FAIL: 'incompatible' carried no machine-readable supported range\n");
+            exit(1);
+        }
+        printf("VERSION-TEST PASS: major-%s hello -> incompatible, device supports major [%u..%u] "
+               "(host can prompt for a firmware/host update)\n",
+               fm, p->client.incompat_major_min, p->client.incompat_major_max);
+    } else {
+        if (rc != 0) {
+            fprintf(stderr, "VERSION-TEST FAIL (control): current-major hello rc=%d code='%s'\n",
+                    rc, rc ? p->client.err_code : "?");
+            exit(1);
+        }
+        printf("VERSION-TEST PASS (control): current-major hello accepted\n");
+    }
+}
+
 static void cmd_demo(probe *p, const char *addr) {
     (void)addr;
     p->verbose_ntf = true;
@@ -1333,7 +1365,9 @@ int main(int argc, char **argv) {
 #else
         die("built without libusb");
 #endif
-    } else if (strcmp(cmd, "cas-test") == 0)
+    } else if (strcmp(cmd, "version-test") == 0)
+        cmd_version_test(&p);
+    else if (strcmp(cmd, "cas-test") == 0)
         cmd_cas_test(&p);
     else if (strcmp(cmd, "demo") == 0)
         cmd_demo(&p, addr);
