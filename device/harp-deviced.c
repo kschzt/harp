@@ -237,6 +237,10 @@ int main(int argc, char **argv) {
     const char *rtp_out = NULL;                       /* §8.7 emit dest HOST:PORT */
     double tone_hz = 0.0;                             /* --tone HZ: SINAD test tone, 0=engine */
     bool no_rate_lock = false;                        /* --no-rate-lock: force host ASRC fallback */
+    bool pmh_flip = false;                            /* --param-map-hash-flip: TEST seam (§9.3/§13.4) —
+                                                       * advertise a 1-bit-altered param-map-hash to mimic
+                                                       * an engine-update param-map change, so the shell's
+                                                       * recall-drift WARNING can be exercised in CI */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc)
             state_dir = argv[++i];
@@ -260,6 +264,8 @@ int main(int argc, char **argv) {
             tone_hz = atof(argv[++i]);
         else if (strcmp(argv[i], "--no-rate-lock") == 0)
             no_rate_lock = true; /* §8.7: drop audio.rate-lock from hello → host ASRC path */
+        else if (strcmp(argv[i], "--param-map-hash-flip") == 0)
+            pmh_flip = true; /* §13.4 test seam: advertise a drifted param-map-hash */
         else {
             fprintf(stderr,
                     "usage: harp-deviced [--state-dir DIR] [--serial S] "
@@ -292,6 +298,7 @@ int main(int argc, char **argv) {
     }
     d->boot_count = bump_boot_count(state_dir);
     compute_param_map_hash(d);
+    if (pmh_flip) d->param_map_hash.b[0] ^= 0x01; /* §13.4 test seam: drift the advertised hash */
     pthread_mutex_init(&d->send_mu, NULL);
     pthread_mutex_init(&d->state_mu, NULL);
 

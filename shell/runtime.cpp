@@ -33,6 +33,13 @@ static void log_msg(const char *fmt, ...) {
     va_end(ap);
 }
 
+/* §9.3/§13.4 param-map drift warning — one message, emitted whether the project
+ * state arrived while connected or a bundle staged offline applied on connect. */
+static void log_param_map_drift() {
+    log_msg("recall: project's param map differs from the device's (engine update?) "
+            "— applying matching ids only");
+}
+
 /* §14.4 host-context-B: record a §12.1 state-machine transition into the
  * SessionHistory ring (control-path). Stamps wall-clock epoch + the current
  * stream MSC; copies a bounded `detail`. NOT on the audio path — see the ring's
@@ -1129,12 +1136,21 @@ bool HarpRuntime::sessionUp() {
          * bundleMutex_ itself. */
         bool haveBundle = false;
         harp_hash target{};
+        bool bundlePmhSet = false;
+        harp_hash bundlePmh{};
         {
             std::lock_guard<std::mutex> blk(bundleMutex_);
             haveBundle = hasBundle_;
             target = bundleTarget_;
+            bundlePmhSet = bundleParamMapHashSet_;
+            bundlePmh = bundleParamMapHash_;
         }
         if (haveBundle) {
+            /* §9.3/§13.4: a bundle that staged while offline applies now — warn if the
+             * device's automatable param map drifted from what the project expects
+             * (paramMapHash_ is valid only now that we're connected). */
+            if (bundlePmhSet && memcmp(bundlePmh.b, paramMapHash_.b, HARP_HASH_LEN) != 0)
+                log_param_map_drift();
             if (pushStateLocked(target)) {
                 log_msg("project state re-asserted");
                 recordLog(HARP_LOG_INFO, "recall", "project state re-asserted");
@@ -3427,6 +3443,8 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
     bool magicOk = false;
     harp_hash target{};
     bool haveTarget = false;
+    bool haveBundlePmh = false; /* §9.3/§13.4: the project's expected param-map-hash */
+    harp_hash bundlePmh{};
     for (uint64_t i = 0; i < n && !d.err; i++) {
         uint64_t key;
         if (!harp_cdec_uint(&d, &key)) return false;
@@ -3457,11 +3475,10 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
                                 const uint8_t *hp;
                                 size_t hl;
                                 if (!harp_cdec_bytes(&d, &hp, &hl)) return false;
-                                if (hl == HARP_HASH_LEN && connected() &&
-                                    memcmp(hp, paramMapHash_.b, HARP_HASH_LEN) != 0)
-                                    log_msg("recall: project's param map differs "
-                                            "from the device's (engine update?) — "
-                                            "applying matching ids only");
+                                if (hl == HARP_HASH_LEN) { /* retain; compared at apply */
+                                    memcpy(bundlePmh.b, hp, HARP_HASH_LEN);
+                                    haveBundlePmh = true;
+                                }
                             } else if (!harp_cdec_skip(&d))
                                 return false;
                         }
@@ -3530,11 +3547,18 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
         std::lock_guard<std::mutex> slk(bundleMutex_);
         hasBundle_ = true;
         bundleTarget_ = target;
+        bundleParamMapHashSet_ = haveBundlePmh; /* retained for the connect-apply re-check */
+        if (haveBundlePmh) bundleParamMapHash_ = bundlePmh;
         bundleParams_.clear();
         paramsFromStore(&store_, target, bundleParams_);
     }
 
     if (connected()) {
+        /* §9.3/§13.4: state arrived while connected — warn now if the device's
+         * automatable param map drifted from what the project expects. A bundle that
+         * staged offline gets the same check when it applies in the connect handler. */
+        if (haveBundlePmh && memcmp(bundlePmh.b, paramMapHash_.b, HARP_HASH_LEN) != 0)
+            log_param_map_drift();
         std::lock_guard<std::mutex> lk(ctlMutex_);
         return pushStateLocked(target);
     }
