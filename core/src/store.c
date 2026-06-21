@@ -187,6 +187,13 @@ bool harp_store_have(const harp_store *s, const harp_hash *h) {
     return path_readable(path) == 0;
 }
 
+/* Test seam (§T10 crash-atomicity): when set, write_atomic stops AFTER the tmp is
+ * written + fsync'd but BEFORE the atomic rename — leaving the complete tmp orphaned
+ * (the store ignores .tmp.* on read) and the target file UNCHANGED, exactly like a
+ * crash in the torn window. Default false; ONLY a test sets it, to prove that a crash
+ * leaves the ref old-or-new, never a hybrid. */
+bool harp_store_fault_skip_rename = false;
+
 /* Write a file atomically: tmp in the same directory, fsync, rename. */
 static int write_atomic(const char *path, const uint8_t *data, size_t len) {
     char tmp[HARP_STORE_PATH_MAX + 64];
@@ -205,6 +212,7 @@ static int write_atomic(const char *path, const uint8_t *data, size_t len) {
         return -1;
     }
     fclose(f);
+    if (harp_store_fault_skip_rename) return -1; /* simulated crash: tmp synced, rename never happens */
     if (rename_atomic(tmp, path) != 0) {
         remove(tmp);
         return -1;
