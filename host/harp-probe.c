@@ -1467,6 +1467,89 @@ static void cmd_demo(probe *p, const char *addr) {
     printf("no silent loss on mismatch — the founding asymmetry of §11.4.\n");
 }
 
+/* §4.4.3: mDNS/DNS-SD discovery of `_harp._tcp` devices. A production host folds this into
+ * its system device list; here it is a `discover` subcommand that browses the segment,
+ * resolves each instance to host:port, and reads the TXT `proto` — proving the §4.4.3
+ * round-trip end to end (and flagging a device that illegally leaks its serial in TXT, §16).
+ * Built only where dns_sd is available (native on macOS, avahi-compat's libdns_sd on Linux);
+ * elsewhere it degrades to a clear stub so the rest of harp-probe still builds. */
+#ifdef HAVE_DNS_SD
+#include <arpa/inet.h>
+#include <dns_sd.h>
+#include <sys/select.h>
+
+static void disc_resolve_cb(DNSServiceRef ref, DNSServiceFlags flags, uint32_t iface,
+                            DNSServiceErrorType err, const char *fullname, const char *host,
+                            uint16_t port, uint16_t txtlen, const unsigned char *txt, void *ctx) {
+    (void)ref;
+    (void)flags;
+    (void)iface;
+    (void)fullname;
+    if (err != kDNSServiceErr_NoError) return;
+    char proto[32] = "?";
+    uint8_t plen = 0;
+    const void *pv = TXTRecordGetValuePtr(txtlen, txt, "proto", &plen);
+    if (pv && plen < sizeof proto) {
+        memcpy(proto, pv, plen);
+        proto[plen] = 0;
+    }
+    /* §16: the TXT MUST carry no serial — flag a device that leaks one. */
+    uint8_t slen = 0;
+    bool leak = TXTRecordGetValuePtr(txtlen, txt, "serial", &slen) != NULL;
+    printf("  %s:%u\tproto=%s%s\n", host, ntohs(port), proto,
+           leak ? "\t[!! serial leaked in TXT — §16 violation]" : "");
+    *(int *)ctx += 1;
+}
+
+/* pump a DNSServiceRef's socket for ~deadline_ds tenths-of-a-second */
+static void disc_pump(DNSServiceRef ref, int deadline_ds) {
+    int fd = DNSServiceRefSockFD(ref);
+    for (int i = 0; i < deadline_ds; i++) {
+        fd_set rs;
+        FD_ZERO(&rs);
+        FD_SET(fd, &rs);
+        struct timeval tv = {0, 100000};
+        if (select(fd + 1, &rs, NULL, NULL, &tv) > 0) DNSServiceProcessResult(ref);
+    }
+}
+
+static void disc_browse_cb(DNSServiceRef ref, DNSServiceFlags flags, uint32_t iface,
+                           DNSServiceErrorType err, const char *name, const char *type,
+                           const char *domain, void *ctx) {
+    (void)ref;
+    if (err != kDNSServiceErr_NoError || !(flags & kDNSServiceFlagsAdd)) return;
+    printf("%s\n", name);
+    DNSServiceRef res;
+    if (DNSServiceResolve(&res, 0, iface, name, type, domain, disc_resolve_cb, ctx) ==
+        kDNSServiceErr_NoError) {
+        disc_pump(res, 20); /* up to ~2s to resolve this instance */
+        DNSServiceRefDeallocate(res);
+    }
+}
+
+static int cmd_discover(int secs) {
+    DNSServiceRef br;
+    int found = 0;
+    if (DNSServiceBrowse(&br, 0, 0, "_harp._tcp", NULL, disc_browse_cb, &found) !=
+        kDNSServiceErr_NoError) {
+        fprintf(stderr, "discover: DNSServiceBrowse failed\n");
+        return 1;
+    }
+    fprintf(stderr, "discover: browsing _harp._tcp for %ds...\n", secs);
+    disc_pump(br, secs * 10);
+    DNSServiceRefDeallocate(br);
+    fprintf(stderr, "discover: %d device address(es) resolved\n", found);
+    return found > 0 ? 0 : 1;
+}
+#else
+static int cmd_discover(int secs) {
+    (void)secs;
+    fprintf(stderr, "discover: built without dns_sd (Bonjour / avahi-compat libdns_sd) — "
+                    "mDNS discovery unavailable on this host build\n");
+    return 2;
+}
+#endif
+
 /* ---------------- main ---------------- */
 
 int main(int argc, char **argv) {
@@ -1501,6 +1584,10 @@ int main(int argc, char **argv) {
         return 0;
     }
 #endif
+
+    /* §4.4.3 `discover` is an mDNS browse of the segment: no device connection at all */
+    if (strcmp(cmd, "discover") == 0)
+        return cmd_discover(3);
 
     probe p = {0};
     sockhandle tcp_fd = SOCK_INVALID;

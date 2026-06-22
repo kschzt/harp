@@ -57,8 +57,10 @@ device g_dev;
  * See scripts/hw-tests-linux.sh recover(). */
 #ifndef _WIN32
 static char g_udc_path[256];
+static pid_t g_mdns_pid = 0; /* §4.4.3: the _harp._tcp advertiser child, 0 = none */
 static void on_term(int sig) {
     (void)sig;
+    if (g_mdns_pid > 0) kill(g_mdns_pid, SIGTERM); /* §4.4.3: stop advertising -> mDNS goodbye */
     if (g_udc_path[0]) {
         int fd = open(g_udc_path, O_WRONLY);
         if (fd >= 0) {
@@ -68,6 +70,36 @@ static void on_term(int sig) {
         }
     }
     _exit(0);
+}
+
+/* §4.4.3: advertise this device as `_harp._tcp` so hosts discover it without a hardcoded
+ * address. The TXT record carries `proto` (major.minor) + the framed-link `port` and MUST
+ * NOT carry the serial (§16 privacy — identity is fetched via core.hello). The instance
+ * name is advisory. Discovery-only: the host may still dial directly. Best-effort via the
+ * platform mDNS responder (avahi on Linux, dns-sd on macOS); a missing responder simply
+ * means no advertisement. The child is killed on shutdown (on_term) so the responder emits
+ * the mDNS goodbye record (§12.3 detach signal). */
+static void mdns_advertise(int port) {
+    char ports[16], txtproto[24], txtport[24];
+    snprintf(ports, sizeof ports, "%d", port);
+    snprintf(txtproto, sizeof txtproto, "proto=%d.%d", PROTO_MAJOR, PROTO_MINOR);
+    snprintf(txtport, sizeof txtport, "port=%d", port);
+    signal(SIGCHLD, SIG_IGN); /* auto-reap the advertiser (no waitpid/popen on the --port path) */
+    pid_t pid = fork();
+    if (pid < 0) return; /* best-effort */
+    if (pid == 0) {
+        int n = open("/dev/null", O_RDWR);
+        if (n >= 0) { dup2(n, 1); dup2(n, 2); }
+#ifdef __APPLE__
+        execlp("dns-sd", "dns-sd", "-R", "HARP refdev", "_harp._tcp", "local", ports,
+               txtproto, txtport, (char *)NULL);
+#else
+        execlp("avahi-publish-service", "avahi-publish-service", "HARP refdev", "_harp._tcp",
+               ports, txtproto, txtport, (char *)NULL);
+#endif
+        _exit(127); /* responder tool absent */
+    }
+    g_mdns_pid = pid;
 }
 #endif /* !_WIN32 — FFS UDC unbind is Linux gadget only; Windows CI exits via TerminateProcess */
 
@@ -241,6 +273,8 @@ int main(int argc, char **argv) {
                                                        * advertise a 1-bit-altered param-map-hash to mimic
                                                        * an engine-update param-map change, so the shell's
                                                        * recall-drift WARNING can be exercised in CI */
+    bool mdns = false; /* --mdns: §4.4.3 advertise _harp._tcp (off by default; the eth-suite
+                        * dials directly and the simulator shouldn't pollute the local segment) */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc)
             state_dir = argv[++i];
@@ -266,6 +300,8 @@ int main(int argc, char **argv) {
             no_rate_lock = true; /* §8.7: drop audio.rate-lock from hello → host ASRC path */
         else if (strcmp(argv[i], "--param-map-hash-flip") == 0)
             pmh_flip = true; /* §13.4 test seam: advertise a drifted param-map-hash */
+        else if (strcmp(argv[i], "--mdns") == 0)
+            mdns = true; /* §4.4.3: advertise _harp._tcp (--port mode; avahi on Linux, dns-sd on macOS) */
         else {
             fprintf(stderr,
                     "usage: harp-deviced [--state-dir DIR] [--serial S] "
@@ -365,6 +401,11 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "harp-deviced: serial %s, state %s, listening on %d (boot %llu)\n",
             d->serial, state_dir, port, (unsigned long long)d->boot_count);
+#ifndef _WIN32
+    if (mdns) mdns_advertise(port); /* §4.4.3: advertise _harp._tcp now the port is bound */
+#else
+    (void)mdns; /* mDNS advertise is POSIX-only (Windows is host-side, not a refdev target) */
+#endif
 
     for (;;) {
         harp_sockhandle cfd = accept(sfd, NULL, NULL);
