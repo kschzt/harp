@@ -333,7 +333,8 @@ typedef struct {
 
     /* counters (§14.2): frame_errors has render + session writers;
      * snapshots_taken has session + panel writers; all read cross-thread */
-    _Atomic uint64_t frame_errors, session_resets, snapshots_taken, audio_overruns, evt_stale_epoch;
+    _Atomic uint64_t frame_errors, session_resets, snapshots_taken, audio_overruns, evt_stale_epoch,
+        audio_late_frames;
 } device;
 
 extern device g_dev;
