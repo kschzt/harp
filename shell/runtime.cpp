@@ -145,6 +145,30 @@ bool HarpRuntime::helloAndIdentity() {
     engineVer_ = id.engine_ver;
     paramMapHash_ = id.param_map_hash;
     deviceRateLock_ = harp_client_has_cap(&id, "audio.rate-lock"); /* §8.7: honors audio.trim */
+    /* §12.2: if the device's engine MAJOR changed across this (re)connect, the staged
+     * project state may not fit the new engine — record it and hold the state read-only
+     * (sessionUp then skips the auto-push). engineVer_ is "MAJOR.MINOR.PATCH"; atoi reads
+     * the leading major. HARP_FORCE_ENGINE_MAJOR seeds the baseline so the conformance
+     * test can force a single-connect mismatch. A matching reconnect self-clears the flag. */
+    {
+        int curMajor = atoi(engineVer_.c_str());
+        if (!engineMajorSeeded_) {
+            const char *force = getenv("HARP_FORCE_ENGINE_MAJOR");
+            engineMajorSeen_ = (force && *force) ? atoi(force) : curMajor;
+            engineMajorSeeded_ = true;
+        }
+        if (curMajor != engineMajorSeen_) {
+            readOnlyDefault_ = true;
+            char d[80];
+            snprintf(d, sizeof d, "engine major %d -> %d: project state held read-only",
+                     engineMajorSeen_, curMajor);
+            recordTransition(HARP_ST_ATTACHED, HARP_ST_ATTACHED, HARP_TR_ENGINE_MAJOR_MISMATCH, d);
+            log_msg("%s", d);
+        } else {
+            readOnlyDefault_ = false;
+        }
+        engineMajorSeen_ = curMajor;
+    }
     /* §6.4 latency-profile (key 8): cache for the §14.3 LoopbackMeasurer's expected-
      * RTT. Off the loopback path this is just stored, never read (no render effect). */
     nLat_ = 0;
@@ -1154,7 +1178,14 @@ bool HarpRuntime::sessionUp() {
             bundlePmhSet = bundleParamMapHashSet_;
             bundlePmh = bundleParamMapHash_;
         }
-        if (haveBundle) {
+        if (haveBundle && readOnlyDefault_) {
+            /* §12.2: the engine major changed across this (re)connect — do NOT auto-apply
+             * the staged project state (it may not fit the new engine). Hold it read-only;
+             * the user re-applies explicitly once they've confirmed it still fits. */
+            log_msg("project state held read-only (engine major changed) — not auto-applied");
+            recordLog(HARP_LOG_WARN, "recall",
+                      "project state read-only: engine major changed, not auto-applied");
+        } else if (haveBundle) {
             /* §9.3/§13.4: a bundle that staged while offline applies now — warn if the
              * device's automatable param map drifted from what the project expects
              * (paramMapHash_ is valid only now that we're connected). */
