@@ -1142,6 +1142,95 @@ static void handle_evt_params(device *d, const harp_env *e) {
     harp_cbuf_free(&m);
 }
 
+/* §9.8 evt.format / evt.parse: value<->string for mappings a descriptor can't express.
+ * The refdev maps a stepped param's value to its enum label, a continuous param's value
+ * to a fixed-precision decimal, and back. SHOULD-level; hosts use it as a fallback. */
+static void handle_evt_format(device *d, const harp_env *e) {
+    uint64_t id = 0;
+    double val = 0;
+    if (e->has_body) {
+        harp_cdec b;
+        harp_cdec_init(&b, e->body, e->body_len);
+        uint64_t n, key;
+        if (harp_cdec_map(&b, &n))
+            for (uint64_t i = 0; i < n; i++) {
+                if (!harp_cdec_uint(&b, &key)) break;
+                if (key == 0) { if (!harp_cdec_uint(&b, &id)) break; }
+                else if (key == 1) { if (!harp_cdec_float(&b, &val)) break; }
+                else if (!harp_cdec_skip(&b)) break;
+            }
+    }
+    int idx = param_index((uint32_t)id);
+    if (idx < 0) { send_error(d, e->rid, e->method, "not-found", "unknown param"); return; }
+    const dev_param *p = &g_params[idx];
+    char out[64];
+    if (p->steps > 1 && p->labels) {
+        int si = (int)((float)val * p->steps); /* same mapping as the engine (param_step_index) */
+        if (si < 0) si = 0;
+        if (si >= p->steps) si = p->steps - 1;
+        snprintf(out, sizeof out, "%s", p->labels[si]);
+    } else {
+        snprintf(out, sizeof out, "%.3f", val);
+    }
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, true);
+    harp_cbor_map(&m, 1);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_text(&m, out);
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+
+static void handle_evt_parse(device *d, const harp_env *e) {
+    uint64_t id = 0;
+    char str[64] = "";
+    if (e->has_body) {
+        harp_cdec b;
+        harp_cdec_init(&b, e->body, e->body_len);
+        uint64_t n, key;
+        if (harp_cdec_map(&b, &n))
+            for (uint64_t i = 0; i < n; i++) {
+                if (!harp_cdec_uint(&b, &key)) break;
+                if (key == 0) { if (!harp_cdec_uint(&b, &id)) break; }
+                else if (key == 1) {
+                    const char *s;
+                    size_t sl;
+                    if (!harp_cdec_text(&b, &s, &sl)) break;
+                    if (sl >= sizeof str) sl = sizeof str - 1;
+                    memcpy(str, s, sl);
+                    str[sl] = 0;
+                } else if (!harp_cdec_skip(&b))
+                    break;
+            }
+    }
+    int idx = param_index((uint32_t)id);
+    if (idx < 0) { send_error(d, e->rid, e->method, "not-found", "unknown param"); return; }
+    const dev_param *p = &g_params[idx];
+    float val = 0;
+    bool ok = false;
+    if (p->steps > 1 && p->labels) {
+        for (int si = 0; si < p->steps; si++)
+            if (strcmp(str, p->labels[si]) == 0) {
+                val = ((float)si + 0.5f) / p->steps; /* mid-step: format(val) round-trips to this label */
+                ok = true;
+                break;
+            }
+    } else {
+        float v;
+        if (sscanf(str, "%f", &v) == 1) { val = v; ok = true; }
+    }
+    if (!ok) { send_error(d, e->rid, e->method, "malformed", "cannot parse value"); return; }
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, true);
+    harp_cbor_map(&m, 1);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_float(&m, val);
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+
 /* evt stream (§9.2): timestamped event messages. Slice 1: etype 1 (param
  * set) applied at "now"; other types skipped. Events have no responses.
  * Host-driven sets do NOT echo (§9.4). */
@@ -1539,6 +1628,10 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
         handle_state_refset(d, &e);
     else if (strcmp(e.method, "evt.params") == 0)
         handle_evt_params(d, &e);
+    else if (strcmp(e.method, "evt.format") == 0)
+        handle_evt_format(d, &e);
+    else if (strcmp(e.method, "evt.parse") == 0)
+        handle_evt_parse(d, &e);
     else if (strcmp(e.method, "audio.start") == 0)
         handle_audio_start(d, &e);
     else if (strcmp(e.method, "audio.stop") == 0)

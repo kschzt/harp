@@ -1336,6 +1336,83 @@ static void cmd_notif_test(probe *p) {
     printf("NOTIF-TEST PASS: unknown notification ignored, device still serving\n");
 }
 
+/* --- §9.8 evt.format / evt.parse helpers + round-trip test --- */
+static void evt_format(probe *p, uint64_t id, double val, char *out, size_t n) {
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    req_head(p, &req, "evt.format", true);
+    harp_cbor_map(&req, 2);
+    harp_cbor_uint(&req, 0); harp_cbor_uint(&req, id);
+    harp_cbor_uint(&req, 1); harp_cbor_float(&req, val);
+    harp_env e = request(p, &req, &rsp);
+    out[0] = 0;
+    if (e.has_body) {
+        harp_cdec b;
+        harp_cdec_init(&b, e.body, e.body_len);
+        uint64_t m, key;
+        const char *s;
+        size_t sl;
+        if (harp_cdec_map(&b, &m) && m >= 1 && harp_cdec_uint(&b, &key) && key == 0 &&
+            harp_cdec_text(&b, &s, &sl)) {
+            if (sl >= n) sl = n - 1;
+            memcpy(out, s, sl);
+            out[sl] = 0;
+        }
+    }
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+}
+
+static double evt_parse_val(probe *p, uint64_t id, const char *str) {
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    req_head(p, &req, "evt.parse", true);
+    harp_cbor_map(&req, 2);
+    harp_cbor_uint(&req, 0); harp_cbor_uint(&req, id);
+    harp_cbor_uint(&req, 1); harp_cbor_text(&req, str);
+    harp_env e = request(p, &req, &rsp);
+    double val = -1;
+    if (e.has_body) {
+        harp_cdec b;
+        harp_cdec_init(&b, e.body, e.body_len);
+        uint64_t m, key;
+        if (harp_cdec_map(&b, &m) && m >= 1 && harp_cdec_uint(&b, &key) && key == 0)
+            harp_cdec_float(&b, &val);
+    }
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+    return val;
+}
+
+/* format-test (§9.8): evt.format/evt.parse round-trip for a continuous param (Filter
+ * Cutoff, id 3) and a stepped param (Arp Mode, id 9, enum labels). */
+static void cmd_format_test(probe *p) {
+    do_hello(p);
+    printf("── format-test: evt.format/evt.parse round-trip (§9.8)\n");
+    char s1[64];
+    evt_format(p, 3, 0.5, s1, sizeof s1);
+    double v1 = evt_parse_val(p, 3, s1);
+    double diff = v1 - 0.5;
+    if (diff < 0) diff = -diff;
+    if (diff > 0.01) {
+        fprintf(stderr, "FORMAT-TEST FAIL: continuous 0.5 -> '%s' -> %g\n", s1, v1);
+        exit(1);
+    }
+    printf("   continuous (Filter Cutoff): 0.5 -> '%s' -> %g: OK\n", s1, v1);
+    char s2[64], s3[64];
+    evt_format(p, 9, 0.0, s2, sizeof s2);
+    double v2 = evt_parse_val(p, 9, s2);
+    evt_format(p, 9, v2, s3, sizeof s3);
+    if (s2[0] == 0 || strcmp(s2, s3) != 0) {
+        fprintf(stderr, "FORMAT-TEST FAIL: stepped '%s' -> %g -> '%s'\n", s2, v2, s3);
+        exit(1);
+    }
+    printf("   stepped (Arp Mode): 0.0 -> '%s' -> %g -> '%s': OK\n", s2, v2, s3);
+    printf("FORMAT-TEST PASS: evt.format/evt.parse round-trip (continuous + stepped)\n");
+}
+
 static void cmd_demo(probe *p, const char *addr) {
     (void)addr;
     p->verbose_ntf = true;
@@ -1530,6 +1607,8 @@ int main(int argc, char **argv) {
         cmd_epoch_test(&p);
     else if (strcmp(cmd, "notif-test") == 0)
         cmd_notif_test(&p);
+    else if (strcmp(cmd, "format-test") == 0)
+        cmd_format_test(&p);
     else if (strcmp(cmd, "cas-test") == 0)
         cmd_cas_test(&p);
     else if (strcmp(cmd, "demo") == 0)
