@@ -18,6 +18,16 @@
 #define HARP_FRAME_MAX_PAYLOAD 65536u
 #define HARP_FLAG_FIN 0x0001u
 
+/* §4.2.1 per-stream reassembled-MESSAGE bounds. ctl is 64 KiB (small RPC envelopes —
+ * the largest in practice is a ~3 KiB diag.bundle; bulk data rides OBJ); evt and log
+ * are 4 KiB (single events / single log records). OBJ has no fixed message cap — it is
+ * flow-controlled by core.credit instead. Enforced in harp_link_recv during reassembly:
+ * an over-cap message is malformed -> session reset (§12.4), and capping mid-reassembly
+ * also bounds the accumulator so a peer can't grow it without ever sending FIN. */
+#define HARP_CTL_MAX_PAYLOAD 65536u
+#define HARP_EVT_MAX_PAYLOAD 4096u
+#define HARP_LOG_MAX_PAYLOAD 4096u
+
 #define HARP_STREAM_CTL 0
 #define HARP_STREAM_EVT 1
 #define HARP_STREAM_OBJ 2
