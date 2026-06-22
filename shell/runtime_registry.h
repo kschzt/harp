@@ -26,6 +26,7 @@
  */
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 class HarpRuntime;
@@ -72,3 +73,22 @@ void runtime_release(const RuntimeHandle &h);
  * crash, and it is torn down at the last release. In practice instances of one
  * project activate/deactivate together, so this is an edge. P5 (where attached
  * instances become per-part drivers) introduces real owner handoff. */
+
+/* §8.4 admission-control ledger — process-global, keyed by transport PATH (one USB
+ * controller / eth segment carries several device sessions but ONE bandwidth budget).
+ * Bandwidth is bytes/sec; reservationKey names one live session on the path. Lives in the
+ * registry TU because that is the one shared, process-global home reached by every
+ * independent per-device runtime. Its own mutex (distinct from the registry's), and the
+ * functions take no other lock — callers MUST NOT take ctlMutex_ while holding the ledger.
+ *   ledger_reserve  — admit needBps iff (sum of OTHER sessions on pathKey) + needBps <=
+ *                     capacityBps; records the row on admit, nothing on refusal. ALWAYS
+ *                     fills outReserved (others' usage) / outCapacity / outAvail so the
+ *                     caller can refuse WITH the computed budget. Returns whether admitted.
+ *   ledger_release  — drop this session's row (idempotent: erase-if-present).
+ *   ledger_reserved — total bytes/sec reserved on pathKey (ALL sessions) + the path
+ *                     capacity, for the §14.4 diagnostic bundle. */
+bool ledger_reserve(const std::string &pathKey, const std::string &reservationKey,
+                    uint64_t needBps, uint64_t capacityBps,
+                    uint64_t *outReserved, uint64_t *outCapacity, uint64_t *outAvail);
+void ledger_release(const std::string &pathKey, const std::string &reservationKey);
+uint64_t ledger_reserved(const std::string &pathKey, uint64_t *outCapacity);

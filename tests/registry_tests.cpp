@@ -26,6 +26,7 @@
  *   - idempotence: release of a default/zeroed handle is a no-op.
  */
 #include <cstdio>
+#include <thread> /* §8.4 admission ledger concurrency sub-test */
 #include <cstdlib>
 #ifndef _WIN32
 #include <unistd.h> /* mkdtemp, setenv — POSIX only */
@@ -142,6 +143,69 @@ static void test_release_of_zeroed_handle_is_noop() {
      * not a registry property — the contract only promises the zeroed no-op.) */
 }
 
+/* §8.4 admission ledger: cross-session aggregation on one path, refuse-WITH-budget, exact
+ * release, re-negotiation idempotency (sum-excluding-own-row), no leak, and >=8 sessions. */
+static void test_admission_ledger() {
+    uint64_t reserved = 0, cap = 0, avail = 0;
+    /* SIM-A reserves 384000 of a 500000 path -> admitted; 116000 left. */
+    CHECK(ledger_reserve("eth:T1", "SIM-A", 384000, 500000, &reserved, &cap, &avail));
+    /* SIM-B wants 384000 but only 116000 remains -> REFUSED, and the COMPUTED budget is returned. */
+    CHECK(!ledger_reserve("eth:T1", "SIM-B", 384000, 500000, &reserved, &cap, &avail));
+    CHECK(reserved == 384000 && cap == 500000 && avail == 116000);
+    /* release A -> the path frees up; B now fits. */
+    ledger_release("eth:T1", "SIM-A");
+    CHECK(ledger_reserve("eth:T1", "SIM-B", 384000, 500000, &reserved, &cap, &avail));
+    /* re-negotiation: SIM-B re-reserves a WIDER figure on the SAME key — it re-meters against
+     * OTHERS only (none here), never refuses itself, never double-counts. */
+    CHECK(ledger_reserve("eth:T1", "SIM-B", 480000, 500000, &reserved, &cap, &avail));
+    CHECK(reserved == 0); /* no OTHER session on this path */
+    CHECK(ledger_reserved("eth:T1", &cap) == 480000 && cap == 500000);
+    ledger_release("eth:T1", "SIM-B");
+    CHECK(ledger_reserved("eth:T1", &cap) == 0);
+
+    /* no leak: reserve+release N times returns the path to 0. */
+    for (int i = 0; i < 100; i++) {
+        CHECK(ledger_reserve("eth:T2", "loop", 1000, 1000000, &reserved, &cap, &avail));
+        ledger_release("eth:T2", "loop");
+    }
+    CHECK(ledger_reserved("eth:T2", &cap) == 0);
+
+    /* >=8 concurrent sessions admit under a realistic segment budget (8*384000 = 3.07 MB/s
+     * vs 110 MB/s) — confirms admission never caps the session COUNT, only genuine bandwidth. */
+    char key[16];
+    for (int i = 0; i < 8; i++) {
+        snprintf(key, sizeof key, "S%d", i);
+        CHECK(ledger_reserve("eth:8", key, 384000, 110ull * 1024 * 1024, &reserved, &cap, &avail));
+    }
+    CHECK(ledger_reserved("eth:8", &cap) == 8ull * 384000);
+    for (int i = 0; i < 8; i++) {
+        snprintf(key, sizeof key, "S%d", i);
+        ledger_release("eth:8", key);
+    }
+    CHECK(ledger_reserved("eth:8", &cap) == 0);
+
+    /* concurrency: N threads each reserve+release a DISTINCT key on the SAME path many times.
+     * After the join the path must be EXACTLY 0 — a dropped lock_guard races the std::map and
+     * TSan flags it; a torn read/write would leave a nonzero residue here even without TSan. */
+    {
+        const int NT = 8;
+        std::thread th[NT];
+        for (int t = 0; t < NT; t++)
+            th[t] = std::thread([t]() {
+                char k[16];
+                snprintf(k, sizeof k, "T%d", t);
+                uint64_t r, c, a;
+                for (int i = 0; i < 2000; i++) {
+                    ledger_reserve("eth:mt", k, 1000, 100000000, &r, &c, &a);
+                    ledger_release("eth:mt", k);
+                }
+            });
+        for (int t = 0; t < NT; t++) th[t].join();
+        uint64_t c2 = 0;
+        CHECK(ledger_reserved("eth:mt", &c2) == 0);
+    }
+}
+
 int main() {
     /* Hermetic store: keep the ctor's harp_store_open out of the real cache.
      * POSIX only; on Windows the default store dir is used (harmless — the
@@ -156,6 +220,7 @@ int main() {
     test_different_serials_distinct_runtimes();
     test_empty_serial_always_fresh();
     test_release_of_zeroed_handle_is_noop();
+    test_admission_ledger();
 
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

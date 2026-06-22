@@ -1,4 +1,5 @@
 #include "runtime.h"
+#include "runtime_registry.h" /* §8.4 admission ledger (ledger_reserve/release/reserved) */
 #include "ump.h"
 #include "usb_transport.h" /* the concrete USB binding selectDevice() wraps */
 #include "eth_transport.h" /* the §8.7 Ethernet binding (bit-exact host-locked) */
@@ -182,6 +183,34 @@ bool HarpRuntime::helloAndIdentity() {
     return true;
 }
 
+namespace {
+/* §8.4 practical-bulk capacity for a usb-speed enum (bytes/sec). Only High-Speed=30 MB/s
+ * is spec-anchored (§8.4 topology note); the rest are informative engineering estimates. */
+uint64_t usbSpeedBps(int speed) {
+    switch (speed) {
+    case 5: return 700ull * 1024 * 1024; /* SuperSpeed+ */
+    case 4: return 350ull * 1024 * 1024; /* SuperSpeed */
+    case 3: return 30ull * 1024 * 1024;  /* High-Speed (the one spec-anchored figure) */
+    case 2: return 1ull * 1024 * 1024;   /* Full-Speed */
+    default: return 1ull * 1024 * 1024;  /* Low / unknown: conservative floor */
+    }
+}
+/* §8.4 capacity of the transport PATH (bytes/sec). Priority: the HARP_ADMISSION_BUDGET env
+ * seam (test/field override) wins; else a real USB controller's practical-bulk speed; else
+ * a nominal segment budget for eth/loopback — no real controller is host-observable from a
+ * TCP socket, so that figure is a DECLARED policy number, not a measurement. */
+uint64_t pathCapacityBps(ShellTransport *t) {
+    if (const char *e = getenv("HARP_ADMISSION_BUDGET")) {
+        unsigned long long v = strtoull(e, nullptr, 10); /* 64-bit: a >2GB budget overflows long on MSVC */
+        if (v > 0) return (uint64_t)v;
+    }
+    harp_usb_topology topo;
+    if (t && t->kind() == ShellTransport::Kind::Usb && t->usbTopology(&topo) && topo.ok)
+        return usbSpeedBps(topo.speed);
+    return 110ull * 1024 * 1024; /* eth/loopback nominal (~1 Gbit practical): declared policy */
+}
+} // namespace
+
 bool HarpRuntime::audioStart(uint32_t rate) {
     /* P5b: the audio.start subscription is the UNION of every instance's
      * requested output slots — the owner's outSlots_ (the main mix {0,1} by
@@ -199,6 +228,54 @@ bool HarpRuntime::audioStart(uint32_t rate) {
     /* the reader demuxes RTP packets by this width (USB carries it per-frame). Set
      * before audio.start so it is live before the device's first post-start RTP. */
     unionWidth_.store((uint16_t)unionSlots_.size(), std::memory_order_relaxed);
+
+    /* §8.4 admission control: before audio.start reaches the wire, reserve this session's
+     * audio bandwidth in the process-global per-path ledger, and refuse explicitly with the
+     * computed budget if the transport path is full — never degrade silently. needBps is
+     * exactly what this branch puts on the wire: the OUT union plus the IN columns declared
+     * (0 free-running RTP, 1 loopback, else 2 host-paced), float32. */
+    {
+        uint32_t outCh = (uint32_t)unionSlots_.size();
+        uint32_t inCh = freeRunning_.load(std::memory_order_relaxed) ? 0u : (loopbackArmed() ? 1u : 2u);
+        uint64_t needBps = (uint64_t)(outCh + inCh) * 4ull * rate;
+        std::string pathKey;
+        if (transport_ && transport_->kind() == ShellTransport::Kind::Usb) {
+            harp_usb_topology topo;
+            pathKey = std::string("usb:") +
+                      ((transport_->usbTopology(&topo) && topo.ok) ? topo.controller : "unknown");
+        } else {
+            pathKey = "eth:global"; /* loopback/eth: one shared local segment (honest for the refdev) */
+        }
+        /* resKey identifies THIS runtime's one session uniquely + stably. The serial is a
+         * grouping HINT, not a uniqueness guarantee (two serial-less USB gadgets both report
+         * "?"), and shared instances ride one runtime — so the runtime pointer is the right
+         * key: unique per session, identical for every instance attached to it. */
+        std::string resKey = "rt:" + std::to_string((uintptr_t)this);
+        uint64_t cap = pathCapacityBps(transport_);
+        if (admittedBps_ && admittedPath_ != pathKey) {
+            /* rebound to a DIFFERENT path (controller/segment): free the old path's row. A
+             * SAME-path re-negotiation keeps our row — ledger_reserve overwrites it on admit
+             * (excludes our own key when summing) or leaves it intact on refusal, so a refused
+             * widen never throws away the still-valid prior reservation. */
+            ledger_release(admittedPath_, admittedKey_);
+            admittedBps_ = 0;
+        }
+        uint64_t reserved = 0, capOut = 0, avail = 0;
+        if (!ledger_reserve(pathKey, resKey, needBps, cap, &reserved, &capOut, &avail)) {
+            log_msg("§8.4 admission: REFUSED audio.start on %s — requested %llu B/s (%u out + %u in "
+                    "ch x 4 B x %u Hz float32), available %llu B/s, capacity %llu B/s",
+                    pathKey.c_str(), (unsigned long long)needBps, outCh, inCh, rate,
+                    (unsigned long long)avail, (unsigned long long)capOut);
+            recordLog(HARP_LOG_ERROR, "admission", "audio.start refused: path bandwidth budget exceeded");
+            recordTransition(HARP_ST_NEGOTIATED, HARP_ST_DETACHED, HARP_TR_AUDIO_START,
+                             "§8.4 admission refused: requested bandwidth exceeds path budget");
+            return false; /* audio.start NEVER reaches the wire (state matches the wire-failure edge) */
+        }
+        admittedPath_ = pathKey;
+        admittedKey_ = resKey;
+        admittedBps_ = needBps;
+    }
+
     harp_cbuf req, rsp;
     harp_cbuf_init(&req);
     harp_cbuf_init(&rsp);
@@ -272,6 +349,11 @@ bool HarpRuntime::audioStart(uint32_t rate) {
     bool ok = request(&req, &rsp, &e);
     harp_cbuf_free(&req);
     harp_cbuf_free(&rsp);
+    if (!ok && admittedBps_) { /* §8.4: audio.start failed ON THE WIRE — release here, because the
+                                * sessionUp false-branch deletes transport_ WITHOUT a sessionDown */
+        ledger_release(admittedPath_, admittedKey_);
+        admittedBps_ = 0;
+    }
     return ok;
 }
 
@@ -431,6 +513,12 @@ void HarpRuntime::audioRenegotiateLocked() {
         recordTransition(HARP_ST_STREAMING, HARP_ST_STREAMING, HARP_TR_AUDIO_START,
                          "re-negotiation: audio.start failed");
         recordLog(HARP_LOG_WARN, "reneg", "re-negotiation: audio.start failed");
+        /* §8.4: a re-neg audio.start that FAILS (incl. an admission refusal — the device is
+         * already stopped, so the host-paced reader only times out r==0, never r<0) would
+         * leave connected_=true and the supervisor parked in feeder() forever: a silent wedge.
+         * Drop connected_ so the supervisor reaps + reconnects, re-running audio.start (and
+         * admission) from a clean sessionUp — it self-heals once the path frees up. */
+        connected_.store(false, std::memory_order_release);
     } else {
         renegCount_.fetch_add(1, std::memory_order_release);
         log_msg("re-negotiated audio stream: %zu union slot(s) now streamed",
@@ -1340,6 +1428,12 @@ void HarpRuntime::sessionDown() {
             if (r < 0) break;
             quiet = (r == 0) ? quiet + 1 : 0;
         }
+    }
+    /* §8.4: free this session's bandwidth reservation before the transport goes. Idempotent
+     * (admittedBps_==0 = nothing held: never streamed, or already released on a wire failure). */
+    if (admittedBps_) {
+        ledger_release(admittedPath_, admittedKey_);
+        admittedBps_ = 0;
     }
     harp_client_free(&client_);
     delete transport_; /* UsbTransport::~ closes the claim; the libusb ctx survives */
@@ -3103,6 +3197,21 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
                        transport_->kind() == ShellTransport::Kind::Usb &&
                        transport_->usbTopology(&usbTopo) && usbTopo.ok;
 
+    /* §8.4 path-utilization (key 14): present whenever bound — this session's transport
+     * path id, computed exactly like audioStart's admission key (the live reservation's
+     * cached path if streaming, else the current binding's). Its reserved/capacity come
+     * from the process-global admission ledger below. */
+    bool haveUtil = transport_ != nullptr;
+    std::string utilPath;
+    if (haveUtil) {
+        if (admittedBps_ && !admittedPath_.empty())
+            utilPath = admittedPath_;
+        else if (transport_->kind() == ShellTransport::Kind::Usb)
+            utilPath = std::string("usb:") + (usbTopo.ok ? usbTopo.controller : "unknown");
+        else
+            utilPath = "eth:global";
+    }
+
     /* Top-level diag-bundle map. v3 fills keys 0-6, 8, 9, 11 + (10 USB | 13 Eth);
      * key 7/12 (loopback-results) is a later sub-step (a vN writer omits unfilled
      * sections). key 9 is present only when a session is up (audio-config is
@@ -3117,6 +3226,7 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
     nkeys++;                       /* key 11 clock-stats (ALWAYS) */
     if (haveUsbTopo) nkeys++;      /* key 10 usb-topology (USB binding) */
     if (isEth) nkeys++;            /* key 13 net-topology (Ethernet binding) */
+    if (haveUtil) nkeys++;         /* key 14 §8.4 path-utilization (any binding) */
     harp_cbor_map(&out, nkeys);
 
     /* KEY 0: magic. */
@@ -3127,7 +3237,7 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
      * adds host-context-C: clock-stats (key 11, always) + usb-topology (key 10,
      * USB) | net-topology (key 13, Ethernet) + transport enum (audio-config key 12). */
     harp_cbor_uint(&out, 1);
-    harp_cbor_uint(&out, 3);
+    harp_cbor_uint(&out, 4); /* v4: §8.4 path-utilization (top key 14) */
 
     /* KEY 2: bundle-meta { 0 => tstamp [epoch, msc], 1 => tool }. */
     harp_cbor_uint(&out, 2);
@@ -3282,6 +3392,29 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
     /* KEY 13: net-topology — Ethernet binding ONLY (the §8.7 loopback path). §16
      * clears host:port (key 0); the jitter depth + net.offline flag RETAINED. */
     if (isEth) emitNetTopology(&out, anonymize);
+
+    /* KEY 14: §8.4 path-utilization — audio bandwidth reserved on THIS session's transport
+     * path vs the path capacity, from the process-global admission ledger. The spec's
+     * "per-controller utilization in the diagnostic bundle": on real USB the controller's
+     * figures, on the refdev loopback the single eth:global path's. { 0 => path-id,
+     * 1 => reserved B/s, 2 => capacity B/s, 3 => per-mille }. §16 clears the path-id (0);
+     * the numeric gauges are retained (reveal whether/how-much, not the controller name). */
+    if (haveUtil) {
+        uint64_t ucap = 0; /* the capacity the path was last metered against — self-consistent
+                            * with `reserved` (vs recomputing, which could diverge if a USB
+                            * topology query transiently fails at diag time). */
+        uint64_t ures = ledger_reserved(utilPath, &ucap);
+        harp_cbor_uint(&out, 14);
+        harp_cbor_map(&out, 4);
+        harp_cbor_uint(&out, 0);
+        harp_cbor_text(&out, anonymize ? "" : utilPath.c_str());
+        harp_cbor_uint(&out, 1);
+        harp_cbor_uint(&out, ures);
+        harp_cbor_uint(&out, 2);
+        harp_cbor_uint(&out, ucap);
+        harp_cbor_uint(&out, 3);
+        harp_cbor_uint(&out, ucap ? (ures * 1000 / ucap) : 0);
+    }
 
     std::vector<uint8_t> result(out.buf, out.buf + out.len);
     harp_cbuf_free(&out);

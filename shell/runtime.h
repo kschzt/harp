@@ -659,6 +659,12 @@ private:
     bool readOnlyDefault_ = false; /* §12.2: the engine major changed across (re)connect — the staged
                                     * project state may not fit the new engine, so HOLD it read-only
                                     * (don't auto-apply on connect); the user re-applies explicitly. */
+    /* §8.4 admission: the bandwidth reservation this runtime currently holds in the
+     * process-global ledger. admittedBps_==0 means "no live reservation"; the cached
+     * path/key let release run against a half-torn-down transport_. Touched only under
+     * ctlMutex_ (audioStart / sessionDown), so no atomic needed. */
+    std::string admittedPath_, admittedKey_;
+    uint64_t admittedBps_ = 0;
     bool bitExact_ = true; /* §8.7 clock mode (set at sessionUp): a free-running device that
                             * rate-locks => play 1:1 + audio.trim (bit-exact). One that does
                             * NOT => host ASRC-resample. Always true on USB (host-paced;

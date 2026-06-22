@@ -106,7 +106,7 @@ if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then
     my $b = CBOR::XS->new->decode(<$fh>);
     ref $b eq "HASH" or die "top-level is not a CBOR map\n";
     $b->{0} eq "harpd" or die "key 0 != harpd\n";
-    $b->{1} == 3       or die "key 1 (version) != 3 (host-context-C adds clock-stats(11) + usb(10)|net(13) + transport): $b->{1}\n";
+    $b->{1} == 4       or die "key 1 (version) != 4 (v4 adds §8.4 path-utilization key 14): $b->{1}\n";
     exists $b->{4}     or die "key 4 (device-section) absent\n";
     ref $b->{4} eq "HASH" or die "device-section is not a map\n";
     exists $b->{4}{1}  or die "device-section key 1 (counters) absent\n";
@@ -198,7 +198,17 @@ if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then
     # loopback is an Ethernet binding, so key 10 MUST be ABSENT (the test must not require it).
     !exists $b->{10}    or die "key 10 (usb-topology) present on the §8.7 Ethernet loopback — it is USB-hardware-only\n";
 
-    print "   decode OK: key0 harpd, key1 v3, key4.device-section(usb_errors+serial), key5.host-counters(0..6), key6.session-history(", scalar(@{$b->{6}}), " transitions ->STREAMING), key8.runtime-logs(", scalar(@{$b->{8}}), " records), key9.audio-config(rate=48000,block=256,transport=ethernet,out-slots=[@{$b->{9}{3}}]), key11.clock-stats(recovery=$rec,drift=$b->{11}{0}), key13.net-topology(host:port=$b->{13}{0},jitter=$b->{13}{2}), key10.usb-topology ABSENT(eth)\n";
+    # §8.4 — key 14: path-utilization from the admission ledger. Over the §8.7 loopback the
+    # path is "eth:global"; reserved/capacity/per-mille are present + numeric. Captured while
+    # streaming, so the live session audio reservation is in the ledger (reserved > 0).
+    exists $b->{14}     or die "key 14 (§8.4 path-utilization) absent — admission ledger not emitted\n";
+    ref $b->{14} eq "HASH" or die "path-utilization (key 14) is not a map\n";
+    defined $b->{14}{0} && $b->{14}{0} eq "eth:global" or die "path-util path-id (key 0) != eth:global on loopback: $b->{14}{0}\n";
+    exists $b->{14}{1} && exists $b->{14}{2} && exists $b->{14}{3} or die "path-util missing reserved/capacity/per-mille (keys 1/2/3)\n";
+    $b->{14}{1} > 0     or die "path-util reserved (key 1) == 0 while streaming — the audio reservation is not in the ledger\n";
+    $b->{14}{2} > 0     or die "path-util capacity (key 2) == 0\n";
+
+    print "   decode OK: key0 harpd, key1 v4, key4.device-section(usb_errors+serial), key5.host-counters(0..6), key6.session-history(", scalar(@{$b->{6}}), " transitions ->STREAMING), key8.runtime-logs(", scalar(@{$b->{8}}), " records), key9.audio-config(rate=48000,block=256,transport=ethernet,out-slots=[@{$b->{9}{3}}]), key11.clock-stats(recovery=$rec,drift=$b->{11}{0}), key13.net-topology(host:port=$b->{13}{0},jitter=$b->{13}{2}), key14.path-util(path=$b->{14}{0},reserved=$b->{14}{1},cap=$b->{14}{2}), key10.usb-topology ABSENT(eth)\n";
 
     # ── COMPREHENSIVE §16 anon assertion ──────────────────────────────────────
     # The SECOND bundle must clear EVERY emitted PII leaf to "" IN PLACE while
@@ -270,6 +280,13 @@ if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then
     $a->{13}{2} == $b->{13}{2} or die "anon: net-topology jitter depth (key 2) changed — must be RETAINED\n";
     exists $a->{13}{5} or die "anon: net-topology net.offline (key 5) dropped — must be RETAINED\n";
 
+    # (4) §8.4 path-utilization (key 14): path-id(0) cleared; reserved(1)/capacity(2)/per-mille(3)
+    # RETAINED (reveal how-much, not the controller name — §16).
+    exists $a->{14} or die "anon: key 14 (path-utilization) absent — anon must preserve structure\n";
+    defined $a->{14}{0} && $a->{14}{0} eq "" or die "anon: path-util path-id (key 0) not cleared to \"\" (§16)\n";
+    $a->{14}{1} == $b->{14}{1} or die "anon: path-util reserved (key 1) changed — must be RETAINED\n";
+    $a->{14}{2} == $b->{14}{2} or die "anon: path-util capacity (key 2) changed — must be RETAINED\n";
+
     # (4) clock-stats (key 11): NO PII — the anon pass leaves it untouched. Its
     # leaves are LIVE numeric gauges (drift, recovery, asrc/ratelock sub-stats), so
     # assert the key-set + numeric type survive, NOT cross-capture value-equality.
@@ -331,6 +348,7 @@ else
   pii_present_absent "Part 1 L"                "channel-map name (identity key 7 entry.2)"
   pii_present_absent "refdev sim "             "build-id (identity key 9)"
   pii_present_absent "127.0.0.1:$PORT"         "net-topology host:port (key 13.0)"
+  pii_present_absent "eth:global"              "§8.4 path-util path-id (key 14.0)"
   pii_present_absent "audio stream negotiated" "runtime-log msg (key 8 log-record.3)"
   pii_present_absent "reader + event pump up"  "state-transition detail (key 6 transition.4)"
   # RETAINED tokens (reveal whether/type, NOT value) — PRESENT in BOTH bundles:
@@ -350,8 +368,8 @@ else
   retained_both "usb_errors"        "device counter key (key 4 device-section.1)"
   retained_both "refdev-null"       "engine-id (identity key 4.0, vid/pid-grade text token)"
   retained_both "x.harp-refdev.sim" "capability token (identity key 6)"
-  echo "   anon grep OK: all 8 emitted PII strings cleared in anon; all 4 retained tokens kept in both"
+  echo "   anon grep OK: all 9 emitted PII strings cleared in anon; all 4 retained tokens kept in both"
 fi
 
 kill -9 "$DP" 2>/dev/null; DP=""
-echo "DIAG-BUNDLE-HOST PASS (host getDiagBundle v3: 'harpd' + verbatim device-section (usb_errors+$SERIAL) + host-counters key5 + session-history key6 + runtime-logs key8 + audio-config key9(transport=ethernet) + clock-stats key11(recovery) + net-topology key13(host:port); key10 usb-topology ABSENT on the Ethernet loopback (real-hardware-only); §16 anon clears detail/msg + net host:port, keeps tags + clock-stats drift/recovery; $(wc -c <"$BUNDLE") bytes)"
+echo "DIAG-BUNDLE-HOST PASS (host getDiagBundle v4: 'harpd' + verbatim device-section (usb_errors+$SERIAL) + host-counters key5 + session-history key6 + runtime-logs key8 + audio-config key9(transport=ethernet) + clock-stats key11(recovery) + net-topology key13(host:port) + §8.4 path-utilization key14(path/reserved/cap); key10 usb-topology ABSENT on the Ethernet loopback (real-hardware-only); §16 anon clears detail/msg + net host:port + path-id, keeps tags + clock-stats drift/recovery + util gauges; $(wc -c <"$BUNDLE") bytes)"
