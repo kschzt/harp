@@ -65,9 +65,10 @@ any conforming host:
   sample-exactly, survives loop wraps, and renders a *byte-identical
   groove* — determinism extended to musical time.
 - **Identity, timing, diagnostics** — engine versioning and parameter-map
-  hashing protect old songs from new firmware, latency is measured (never
-  guessed), and error counters at every layer end "it glitched" support
-  threads with evidence.
+  hashing protect old songs from new firmware (a breaking engine-major change
+  reopens the project read-only; an incompatible protocol surfaces an update
+  prompt, not a dead session), latency is measured (never guessed), and honest
+  error counters at every layer end "it glitched" support threads with evidence.
 - **Roadie-proof sessions** — unplug the cable mid-song and plug it back:
   the shell reconnects, re-asserts the project's state, and audio resumes.
   Hostile or corrupt wire input ends in a clean session reset, never a
@@ -97,8 +98,10 @@ VST3 Note Expression, CLAP per-note parameter modulation, and MPE (CLAP, VST3,
 and raw 16-channel MIDI into the AU — Logic / Ableton Live). It is *not* yet an
 ecosystem of instruments; building richer synths and shipping real devices on
 top of the protocol is the roadmap, not a claim about the present. The spec is
-an **editor's draft** (0.3.8): breaking changes are expected and negotiated at
-`hello`. The four-actions recall UI and the Ethernet binding are next — the
+an **editor's draft** (0.4.0): breaking changes are expected and negotiated at
+`hello`. The four-actions recall UI is next, and the spec-conformance periphery
+(mDNS discovery, credit flow-control, event transactions, admission control, the
+version/update prompt) has been filled in over the §8.7 Ethernet/IP binding — the
 [Status](#status) section is the full breakdown.
 
 ## Repository map
@@ -276,7 +279,10 @@ or after the DAW — the shell's supervisor reconnects either way.
   — a design pass at the §4.4 network binding (RTP/UDP + PTP for audio, the
   framed link over TCP for control, trusted-segment security, an AES67 bridge
   reserved). Now folded into the spec (§4.4, §7.3, §8.7) and clock-correlation
-  prototyped on hardware (PTP ~22 µs idle); no runtime implementation yet.
+  prototyped on hardware (PTP ~22 µs idle). The §8.7 binding is now implemented and
+  CI-gated (`eth.yml`, three OSes): the framed control link over TCP, the RTP/UDP
+  audio plane, the host-locked rate-trim loop and ASRC, and host-paced offline
+  bounce — PTP-grade sync stays a prototype, not yet wired into the runtime.
 - **Pi runbook**: [`scripts/pi-bringup.md`](scripts/pi-bringup.md) —
   provisioning, the sudo-free deploy loop, USB debugging tricks.
 
@@ -287,7 +293,8 @@ or after the DAW — the shell's supervisor reconnects either way.
 - **Protocol core** — `harp-core` (framing, deterministic CBOR, SHA-256,
   content-addressed object store), `harp-recall` (save / snapshot / restore),
   `harp-stream` (free-running and host-paced; `audio.deterministic` +
-  `audio.offline-rate`), and the USB binding.
+  `audio.offline-rate`), and two transport bindings: USB (FunctionFS gadget) and
+  the §8.7 Ethernet/IP binding (framed control over TCP + an RTP/UDP audio plane).
 - **The plugin shell** — VST3 on macOS/Windows/Linux, an Audio Unit on macOS,
   and a CLAP on macOS/Windows/Linux (all three byte-identical), driving the device in
   Ableton Live (macOS + Windows), Renoise (Windows), and an automated headless
@@ -346,6 +353,14 @@ or after the DAW — the shell's supervisor reconnects either way.
 
 **Gated in CI on every push:**
 
+- **Ethernet/IP conformance suite** against the simulated device on three OSes
+  (`scripts/eth-suite.sh`, the `eth` badge): the framed control link + RTP/UDP
+  audio plane with no hardware — bit-exact live play with a host-locked rate-trim
+  loop, multichannel ASRC, deterministic host-paced offline bounce, mid-session
+  reconnect, RTP packet-loss tolerance, hostile-frame fault injection, and the
+  spec-conformance closures (credit flow-control §4.2.1, event transactions §9.6,
+  admission control §8.4, engine-major read-only §12.2, the §14.4 diag bundle and
+  §14.3 loopback, plus mDNS discovery §4.4.3 on macOS).
 - **Hardware suite** on a real Pi (`scripts/hw-tests-linux.sh`, the `hw`
   badge): 21 sub-tests — 19 pass / 2 skip on the one-board, no-AU CI rig (the
   two-device and VST3↔AU-recall tests self-skip there). It gates the **golden
@@ -371,10 +386,13 @@ or after the DAW — the shell's supervisor reconnects either way.
   T15/T17 (byte-identical renders), T16 (event timing).
 
 **Not yet:** the four-safe-actions UI (v0 auto-resolves by Push-with-archive),
-the deeper diagnostics (`diag.bundle` / loopback, §14), runtime/shell process split
-(§15.1), firmware management (§13), class-audio coexistence (§8.5), free-running
-ASRC for analog devices, the Ethernet/IP binding implementation (§4.4 — specced
-+ clock-prototyped, no runtime yet).
+runtime/shell process split (§15.1), firmware management (§13), class-audio
+coexistence (§8.5), free-running ASRC for an analog device, the `core.changed` /
+`core.bye` senders (§5.5), and PTP-grade Ethernet clock sync wired into the
+runtime (the §8.7 binding ships with a rate-trim loop + ASRC; PTP stays a
+hardware prototype). Spec conformance is otherwise complete across core and
+normative periphery; **§13 firmware management and certification is the remaining
+bar.**
 
 The spec is an **editor's draft**: breaking changes expected, version
 negotiated at `core.hello`. Changes flow through HARP Enhancement Proposals
