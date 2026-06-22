@@ -548,6 +548,44 @@ static bool mem_read(harp_io *io, void *buf, size_t n) {
     return true;
 }
 
+/* §4.2: two streams whose partial frames are INTERLEAVED on the wire must reassemble
+ * independently — the per-stream acc[] demux. harp_link_send only ever emits one
+ * stream's frames contiguously, so this hand-builds the interleaved frame sequence. */
+static void write_frame(mem_io *m, uint8_t stream, bool fin, const char *payload, size_t len) {
+    harp_frame_hdr h = {HARP_FRAME_FVER, stream, (uint16_t)(fin ? HARP_FLAG_FIN : 0),
+                        (uint32_t)len};
+    uint8_t hdr[HARP_FRAME_HDR_LEN];
+    harp_frame_hdr_encode(&h, hdr);
+    harp_cbuf_put(&m->wire, hdr, HARP_FRAME_HDR_LEN);
+    if (len) harp_cbuf_put(&m->wire, payload, len);
+}
+
+static void test_link_interleave(void) {
+    mem_io m;
+    m.io.read_exact = mem_read;
+    m.io.write_all = mem_write;
+    harp_cbuf_init(&m.wire);
+    m.rpos = 0;
+    /* stream 0 and stream 2 each split across two frames, interleaved */
+    write_frame(&m, 0, false, "foo", 3);
+    write_frame(&m, 2, false, "BAR", 3);
+    write_frame(&m, 0, true, "bar", 3);
+    write_frame(&m, 2, true, "qux", 3);
+
+    harp_link l;
+    harp_link_init(&l);
+    uint8_t stream = 0xff;
+    harp_cbuf msg;
+    harp_cbuf_init(&msg);
+    CHECK(harp_link_recv(&m.io, &l, &stream, &msg) == 0);
+    CHECK(stream == 0 && msg.len == 6 && memcmp(msg.buf, "foobar", 6) == 0);
+    CHECK(harp_link_recv(&m.io, &l, &stream, &msg) == 0);
+    CHECK(stream == 2 && msg.len == 6 && memcmp(msg.buf, "BARqux", 6) == 0);
+    harp_cbuf_free(&msg);
+    harp_cbuf_free(&m.wire);
+    harp_link_free(&l);
+}
+
 /* §4.2 framed link: a message of any size round-trips byte-exact through the
  * <=65536-per-frame chunking — empty (one FIN frame, no payload), sub-frame,
  * exactly one frame, and the multi-frame boundaries where an off-by-one in the
@@ -635,6 +673,7 @@ static void test_hash_read(void) {
 int main(void) {
     test_sha256();
     test_link_fragmentation();
+    test_link_interleave();
     test_event_channel();
     test_cbor_encode();
     test_cbor_roundtrip();

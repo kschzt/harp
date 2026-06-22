@@ -48,7 +48,7 @@ here is the normative *periphery*. Closed one at a time.
 | §4.4.3 | mDNS/DNS-SD `_harp._tcp` discovery entirely absent (host dials a hardcoded `HARP_ETH_DEVICE`); TXT proto/port + serial-omission privacy unimplemented | TODO |
 | §8.4 | ≥8 concurrent sessions each with own correlation/ASRC (one runtime owns one transport); admission-control / refuse-with-budget | TODO |
 | §9.6 | transaction plane (etypes 2/3/4 silently skipped; no txn capability) | TODO (deprioritized) |
-| tests | untested-but-implemented: §5.2 ignore-unknown-notification, §4.2 per-stream interleave reassembly, §11.5 storage counters, §10.4 snapshot rsp hash/gen | TODO |
+| tests | untested-but-implemented: §5.2 ignore-unknown-notification, §4.2 per-stream interleave, §11.5 storage counters, §10.4 snapshot rsp hash/gen | PARTIAL — §5.2 (`harp-probe notif-test`: an unknown NOTIFICATION is ignored + the device keeps serving — the audit's one status downgrade) and §4.2 per-stream interleave (`test_link_interleave`: two streams' interleaved frames demux independently) now covered + CI-gated. REMAINING: §11.5 storage-counter + §10.4 snapshot hash/gen value assertions |
 
 Observed 2026-06-21 on the real KR260 over the `eth1` direct link (two genuinely
 independent clocks, which localhost loopback cannot exercise): the §8.7 free-running

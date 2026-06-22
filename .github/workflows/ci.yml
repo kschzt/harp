@@ -240,6 +240,9 @@ jobs:
           # §7.1/§8.6 time.epoch on a sample-rate change + stale-epoch event discard (evt_stale_epoch)
           ./build/harp-probe -d 127.0.0.1:47800 -s /tmp/host epoch-test | tee epoch.out
           grep -q "EPOCH-TEST PASS" epoch.out
+          # §5.2 the device ignores unknown notifications + keeps serving
+          ./build/harp-probe -d 127.0.0.1:47800 -s /tmp/host notif-test | tee notif.out
+          grep -q "NOTIF-TEST PASS" notif.out
       - name: reconcile relay (§11.4 four actions over the protocol, sim device + panel)
         run: ./scripts/reconcile-relay-test.sh
       - name: web panel sidecar smoke (§11 — harp-panel.py JSON endpoints over the sim daemon)
