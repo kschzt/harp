@@ -44,6 +44,17 @@ After=harp-gadget.service
 Conflicts=harp-deviced.service
 
 [Service]
+# Wipe the device state store before each (re)start. The §11.4 recall ARCHIVE refs accumulate
+# UNBOUNDED (one per recall — a long CI run reached 9.5K refs / 121K objects / 525M on this
+# board), and a bloated store makes getState/snapshot fail outright (RECALL / RECALL-PERPART /
+# SESSION-SHARE all failed as "device busy / component getState failed" until the store was
+# cleared). A fresh store per start keeps the recall/save path reliable and the "0 -> 1 archive"
+# assertion deterministic. The hw.yml deploy restarts this unit at the start of every run, so
+# this is the "wipe the store at the beginning of the hw run" — done root-clean here since the
+# daemon (User=root) owns the store. NOTE: the unbounded archive growth AND getState's failure
+# on a large store are REAL device bugs (a long-lived device hits both) — tracked in debt.md;
+# this only keeps the CI rig clean. Leading '-' tolerates a missing dir.
+ExecStartPre=-/usr/bin/rm -rf /home/ci/harp-state
 ExecStart=/home/ci/harp/build/harp-deviced --state-dir /home/ci/harp-state --serial $SERIAL --ffs /dev/ffs-harp
 Restart=always
 RestartSec=1
