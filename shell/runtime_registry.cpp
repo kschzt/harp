@@ -10,6 +10,7 @@
  */
 #include "runtime_registry.h"
 
+#include <cstdint>
 #include <map>
 #include <mutex>
 
@@ -31,6 +32,22 @@ std::mutex &registryMutex() {
 }
 std::map<std::string, Entry> &registryTable() {
     static std::map<std::string, Entry> t;
+    return t;
+}
+
+/* §8.4 admission ledger: audio bandwidth reserved per transport PATH, one row per live
+ * session. A SEPARATE mutex from registryMutex() — the ledger functions take no other
+ * lock, so they nest with nothing (audioStart holds ctlMutex_ when it reserves). */
+struct PathLedger {
+    std::map<std::string, uint64_t> reservations; /* reservationKey -> bytes/sec */
+    uint64_t capacity = 0;                         /* last capacity seen on this path (diag) */
+};
+std::mutex &ledgerMutex() {
+    static std::mutex m;
+    return m;
+}
+std::map<std::string, PathLedger> &ledgerTable() {
+    static std::map<std::string, PathLedger> t;
     return t;
 }
 
@@ -111,4 +128,48 @@ void runtime_release(const RuntimeHandle &h) {
         toDestroy->stop(); /* joins supervisor/reader/pump, like ~HarpRuntime */
         delete toDestroy;
     }
+}
+
+/* ---- §8.4 admission ledger ---- */
+
+bool ledger_reserve(const std::string &pathKey, const std::string &reservationKey,
+                    uint64_t needBps, uint64_t capacityBps, uint64_t *outReserved,
+                    uint64_t *outCapacity, uint64_t *outAvail) {
+    std::lock_guard<std::mutex> lk(ledgerMutex());
+    auto &table = ledgerTable();
+    /* sum every OTHER session's reservation on this path — excluding our OWN row makes a
+     * re-negotiation that overwrites its figure inherently safe (no double-count, no leak).
+     * find() (not operator[]) so a REFUSAL on a transient/unknown path leaves no zombie row. */
+    auto it = table.find(pathKey);
+    uint64_t used = 0;
+    if (it != table.end())
+        for (const auto &kv : it->second.reservations)
+            if (kv.first != reservationKey) used += kv.second;
+    uint64_t avail = capacityBps > used ? capacityBps - used : 0;
+    if (outReserved) *outReserved = used;
+    if (outCapacity) *outCapacity = capacityBps;
+    if (outAvail) *outAvail = avail;
+    if (needBps > avail) return false; /* refuse: record NOTHING, leave the table clean */
+    PathLedger &pl = table[pathKey];   /* admit: now create/get the row */
+    pl.capacity = capacityBps;
+    pl.reservations[reservationKey] = needBps;
+    return true;
+}
+
+void ledger_release(const std::string &pathKey, const std::string &reservationKey) {
+    std::lock_guard<std::mutex> lk(ledgerMutex());
+    auto it = ledgerTable().find(pathKey);
+    if (it != ledgerTable().end()) it->second.reservations.erase(reservationKey); /* idempotent */
+}
+
+uint64_t ledger_reserved(const std::string &pathKey, uint64_t *outCapacity) {
+    std::lock_guard<std::mutex> lk(ledgerMutex());
+    auto it = ledgerTable().find(pathKey);
+    uint64_t used = 0, cap = 0;
+    if (it != ledgerTable().end()) {
+        for (const auto &kv : it->second.reservations) used += kv.second;
+        cap = it->second.capacity;
+    }
+    if (outCapacity) *outCapacity = cap;
+    return used;
 }
