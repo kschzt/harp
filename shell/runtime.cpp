@@ -1428,11 +1428,15 @@ void HarpRuntime::sessionDown() {
             if (r < 0) break;
             quiet = (r == 0) ? quiet + 1 : 0;
         }
-        /* §5.5: orderly goodbye so the device can release host-related locks promptly
-         * instead of inferring our exit from a dead link. Best-effort and last (after the
-         * stream is stopped + drained): on a device-gone teardown the send just fails fast,
-         * and we drop the client immediately below regardless. */
-        harp_client_bye(&client_);
+        /* §5.5: the shell does NOT auto-send core.bye on sessionDown. It looks clean, but on
+         * the USB/FunctionFS path the device's session-close (d->closing) is exactly the
+         * "host sees a real disconnect" behavior the daemon's UDC-unbind machinery is built
+         * around — so a bye on EVERY teardown slows/disrupts the immediate re-claim the hw
+         * suite does per test (connect -> 0.5s settle render -> teardown -> re-claim -> render),
+         * producing wrong/slow renders. Over loopback it was instant + clean (eth-suite green),
+         * which hid the difference; the USB rig caught it. The host caller exists
+         * (harp_client_bye) and is exercised by harp-probe core-test; wiring it into the shell
+         * teardown is deferred until it can be made USB-safe (eth-binding-only, or post-settle). */
     }
     /* §8.4: free this session's bandwidth reservation before the transport goes. Idempotent
      * (admittedBps_==0 = nothing held: never streamed, or already released on a wire failure). */
