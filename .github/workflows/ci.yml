@@ -243,6 +243,9 @@ jobs:
           # §5.2 the device ignores unknown notifications + keeps serving
           ./build/harp-probe -d 127.0.0.1:47800 -s /tmp/host notif-test | tee notif.out
           grep -q "NOTIF-TEST PASS" notif.out
+          # §9.8 evt.format/evt.parse round-trip (continuous + stepped params)
+          ./build/harp-probe -d 127.0.0.1:47800 -s /tmp/host format-test | tee format.out
+          grep -q "FORMAT-TEST PASS" format.out
       - name: reconcile relay (§11.4 four actions over the protocol, sim device + panel)
         run: ./scripts/reconcile-relay-test.sh
       - name: web panel sidecar smoke (§11 — harp-panel.py JSON endpoints over the sim daemon)
