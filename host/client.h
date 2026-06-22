@@ -34,6 +34,7 @@
 /* closure walks are bounded: a refdev-class state tree is < 10 objects;
  * 512 leaves room for real devices (wavetables, per-pad kits) */
 #define HARP_CLIENT_MAX_CLOSURE 512
+#define HARP_CLIENT_SENDQ_CAP 1024 /* §4.2.1 obj-send queue; > MAX_CLOSURE so an honest push can't overflow */
 
 #define HARP_CLIENT_MAX_CAPS 32
 typedef struct {
@@ -69,6 +70,16 @@ typedef struct {
     harp_cbuf msg;     /* rx scratch */
     uint64_t next_rid;
     uint64_t peer_credit; /* core.credit grants from the device */
+    /* §4.2.1 credit flow-control (symmetric to the device). `granted` is the sliding
+     * window of credit WE granted the device for its D->H sends — decremented as we
+     * consume, re-granted when it halves (this was entirely missing: the device would
+     * otherwise stall once our initial grant drained). sendq holds object hashes we must
+     * push but couldn't yet for lack of peer_credit; push_closure self-pumps the link to
+     * drain it (no background thread raises peer_credit). Single-owner client, no lock. */
+    uint64_t granted;
+    harp_hash sendq[HARP_CLIENT_SENDQ_CAP];
+    size_t sendq_head, sendq_tail, sendq_count;
+    uint64_t obj_drops;
 
     /* out-of-band notification hook (state.changed, log); may be NULL.
      * core.credit is consumed internally either way. */

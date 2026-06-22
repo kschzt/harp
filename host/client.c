@@ -37,6 +37,26 @@ static void handle_ntf(harp_client *c, const harp_env *e) {
     if (c->on_ntf) c->on_ntf(c->ud, e);
 }
 
+/* §4.2.1: grant the device a fresh credit window on the CTL stream and track it in our
+ * sliding `granted`. Used at hello and as a re-grant when consumption halves the window. */
+static int client_grant(harp_client *c) {
+    /* §4.2.1b: HARP_FORCE_CREDIT_GRANT shrinks the window for the starvation test; the
+     * 16 MiB default otherwise (the queue stays empty and this path is zero-overhead). */
+    uint64_t amt = CREDIT_GRANT;
+    const char *f = getenv("HARP_FORCE_CREDIT_GRANT");
+    if (f && *f) { uint64_t v = strtoull(f, NULL, 10); if (v) amt = v; } /* 0/garbage -> real grant */
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    harp_env_head(&m, HARP_MSG_NOTIFICATION, 0, "core.credit", true);
+    harp_cbor_map(&m, 1);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, amt);
+    int rc = harp_link_send(c->io, HARP_STREAM_CTL, m.buf, m.len);
+    harp_cbuf_free(&m);
+    if (rc == 0) c->granted += amt;
+    return rc;
+}
+
 /* Receive one frame; obj frames land in the store, notifications dispatch.
  * Returns the stream id, or -1 on transport failure. */
 static int pump_one(harp_client *c, harp_env *ctl_env, bool *is_ctl) {
@@ -45,10 +65,18 @@ static int pump_one(harp_client *c, harp_env *ctl_env, bool *is_ctl) {
     if (harp_link_recv(c->io, c->link, &stream, &c->msg) != 0) return -1;
     if (stream == HARP_STREAM_OBJ) {
         if (c->store) harp_store_put(c->store, c->msg.buf, c->msg.len, NULL);
+        /* §4.2.1: re-grant the device on consume (sliding window, symmetric to the
+         * device's handle_obj) so a long D->H pull never stalls once our grant drains. */
+        uint64_t got = c->msg.len;
+        if (c->granted >= got) c->granted -= got; else c->granted = 0;
+        if (c->granted < CREDIT_GRANT / 2) client_grant(c);
         return stream;
     }
-    if (stream != HARP_STREAM_CTL) return stream; /* evt during a wait: owner's
-                                                     poll loop sees it next */
+    if (stream != HARP_STREAM_CTL) return stream; /* evt/log: already consumed off the wire
+                                                     (sits in c->msg, overwritten on the next
+                                                     recv) — a caller awaiting a ctl rsp drops
+                                                     it; the shell's idle pollEcho is what
+                                                     normally drains evt, not this path */
     if (!harp_env_parse(c->msg.buf, c->msg.len, ctl_env)) return -1;
     if (ctl_env->msgtype == HARP_MSG_NOTIFICATION) {
         handle_ntf(c, ctl_env);
@@ -56,6 +84,50 @@ static int pump_one(harp_client *c, harp_env *ctl_env, bool *is_ctl) {
     }
     *is_ctl = true;
     return stream;
+}
+
+/* §4.2.1 host obj-send queue (FIFO ring of hashes; single-owner client, no lock). */
+static void csendq_push(harp_client *c, const harp_hash *h) {
+    if (c->sendq_count == HARP_CLIENT_SENDQ_CAP) { c->obj_drops++; return; } /* overflow: drop + count */
+    c->sendq[c->sendq_tail] = *h;
+    c->sendq_tail = (c->sendq_tail + 1) % HARP_CLIENT_SENDQ_CAP;
+    c->sendq_count++;
+}
+
+/* Drain the obj-send queue in FIFO order, SELF-PUMPING the link for grants when the head
+ * doesn't fit peer_credit. Unlike the device (whose recv thread flushes on each grant),
+ * the host has NO background thread that raises peer_credit — pollEcho try-locks the held
+ * ctlMutex_ and drops ctl notifications — so push_closure must drive pump_one itself until
+ * the queue empties. Mirrors the fetch_closure receive loop. Returns 0 on full drain,
+ * HARP_CLIENT_EIO on transport death or the spin cap (a silent peer). */
+static int csendq_flush(harp_client *c) {
+    harp_cbuf enc;
+    harp_cbuf_init(&enc);
+    int rc = 0, spins = 0;
+    while (c->sendq_count) {
+        const harp_hash *h = &c->sendq[c->sendq_head];
+        harp_cbuf_reset(&enc); /* harp_store_get APPENDS — reset before each get */
+        if (harp_store_get(c->store, h, &enc) != 0) { rc = HARP_CLIENT_EIO; break; } /* local closure incomplete */
+        while (enc.len > c->peer_credit) { /* self-pump for a grant on the ungated CTL stream */
+            if (++spins > 100000) { rc = HARP_CLIENT_EIO; goto done; } /* dead/silent peer guard */
+            harp_env pe;
+            bool is_ctl;
+            if (pump_one(c, &pe, &is_ctl) < 0) { rc = HARP_CLIENT_EIO; goto done; }
+            /* is_ctl==true is a stray response/error (no request in flight) -> ignore;
+             * core.credit notifications were already applied inside pump_one (handle_ntf).
+             * An EVT frame (a front-panel echo) consumed here is dropped from the echo mirror
+             * — acceptable: this self-pump only runs under credit STARVATION (never the
+             * 16 MiB production window), and the mirror is best-effort, re-derived on re-fetch. */
+        }
+        c->peer_credit -= enc.len;
+        if (harp_link_send(c->io, HARP_STREAM_OBJ, enc.buf, enc.len) != 0) { rc = HARP_CLIENT_EIO; break; }
+        c->sendq_head = (c->sendq_head + 1) % HARP_CLIENT_SENDQ_CAP;
+        c->sendq_count--;
+    }
+done:
+    harp_cbuf_free(&enc);
+    if (rc != 0) c->sendq_head = c->sendq_tail = c->sendq_count = 0; /* error: don't leak stale order */
+    return rc;
 }
 
 void harp_client_req_head(harp_client *c, harp_cbuf *out, const char *method,
@@ -298,16 +370,10 @@ int harp_client_hello(harp_client *c, const char *agent, harp_client_identity *o
     }
     if (!ok) return HARP_CLIENT_EIO;
 
-    /* grant the device obj credit so pulls can flow immediately */
-    harp_cbuf m;
-    harp_cbuf_init(&m);
-    harp_env_head(&m, HARP_MSG_NOTIFICATION, 0, "core.credit", true);
-    harp_cbor_map(&m, 1);
-    harp_cbor_uint(&m, 0);
-    harp_cbor_uint(&m, CREDIT_GRANT);
-    int src = harp_link_send(c->io, HARP_STREAM_CTL, m.buf, m.len);
-    harp_cbuf_free(&m);
-    return src == 0 ? 0 : HARP_CLIENT_EIO;
+    /* §4.2.1: grant the device obj credit so pulls flow immediately; granted seeds the
+     * sliding window that pump_one re-grants on consume. */
+    c->granted = 0;
+    return client_grant(c) == 0 ? 0 : HARP_CLIENT_EIO;
 }
 
 /* ---------------- refs / snapshot ---------------- */
@@ -525,17 +591,12 @@ int harp_client_push_closure(harp_client *c, const harp_hash *root, size_t *sent
         harp_cbor_uint(&req, 1);
         harp_cbor_uint(&req, total);
         rc = harp_client_request(c, &req, &rsp, &e);
-        for (size_t i = 0; rc == 0 && i < clo.n; i++) {
-            if (!missing[i]) continue;
-            harp_cbuf_reset(&enc);
-            if (harp_store_get(c->store, &clo.h[i], &enc) != 0) {
-                rc = HARP_CLIENT_EIO;
-                break;
-            }
-            if (enc.len <= c->peer_credit) c->peer_credit -= enc.len;
-            if (harp_link_send(c->io, HARP_STREAM_OBJ, enc.buf, enc.len) != 0)
-                rc = HARP_CLIENT_EIO;
-        }
+        /* §4.2.1: enqueue every missing object (FIFO, fixed clo order) then self-pump the
+         * link until the queue drains — push_closure must not return with a fitting object
+         * stranded, and the host has no background thread that raises peer_credit. */
+        for (size_t i = 0; rc == 0 && i < clo.n; i++)
+            if (missing[i]) csendq_push(c, &clo.h[i]);
+        if (rc == 0) rc = csendq_flush(c);
         harp_cbuf_free(&enc);
     }
 out:
