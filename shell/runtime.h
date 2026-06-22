@@ -163,7 +163,6 @@ public:
     void stop();
     bool connected() const { return connected_.load(std::memory_order_acquire); }
     bool needsFirmwareUpdate() const { return needsFirmwareUpdate_; } /* §5.4: device protocol too old */
-    bool readOnlyDefault() const { return readOnlyDefault_; } /* §12.2: engine major changed — state held */
     /* §8.3-over-§8.7: the shell calls this from its offline-render hook (VST3
      * processMode==kOffline, CLAP CLAP_RENDER_OFFLINE, AU OfflineRender). On an
      * Ethernet binding it selects HOST-PACED (deterministic offline bounce over TCP)
@@ -653,7 +652,10 @@ private:
                                    * audio.trim). Captured in helloAndIdentity. */
     bool needsFirmwareUpdate_ = false; /* §5.4: device rejected hello as 'incompatible' — set in
                                         * helloAndIdentity so the UI can prompt for a firmware/host update. */
-    int engineMajorSeen_ = -1;     /* §12.2: engine major from the last (re)connect (-1 = none yet). */
+    int engineMajorSeen_ = 0;      /* §12.2: engine major from the last (re)connect. */
+    bool engineMajorSeeded_ = false; /* §12.2: has engineMajorSeen_ been seeded yet? (an explicit
+                                      * flag, not a sentinel value, so a pathological negative major
+                                      * can't re-arm the HARP_FORCE_ENGINE_MAJOR seam on reconnect). */
     bool readOnlyDefault_ = false; /* §12.2: the engine major changed across (re)connect — the staged
                                     * project state may not fit the new engine, so HOLD it read-only
                                     * (don't auto-apply on connect); the user re-applies explicitly. */

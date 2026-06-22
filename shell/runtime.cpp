@@ -152,9 +152,10 @@ bool HarpRuntime::helloAndIdentity() {
      * test can force a single-connect mismatch. A matching reconnect self-clears the flag. */
     {
         int curMajor = atoi(engineVer_.c_str());
-        if (engineMajorSeen_ < 0) {
+        if (!engineMajorSeeded_) {
             const char *force = getenv("HARP_FORCE_ENGINE_MAJOR");
             engineMajorSeen_ = (force && *force) ? atoi(force) : curMajor;
+            engineMajorSeeded_ = true;
         }
         if (curMajor != engineMajorSeen_) {
             readOnlyDefault_ = true;

@@ -3,19 +3,27 @@
 #
 # Per §12.2, when a device's ENGINE MAJOR differs from what the host last saw across a
 # (re)connect, the staged project state may not fit the new engine: the runtime must
-# RECORD the change (a state-transition with reason ENGINE_MAJOR_MISMATCH=4) and HOLD
-# the project state read-only (skip the connect-time auto-push) until the user re-applies
-# it explicitly. This proves the read-only-default half of §12.2 (the serial-differs flow
-# is enforced upstream by the host pinning boundSerial_ at selectDevice).
+#   (1) RECORD the change — a state-transition with reason ENGINE_MAJOR_MISMATCH=4, AND
+#   (2) HOLD the staged project state read-only — SKIP the connect-time auto-push, so a
+#       project that was about to be re-asserted is NOT applied until the user re-applies
+#       it explicitly.
+# This proves BOTH halves: detection (1) AND enforcement (2). Enforcement only fires when
+# a bundle is actually staged (the auto-push gate is `if (haveBundle && readOnlyDefault_)`),
+# so we --save-state a fixture first, then --load-state it (which sets hasBundle_) into the
+# runs that must gate on it. Without the staged bundle the sessionUp half could be deleted
+# and a detection-only test would still pass — so the fixture is load-bearing.
 #
 # We can't hot-swap the refdev's engine mid-test, so the runtime exposes ONE seam:
 # HARP_FORCE_ENGINE_MAJOR seeds the "last-seen" major to a value that differs from the
-# device's real one, forcing the mismatch on a single connect. The test asserts:
-#   - the host LOGS "engine major <seed> -> <real>: project state held read-only"
-#   - the captured diag-bundle's session-history (key 6) carries a transition whose
-#     reason (key 3) is ENGINE_MAJOR_MISMATCH (4).
-# A CONTROL run WITHOUT the seam asserts NEITHER fires — the normal (matching-engine)
-# path stays clean, so the seam can't silently corrupt ordinary operation.
+# device's real one, forcing the mismatch on a single connect. Asserts:
+#   FORCED (seam + staged bundle): host logs the helloAndIdentity detection ("engine
+#     major 99 -> ...") AND the DISTINCT sessionUp enforcement line ("...not auto-applied");
+#     does NOT log "project state re-asserted"; diag-bundle session-history (key 6) carries
+#     a reason-4 transition.
+#   CONTROL (no seam + same staged bundle): host logs "project state re-asserted" (the
+#     auto-push fired); does NOT log the enforcement line; NO reason-4 transition.
+# The control proves the seam — and only the seam — gates the push: same staged bundle,
+# same device, the only difference is the forced major.
 #
 # Co-existence: unique port; kills ONLY its own pids; perl-alarm watchdog; workspace-
 # RELATIVE state dir (Git Bash /tmp->C:\ trips the device mkdir on Windows; see eth-tests.sh).
@@ -30,6 +38,7 @@ SERIAL="${SERIAL:-SIM-0001}"
 DEVDIR=engine-mismatch-eth-state   # workspace-RELATIVE (see header)
 DEVLOG=/tmp/engine-mismatch-eth-dev.log
 HOSTLOG=/tmp/engine-mismatch-eth-host.log
+STATE=/tmp/engine-mismatch.state    # --save-state fixture, --load-state'd to stage a bundle
 BUNDLE=/tmp/engine-mismatch.cbor
 fail() { echo "ENGINE-MISMATCH FAIL: $1"; exit 1; }
 [ -x "$DEVICED" ] || fail "$DEVICED not built"
@@ -40,20 +49,18 @@ DP=""; HP=""
 trap '[ -n "$DP" ] && kill -9 "$DP" 2>/dev/null; [ -n "$HP" ] && kill -9 "$HP" 2>/dev/null' EXIT
 wait_listen() { for _ in $(seq 1 25); do grep -q "listening on $PORT" "$DEVLOG" 2>/dev/null && return 0; sleep 0.2; done; return 1; }
 
-# Run the host once with a given HARP_FORCE_ENGINE_MAJOR ("" = control, no seam).
-# $1 = forced major (or ""), $2 = outfile. Hang-proof: 30s perl-alarm, waited by pid.
+# run_host <force> <label> <extra host args...>  — force "" = no seam (control). Hang-proof:
+# 30s perl-alarm, waited by pid. Leaves output in $HOSTLOG for the caller to assert on.
 run_host() {
-  local force="$1" out="$2"
-  rm -f "$out"; : > "$HOSTLOG"
-  echo "── run the host (§8.7 Ethernet), HARP_FORCE_ENGINE_MAJOR='${force:-<unset>}' -> $out"
+  local force="$1" label="$2"; shift 2
+  : > "$HOSTLOG"
+  echo "── run the host (§8.7 Ethernet) [$label] HARP_FORCE_ENGINE_MAJOR='${force:-<unset>}' $*"
   HARP_ETH_DEVICE="127.0.0.1:$PORT" HARP_DEVICE_SERIAL="$SERIAL" HARP_FORCE_ENGINE_MAJOR="$force" \
-    perl -e 'alarm 30; exec @ARGV' "$HOSTBIN" "$PLUG" --seconds 2 --realtime \
-      --diag-bundle "$out" >"$HOSTLOG" 2>&1 & HP=$!
+    perl -e 'alarm 30; exec @ARGV' "$HOSTBIN" "$PLUG" --seconds 2 --realtime "$@" >"$HOSTLOG" 2>&1 & HP=$!
   wait "$HP"; local rc=$?; HP=""
-  [ "$rc" -eq 142 ] && { cat "$HOSTLOG"; fail "host HUNG (perl-alarm watchdog fired)"; }
-  [ "$rc" -eq 0 ] || { cat "$HOSTLOG"; fail "host exited rc=$rc"; }
-  grep -q "connected:" "$HOSTLOG" || { cat "$HOSTLOG"; fail "host never connected"; }
-  [ -s "$out" ] || { cat "$HOSTLOG"; fail "no diag bundle written to $out (capture didn't run?)"; }
+  [ "$rc" -eq 142 ] && { cat "$HOSTLOG"; fail "[$label] host HUNG (perl-alarm watchdog fired)"; }
+  [ "$rc" -eq 0 ] || { cat "$HOSTLOG"; fail "[$label] host exited rc=$rc"; }
+  grep -q "connected:" "$HOSTLOG" || { cat "$HOSTLOG"; fail "[$label] host never connected"; }
 }
 
 # Assert the bundle's session-history (key 6) HAS / HASN'T a reason-4 transition.
@@ -72,24 +79,33 @@ assert_reason4() {
   ' "$1" "$2" || fail "$3"
 }
 
-rm -rf "$DEVDIR"; : > "$DEVLOG"
+rm -rf "$DEVDIR"; : > "$DEVLOG"; rm -f "$STATE"
 echo "── start device (serial $SERIAL) on $PORT over the §8.7 loopback"
 "$DEVICED" --serial "$SERIAL" --port "$PORT" --state-dir "$DEVDIR" >>"$DEVLOG" 2>&1 & DP=$!
 wait_listen || { cat "$DEVLOG"; fail "device didn't start on $PORT"; }
 
-# ── 1) FORCED mismatch: seed a different major; the change must be logged + recorded.
-run_host 99 "$BUNDLE"
-grep -q "engine major 99 ->" "$HOSTLOG" || { cat "$HOSTLOG"; fail "host did not detect the forced engine-major change"; }
-grep -q "project state held read-only" "$HOSTLOG" || { cat "$HOSTLOG"; fail "host did not hold project state read-only on engine-major change"; }
+# ── 0) Stage a project bundle fixture: a plain session that saves its state. This is what
+#       later --load-state runs re-assert on connect (sets hasBundle_, arming the auto-push).
+run_host "" save-fixture --save-state "$STATE"
+[ -s "$STATE" ] || { cat "$HOSTLOG"; fail "save-state produced no fixture at $STATE"; }
+echo "   ✓ staged a project-state fixture ($(wc -c <"$STATE") bytes)"
+
+# ── 1) FORCED mismatch WITH the staged bundle: detection logged, enforcement gates the
+#       auto-push (state held read-only, NOT re-asserted), reason-4 recorded.
+run_host 99 forced --load-state "$STATE" --diag-bundle "$BUNDLE"
+grep -q "engine major 99 ->" "$HOSTLOG" || { cat "$HOSTLOG"; fail "host did not detect the forced engine-major change (helloAndIdentity)"; }
+grep -q "not auto-applied" "$HOSTLOG"    || { cat "$HOSTLOG"; fail "host did not SKIP the auto-push (sessionUp enforcement line absent — read-only gate not taken)"; }
+grep -q "project state re-asserted" "$HOSTLOG" && { cat "$HOSTLOG"; fail "host RE-ASSERTED the project state despite the engine-major change (auto-push not held)"; }
 if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then assert_reason4 "$BUNDLE" 1 "forced-mismatch history missing reason 4"
 else echo "   (CBOR::XS absent — host-log gate only; CI runs the decode)"; fi
-echo "   ✓ forced engine-major change: logged + held read-only + recorded (reason 4)"
+echo "   ✓ forced engine-major change: detected + auto-push HELD read-only + reason-4 recorded"
 
-# ── 2) CONTROL: no seam => the device's own major matches the baseline => NO mismatch.
-run_host "" "$BUNDLE.ctl"
-grep -q "project state held read-only" "$HOSTLOG" && { cat "$HOSTLOG"; fail "control run wrongly held state read-only (false positive on a matching engine)"; }
+# ── 2) CONTROL: same staged bundle, NO seam => matching engine => auto-push FIRES, no gate.
+run_host "" control --load-state "$STATE" --diag-bundle "$BUNDLE.ctl"
+grep -q "project state re-asserted" "$HOSTLOG" || { cat "$HOSTLOG"; fail "control run did NOT re-assert the staged project state (auto-push should fire on a matching engine)"; }
+grep -q "not auto-applied" "$HOSTLOG" && { cat "$HOSTLOG"; fail "control run wrongly held state read-only (false positive on a matching engine)"; }
 if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then assert_reason4 "$BUNDLE.ctl" 0 "control run wrongly recorded reason 4"; fi
-echo "   ✓ control (matching engine): clean — no read-only, no reason-4"
+echo "   ✓ control (matching engine): auto-push fired (re-asserted) — no read-only, no reason-4"
 
 kill -9 "$DP" 2>/dev/null; DP=""
-echo "ENGINE-MISMATCH PASS (§12.2: engine-major change -> ENGINE_MAJOR_MISMATCH(4) recorded + project state held read-only; matching engine stays clean)"
+echo "ENGINE-MISMATCH PASS (§12.2: engine-major change -> reason-4 recorded AND staged project state held read-only [auto-push skipped]; matching engine re-asserts normally)"
