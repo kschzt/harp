@@ -81,6 +81,7 @@ run corrupt-cbor       scripts/corrupt-cbor-eth-test.sh      # §8.7 hostile-fra
 run reconnect          scripts/reconnect-eth-test.sh         # §8.7 mid-session disconnect survival
 run rtp-loss           scripts/rtp-loss-eth-test.sh          # §8.7 RTP/UDP packet-loss tolerance
 run diag-bundle-host   scripts/diag-bundle-host-eth-test.sh  # §14.4 runtime getDiagBundle (probe-free)
+run engine-mismatch    scripts/engine-mismatch-eth-test.sh   # §12.2 engine-major change -> read-only default
 run loopback           scripts/loopback-eth-test.sh          # §14.3 round-trip RTT (probe-free)
 run reported-latency   scripts/reported-latency-test.sh      # §6.4 reported PDC latency (exact, all formats)
 run param-map-recall   scripts/param-map-recall-test.sh      # §13.4 recall warns on param-map drift
