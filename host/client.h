@@ -45,6 +45,7 @@ typedef struct {
     char engine_id[64], engine_ver[32];
     harp_hash param_map_hash;
     uint64_t boot_count;
+    uint64_t txn_max, txn_events; /* §9.6 transaction limits (identity key 13); 0 if not advertised */
     char caps[HARP_CLIENT_MAX_CAPS][32]; /* capability strings (identity key 6) */
     size_t ncaps;
     /* §6.4 latency-profile (identity key 8): one entry per negotiated rate. Each

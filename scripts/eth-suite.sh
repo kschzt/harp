@@ -110,6 +110,7 @@ else skip mdns-discover "mDNS needs a live responder (macOS CI only; bench-prove
 if have "$PROBE"; then
   run recall           scripts/recall-eth-test.sh            # §11.4 recall round-trip + archive
   run credit           scripts/credit-eth-test.sh            # §4.2.1b obj credit queue/flush under starvation
+  run txn              scripts/txn-test.sh                   # §9.6 event transactions: buffer/commit-atomic/abort
   run offline-edit     scripts/offline-edit-eth-test.sh      # §15.5 edit-while-absent reaches device
   run diag-bundle      scripts/diag-bundle-eth-test.sh       # §14.4 device-side export + §16 anon
 else

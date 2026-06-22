@@ -179,10 +179,37 @@ typedef struct {
                         (whole-part) — single-part / non-per-voice wire unchanged. */
 } dev_event;
 
-#define DEV_EVQ_CAP 256
+/* The live event queue. Sized with headroom OVER a maximal transaction (DEV_TXN_EVENTS_MAX):
+ * txn-commit lands the whole buffered batch ALL-OR-NOTHING (evq_push_batch), so a maximal commit
+ * during a busy stream (concurrent notes/params/ramps already occupying slots) would be rejected
+ * outright if the queue were the same size — making the advertised txn-events limit uncommittable
+ * in practice. The _Static_assert by the txn defs below pins the required headroom. */
+#define DEV_EVQ_CAP 512
+
+/* §9.6 event transactions: events tagged with a txn-id buffer here (not applied) until
+ * txn-commit re-stamps them to one instant and applies the whole batch atomically; txn-abort
+ * discards. The device MUST bound open txns (>=1) and events/txn (>=256) and report the limits
+ * in capabilities (identity key 13). The table is recv-thread-private (no lock). */
+#define DEV_TXN_MAX 4          /* concurrent open transactions (spec MUST >= 1) */
+#define DEV_TXN_EVENTS_MAX 256 /* buffered events per transaction (spec MUST >= 256) */
+typedef struct {
+    bool open;
+    uint64_t id; /* full uint64 wire id — never truncated (no aliasing for large ids) */
+    uint16_t n;
+    dev_event ev[DEV_TXN_EVENTS_MAX];
+} dev_txn;
+/* A maximal advertised txn (DEV_TXN_EVENTS_MAX events) MUST stay committable on a LIVE stream —
+ * i.e. fit in the evq even with steady-state traffic already queued — else evq_push_batch rejects
+ * the whole batch and the atomic-apply guarantee is hollow for the exact kit-load/morph case §9.6
+ * names. Keep >= 64 slots of steady-state headroom over a full batch. */
+_Static_assert(DEV_EVQ_CAP >= DEV_TXN_EVENTS_MAX + 64, "evq needs headroom over a maximal txn batch");
+
 /* the queue itself (storage, count, mutex) and the per-param ramp state
  * are private to engine.c; sessions interact through these: */
 bool evq_full(void); /* the never-drop-a-note-off escalation check */
+/* §9.6: push a whole batch ALL-OR-NOTHING under one lock (a commit applies every buffered
+ * event or none — a per-event push could partially drop at DEV_EVQ_CAP, breaking atomicity). */
+bool evq_push_batch(const dev_event *evs, size_t count);
 
 extern _Atomic int g_touch_pending;       /* dirty-flag work deferred off the
                                              render thread; set release, read
@@ -318,6 +345,7 @@ typedef struct {
      * ONLY on the recv thread — serialized, so no lock. */
     harp_hash sendq[HARP_SENDQ_CAP];
     size_t sendq_head, sendq_tail, sendq_count;
+    dev_txn txn[DEV_TXN_MAX]; /* §9.6 open event transactions (recv-thread-private) */
     uint32_t rtp_peer_ip;   /* §8.7: the TCP peer's IPv4 (network order), or 0 when
                                the session is not over TCP (USB gadget). It is the
                                RTP audio destination when audio.start negotiates a
@@ -341,7 +369,7 @@ typedef struct {
     /* counters (§14.2): frame_errors has render + session writers;
      * snapshots_taken has session + panel writers; all read cross-thread */
     _Atomic uint64_t frame_errors, session_resets, snapshots_taken, audio_overruns, evt_stale_epoch,
-        audio_late_frames, obj_drops;
+        audio_late_frames, obj_drops, evt_txn_rejected, evt_txn_overflow, evt_txn_unknown;
 } device;
 
 extern device g_dev;

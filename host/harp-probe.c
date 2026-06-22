@@ -1311,6 +1311,292 @@ static void cmd_epoch_test(probe *p) {
     printf("EPOCH-TEST PASS: time.epoch emitted on rate change; stale-epoch events discarded + counted\n");
 }
 
+/* ---- §9.6 event transactions ---- */
+
+static bool txn_approx(double a, double b) {
+    double d = a - b;
+    return d < 0.02 && d > -0.02;
+}
+
+/* read one param value via x.harp-refdev.params; -1 if absent */
+static double probe_param(probe *p, uint64_t want) {
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    req_head(p, &req, "x.harp-refdev.params", false);
+    harp_env e = request(p, &req, &rsp);
+    double out = -1;
+    harp_cdec b;
+    harp_cdec_init(&b, e.body, e.body_len);
+    uint64_t n, key, alen;
+    if (e.has_body && harp_cdec_map(&b, &n) && n >= 1 && harp_cdec_uint(&b, &key) && key == 0 &&
+        harp_cdec_array(&b, &alen)) {
+        for (uint64_t i = 0; i < alen; i++) {
+            uint64_t three, id;
+            const char *s;
+            size_t sl;
+            double v;
+            if (!harp_cdec_array(&b, &three) || three != 3 || !harp_cdec_uint(&b, &id) ||
+                !harp_cdec_text(&b, &s, &sl) || !harp_cdec_float(&b, &v))
+                break;
+            if (id == want) out = v;
+        }
+    }
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+    return out;
+}
+
+/* raw param event { 0:id, 1:value, ?4:txn } at [epoch 0=now, msc] on the EVT stream */
+static void send_param_evt(probe *p, uint64_t id, double value, uint64_t txn, uint64_t msc) {
+    harp_cbuf ev;
+    harp_cbuf_init(&ev);
+    harp_cbor_array(&ev, 3);
+    harp_cbor_array(&ev, 2);
+    harp_cbor_uint(&ev, 0);
+    harp_cbor_uint(&ev, msc);
+    harp_cbor_uint(&ev, 1); /* etype 1 = param */
+    harp_cbor_map(&ev, txn ? 3 : 2);
+    harp_cbor_uint(&ev, 0);
+    harp_cbor_uint(&ev, id);
+    harp_cbor_uint(&ev, 1);
+    harp_cbor_float(&ev, (float)value);
+    if (txn) {
+        harp_cbor_uint(&ev, 4);
+        harp_cbor_uint(&ev, txn);
+    }
+    harp_link_send(p->io, HARP_STREAM_EVT, ev.buf, ev.len);
+    harp_cbuf_free(&ev);
+}
+
+/* txn control event: etype 2 begin / 3 commit / 4 abort, body { 0: txn-id, ?1: [epoch,msc] } */
+static void send_txn_evt(probe *p, uint64_t etype, uint64_t txn) {
+    harp_cbuf ev;
+    harp_cbuf_init(&ev);
+    harp_cbor_array(&ev, 3);
+    harp_cbor_array(&ev, 2);
+    harp_cbor_uint(&ev, 0);
+    harp_cbor_uint(&ev, 0); /* outer [epoch 0, msc 0] -> commit applies "now" (asap) */
+    harp_cbor_uint(&ev, etype);
+    harp_cbor_map(&ev, 1);
+    harp_cbor_uint(&ev, 0);
+    harp_cbor_uint(&ev, txn);
+    harp_link_send(p->io, HARP_STREAM_EVT, ev.buf, ev.len);
+    harp_cbuf_free(&ev);
+}
+
+/* read the §9.6 txn reject meters via x.harp-refdev.txn -> {0:rejected, 1:overflow, 2:unknown}.
+ * These live OUTSIDE the §14.2 16-pair counters golden, so the reject paths are observable to a
+ * test (a begin/submit/commit/abort that is supposed to be refused leaves a counted, readable mark
+ * rather than a silent no-op). The CTL request is ordered after prior EVT sends on the one link. */
+static void probe_txn_ctrs(probe *p, uint64_t *rej, uint64_t *ovf, uint64_t *unk) {
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    req_head(p, &req, "x.harp-refdev.txn", false);
+    harp_env e = request(p, &req, &rsp);
+    *rej = *ovf = *unk = 0;
+    harp_cdec b;
+    harp_cdec_init(&b, e.body, e.body_len);
+    uint64_t n;
+    if (e.has_body && harp_cdec_map(&b, &n)) {
+        for (uint64_t i = 0; i < n; i++) {
+            uint64_t k, v;
+            if (!harp_cdec_uint(&b, &k) || !harp_cdec_uint(&b, &v)) break;
+            if (k == 0) *rej = v;
+            else if (k == 1) *ovf = v;
+            else if (k == 2) *unk = v;
+        }
+    }
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+}
+
+#define TXN_SETTLE_NS 80000000ull /* ~15 render blocks @48k/256: the evq drains + applies */
+
+/* §9.6: events tagged with a txn-id buffer until commit applies them atomically; abort discards.
+ * Observable via the param readback — a buffered event NEVER reaches the evq, so it cannot apply
+ * (timing-independent); after commit the whole batch is on the evq and the running stream applies
+ * it. Needs a live stream (audio.start) so the render thread drains the evq. */
+static void cmd_txn_test(probe *p) {
+    harp_client_identity id = do_hello(p);
+    printf("── txn-test: §9.6 event transactions (capability / atomic apply / abort / unknown)\n");
+
+    if (!harp_client_has_cap(&id, "evt.txn")) {
+        fprintf(stderr, "TXN-TEST FAIL: device does not advertise the evt.txn capability\n");
+        exit(1);
+    }
+    printf("   capability evt.txn advertised: OK\n");
+    if (id.txn_max < 1 || id.txn_events < 256) { /* §9.6 MUST: >= 1 concurrent, >= 256 events */
+        fprintf(stderr, "TXN-TEST FAIL: txn limits (key 13) not reported / below spec min "
+                "(concurrent=%llu events=%llu, MUST >= 1 / >= 256)\n",
+                (unsigned long long)id.txn_max, (unsigned long long)id.txn_events);
+        exit(1);
+    }
+    printf("   txn limits reported (identity key 13): concurrent=%llu, events=%llu (>= spec min 1/256): OK\n",
+           (unsigned long long)id.txn_max, (unsigned long long)id.txn_events);
+
+    audio_start_rtp(p, 48000);
+    const uint64_t PID = 3;
+
+    /* sanity: an UNTAGGED param set applies under our timing (the evq path works) */
+    send_param_evt(p, PID, 0.90, 0, 0);
+    harp_sleep_ns(TXN_SETTLE_NS);
+    double base = probe_param(p, PID);
+    if (!txn_approx(base, 0.90)) {
+        fprintf(stderr, "TXN-TEST FAIL: untagged param set did not apply (%.3f != 0.90)\n", base);
+        exit(1);
+    }
+    printf("   (sanity) untagged param set applied: %.3f\n", base);
+
+    /* (1) ATOMIC: begin -> tagged set MUST NOT move the param (buffered) -> commit moves it */
+    send_txn_evt(p, 2, 7);              /* txn-begin 7 */
+    send_param_evt(p, PID, 0.20, 7, 0); /* tagged: buffered, must not apply */
+    harp_sleep_ns(TXN_SETTLE_NS);
+    double buffered = probe_param(p, PID);
+    if (!txn_approx(buffered, 0.90)) {
+        fprintf(stderr, "TXN-TEST FAIL: a buffered (uncommitted) event applied early (%.3f, want 0.90)\n",
+                buffered);
+        exit(1);
+    }
+    printf("   (1a) buffered event did NOT apply pre-commit: %.3f (still 0.90): OK\n", buffered);
+    send_txn_evt(p, 3, 7); /* txn-commit 7 */
+    harp_sleep_ns(TXN_SETTLE_NS);
+    double committed = probe_param(p, PID);
+    if (!txn_approx(committed, 0.20)) {
+        fprintf(stderr, "TXN-TEST FAIL: commit did not apply the buffered event (%.3f, want 0.20)\n",
+                committed);
+        exit(1);
+    }
+    printf("   (1b) commit applied the buffered event atomically: %.3f: OK\n", committed);
+
+    /* (2) ABORT: begin -> tagged set -> abort -> the param MUST stay (discarded) */
+    send_txn_evt(p, 2, 8);
+    send_param_evt(p, PID, 0.70, 8, 0);
+    send_txn_evt(p, 4, 8); /* txn-abort 8 */
+    harp_sleep_ns(TXN_SETTLE_NS);
+    double aborted = probe_param(p, PID);
+    if (!txn_approx(aborted, 0.20)) {
+        fprintf(stderr, "TXN-TEST FAIL: an ABORTED txn applied (%.3f, want 0.20)\n", aborted);
+        exit(1);
+    }
+    printf("   (2) abort discarded the buffered event: %.3f (still 0.20): OK\n", aborted);
+
+    /* (3) UNKNOWN COMMIT: a never-begun id is a no-op + the device keeps serving */
+    send_txn_evt(p, 3, 99);
+    harp_sleep_ns(TXN_SETTLE_NS);
+    double after_unknown = probe_param(p, PID);
+    if (!txn_approx(after_unknown, 0.20)) {
+        fprintf(stderr, "TXN-TEST FAIL: commit of an unknown txn changed state (%.3f)\n", after_unknown);
+        exit(1);
+    }
+    printf("   (3) commit of an unknown txn-id: no-op, device still serving (%.3f): OK\n", after_unknown);
+
+    /* (4) MULTI-EVENT ATOMICITY — the actual point of evq_push_batch: a txn buffering SEVERAL
+     * distinct params applies them ALL on commit and NONE before. The single-event cases above
+     * never exercise count>1, where a per-event push could partial-apply at the queue edge. */
+    const uint64_t A = 1, B = 2, C = 4; /* three distinct params (NPARAMS=13); avoid PID=3 */
+    send_param_evt(p, A, 0.10, 0, 0);
+    send_param_evt(p, B, 0.10, 0, 0);
+    send_param_evt(p, C, 0.10, 0, 0);
+    harp_sleep_ns(TXN_SETTLE_NS);
+    send_txn_evt(p, 2, 11); /* begin 11 */
+    send_param_evt(p, A, 0.55, 11, 0);
+    send_param_evt(p, B, 0.65, 11, 0);
+    send_param_evt(p, C, 0.75, 11, 0);
+    harp_sleep_ns(TXN_SETTLE_NS);
+    double pa = probe_param(p, A), pb = probe_param(p, B), pc = probe_param(p, C);
+    if (!txn_approx(pa, 0.10) || !txn_approx(pb, 0.10) || !txn_approx(pc, 0.10)) {
+        fprintf(stderr, "TXN-TEST FAIL: a multi-event txn applied a param before commit "
+                "(A=%.3f B=%.3f C=%.3f, want all 0.10)\n", pa, pb, pc);
+        exit(1);
+    }
+    send_txn_evt(p, 3, 11); /* commit 11 */
+    harp_sleep_ns(TXN_SETTLE_NS);
+    pa = probe_param(p, A);
+    pb = probe_param(p, B);
+    pc = probe_param(p, C);
+    if (!txn_approx(pa, 0.55) || !txn_approx(pb, 0.65) || !txn_approx(pc, 0.75)) {
+        fprintf(stderr, "TXN-TEST FAIL: a multi-event commit did not apply the whole batch "
+                "(A=%.3f want 0.55, B=%.3f want 0.65, C=%.3f want 0.75)\n", pa, pb, pc);
+        exit(1);
+    }
+    printf("   (4) multi-event txn: 3 params buffered together, applied atomically on commit "
+           "(%.2f/%.2f/%.2f): OK\n", pa, pb, pc);
+
+    /* (5) BEGIN REJECTS — observed via the x.harp-refdev.txn meter (golden-free): opening one
+     * past the advertised concurrent limit, a duplicate of an open id, and the reserved txn-id 0
+     * are EACH refused + counted, without clobbering the open ones. */
+    uint64_t rej0, ovf0, unk0;
+    probe_txn_ctrs(p, &rej0, &ovf0, &unk0);
+    for (uint64_t i = 0; i < id.txn_max; i++) send_txn_evt(p, 2, 100 + i); /* fill every slot */
+    send_txn_evt(p, 2, 100 + id.txn_max);                                  /* one too many */
+    send_txn_evt(p, 2, 100);                                               /* duplicate of an open id */
+    send_txn_evt(p, 2, 0);                                                 /* reserved sentinel id 0 */
+    harp_sleep_ns(TXN_SETTLE_NS);
+    uint64_t rej1, ovf1, unk1;
+    probe_txn_ctrs(p, &rej1, &ovf1, &unk1);
+    if (rej1 - rej0 != 3) {
+        fprintf(stderr, "TXN-TEST FAIL: begin rejects miscounted (delta=%llu, want 3: over-limit + "
+                "duplicate + reserved-id-0)\n", (unsigned long long)(rej1 - rej0));
+        exit(1);
+    }
+    printf("   (5) begin rejects: over-limit + duplicate + reserved-id-0 each counted (delta=3): OK\n");
+    for (uint64_t i = 0; i < id.txn_max; i++) send_txn_evt(p, 4, 100 + i); /* abort: free the slots */
+    harp_sleep_ns(TXN_SETTLE_NS);
+
+    /* (6) UNKNOWN tag + abort: a submit or abort naming a never-open txn is swallowed + counted
+     * (never half-applied), and leaks nothing into state. */
+    uint64_t rej2, ovf2, unk2;
+    probe_txn_ctrs(p, &rej2, &ovf2, &unk2);
+    send_param_evt(p, PID, 0.42, 31337, 0); /* tag for an unknown txn -> swallowed */
+    send_txn_evt(p, 4, 31337);              /* abort an unknown txn -> no-op */
+    harp_sleep_ns(TXN_SETTLE_NS);
+    uint64_t rej3, ovf3, unk3;
+    probe_txn_ctrs(p, &rej3, &ovf3, &unk3);
+    if (unk3 - unk2 != 2) {
+        fprintf(stderr, "TXN-TEST FAIL: unknown-txn submit/abort not counted (delta=%llu, want 2)\n",
+                (unsigned long long)(unk3 - unk2));
+        exit(1);
+    }
+    if (!txn_approx(probe_param(p, PID), 0.20)) {
+        fprintf(stderr, "TXN-TEST FAIL: an unknown-tagged event leaked into state (%.3f, want 0.20)\n",
+                probe_param(p, PID));
+        exit(1);
+    }
+    printf("   (6) unknown-txn submit + abort: swallowed + counted (delta=2), no state change: OK\n");
+
+    /* (7) PER-TXN OVERFLOW: buffering one past the advertised per-txn event limit drops + counts
+     * the extra event, and the txn still commits the events that fit. */
+    uint64_t rej4, ovf4, unk4;
+    probe_txn_ctrs(p, &rej4, &ovf4, &unk4);
+    send_txn_evt(p, 2, 200); /* begin */
+    for (uint64_t i = 0; i < id.txn_events + 1; i++) /* one past the advertised per-txn cap */
+        send_param_evt(p, PID, 0.30, 200, 0);
+    harp_sleep_ns(TXN_SETTLE_NS * 2);
+    uint64_t rej5, ovf5, unk5;
+    probe_txn_ctrs(p, &rej5, &ovf5, &unk5);
+    if (ovf5 - ovf4 < 1) {
+        fprintf(stderr, "TXN-TEST FAIL: over-limit buffering (%llu events into a %llu-cap txn) not "
+                "counted (overflow delta=%llu)\n", (unsigned long long)(id.txn_events + 1),
+                (unsigned long long)id.txn_events, (unsigned long long)(ovf5 - ovf4));
+        exit(1);
+    }
+    send_txn_evt(p, 3, 200); /* commit the events that fit */
+    harp_sleep_ns(TXN_SETTLE_NS);
+    if (!txn_approx(probe_param(p, PID), 0.30)) {
+        fprintf(stderr, "TXN-TEST FAIL: an over-limit txn did not commit the events that fit "
+                "(%.3f, want 0.30)\n", probe_param(p, PID));
+        exit(1);
+    }
+    printf("   (7) per-txn overflow: the %lluth event dropped + counted, txn still commits: OK\n",
+           (unsigned long long)(id.txn_events + 1));
+
+    audio_stop_probe(p);
+    printf("TXN-TEST PASS: §9.6 events buffer under a txn, apply atomically on commit, discard on abort; "
+           "evt.txn advertised\n");
+}
+
 /* notif-test (§5.2): the device MUST ignore unknown notifications. Send a well-formed
  * NOTIFICATION with an unknown method, then prove the device kept serving — a follow-up
  * request must still succeed (request() dies via ck() if the device crashed or errored). */
@@ -1692,6 +1978,8 @@ int main(int argc, char **argv) {
         cmd_version_test(&p);
     else if (strcmp(cmd, "epoch-test") == 0)
         cmd_epoch_test(&p);
+    else if (strcmp(cmd, "txn-test") == 0)
+        cmd_txn_test(&p);
     else if (strcmp(cmd, "notif-test") == 0)
         cmd_notif_test(&p);
     else if (strcmp(cmd, "format-test") == 0)

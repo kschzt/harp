@@ -430,6 +430,22 @@ void evq_push(dev_event ev) {
     pthread_mutex_unlock(&g_evq_mu);
 }
 
+/* §9.6: enqueue a whole transaction batch ALL-OR-NOTHING under ONE lock. The render thread
+ * drains same-ts events together (evq_apply_due), so committing the batch at one ts applies
+ * it atomically — but ONLY if the whole batch lands; a per-event push could drop part of it
+ * at DEV_EVQ_CAP and apply a partial kit-load. Returns false (batch rejected, counted) when
+ * the queue can't hold all of it. */
+bool evq_push_batch(const dev_event *evs, size_t count) {
+    pthread_mutex_lock(&g_evq_mu);
+    bool ok = (g_evq_n + count <= DEV_EVQ_CAP);
+    if (ok)
+        for (size_t i = 0; i < count; i++) g_evq[g_evq_n++] = evs[i];
+    else
+        for (size_t i = 0; i < count; i++) CTR_INC(g_evq_drops);
+    pthread_mutex_unlock(&g_evq_mu);
+    return ok;
+}
+
 bool evq_full(void) {
     pthread_mutex_lock(&g_evq_mu);
     bool full = g_evq_n >= DEV_EVQ_CAP;
