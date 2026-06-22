@@ -1311,6 +1311,31 @@ static void cmd_epoch_test(probe *p) {
     printf("EPOCH-TEST PASS: time.epoch emitted on rate change; stale-epoch events discarded + counted\n");
 }
 
+/* notif-test (§5.2): the device MUST ignore unknown notifications. Send a well-formed
+ * NOTIFICATION with an unknown method, then prove the device kept serving — a follow-up
+ * request must still succeed (request() dies via ck() if the device crashed or errored). */
+static void cmd_notif_test(probe *p) {
+    do_hello(p);
+    printf("── notif-test: device ignores unknown notifications (§5.2)\n");
+    harp_cbuf ntf;
+    harp_cbuf_init(&ntf);
+    harp_env_head(&ntf, HARP_MSG_NOTIFICATION, 0, "x.unknown.notification", true);
+    harp_cbor_map(&ntf, 1);
+    harp_cbor_uint(&ntf, 0);
+    harp_cbor_uint(&ntf, 12345);
+    harp_link_send(p->io, HARP_STREAM_CTL, ntf.buf, ntf.len);
+    harp_cbuf_free(&ntf);
+    /* the device must ignore the notification and keep serving */
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    req_head(p, &req, "diag.counters", false);
+    request(p, &req, &rsp);
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+    printf("NOTIF-TEST PASS: unknown notification ignored, device still serving\n");
+}
+
 static void cmd_demo(probe *p, const char *addr) {
     (void)addr;
     p->verbose_ntf = true;
@@ -1503,6 +1528,8 @@ int main(int argc, char **argv) {
         cmd_version_test(&p);
     else if (strcmp(cmd, "epoch-test") == 0)
         cmd_epoch_test(&p);
+    else if (strcmp(cmd, "notif-test") == 0)
+        cmd_notif_test(&p);
     else if (strcmp(cmd, "cas-test") == 0)
         cmd_cas_test(&p);
     else if (strcmp(cmd, "demo") == 0)
