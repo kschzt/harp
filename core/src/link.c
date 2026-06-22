@@ -82,6 +82,16 @@ void harp_io_fd_init(harp_io_fd *f, int rfd, int wfd) {
     f->wfd = wfd;
 }
 
+/* §4.2.1 per-stream reassembled-message cap; 0 = OBJ (credit-gated, no fixed cap). */
+static size_t harp_stream_msg_cap(uint8_t stream) {
+    switch (stream) {
+        case HARP_STREAM_CTL: return HARP_CTL_MAX_PAYLOAD;
+        case HARP_STREAM_EVT: return HARP_EVT_MAX_PAYLOAD;
+        case HARP_STREAM_LOG: return HARP_LOG_MAX_PAYLOAD;
+        default:              return 0; /* OBJ */
+    }
+}
+
 int harp_link_recv(harp_io *io, harp_link *l, uint8_t *stream, harp_cbuf *msg) {
     uint8_t hdr[HARP_FRAME_HDR_LEN];
     uint8_t payload[HARP_FRAME_MAX_PAYLOAD];
@@ -94,6 +104,11 @@ int harp_link_recv(harp_io *io, harp_link *l, uint8_t *stream, harp_cbuf *msg) {
         harp_cbuf *acc = &l->acc[h.stream];
         harp_cbuf_put(acc, payload, h.length);
         if (acc->oom) return -2;
+        /* §4.2.1: enforce the per-stream message bound during reassembly. An over-cap
+         * ctl/evt/log message is malformed (-> session reset, §12.4); checking mid-
+         * reassembly also stops a peer growing the accumulator without ever sending FIN. */
+        size_t cap = harp_stream_msg_cap(h.stream);
+        if (cap && acc->len > cap) return -2;
         if (h.flags & HARP_FLAG_FIN) {
             harp_cbuf_reset(msg);
             harp_cbuf_put(msg, acc->buf, acc->len);

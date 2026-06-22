@@ -625,6 +625,89 @@ static void test_link_fragmentation(void) {
     }
 }
 
+/* §4.2.1: harp_link_recv enforces the per-stream reassembled-message caps (ctl 64KiB,
+ * evt/log 4KiB; OBJ uncapped — credit-gated). An over-cap message is malformed (-2 ->
+ * session reset), and the cap is checked DURING reassembly so a peer cannot grow the
+ * accumulator past the bound by withholding FIN. */
+static void check_stream_cap(uint8_t stream, size_t cap) {
+    uint8_t *buf = (uint8_t *)malloc(cap);
+    memset(buf, 0xab, cap);
+    /* exactly `cap` in one FIN frame -> accepted, reassembled byte-exact */
+    {
+        mem_io m;
+        m.io.read_exact = mem_read;
+        m.io.write_all = mem_write;
+        harp_cbuf_init(&m.wire);
+        m.rpos = 0;
+        write_frame(&m, stream, true, (const char *)buf, cap);
+        harp_link l;
+        harp_link_init(&l);
+        uint8_t s = 0xff;
+        harp_cbuf msg;
+        harp_cbuf_init(&msg);
+        CHECK(harp_link_recv(&m.io, &l, &s, &msg) == 0);
+        CHECK(s == stream && msg.len == cap);
+        harp_cbuf_free(&msg);
+        harp_cbuf_free(&m.wire);
+        harp_link_free(&l);
+    }
+    /* `cap` then one more byte, NEITHER frame FIN: the accumulator crosses the bound and
+     * is rejected (-2) before any FIN — proves the cap also bounds a no-FIN flood. Two
+     * frames (not a single cap+1 frame) so the message cap is what trips, not the
+     * 64KiB-per-FRAME limit (which would mask the ctl case). */
+    {
+        uint8_t one = 0xcd;
+        mem_io m;
+        m.io.read_exact = mem_read;
+        m.io.write_all = mem_write;
+        harp_cbuf_init(&m.wire);
+        m.rpos = 0;
+        write_frame(&m, stream, false, (const char *)buf, cap);
+        write_frame(&m, stream, false, (const char *)&one, 1);
+        harp_link l;
+        harp_link_init(&l);
+        uint8_t s = 0xff;
+        harp_cbuf msg;
+        harp_cbuf_init(&msg);
+        CHECK(harp_link_recv(&m.io, &l, &s, &msg) == -2);
+        harp_cbuf_free(&msg);
+        harp_cbuf_free(&m.wire);
+        harp_link_free(&l);
+    }
+    free(buf);
+}
+
+static void test_link_stream_caps(void) {
+    check_stream_cap(HARP_STREAM_CTL, HARP_CTL_MAX_PAYLOAD);
+    check_stream_cap(HARP_STREAM_EVT, HARP_EVT_MAX_PAYLOAD);
+    check_stream_cap(HARP_STREAM_LOG, HARP_LOG_MAX_PAYLOAD);
+
+    /* OBJ is exempt (credit-gated): a multi-frame message far past 64KiB reassembles to
+     * 0, NOT -2 — the cap path must not touch the bulk-object stream. */
+    {
+        size_t big = HARP_CTL_MAX_PAYLOAD * 2 + 5; /* 131077: spans three frames */
+        uint8_t *p = (uint8_t *)malloc(big);
+        memset(p, 0x5a, big);
+        mem_io m;
+        m.io.read_exact = mem_read;
+        m.io.write_all = mem_write;
+        harp_cbuf_init(&m.wire);
+        m.rpos = 0;
+        CHECK(harp_link_send(&m.io, HARP_STREAM_OBJ, p, big) == 0);
+        harp_link l;
+        harp_link_init(&l);
+        uint8_t s = 0xff;
+        harp_cbuf msg;
+        harp_cbuf_init(&msg);
+        CHECK(harp_link_recv(&m.io, &l, &s, &msg) == 0);
+        CHECK(s == HARP_STREAM_OBJ && msg.len == big);
+        harp_cbuf_free(&msg);
+        harp_cbuf_free(&m.wire);
+        harp_link_free(&l);
+        free(p);
+    }
+}
+
 static void test_hash_read(void) {
     /* §10.2: harp_hash_read is the single gate every wire parse site uses. It
      * accepts a well-formed SHA-256 hash and rejects an unknown algorithm byte,
@@ -674,6 +757,7 @@ int main(void) {
     test_sha256();
     test_link_fragmentation();
     test_link_interleave();
+    test_link_stream_caps();
     test_event_channel();
     test_cbor_encode();
     test_cbor_roundtrip();
