@@ -1088,6 +1088,9 @@ bool HarpRuntime::sessionUp() {
     /* cache the binding mode once, off the RT path (review m2). USB => false,
      * so every host-paced branch below is reached exactly as before. */
     freeRunning_ = transport_->isFreeRunning();
+    /* §12.1: the transport is up — DETACHED -> ATTACHED, before hello/identity. */
+    recordTransition(HARP_ST_DETACHED, HARP_ST_ATTACHED, HARP_TR_ATTACH,
+                     freeRunning_ ? "transport up (ethernet)" : "transport up (usb)");
     {
         std::lock_guard<std::mutex> lk(ctlMutex_);
         /* capture the bound device's USB identity (vid:pid:serial) UNDER
@@ -1119,13 +1122,13 @@ bool HarpRuntime::sessionUp() {
         log_msg("connected: %s %s (serial %s, engine %s %s)", vendorName_.c_str(),
                 productName_.c_str(), serial_.c_str(), engineId_.c_str(),
                 engineVer_.c_str());
-        /* §12.1: hello-ok — the device identified, the session is ATTACHED. */
+        /* §12.1: hello-ok — the device identified + capabilities known: ATTACHED -> NEGOTIATED. */
         {
             char d[256];
             snprintf(d, sizeof d, "%s %s (serial %s, engine %s %s)", vendorName_.c_str(),
                      productName_.c_str(), serial_.c_str(), engineId_.c_str(),
                      engineVer_.c_str());
-            recordTransition(HARP_ST_DETACHED, HARP_ST_ATTACHED, HARP_TR_HELLO_OK, d);
+            recordTransition(HARP_ST_ATTACHED, HARP_ST_NEGOTIATED, HARP_TR_HELLO_OK, d);
             recordLog(HARP_LOG_INFO, "session", d);
         }
         /* §8.7 clock mode (auto-select): a free-running (Ethernet/RTP) device that
@@ -1168,8 +1171,8 @@ bool HarpRuntime::sessionUp() {
         }
         if (!audioStart(rate_)) {
             log_msg("audio.start failed");
-            /* §12.1: ATTACHED but the stream never came up -> back to DETACHED. */
-            recordTransition(HARP_ST_ATTACHED, HARP_ST_DETACHED, HARP_TR_AUDIO_START,
+            /* §12.1: NEGOTIATED but the stream never came up -> back to DETACHED. */
+            recordTransition(HARP_ST_NEGOTIATED, HARP_ST_DETACHED, HARP_TR_AUDIO_START,
                              "audio.start failed");
             recordLog(HARP_LOG_ERROR, "audio.start", "audio.start failed");
             harp_client_free(&client_);
@@ -1177,8 +1180,8 @@ bool HarpRuntime::sessionUp() {
             transport_ = nullptr;
             return false;
         }
-        /* §12.1: audio.start accepted -> SYNCED (stream negotiated, clock locked). */
-        recordTransition(HARP_ST_ATTACHED, HARP_ST_SYNCED, HARP_TR_AUDIO_START,
+        /* §12.1: audio.start accepted -> SYNCED (stream synced, clock locked). */
+        recordTransition(HARP_ST_NEGOTIATED, HARP_ST_SYNCED, HARP_TR_AUDIO_START,
                          bitExact_ ? "audio.start ok (bit-exact)" : "audio.start ok (ASRC)");
         recordLog(HARP_LOG_INFO, "audio.start", "audio stream negotiated");
         /* §14.3 LoopbackMeasurer SAFETY (review MINOR). A prior probe that crashed /

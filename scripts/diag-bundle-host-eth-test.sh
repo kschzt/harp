@@ -142,6 +142,7 @@ if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then
     ref $b->{6} eq "ARRAY" or die "session-history (key 6) is not an array\n";
     @{$b->{6}} >= 1    or die "session-history (key 6) is empty\n";
     my $sawStream = 0;
+    my $sawNeg = 0;
     for my $t (@{$b->{6}}) {
       ref $t eq "HASH" or die "state-transition is not a map\n";
       ref $t->{0} eq "ARRAY" && @{$t->{0}} == 2 or die "state-transition key 0 (tstamp) not [epoch,msc]\n";
@@ -149,8 +150,10 @@ if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then
       exists $t->{3} or die "state-transition missing reason (key 3)\n";
       exists $t->{4} or die "state-transition missing detail (key 4)\n";
       $sawStream = 1 if $t->{2} == 4;   # to-state STREAMING
+      $sawNeg = 1 if $t->{2} == 2;      # to-state NEGOTIATED (§12.1)
     }
     $sawStream or die "session-history never reached STREAMING (to-state 4)\n";
+    $sawNeg or die "session-history never reached NEGOTIATED (to-state 2) — §12.1\n";
     # key 8: runtime logs — an array of well-formed log-record maps, tags non-empty.
     exists $b->{8}     or die "key 8 (runtime logs) absent (log ring not drained?)\n";
     ref $b->{8} eq "ARRAY" or die "runtime logs (key 8) is not an array\n";
