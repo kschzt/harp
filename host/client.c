@@ -34,6 +34,23 @@ static void handle_ntf(harp_client *c, const harp_env *e) {
             c->peer_credit += v;
         return;
     }
+    if (strcmp(e->method, "core.changed") == 0 && e->has_body) {
+        /* §5.5: record the "re-query topic X" hint {0 => tstr}, then still surface it. */
+        harp_cdec b;
+        harp_cdec_init(&b, e->body, e->body_len);
+        uint64_t n, key;
+        const char *s;
+        size_t sl;
+        if (harp_cdec_map(&b, &n) && n >= 1 && harp_cdec_uint(&b, &key) && key == 0 &&
+            harp_cdec_text(&b, &s, &sl)) {
+            size_t cl = sl < sizeof c->last_changed_topic - 1 ? sl : sizeof c->last_changed_topic - 1;
+            memcpy(c->last_changed_topic, s, cl);
+            c->last_changed_topic[cl] = 0;
+            c->changed_pending = true;
+        }
+        if (c->on_ntf) c->on_ntf(c->ud, e);
+        return;
+    }
     if (c->on_ntf) c->on_ntf(c->ud, e);
 }
 
@@ -388,6 +405,69 @@ int harp_client_hello(harp_client *c, const char *agent, harp_client_identity *o
      * sliding window that pump_one re-grants on consume. */
     c->granted = 0;
     return client_grant(c) == 0 ? 0 : HARP_CLIENT_EIO;
+}
+
+/* §5.5: re-fetch identity without a session reset. The response body IS the bare
+ * identity map (unlike core.hello, which wraps it under key 1). */
+int harp_client_identify(harp_client *c, harp_client_identity *out) {
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    harp_client_req_head(c, &req, "core.identify", false);
+    harp_env e;
+    int rc = harp_client_request(c, &req, &rsp, &e);
+    bool ok = false;
+    if (rc == 0 && e.has_body) {
+        harp_cdec b;
+        harp_cdec_init(&b, e.body, e.body_len);
+        ok = parse_identity(&b, out);
+    }
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+    if (rc != 0) return rc;
+    return ok ? 0 : HARP_CLIENT_EIO;
+}
+
+/* §5.5: liveness — the device echoes the request body verbatim. Send a fixed nonce
+ * and verify the echo, so a silent/garbled link is caught (not just a missing reply). */
+int harp_client_ping(harp_client *c) {
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    harp_client_req_head(c, &req, "core.ping", true);
+    /* per-call nonce (from the rid this request will carry) so each ping is unique — a fresh
+     * echo must traverse the live link; a replayed/canned response would not match. */
+    uint64_t r = c->next_rid;
+    const uint8_t nonce[4] = {(uint8_t)r, (uint8_t)(r >> 8), (uint8_t)(r >> 16), (uint8_t)(r >> 24)};
+    harp_cbor_bytes(&req, nonce, sizeof nonce);
+    harp_env e;
+    int rc = harp_client_request(c, &req, &rsp, &e);
+    bool ok = false;
+    if (rc == 0 && e.has_body) {
+        harp_cdec b;
+        harp_cdec_init(&b, e.body, e.body_len);
+        const uint8_t *p;
+        size_t pl;
+        ok = harp_cdec_bytes(&b, &p, &pl) && pl == sizeof nonce && memcmp(p, nonce, pl) == 0;
+    }
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+    if (rc != 0) return rc;
+    return ok ? 0 : HARP_CLIENT_EIO;
+}
+
+/* §5.5: orderly session end. The device acks then closes its end (the session loop
+ * breaks on d->closing); callers should not issue further requests on this client. */
+int harp_client_bye(harp_client *c) {
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    harp_client_req_head(c, &req, "core.bye", false);
+    harp_env e;
+    int rc = harp_client_request(c, &req, &rsp, &e);
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+    return rc;
 }
 
 /* ---------------- refs / snapshot ---------------- */

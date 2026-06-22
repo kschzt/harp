@@ -94,6 +94,14 @@ typedef struct {
 
     /* §5.4: device's supported protocol major range, valid after HARP_CLIENT_EINCOMPAT */
     uint32_t incompat_major_min, incompat_major_max;
+
+    /* §5.5 core.changed (D->H "re-query topic X" hint): the last topic the device asked
+     * us to re-query, recorded as the ntf arrives (on_ntf still fires too). The owner polls
+     * changed_pending and re-queries (e.g. core.identify on "identity"), then clears it.
+     * Today only harp-probe's core-test reads it; the shell records but does not yet act on
+     * it (the refdev never emits core.changed spontaneously — it is driven via a test seam). */
+    char last_changed_topic[32];
+    bool changed_pending;
 } harp_client;
 
 void harp_client_init(harp_client *c, harp_io *io, harp_link *link, harp_store *store,
@@ -115,6 +123,14 @@ int harp_client_wait(harp_client *c, uint64_t rid, harp_cbuf *rsp, harp_env *e);
 /* ---- core ---- */
 /* hello + identity parse + obj-credit grant. `agent` names this host. */
 int harp_client_hello(harp_client *c, const char *agent, harp_client_identity *out);
+
+/* §5.5 core methods (the device handlers exist; these are the missing host callers).
+ *   identify — re-fetch identity (§6.2) WITHOUT resetting the session.
+ *   ping     — liveness; the device echoes the body. Returns 0 iff the echo matches.
+ *   bye      — orderly session end; the device acks then closes (MAY release host locks). */
+int harp_client_identify(harp_client *c, harp_client_identity *out);
+int harp_client_ping(harp_client *c);
+int harp_client_bye(harp_client *c);
 
 /* ---- recall ---- */
 int harp_client_refs(harp_client *c, harp_ref *out, size_t cap, size_t *count);

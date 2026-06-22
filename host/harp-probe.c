@@ -1699,6 +1699,71 @@ static void cmd_format_test(probe *p) {
     printf("FORMAT-TEST PASS: evt.format/evt.parse round-trip (continuous + stepped)\n");
 }
 
+/* §5.5 core methods beyond hello/credit: ping (liveness echo), identify (re-fetch identity
+ * with no session reset), core.changed (a D->H "re-query topic" hint — the refdev has no
+ * spontaneous identity change, so we trigger it via the x.harp-refdev.notify-changed seam),
+ * and an orderly core.bye. core.bye is LAST: the device closes its end after acking it. */
+static void cmd_core_test(probe *p) {
+    harp_client_identity id = do_hello(p);
+    printf("── core-test: §5.5 core.ping / core.identify / core.changed / core.bye\n");
+
+    if (harp_client_ping(&p->client) != 0) {
+        fprintf(stderr, "CORE-TEST FAIL: core.ping did not echo the nonce (liveness)\n");
+        exit(1);
+    }
+    printf("   core.ping: nonce echoed verbatim (liveness): OK\n");
+
+    harp_client_identity id2;
+    if (harp_client_identify(&p->client, &id2) != 0) {
+        fprintf(stderr, "CORE-TEST FAIL: core.identify failed\n");
+        exit(1);
+    }
+    bool differs = strcmp(id.serial, id2.serial) != 0 || strcmp(id.engine_id, id2.engine_id) != 0 ||
+                   strcmp(id.engine_ver, id2.engine_ver) != 0 || strcmp(id.fw, id2.fw) != 0 ||
+                   memcmp(&id.param_map_hash, &id2.param_map_hash, sizeof id.param_map_hash) != 0 ||
+                   id2.ncaps != id.ncaps;
+    for (size_t i = 0; !differs && i < id.ncaps; i++)
+        if (strcmp(id.caps[i], id2.caps[i]) != 0) differs = true;
+    if (differs) {
+        fprintf(stderr, "CORE-TEST FAIL: core.identify identity differs from hello "
+                "(serial '%s' vs '%s', engine '%s %s' vs '%s %s', caps %zu vs %zu)\n",
+                id.serial, id2.serial, id.engine_id, id.engine_ver, id2.engine_id, id2.engine_ver,
+                id.ncaps, id2.ncaps);
+        exit(1);
+    }
+    printf("   core.identify: re-fetched identity matches hello (serial %s, %zu caps), no reset: OK\n",
+           id2.serial, id2.ncaps);
+
+    /* core.changed: trigger the device to emit core.changed{0:"identity"}. The device sends
+     * the ntf BEFORE this seam's own response, so request() routes it to the client en route. */
+    p->client.changed_pending = false;
+    p->client.last_changed_topic[0] = 0;
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    req_head(p, &req, "x.harp-refdev.notify-changed", true);
+    harp_cbor_map(&req, 1);
+    harp_cbor_uint(&req, 0);
+    harp_cbor_text(&req, "identity");
+    request(p, &req, &rsp);
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+    if (!p->client.changed_pending || strcmp(p->client.last_changed_topic, "identity") != 0) {
+        fprintf(stderr, "CORE-TEST FAIL: core.changed{identity} not received (pending=%d topic='%s')\n",
+                p->client.changed_pending, p->client.last_changed_topic);
+        exit(1);
+    }
+    printf("   core.changed: device hint to re-query '%s' received: OK\n", p->client.last_changed_topic);
+
+    if (harp_client_bye(&p->client) != 0) {
+        fprintf(stderr, "CORE-TEST FAIL: core.bye was not acknowledged\n");
+        exit(1);
+    }
+    printf("   core.bye: orderly session end acknowledged: OK\n");
+
+    printf("CORE-TEST PASS: §5.5 core.ping/identify/changed/bye all conformant\n");
+}
+
 static void cmd_demo(probe *p, const char *addr) {
     (void)addr;
     p->verbose_ntf = true;
@@ -1984,6 +2049,8 @@ int main(int argc, char **argv) {
         cmd_notif_test(&p);
     else if (strcmp(cmd, "format-test") == 0)
         cmd_format_test(&p);
+    else if (strcmp(cmd, "core-test") == 0)
+        cmd_core_test(&p);
     else if (strcmp(cmd, "cas-test") == 0)
         cmd_cas_test(&p);
     else if (strcmp(cmd, "demo") == 0)

@@ -134,6 +134,21 @@ void meter_pump_stop(device *d) {
     atomic_store_explicit(&a->meter_live, false, memory_order_relaxed);
 }
 
+/* §5.5: core.changed (D->H notification) — a generic "re-query topic X" hint
+ * {0 => tstr topic}, e.g. "identity" after something the host caches has changed.
+ * The host MAY ignore it; a conformant host re-queries via core.identify / state.refs. */
+static void ntf_core_changed(device *d, const char *topic) {
+    if (!atomic_load_explicit(&d->hello_done, memory_order_acquire)) return;
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    harp_env_head(&m, HARP_MSG_NOTIFICATION, 0, "core.changed", true);
+    harp_cbor_map(&m, 1);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_text(&m, topic);
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+
 void ntf_state_changed(device *d, const harp_ref *r) {
     if (!atomic_load_explicit(&d->hello_done, memory_order_acquire)) return;
     harp_cbuf m;
@@ -1856,6 +1871,31 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
         handle_dev_meters(d, &e);
     else if (strcmp(e.method, "x.harp-refdev.txn") == 0)
         handle_dev_txn(d, &e); /* §9.6 reject meters — golden-free observability */
+    else if (strcmp(e.method, "x.harp-refdev.notify-changed") == 0) {
+        /* §5.5 conformance seam: the refdev has no spontaneous identity mutation, so a test
+         * drives the core.changed sender from here. body {0 => tstr topic}, default "identity".
+         * The ntf is emitted BEFORE this response so the host routes it during the request wait. */
+        char topic[32] = "identity";
+        if (e.has_body) {
+            harp_cdec b;
+            harp_cdec_init(&b, e.body, e.body_len);
+            uint64_t n, key;
+            const char *s;
+            size_t sl;
+            if (harp_cdec_map(&b, &n) && n >= 1 && harp_cdec_uint(&b, &key) && key == 0 &&
+                harp_cdec_text(&b, &s, &sl)) {
+                size_t cl = sl < sizeof topic - 1 ? sl : sizeof topic - 1;
+                memcpy(topic, s, cl);
+                topic[cl] = 0;
+            }
+        }
+        ntf_core_changed(d, topic);
+        harp_cbuf m;
+        harp_cbuf_init(&m);
+        rsp_head(&m, e.rid, e.method, false);
+        send_ctl(d, &m);
+        harp_cbuf_free(&m);
+    }
     else if (strcmp(e.method, "x.harp-refdev.restart") == 0) {
         /* dev-loop helper: exit cleanly so systemd (Restart=always) respawns
          * the daemon from the (possibly updated) binary on disk — the
