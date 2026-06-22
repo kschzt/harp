@@ -101,6 +101,7 @@ else run part-filter    scripts/part-filter-eth-test.sh; fi
 # built on every platform yet (Windows: pending); the gate auto-enables them when it is.
 if have "$PROBE"; then
   run recall           scripts/recall-eth-test.sh            # §11.4 recall round-trip + archive
+  run credit           scripts/credit-eth-test.sh            # §4.2.1b obj credit queue/flush under starvation
   run offline-edit     scripts/offline-edit-eth-test.sh      # §15.5 edit-while-absent reaches device
   run diag-bundle      scripts/diag-bundle-eth-test.sh       # §14.4 device-side export + §16 anon
 else

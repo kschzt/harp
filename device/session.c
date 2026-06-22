@@ -9,6 +9,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h> /* getenv/strtoull: the §4.2.1b HARP_FORCE_CREDIT_GRANT test seam */
 #include <string.h>
 #ifndef _WIN32
 #include <sys/statvfs.h> /* free-space checks; Windows skips them (see handle_* below) */
@@ -155,15 +156,59 @@ void ntf_state_changed(device *d, const harp_ref *r) {
 }
 
 void grant_credit(device *d) {
+    /* §4.2.1b: HARP_FORCE_CREDIT_GRANT shrinks the window so the conformance test can drive
+     * the obj-send queue/flush/re-grant under starvation; unset, this is the 16 MiB default. */
+    uint64_t amt = CREDIT_GRANT;
+    const char *f = getenv("HARP_FORCE_CREDIT_GRANT");
+    if (f && *f) { uint64_t v = strtoull(f, NULL, 10); if (v) amt = v; } /* 0/garbage -> real grant */
     harp_cbuf m;
     harp_cbuf_init(&m);
     harp_env_head(&m, HARP_MSG_NOTIFICATION, 0, "core.credit", true);
     harp_cbor_map(&m, 1);
     harp_cbor_uint(&m, 0);
-    harp_cbor_uint(&m, CREDIT_GRANT);
+    harp_cbor_uint(&m, amt);
     send_ctl(d, &m);
     harp_cbuf_free(&m);
-    d->granted += CREDIT_GRANT;
+    d->granted += amt;
+}
+
+/* §4.2.1 obj-send queue: a FIFO ring of (content-addressed, durable) object hashes the
+ * device holds but couldn't send yet for lack of peer credit. Both accessors run ONLY on
+ * the recv thread (handle_state_want enqueues; the core.credit handler flushes), so the
+ * ring needs no lock; the harp_link_send itself takes send_mu, frame-atomic against the
+ * panel-thread evt echo (the old unconditional send here did NOT — a latent interleave). */
+static void sendq_push(device *d, const harp_hash *h) {
+    if (d->sendq_count == HARP_SENDQ_CAP) { CTR_INC(d->obj_drops); return; } /* overflow: drop + count */
+    d->sendq[d->sendq_tail] = *h;
+    d->sendq_tail = (d->sendq_tail + 1) % HARP_SENDQ_CAP;
+    d->sendq_count++;
+}
+
+/* Send queued objects in FIFO order while peer_credit covers the head; stop at the first
+ * that doesn't fit (never reorder) — the next core.credit grant resumes the drain. A
+ * queued hash that no longer resolves in the store is dropped + counted. */
+static void sendq_flush(device *d) {
+    harp_cbuf enc;
+    harp_cbuf_init(&enc);
+    while (d->sendq_count) {
+        const harp_hash *h = &d->sendq[d->sendq_head];
+        harp_cbuf_reset(&enc); /* harp_store_get APPENDS — reset before each get */
+        if (harp_store_get(&d->store, h, &enc) != 0) { /* unresolvable head: drop, keep draining */
+            d->sendq_head = (d->sendq_head + 1) % HARP_SENDQ_CAP;
+            d->sendq_count--;
+            CTR_INC(d->obj_drops);
+            continue;
+        }
+        if (enc.len > d->peer_credit) break; /* head doesn't fit -> wait for the next grant */
+        pthread_mutex_lock(&d->send_mu);
+        int rc = d->io ? harp_link_send(d->io, HARP_STREAM_OBJ, enc.buf, enc.len) : -1;
+        pthread_mutex_unlock(&d->send_mu);
+        if (rc != 0) break; /* io gone / send failed: keep the queue (cleared at next session start/hello) */
+        d->peer_credit -= enc.len;
+        d->sendq_head = (d->sendq_head + 1) % HARP_SENDQ_CAP;
+        d->sendq_count--;
+    }
+    harp_cbuf_free(&enc);
 }
 
 void send_error(device *d, uint64_t rid, const char *method, const char *code,
@@ -376,6 +421,7 @@ static void handle_hello(device *d, const harp_env *e) {
     atomic_store_explicit(&d->hello_done, true, memory_order_release);
     d->peer_credit = 0;
     d->granted = 0;
+    d->sendq_head = d->sendq_tail = d->sendq_count = 0; /* §4.2.1: drop any backlog from a dead session */
 
     harp_cbuf m;
     harp_cbuf_init(&m);
@@ -530,17 +576,12 @@ static void handle_state_want(device *d, const harp_env *e) {
     send_ctl(d, &m);
     harp_cbuf_free(&m);
 
-    harp_cbuf enc;
-    harp_cbuf_init(&enc);
-    for (size_t i = 0; i < nq; i++) {
-        harp_cbuf_reset(&enc);
-        if (harp_store_get(&d->store, &queue[i], &enc) != 0) continue;
-        /* §4.2.1: never exceed granted credit. The simulator grants 16 MiB up
-         * front and objects are small; a full implementation would queue. */
-        if (enc.len <= d->peer_credit) d->peer_credit -= enc.len;
-        harp_link_send(d->io, HARP_STREAM_OBJ, enc.buf, enc.len);
-    }
-    harp_cbuf_free(&enc);
+    /* §4.2.1: enqueue every held object in want order, then send as much as the granted
+     * credit covers; the remainder drains on the next core.credit grant (sendq_flush). The
+     * nq count sent above stays honest — it is how many objects we HOLD, not how many were
+     * already put on the wire, and the host's fetch loop tolerates later arrival. */
+    for (size_t i = 0; i < nq; i++) sendq_push(d, &queue[i]);
+    sendq_flush(d);
 }
 
 static void handle_state_send(device *d, const harp_env *e) {
@@ -1550,8 +1591,10 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
             harp_cdec_init(&b, e.body, e.body_len);
             uint64_t n, key, v;
             if (harp_cdec_map(&b, &n) && n >= 1 && harp_cdec_uint(&b, &key) && key == 0 &&
-                harp_cdec_uint(&b, &v))
+                harp_cdec_uint(&b, &v)) {
                 d->peer_credit += v;
+                sendq_flush(d); /* §4.2.1: a grant arrived -> drain whatever the want loop couldn't */
+            }
         }
         return; /* unknown notifications are ignored (§5.2) */
     }
@@ -1688,6 +1731,13 @@ void harp_deviced_run_session(device *d, harp_io *io) {
     pthread_mutex_unlock(&d->send_mu);
     atomic_store_explicit(&d->hello_done, false, memory_order_release);
     d->closing = false;
+    /* §4.2.1: a fresh session starts with no credit and an empty send queue. handle_hello
+     * resets these too, but the core.credit handler is NOT hello-gated, so a malformed peer
+     * could grant BEFORE hello — that must not flush a prior session's leftover queue (it
+     * would put un-want'ed objects on the new OBJ stream and debit its peer_credit). */
+    d->peer_credit = 0;
+    d->granted = 0;
+    d->sendq_head = d->sendq_tail = d->sendq_count = 0;
     harp_link_init(&d->link);
     harp_cbuf msg;
     harp_cbuf_init(&msg);

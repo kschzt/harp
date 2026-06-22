@@ -46,6 +46,7 @@
 #define ENGINE_VERSION "1.1.0"
 #define FW_VERSION "0.1.0"
 #define CREDIT_GRANT (16u << 20)
+#define HARP_SENDQ_CAP 1024 /* §4.2.1 bounded obj-send queue (FIFO of hashes); 1024*33B ≈ 33 KiB */
 #define LIVE_REF "live/project"
 #define PARAMS_MEDIA "application/x.harp-refdev.params"
 
@@ -311,6 +312,12 @@ typedef struct {
     bool closing;            /* session thread only */
     uint64_t peer_credit;   /* bytes we may still send on obj */
     uint64_t granted;       /* unconsumed credit we granted the peer */
+    /* §4.2.1 obj-send flow control: when peer_credit can't cover a held object, queue its
+     * (content-addressed, durable) hash and flush in FIFO order when a core.credit grant
+     * arrives. Producer (handle_state_want) and flusher (the core.credit handler) both run
+     * ONLY on the recv thread — serialized, so no lock. */
+    harp_hash sendq[HARP_SENDQ_CAP];
+    size_t sendq_head, sendq_tail, sendq_count;
     uint32_t rtp_peer_ip;   /* §8.7: the TCP peer's IPv4 (network order), or 0 when
                                the session is not over TCP (USB gadget). It is the
                                RTP audio destination when audio.start negotiates a
@@ -334,7 +341,7 @@ typedef struct {
     /* counters (§14.2): frame_errors has render + session writers;
      * snapshots_taken has session + panel writers; all read cross-thread */
     _Atomic uint64_t frame_errors, session_resets, snapshots_taken, audio_overruns, evt_stale_epoch,
-        audio_late_frames;
+        audio_late_frames, obj_drops;
 } device;
 
 extern device g_dev;
