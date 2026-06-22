@@ -325,7 +325,7 @@ hello-rsp = { 0 => [uint, uint],            ; protocol version selected by devic
               1 => identity }               ; §6.2
 ```
 
-The device selects the highest mutually supported `major` and replies; differing `minor` within a `major` is compatible by rule (§18). If no common `major` exists, the device replies with error `incompatible` including its supported range, and the host MUST surface a firmware/host-update prompt rather than failing silently. `core.hello` MUST complete before any other method; a device MUST reset all per-session state upon receiving it.
+The device selects the highest mutually supported `major` and replies; differing `minor` within a `major` is compatible by rule (§18). If no common `major` exists, the device replies with error `incompatible` whose details (`error-body` key 2) carry its supported major range as `{ 0 => uint min-major, 1 => uint max-major }`, and the host MUST surface a firmware/host-update prompt rather than failing silently. `core.hello` MUST complete before any other method; a device MUST reset all per-session state upon receiving it.
 
 ### 5.5 Core methods
 
@@ -363,7 +363,12 @@ identity = {
   8  => latency-profile, ; §6.4
   ? 9  => tstr,          ; firmware build id (informative)
   ? 10 => uint,          ; boot count (diagnostics correlation)
+  ? 11 => ump-group-map, ; §9.10; declared by `evt.ump` devices
+  ? 12 => uint,          ; multitimbral part count (§9.4, §15.2); declared by `evt.multitimbral`, absent ⇒ 1
+  ? 13 => txn-limits,    ; §9.6 transaction bounds; declared by `evt.txn`
 }
+ump-group-map = [* { 0 => uint group-index, 1 => tstr role }]
+txn-limits    = { 0 => uint max-concurrent, 1 => uint max-events }  ; MUST: max-concurrent ≥ 1, max-events ≥ 256
 semver = tstr            ; "MAJOR.MINOR.PATCH", SemVer 2.0.0
 hash   = bstr .size 33   ; 1 algorithm byte (0x01 = SHA-256) + digest
 ```
@@ -635,7 +640,15 @@ The optional `voice` field is a packed uint aligned with UMP addressing: `(group
 
 ### 9.6 Transactions
 
-Transactions group events for atomic application (kit loads, morph targets): `txn-begin {txn-id}` … events tagged with `txn-id` … `txn-commit {txn-id, tstamp}` applies all at one instant; `txn-abort` discards. Devices MUST bound open transactions (≥ 1 concurrent, ≥ 256 events) and report limits in capabilities.
+Transactions group events for atomic application (kit loads, morph targets). They ride the `evt` stream (§9.2) as events with no body of their own beyond a transaction id, gated by capability `evt.txn`:
+
+```cddl
+txn-begin  = { 0 => uint txn-id }                 ; etype 2
+txn-commit = { 0 => uint txn-id, ? 1 => tstamp }  ; etype 3
+txn-abort  = { 0 => uint txn-id }                 ; etype 4
+```
+
+After `txn-begin`, a `param`/`ramp`/`mod` event carrying that `txn-id` in body key 4 (§9.4) **buffers** in the named transaction instead of applying, and MUST NOT dirty live state. `txn-commit` re-stamps the whole buffered batch onto a single instant — its optional `tstamp [epoch, msc]`, else the commit message's own timestamp — and applies the batch **all-or-nothing**; `txn-abort` discards it. **`txn-id` 0 is reserved as the untagged sentinel**: an event with no key 4, or key 4 == 0, applies immediately and is never buffered, so 0 can never name an open transaction. A device MUST reject `txn-begin {0}` (and SHOULD count the rejection); a `txn-commit`/`txn-abort` for an unknown or already-closed id is a no-op. Devices MUST bound open transactions (≥ 1 concurrent, ≥ 256 buffered events) and report the limits in identity key 13 (§6.2); a buffered event for a full transaction is dropped and counted, never applied partially. Transport (etype 7) is never transactional — its body key 4 is PPQ (§9.7), not a `txn-id`.
 
 ### 9.7 Transport, tempo, and musical time
 
@@ -1066,7 +1079,10 @@ tstamp = [uint, uint64]            ; (epoch, msc)
 ; --- identity ---
 identity = { 0 => vendor, 1 => product, 2 => tstr, 3 => semver, 4 => engine,
              5 => [uint, uint], 6 => [* tstr], 7 => channel-map, 8 => latency-profile,
-             ? 9 => tstr, ? 10 => uint }
+             ? 9 => tstr, ? 10 => uint,
+             ? 11 => ump-group-map, ? 12 => uint, ? 13 => txn-limits }
+ump-group-map = [* { 0 => uint, 1 => tstr }]
+txn-limits    = { 0 => uint, 1 => uint }    ; max-concurrent ≥ 1, max-events ≥ 256
 vendor   = { 0 => uint, 1 => tstr }
 product  = { 0 => uint, 1 => tstr }
 engine   = { 0 => tstr, 1 => semver, 2 => hash }
@@ -1079,6 +1095,10 @@ event = [ tstamp, etype: 0..7, any ]
 param-event = { 0 => uint, 1 => float32, ? 2 => int, ? 3 => uint, ? 4 => uint, ? 5 => uint }
 ramp-event  = { 0 => uint, 1 => float32, 2 => tstamp, ? 3 => uint, ? 4 => uint, ? 5 => uint }
 mod-event   = { 0 => uint, 1 => float32, ? 3 => uint, ? 4 => uint, ? 5 => uint }
+; txn-id 0 (or absent key 4) = untagged, apply immediately; a device MUST reject txn-begin{0}
+txn-begin   = { 0 => uint }                ; etype 2
+txn-commit  = { 0 => uint, ? 1 => tstamp } ; etype 3 — re-stamp the batch onto this instant, apply all-or-nothing
+txn-abort   = { 0 => uint }                ; etype 4
 transport-event = { 0 => uint, ? 1 => float64, ? 2 => [uint, uint], ? 3 => uint64,
                     ? 4 => float64, ? 5 => [float64, float64], ? 6 => float64 }
 param  = { 0 => uint, 1 => tstr, ? 2 => tstr, ? 3 => tstr, ? 4 => [float, float],
