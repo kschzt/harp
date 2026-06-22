@@ -90,6 +90,24 @@ target_link_libraries(harp-probe harpcore ${HARP_MATH_LIB} ${HARP_PLAT_LIBS})
 if(WIN32)
   target_link_libraries(harp-probe ws2_32) # Winsock for the TCP dev transport
 endif()
+# §4.4.3 mDNS discovery (`harp-probe discover`): dns_sd is native on macOS (libSystem) and
+# provided by avahi-compat's libdns_sd on Linux. Where neither header nor lib is present
+# (bare CI), the discover command compiles to a clear stub — no build break.
+include(CheckIncludeFile)
+check_include_file(dns_sd.h HARP_HAVE_DNS_SD_HDR)
+if(HARP_HAVE_DNS_SD_HDR)
+  if(APPLE)
+    target_compile_definitions(harp-probe PRIVATE HAVE_DNS_SD)
+    message(STATUS "harp-probe: dns_sd (macOS native), mDNS discover enabled")
+  else()
+    find_library(HARP_DNSSD_LIB dns_sd)
+    if(HARP_DNSSD_LIB)
+      target_compile_definitions(harp-probe PRIVATE HAVE_DNS_SD)
+      target_link_libraries(harp-probe ${HARP_DNSSD_LIB})
+      message(STATUS "harp-probe: dns_sd (${HARP_DNSSD_LIB}), mDNS discover enabled")
+    endif()
+  endif()
+endif()
 
 find_package(PkgConfig QUIET)
 if(PKG_CONFIG_FOUND)

@@ -97,6 +97,13 @@ else skip latefr "harp-eth-latefr-test not built (POSIX-only host-paced tool)"; 
 if [ "$OSID" = windows ]; then skip part-filter "MinGW device panel is a stub (§9.4 multi-instance demux pending Windows panel transport)"
 else run part-filter    scripts/part-filter-eth-test.sh; fi
 
+# §4.4.3 mDNS _harp._tcp discovery round-trip: needs a LIVE mDNS responder + a dns_sd-built
+# harp-probe. macOS CI has mDNSResponder always up; Linux/Windows runners don't reliably, so
+# they SKIP — the path is bench-proven on the KR260 (avahi over the direct cable). The script
+# also self-skips a no-dns_sd build.
+if [ "$OSID" = macos ]; then run mdns-discover scripts/mdns-discover-test.sh
+else skip mdns-discover "mDNS needs a live responder (macOS CI only; bench-proven on the KR260/avahi)"; fi
+
 # These mutate/inspect the device via harp-probe ("the musician"). harp-probe is not
 # built on every platform yet (Windows: pending); the gate auto-enables them when it is.
 if have "$PROBE"; then
