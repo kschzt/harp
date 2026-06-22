@@ -231,7 +231,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
      * map is well-formed CBOR and every advertised key is actually parseable.
      * Identity is not byte-constrained by the golden (which checks rendered
      * audio) nor by param-map-hash (computed from encode_param_array). */
-    harp_cbor_map(m, 13);
+    harp_cbor_map(m, 14); /* §9.6 adds key 13 (txn limits) */
     harp_cbor_uint(m, 0); /* vendor */
     harp_cbor_map(m, 2);
     harp_cbor_uint(m, 0);
@@ -261,7 +261,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, PROTO_MAJOR);
     harp_cbor_uint(m, PROTO_MINOR);
     harp_cbor_uint(m, 6); /* capabilities */
-    harp_cbor_array(m, d->no_rate_lock ? 17 : 18); /* P3: +evt.multitimbral; §9.9: +evt.param.meter;
+    harp_cbor_array(m, d->no_rate_lock ? 18 : 19); /* §9.6: +evt.txn; P3: +evt.multitimbral; §9.9: +evt.param.meter;
                                +evt.param.mod; §8.7: +audio.rate-lock (dropped under
                                --no-rate-lock to force the host ASRC fallback);
                                §14.4: +diag.bundle; §14.3: +diag.loopback.digital */
@@ -287,6 +287,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
                                            that renders them is Phase 2 */
     harp_cbor_text(m, "evt.transport");
     harp_cbor_text(m, "evt.ump"); /* note input as UMP (§9.10); group map = key 11 */
+    harp_cbor_text(m, "evt.txn"); /* §9.6 event transactions; limits in identity key 13 */
     harp_cbor_text(m, "evt.multitimbral"); /* P3: 16 independent per-part timbres;
                                               params/notes/ramps route by §9.4 part
                                               (channel key 5). Part count = key 12 */
@@ -364,6 +365,14 @@ static void encode_identity(device *d, harp_cbuf *m) {
                               ump-group-map style); hosts that don't know it skip
                               it. Pairs with the "evt.multitimbral" capability. */
     harp_cbor_uint(m, NPARTS);
+    harp_cbor_uint(m, 13); /* §9.6 transaction limits { 0: max concurrent, 1: max events/txn }.
+                              Reported here (not in the cap string) because caps >= 32 chars are
+                              dropped by the host parser, so "evt.txn" stays the strcmp token. */
+    harp_cbor_map(m, 2);
+    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, DEV_TXN_MAX);
+    harp_cbor_uint(m, 1);
+    harp_cbor_uint(m, DEV_TXN_EVENTS_MAX);
 }
 
 /* ---------------- method handlers ---------------- */
@@ -422,6 +431,7 @@ static void handle_hello(device *d, const harp_env *e) {
     d->peer_credit = 0;
     d->granted = 0;
     d->sendq_head = d->sendq_tail = d->sendq_count = 0; /* §4.2.1: drop any backlog from a dead session */
+    memset(d->txn, 0, sizeof d->txn); /* §9.6: abandon any open transactions on hello/reset */
 
     harp_cbuf m;
     harp_cbuf_init(&m);
@@ -1054,6 +1064,11 @@ static void handle_audio_start(device *d, const harp_env *e) {
         }
     }
     evq_reset_for_new_stream();
+    /* §9.6: a new stream is a new SSI timeline (§7.1). Buffered transactions hold events stamped
+     * (and ramp-end'd) against the OLD timeline, so committing one after the restart would splice
+     * stale instants into the fresh clock (a ramp end < start → snaps/mis-times). Abandon them with
+     * the evq, same invariant evq_reset_for_new_stream enforces for the queue. */
+    memset(d->txn, 0, sizeof d->txn);
     d->audio.fd = fd;
     d->audio.out_fd = out_fd;
     d->audio.rtp_fd = rtp_fd;   /* >=0 only for RTP; USB stays <0 => emit is a no-op */
@@ -1133,6 +1148,7 @@ static void handle_audio_start(device *d, const harp_env *e) {
 
 static void handle_audio_stop(device *d, const harp_env *e) {
     audio_stop(d);
+    memset(d->txn, 0, sizeof d->txn); /* §9.6: the stream's timeline is gone; drop buffered txns */
     harp_cbuf m;
     harp_cbuf_init(&m);
     rsp_head(&m, e->rid, e->method, false);
@@ -1270,9 +1286,77 @@ static void handle_evt_parse(device *d, const harp_env *e) {
     harp_cbuf_free(&m);
 }
 
+/* ---------------- §9.6 event transactions ---------------- */
+
+/* find the OPEN txn with this id, or NULL. Linear scan of DEV_TXN_MAX (4); recv-thread-only. */
+static dev_txn *txn_find(device *d, uint64_t id) {
+    for (int i = 0; i < DEV_TXN_MAX; i++)
+        if (d->txn[i].open && d->txn[i].id == id) return &d->txn[i];
+    return NULL;
+}
+
+/* txn-begin (etype 2): open a slot for `id`. A duplicate id or no free slot is rejected +
+ * counted, leaving any existing txn untouched (never clobber a live buffer). */
+static void txn_begin(device *d, uint64_t id) {
+    /* txn-id 0 is the in-band "untagged" sentinel: an event with no key-4 (or key-4 == 0) applies
+     * immediately, NOT into a transaction. So 0 can never name an open txn — "opening" it would
+     * silently lose atomicity (its tagged events apply at once; its commit finds an empty slot and
+     * is a no-op). Reject it explicitly. (§9.6: the evt.txn cap / key-13 limits define 0 == untagged.) */
+    if (id == 0) { CTR_INC(d->evt_txn_rejected); return; }
+    if (txn_find(d, id)) { CTR_INC(d->evt_txn_rejected); return; } /* duplicate begin */
+    for (int i = 0; i < DEV_TXN_MAX; i++)
+        if (!d->txn[i].open) {
+            d->txn[i].open = true;
+            d->txn[i].id = id;
+            d->txn[i].n = 0;
+            return;
+        }
+    CTR_INC(d->evt_txn_rejected); /* all DEV_TXN_MAX slots in use */
+}
+
+/* a decoded event tagged with txn_id (0 = untagged): apply NOW, or buffer in the open txn. A
+ * tag for an unknown/closed txn is SWALLOWED + counted — applying it would break atomicity. */
+static void txn_submit(device *d, uint64_t txn_id, dev_event ev) {
+    if (txn_id == 0) { evq_push(ev); return; } /* untagged: byte-identical to pre-§9.6 */
+    dev_txn *t = txn_find(d, txn_id);
+    if (!t) { CTR_INC(d->evt_txn_unknown); return; }
+    if (t->n >= DEV_TXN_EVENTS_MAX) { CTR_INC(d->evt_txn_overflow); return; }
+    t->ev[t->n++] = ev;
+}
+
+/* txn-commit (etype 3): re-stamp every buffered event to commit_msc and apply the WHOLE batch
+ * atomically (evq_push_batch — all or none). Unknown id -> count + no-op. Returns whether the
+ * batch held a param/ramp, so the caller re-dirties the patch ONCE for the committed instant. */
+static bool txn_commit(device *d, uint64_t id, uint64_t commit_msc) {
+    dev_txn *t = txn_find(d, id);
+    if (!t) { CTR_INC(d->evt_txn_unknown); return false; }
+    bool had_dirty = false;
+    for (uint16_t i = 0; i < t->n; i++) {
+        t->ev[i].ts = commit_msc; /* collapse the batch onto one instant */
+        if (t->ev[i].kind == DEV_EV_PARAM_SET || t->ev[i].kind == DEV_EV_RAMP) had_dirty = true;
+    }
+    /* All-or-nothing: if the evq can't hold the whole batch it lands NOTHING (evq_push_batch counts
+     * the dropped events in g_evq_drops — no separate meter, so the commit-time drop isn't double-
+     * counted). Report dirty ONLY if the batch actually applied — else the caller would dirty the
+     * live ref + fire a spurious state.changed for a commit that moved no parameter (misleading
+     * recall and the §11.3 CAS). With the evq headroom over a maximal txn (device.h), this rejection
+     * is reachable only under catastrophic queue pressure. */
+    bool pushed = (t->n == 0) || evq_push_batch(t->ev, t->n);
+    t->open = false; /* commit consumes the txn regardless */
+    return had_dirty && pushed;
+}
+
+/* txn-abort (etype 4): discard the buffer + free the slot. Unknown id -> count + no-op. */
+static void txn_abort(device *d, uint64_t id) {
+    dev_txn *t = txn_find(d, id);
+    if (!t) { CTR_INC(d->evt_txn_unknown); return; }
+    t->open = false;
+}
+
 /* evt stream (§9.2): timestamped event messages. Slice 1: etype 1 (param
  * set) applied at "now"; other types skipped. Events have no responses.
- * Host-driven sets do NOT echo (§9.4). */
+ * Host-driven sets do NOT echo (§9.4). §9.6: events MAY carry a txn-id (body key 4);
+ * etypes 2/3/4 are txn-begin/commit/abort. */
 static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
     harp_cdec dec;
     harp_cdec_init(&dec, buf, len);
@@ -1326,9 +1410,9 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
         return;
     }
     if (etype == 5) { /* ramp (§9.4): {0 param, 1 target, 2 end tstamp} */
-        uint64_t n, key, id = 0, eep = 0, ets = 0, channel = 0, voice = 0;
+        uint64_t n, key, id = 0, eep = 0, ets = 0, channel = 0, voice = 0, txn_id = 0;
         double target = 0;
-        bool have_id = false, have_t = false, have_end = false;
+        bool have_id = false, have_t = false, have_end = false, have_txn = false;
         if (!harp_cdec_map(&dec, &n)) {
             CTR_INC(d->frame_errors);
             return;
@@ -1349,6 +1433,9 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
                 have_end = true;
             } else if (key == 3) { /* §9.5 per-voice (decoded; applied in Phase 2) */
                 if (!harp_cdec_uint(&dec, &voice)) return;
+            } else if (key == 4) { /* §9.6 txn-id */
+                if (!harp_cdec_uint(&dec, &txn_id)) return;
+                have_txn = true;
             } else if (key == 5) { /* multitimbral part (§9.4): 0..15, default 0 */
                 if (!harp_cdec_uint(&dec, &channel)) return;
             } else if (!harp_cdec_skip(&dec))
@@ -1359,8 +1446,8 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
         if (target > 1) target = 1;
         dev_event ev = {msc, DEV_EV_RAMP, (uint32_t)id, (float)target, ets, 0,
                         (uint8_t)(channel & 0xf), (uint32_t)voice};
-        evq_push(ev);
-        live_ref_touch(d, true);
+        txn_submit(d, have_txn ? txn_id : 0, ev);
+        if (!have_txn) live_ref_touch(d, true); /* §9.6: buffered -> no early dirty */
         return;
     }
     if (etype == 7) { /* transport (§9.7): the (ts, ppq, tempo) anchor */
@@ -1392,22 +1479,68 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
                        * MUST NOT alter the base value / dirty state (§9.4): no
                        * live_ref_touch, and the offset is NOT clamped to [0,1] (it is
                        * signed, clamped only after summation onto the base). */
-        uint64_t n, key, id = 0, channel = 0, voice = 0;
+        uint64_t n, key, id = 0, channel = 0, voice = 0, txn_id = 0;
         double offset = 0;
-        bool have_id = false, have_o = false;
+        bool have_id = false, have_o = false, have_txn = false;
         if (!harp_cdec_map(&dec, &n)) { CTR_INC(d->frame_errors); return; }
         for (uint64_t i = 0; i < n; i++) {
             if (!harp_cdec_uint(&dec, &key)) return;
             if (key == 0) { if (!harp_cdec_uint(&dec, &id)) return; have_id = true; }
             else if (key == 1) { if (!harp_cdec_float(&dec, &offset)) return; have_o = true; }
             else if (key == 3) { if (!harp_cdec_uint(&dec, &voice)) return; }
+            else if (key == 4) { if (!harp_cdec_uint(&dec, &txn_id)) return; have_txn = true; } /* §9.6 */
             else if (key == 5) { if (!harp_cdec_uint(&dec, &channel)) return; }
             else if (!harp_cdec_skip(&dec)) return;
         }
         if (!have_id || !have_o) return;
         dev_event ev = {msc, DEV_EV_MOD, (uint32_t)id, (float)offset, 0, 0,
                         (uint8_t)(channel & 0xf), (uint32_t)voice};
-        evq_push(ev);
+        txn_submit(d, have_txn ? txn_id : 0, ev); /* mod is non-destructive: no live_ref_touch */
+        return;
+    }
+    if (etype == 2) { /* §9.6 txn-begin { 0: txn-id } */
+        uint64_t tn2, key, id = 0;
+        bool have_id = false;
+        if (!harp_cdec_map(&dec, &tn2)) { CTR_INC(d->frame_errors); return; }
+        for (uint64_t i = 0; i < tn2; i++) {
+            if (!harp_cdec_uint(&dec, &key)) return;
+            if (key == 0) { if (!harp_cdec_uint(&dec, &id)) return; have_id = true; }
+            else if (!harp_cdec_skip(&dec)) return;
+        }
+        if (have_id) txn_begin(d, id);
+        return;
+    }
+    if (etype == 3) { /* §9.6 txn-commit { 0: txn-id, ?1: tstamp [epoch,msc] } -> apply atomically */
+        uint64_t tn2, key, id = 0, cep = 0, cts = 0, cmsc = msc;
+        bool have_id = false, have_t = false;
+        if (!harp_cdec_map(&dec, &tn2)) { CTR_INC(d->frame_errors); return; }
+        for (uint64_t i = 0; i < tn2; i++) {
+            if (!harp_cdec_uint(&dec, &key)) return;
+            if (key == 0) { if (!harp_cdec_uint(&dec, &id)) return; have_id = true; }
+            else if (key == 1) { /* commit instant [epoch, msc] — same shape as the ramp-end key */
+                uint64_t a2;
+                if (!harp_cdec_array(&dec, &a2) || a2 != 2 || !harp_cdec_uint(&dec, &cep) ||
+                    !harp_cdec_uint(&dec, &cts))
+                    return;
+                have_t = true;
+            } else if (!harp_cdec_skip(&dec))
+                return;
+        }
+        if (!have_id) return;
+        if (have_t) cmsc = cts; /* commit instant (else "now" = the message msc) */
+        if (txn_commit(d, id, cmsc)) live_ref_touch(d, true); /* re-dirty once for a param/ramp batch */
+        return;
+    }
+    if (etype == 4) { /* §9.6 txn-abort { 0: txn-id } -> discard the buffer */
+        uint64_t tn2, key, id = 0;
+        bool have_id = false;
+        if (!harp_cdec_map(&dec, &tn2)) { CTR_INC(d->frame_errors); return; }
+        for (uint64_t i = 0; i < tn2; i++) {
+            if (!harp_cdec_uint(&dec, &key)) return;
+            if (key == 0) { if (!harp_cdec_uint(&dec, &id)) return; have_id = true; }
+            else if (!harp_cdec_skip(&dec)) return;
+        }
+        if (have_id) txn_abort(d, id);
         return;
     }
     if (etype != 1) return; /* unknown event types are skipped, not fatal */
@@ -1418,7 +1551,8 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
         CTR_INC(d->frame_errors);
         return;
     }
-    uint64_t channel = 0, voice = 0;
+    uint64_t channel = 0, voice = 0, txn_id = 0;
+    bool have_txn = false;
     for (uint64_t i = 0; i < n; i++) {
         if (!harp_cdec_uint(&dec, &key)) return;
         if (key == 0) {
@@ -1429,6 +1563,9 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
             have_v = true;
         } else if (key == 3) { /* §9.5 per-voice (decoded; applied in Phase 2) */
             if (!harp_cdec_uint(&dec, &voice)) return;
+        } else if (key == 4) { /* §9.6 txn-id: buffer in the open txn instead of applying now */
+            if (!harp_cdec_uint(&dec, &txn_id)) return;
+            have_txn = true;
         } else if (key == 5) { /* multitimbral part (§9.4): 0..15, default 0 */
             if (!harp_cdec_uint(&dec, &channel)) return;
         } else if (!harp_cdec_skip(&dec))
@@ -1442,8 +1579,8 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
      * the direct path raced ramps_advance on g_ramps[i].active */
     dev_event ev = {msc, DEV_EV_PARAM_SET, (uint32_t)id, (float)v, 0, 0,
                     (uint8_t)(channel & 0xf), (uint32_t)voice};
-    evq_push(ev);
-    live_ref_touch(d, true);
+    txn_submit(d, have_txn ? txn_id : 0, ev);
+    if (!have_txn) live_ref_touch(d, true); /* §9.6: a buffered edit must not dirty until commit */
 }
 
 /* x.harp-refdev.knob {0: param-id, 1: value} — front-panel simulation */
@@ -1573,6 +1710,26 @@ static void handle_dev_meters(device *d, const harp_env *e) {
     harp_cbuf_free(&m);
 }
 
+/* x.harp-refdev.txn -> {0: rejected, 1: overflow, 2: unknown} — the §9.6 transaction reject
+ * meters: begin rejected (txn-id 0 / duplicate / no free slot), per-txn buffer overflow (events
+ * beyond DEV_TXN_EVENTS_MAX at submit), and unknown-id submit/commit/abort. These are deliberately
+ * OUTSIDE the §14.2 16-pair emit_counters golden (a separate vendor read), so a test can observe
+ * the reject paths directly without perturbing the diag.counters byte-image. Pure read, no effect. */
+static void handle_dev_txn(device *d, const harp_env *e) {
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, true);
+    harp_cbor_map(&m, 3);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, CTR_GET(d->evt_txn_rejected));
+    harp_cbor_uint(&m, 1);
+    harp_cbor_uint(&m, CTR_GET(d->evt_txn_overflow));
+    harp_cbor_uint(&m, 2);
+    harp_cbor_uint(&m, CTR_GET(d->evt_txn_unknown));
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+
 /* ---------------- dispatch ---------------- */
 
 static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
@@ -1697,6 +1854,8 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
         handle_dev_params(d, &e);
     else if (strcmp(e.method, "x.harp-refdev.meters") == 0)
         handle_dev_meters(d, &e);
+    else if (strcmp(e.method, "x.harp-refdev.txn") == 0)
+        handle_dev_txn(d, &e); /* §9.6 reject meters — golden-free observability */
     else if (strcmp(e.method, "x.harp-refdev.restart") == 0) {
         /* dev-loop helper: exit cleanly so systemd (Restart=always) respawns
          * the daemon from the (possibly updated) binary on disk — the
@@ -1738,6 +1897,7 @@ void harp_deviced_run_session(device *d, harp_io *io) {
     d->peer_credit = 0;
     d->granted = 0;
     d->sendq_head = d->sendq_tail = d->sendq_count = 0;
+    memset(d->txn, 0, sizeof d->txn); /* §9.6: a fresh session starts with no open transactions */
     harp_link_init(&d->link);
     harp_cbuf msg;
     harp_cbuf_init(&msg);

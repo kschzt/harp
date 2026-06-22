@@ -317,6 +317,20 @@ static bool parse_identity(harp_cdec *b, harp_client_identity *id) {
             case 10:
                 if (!harp_cdec_uint(b, &id->boot_count)) return false;
                 break;
+            case 13: { /* §9.6 transaction limits { 0: max concurrent, 1: max events/txn } */
+                uint64_t tn, k;
+                if (!harp_cdec_map(b, &tn)) return false;
+                for (uint64_t j = 0; j < tn; j++) {
+                    if (!harp_cdec_uint(b, &k)) return false;
+                    if (k == 0) {
+                        if (!harp_cdec_uint(b, &id->txn_max)) return false;
+                    } else if (k == 1) {
+                        if (!harp_cdec_uint(b, &id->txn_events)) return false;
+                    } else if (!harp_cdec_skip(b))
+                        return false;
+                }
+                break;
+            }
             default:
                 if (!harp_cdec_skip(b)) return false;
         }
