@@ -160,6 +160,16 @@ if(NOT WIN32)
   target_include_directories(harp-ffs-link-tests PRIVATE device core/include)
   add_test(NAME ffs_link COMMAND harp-ffs-link-tests)
   set_tests_properties(ffs_link PROPERTIES LABELS unit)
+
+  # harp-eth-latefr-test: §8.2 host-paced late-frame discard — audio.start(key 7),
+  # accepts the device's host-paced connect-back, sends a rewound SSI frame, asserts it
+  # is discarded + counted (audio_late_frames). POSIX-only (raw server socket); it needs
+  # NO libsamplerate, so it lives here, not in the SAMPLERATE_FOUND eth-tools block.
+  add_executable(harp-eth-latefr-test tools/eth-latefr-test.c
+    host/client.c host/sock_io.c ${HARP_PLAT_SRC})
+  target_include_directories(harp-eth-latefr-test PRIVATE host)
+  target_link_libraries(harp-eth-latefr-test harpcore
+    ${HARP_MATH_LIB} ${HARP_PLAT_LIBS} Threads::Threads)
 endif()
 
 # harp-device-tests: unit tests for the params-blob codec (§10 / P3 closer

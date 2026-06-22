@@ -823,6 +823,7 @@ static void host_paced_loop(device *d) {
     /* buffered endpoint reads (packet-multiple, see ffs.c) */
     uint8_t rbuf[16384];
     size_t rlen = 0, rpos = 0;
+    uint64_t expect_ssi = 0; /* §8.2: host-paced render cursor — the next in-order SSI */
 
     while (atomic_load_explicit(&a->running, memory_order_relaxed)) {
         uint8_t hdr[HARP_AUDIO_HDR_LEN];
@@ -948,6 +949,14 @@ static void host_paced_loop(device *d) {
             CTR_INC(d->frame_errors);
             return;
         }
+        /* §8.2: a pacing frame whose ts is behind the render cursor is late — the host
+         * paces in order, so a rewound ts is a host bug. The whole frame is consumed above,
+         * so discarding it keeps the stream in sync; count it and never re-render a range.
+         * (h.ts == expect_ssi on every in-order frame, so the golden never discards.) */
+        if (h.ts < expect_ssi) {
+            CTR_INC(d->audio_late_frames);
+            continue;
+        }
         /* §P2.2: render the requested output slots; `slots` carries the count.
          * Default {0,1} is the unchanged 2-channel main mix (golden holds). */
         uint16_t slots = render_output(a, samples, n, (float)a->rate, h.ts);
@@ -971,6 +980,7 @@ static void host_paced_loop(device *d) {
         size_t payload = (size_t)n * slots * 4;
         memcpy(frame + HARP_AUDIO_HDR_LEN, samples, payload);
         if (!hp_write_all(a->fd, frame, HARP_AUDIO_HDR_LEN + payload)) return;
+        expect_ssi = h.ts + n; /* §8.2: advance the cursor past the rendered range */
     }
 }
 

@@ -731,10 +731,8 @@ static void emit_counters(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, 0);
     harp_cbor_text(m, "audio_overruns");
     harp_cbor_uint(m, CTR_GET(d->audio_overruns));
-    /* §8.2 host-paced late-frame discard (frames whose ts is behind the render cursor) is
-     * wired separately; 0 until then. */
     harp_cbor_text(m, "audio_late_frames");
-    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, CTR_GET(d->audio_late_frames));
     /* §14.2: 0 by construction — the refdev's MSC is monotone (msc += nsamples each block);
      * a transport stall sets the DISCONT header bit + audio_overruns but never gaps the MSC,
      * so there is no unplanned MSC discontinuity to count. */

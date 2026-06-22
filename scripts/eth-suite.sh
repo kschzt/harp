@@ -85,6 +85,11 @@ run loopback           scripts/loopback-eth-test.sh          # §14.3 round-trip
 run reported-latency   scripts/reported-latency-test.sh      # §6.4 reported PDC latency (exact, all formats)
 run param-map-recall   scripts/param-map-recall-test.sh      # §13.4 recall warns on param-map drift
 
+# §8.2 host-paced late-frame discard: the harp-eth-latefr-test tool is POSIX-only (raw
+# server socket for the device's connect-back), so it isn't built on Windows.
+if [ -x ./build/harp-eth-latefr-test ]; then run latefr scripts/latefr-eth-test.sh
+else skip latefr "harp-eth-latefr-test not built (POSIX-only host-paced tool)"; fi
+
 # §9.4 per-part echo demux drives the device front panel over a unix socket; the MinGW
 # device replaces panel.c with a no-op stub, so the multi-instance path is POSIX-only
 # until the Windows panel transport lands.
