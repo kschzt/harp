@@ -1428,6 +1428,11 @@ void HarpRuntime::sessionDown() {
             if (r < 0) break;
             quiet = (r == 0) ? quiet + 1 : 0;
         }
+        /* §5.5: orderly goodbye so the device can release host-related locks promptly
+         * instead of inferring our exit from a dead link. Best-effort and last (after the
+         * stream is stopped + drained): on a device-gone teardown the send just fails fast,
+         * and we drop the client immediately below regardless. */
+        harp_client_bye(&client_);
     }
     /* §8.4: free this session's bandwidth reservation before the transport goes. Idempotent
      * (admittedBps_==0 = nothing held: never streamed, or already released on a wire failure). */
