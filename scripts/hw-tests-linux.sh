@@ -94,7 +94,12 @@ run scripts/golden-test.sh
 run scripts/note-expr-test.sh
 run scripts/voice-steal-test.sh
 run scripts/clap-test.sh
-run scripts/mpe-test.sh
+# mpe-test MOVED to eth.yml (the §8.7 loopback, scripts/mpe-eth-test.sh): its rapid VRLOAD
+# save/reload claim/release wedges this PCI-USB-passthrough controller — the trigger of the
+# cascade that then fails recall/recall-perpart/session-share. The MPE renders are offline/
+# byte-exact, so the per-voice + cross-format (VST3==CLAP==AU) proofs are transport-agnostic
+# and run identically over loopback. (Same rationale as alias-part-audio/part-param-iso below.)
+echo "──── mpe: moved to eth.yml (loopback — rapid VRLOAD claim/release wedges this passthrough USB rig); SKIP here"; SKIP=$((SKIP+1))
 run scripts/multitimbral-test.sh
 run scripts/recall-test.sh
 run scripts/recall-perpart-test.sh

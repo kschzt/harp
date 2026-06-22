@@ -98,6 +98,13 @@ else skip latefr "harp-eth-latefr-test not built (POSIX-only host-paced tool)"; 
 if [ "$OSID" = windows ]; then skip part-filter "MinGW device panel is a stub (§9.4 multi-instance demux pending Windows panel transport)"
 else run part-filter    scripts/part-filter-eth-test.sh; fi
 
+# MPE / §9.5 per-voice + cross-format (VST3==CLAP==AU): MOVED here from the hw rig, where
+# mpe-test's rapid VRLOAD claim/release wedged the USB passthrough controller (cascading to
+# recall/session-share). Offline renders make the relations transport-agnostic. Needs the
+# CLAP host + plugin (vst3/au extend the proof where built); mpe-eth-test self-skips cleanly.
+if have "$CHOST"; then run mpe scripts/mpe-eth-test.sh
+else skip mpe "clap-host not built on $OSID"; fi
+
 # §4.4.3 mDNS _harp._tcp discovery round-trip: needs a LIVE mDNS responder + a dns_sd-built
 # harp-probe. macOS CI has mDNSResponder always up; Linux/Windows runners don't reliably, so
 # they SKIP — the path is bench-proven on the KR260 (avahi over the direct cable). The script
