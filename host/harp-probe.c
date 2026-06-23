@@ -601,8 +601,7 @@ static void cmd_note(probe *p, int pitch, int duration_ms, int velocity, int par
         if (usb) {
             if (harp_usb_audio_read(p->io, acc, sizeof acc, 100) < 0) break;
         } else {
-            struct timespec ts = {0, 20 * 1000000L}; /* 20 ms */
-            nanosleep(&ts, NULL);
+            harp_sleep_ns(20ull * 1000000ull); /* 20 ms — portable (nanosleep is POSIX-only) */
         }
     }
 
