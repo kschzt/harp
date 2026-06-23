@@ -391,6 +391,116 @@ static void test_store_reflist(void) {
     harp_cbuf_free(&b);
 }
 
+/* §10.3 mark-sweep GC: a device MAY reclaim objects no surviving ref reaches.
+ * Proves (1) the reachable closure of every ref survives, the rest is swept;
+ * (2) FAIL-CLOSED — a ref with an incomplete closure sweeps NOTHING (never
+ * deletes against a partial mark); (3) the per-call sweep bound + the crash-
+ * resume fault seam are idempotent (the unswept tail drains on the next call). */
+static void test_store_gc(void) {
+    harp_store s;
+    CHECK(harp_store_open(&s, "/tmp/harp-test-gc") == 0);
+
+    /* Wipe any prior run to a known-empty slate, portably (no shell): drop every
+     * ref, then a GC with no surviving ref sweeps every object. */
+    struct namelist nl = {0};
+    CHECK(harp_store_ref_list(&s, collect_cb, &nl) == 0);
+    for (int i = 0; i < nl.n; i++) CHECK(harp_store_ref_delete(&s, nl.names[i]) == 0);
+    CHECK(harp_store_gc(&s, 0, NULL) == 0);
+    CHECK(harp_store_obj_count(&s) == 0);
+
+    /* ref-name guards: a traversal name is rejected; an absent name is idempotent-ok */
+    CHECK(harp_store_ref_delete(&s, "../escape") != 0);
+    CHECK(harp_store_ref_delete(&s, "live/never-existed") == 0);
+
+    /* reachable graph: tree T -> {blob A, blob B}; ref live/project -> T */
+    harp_cbuf ba, bb, bt;
+    harp_cbuf_init(&ba);
+    harp_cbuf_init(&bb);
+    harp_cbuf_init(&bt);
+    harp_obj_encode_blob(&ba, "application/x.test", "alpha", 5);
+    harp_obj_encode_blob(&bb, "application/x.test", "bravo", 5);
+    harp_hash hA, hB, hT;
+    CHECK(harp_store_put(&s, ba.buf, ba.len, &hA) == 0);
+    CHECK(harp_store_put(&s, bb.buf, bb.len, &hB) == 0);
+    harp_tree_entry ents[2] = {{"a", hA, 0}, {"b", hB, 0}};
+    harp_obj_encode_tree(&bt, ents, 2);
+    CHECK(harp_store_put(&s, bt.buf, bt.len, &hT) == 0);
+    harp_ref live = {0};
+    snprintf(live.name, sizeof live.name, "live/project");
+    live.hash = hT;
+    live.generation = 1;
+    CHECK(harp_store_ref_write(&s, &live) == 0);
+
+    /* + two UNREACHABLE garbage blobs */
+    harp_hash hG[2];
+    for (int i = 0; i < 2; i++) {
+        harp_cbuf g;
+        harp_cbuf_init(&g);
+        char body[16];
+        int n = snprintf(body, sizeof body, "garbage-%d", i);
+        harp_obj_encode_blob(&g, "application/x.test", body, (size_t)n);
+        CHECK(harp_store_put(&s, g.buf, g.len, &hG[i]) == 0);
+        harp_cbuf_free(&g);
+    }
+    CHECK(harp_store_obj_count(&s) == 5); /* hA hB hT hG0 hG1 */
+
+    /* GC: the closure {hT,hA,hB} survives; the two garbage blobs are reclaimed */
+    size_t reclaimed = 0;
+    CHECK(harp_store_gc(&s, 0, &reclaimed) == 0 && reclaimed == 2);
+    CHECK(harp_store_obj_count(&s) == 3);
+    CHECK(harp_store_have(&s, &hT) && harp_store_have(&s, &hA) && harp_store_have(&s, &hB));
+    CHECK(!harp_store_have(&s, &hG[0]) && !harp_store_have(&s, &hG[1]));
+    harp_ref rr;
+    CHECK(harp_store_ref_read(&s, "live/project", &rr) == 0 && harp_hash_eq(&rr.hash, &hT));
+
+    /* FAIL-CLOSED: break the closure (delete reachable leaf hA), add fresh garbage;
+     * GC must sweep NOTHING and report failure — never delete on a partial mark. */
+    CHECK(harp_store_obj_delete(&s, &hA) == 0);
+    harp_cbuf gx;
+    harp_cbuf_init(&gx);
+    harp_obj_encode_blob(&gx, "application/x.test", "post-break", 10);
+    harp_hash hGX;
+    CHECK(harp_store_put(&s, gx.buf, gx.len, &hGX) == 0);
+    size_t before = harp_store_obj_count(&s);
+    reclaimed = 12345;
+    CHECK(harp_store_gc(&s, 0, &reclaimed) == -1); /* incomplete closure -> -1 */
+    CHECK(reclaimed == 0);                         /* and swept NOTHING */
+    CHECK(harp_store_obj_count(&s) == before);     /* the fresh garbage untouched */
+    CHECK(harp_store_have(&s, &hGX));
+
+    /* restore the leaf; GC succeeds again and now reclaims the garbage */
+    CHECK(harp_store_put(&s, ba.buf, ba.len, &hA) == 0);
+    CHECK(harp_store_gc(&s, 0, &reclaimed) == 0 && reclaimed == 1);
+    CHECK(!harp_store_have(&s, &hGX) && harp_store_obj_count(&s) == 3);
+
+    /* bounded sweep + crash-resume: 6 garbage, drain 4 then (faulted) 1 then 1; the
+     * fault seam stops after exactly one delete, the remainder drains next call. */
+    for (int i = 0; i < 6; i++) {
+        harp_cbuf g;
+        harp_cbuf_init(&g);
+        char body[24];
+        int n = snprintf(body, sizeof body, "batch-garbage-%d", i);
+        harp_obj_encode_blob(&g, "application/x.test", body, (size_t)n);
+        harp_hash hh;
+        CHECK(harp_store_put(&s, g.buf, g.len, &hh) == 0);
+        harp_cbuf_free(&g);
+    }
+    CHECK(harp_store_obj_count(&s) == 9);
+    CHECK(harp_store_gc(&s, 4, &reclaimed) == 0 && reclaimed == 4);
+    CHECK(harp_store_obj_count(&s) == 5);
+    harp_store_fault_skip_sweep = true; /* crash after one unlink */
+    CHECK(harp_store_gc(&s, 4, &reclaimed) == 0 && reclaimed == 1);
+    harp_store_fault_skip_sweep = false;
+    CHECK(harp_store_obj_count(&s) == 4);
+    CHECK(harp_store_gc(&s, 4, &reclaimed) == 0 && reclaimed == 1); /* last garbage */
+    CHECK(harp_store_obj_count(&s) == 3);                           /* back to the closure */
+
+    harp_cbuf_free(&ba);
+    harp_cbuf_free(&bb);
+    harp_cbuf_free(&bt);
+    harp_cbuf_free(&gx);
+}
+
 static void test_envelope(void) {
     harp_cbuf b;
     harp_cbuf_init(&b);
@@ -767,6 +877,7 @@ int main(void) {
     test_store();
     test_store_crash_atomic();
     test_store_reflist();
+    test_store_gc();
     test_envelope();
     test_audio_codec();
     printf("%d passed, %d failed\n", g_pass, g_fail);

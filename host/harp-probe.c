@@ -685,6 +685,24 @@ static void cmd_find_ref(probe *p, const char *name) {
            r.dirty ? "DIRTY" : "clean");
 }
 
+/* archive <prefix> <count>: create <count> §11.4 archive refs (archive/<prefix>NNNN, 1-based,
+ * zero-padded) all pointing at the current live head, over the real state.refset wire path —
+ * the archive-before-push primitive in isolation. Drives the device's §10.3 retention+GC (each
+ * archive-class refset prunes to HARP_ARCHIVE_KEEP and ticks the GC interval). Used by gc-test. */
+static void cmd_archive(probe *p, const char *prefix, int count) {
+    do_hello(p);
+    harp_ref live;
+    if (harp_client_find_ref(&p->client, LIVE_REF, &live) != 0 || live.unborn)
+        die("device has no live/project to archive");
+    for (int k = 1; k <= count; k++) {
+        char full[HARP_REF_NAME_MAX];
+        snprintf(full, sizeof full, "archive/%s%04d", prefix, k);
+        refset(p, full, NULL, &live.hash, true); /* unborn -> create, points at the live head */
+    }
+    printf("archived live/project as archive/%s0001..%s%04d (%d refs)\n", prefix, prefix, count,
+           count);
+}
+
 static void cmd_counters(probe *p) {
     do_hello(p);
     harp_cbuf req, rsp;
@@ -1014,6 +1032,33 @@ static void cmd_meters(probe *p) {
                 printf("  part %-2llu  peak %.4f  rms %.4f\n", (unsigned long long)slot, peak, rms);
         }
     }
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+}
+
+/* §10.3 force the device retention+GC cycle: x.harp-refdev.gc -> {0: reclaimed, 1: remaining}.
+ * Prints "gc: reclaimed N objects, M remaining" so the e2e can assert the store drained. */
+static void cmd_gc(probe *p) {
+    do_hello(p);
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    req_head(p, &req, "x.harp-refdev.gc", false);
+    harp_env e = request(p, &req, &rsp);
+    harp_cdec b;
+    harp_cdec_init(&b, e.body, e.body_len);
+    uint64_t n, key, reclaimed = 0, remaining = 0;
+    if (e.has_body && harp_cdec_map(&b, &n)) {
+        for (uint64_t i = 0; i < n; i++) {
+            if (!harp_cdec_uint(&b, &key)) break;
+            uint64_t v;
+            if (!harp_cdec_uint(&b, &v)) break;
+            if (key == 0) reclaimed = v;
+            else if (key == 1) remaining = v;
+        }
+    }
+    printf("gc: reclaimed %llu objects, %llu remaining\n", (unsigned long long)reclaimed,
+           (unsigned long long)remaining);
     harp_cbuf_free(&req);
     harp_cbuf_free(&rsp);
 }
@@ -1941,7 +1986,7 @@ int main(int argc, char **argv) {
     if (i >= argc) {
         fprintf(stderr,
                 "usage: harp-probe [-d HOST:PORT|usb|usb:SERIAL] [-s STOREDIR] "
-                "identify|refs|counters|diag-bundle [--anonymize] [OUT.cbor]|params|meters|knob ID V|save|restore|record SECS WAV|demo\n");
+                "identify|refs|find-ref NAME|counters|diag-bundle [--anonymize] [OUT.cbor]|params|meters|gc|knob ID V|save|restore|record SECS WAV|demo\n");
         return 2;
     }
     const char *cmd = argv[i];
@@ -2006,6 +2051,10 @@ int main(int argc, char **argv) {
         cmd_params(&p);
     else if (strcmp(cmd, "meters") == 0)
         cmd_meters(&p);
+    else if (strcmp(cmd, "gc") == 0)
+        cmd_gc(&p);
+    else if (strcmp(cmd, "archive") == 0 && i + 2 < argc)
+        cmd_archive(&p, argv[i + 1], atoi(argv[i + 2]));
     else if (strcmp(cmd, "knob") == 0 && i + 2 < argc) {
         cmd_knob(&p, strtoull(argv[i + 1], NULL, 10), strtod(argv[i + 2], NULL));
     } else if (strcmp(cmd, "save") == 0) {

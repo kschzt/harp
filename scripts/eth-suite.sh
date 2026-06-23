@@ -113,6 +113,7 @@ if have "$PROBE"; then
   run txn              scripts/txn-test.sh                   # §9.6 event transactions: buffer/commit-atomic/abort
   run core             scripts/core-test.sh                  # §5.5 core methods: ping/identify/changed/bye
   run bloat-recall     scripts/bloat-recall-eth-test.sh      # debt #22: live ref resolves on a many-archive store (recall-breaker)
+  run gc               scripts/gc-test.sh                    # debt #22a: §10.3 archive retention + mark-sweep GC (wired device path)
   run offline-edit     scripts/offline-edit-eth-test.sh      # §15.5 edit-while-absent reaches device
   run diag-bundle      scripts/diag-bundle-eth-test.sh       # §14.4 device-side export + §16 anon
 else
@@ -121,6 +122,7 @@ else
   skip txn          "harp-probe not built on $OSID"
   skip core         "harp-probe not built on $OSID"
   skip bloat-recall "harp-probe not built on $OSID"
+  skip gc           "harp-probe not built on $OSID"
   skip offline-edit "harp-probe not built on $OSID"
   skip diag-bundle  "harp-probe not built on $OSID"
 fi

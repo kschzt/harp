@@ -45,9 +45,34 @@ int harp_store_ref_write(harp_store *s, const harp_ref *r);
 
 typedef void (*harp_ref_cb)(const harp_ref *r, void *ud);
 int harp_store_ref_list(const harp_store *s, harp_ref_cb cb, void *ud);
+/* Remove refs/<name>. 0 ok (including already-absent: idempotent), -1 bad name. */
+int harp_store_ref_delete(harp_store *s, const char *name);
 
 /* CBOR codec for the ref record itself (used on the wire too). */
 void harp_ref_encode(harp_cbuf *out, const harp_ref *r);
 bool harp_ref_decode(harp_cdec *d, harp_ref *r);
+
+/* ---- object iteration + garbage collection (§10.3: a device MAY reclaim unreachable
+ * objects at will; hosts re-send on demand). ---- */
+typedef bool (*harp_obj_cb)(const harp_hash *h, void *ud); /* return false to stop early */
+/* Iterate every stored object hash (objects/<66-hex>; skips dotfiles, .tmp.* temporaries
+ * and non-hex names). 0 ok, -1 if objects/ can't be opened. */
+int harp_store_obj_foreach(const harp_store *s, harp_obj_cb cb, void *ud);
+/* Number of stored objects (one directory pass; used to pre-size the GC mark set). */
+size_t harp_store_obj_count(const harp_store *s);
+/* Remove one object. 0 ok (incl. absent), -1 io. Caller MUST guarantee unreachability. */
+int harp_store_obj_delete(harp_store *s, const harp_hash *h);
+
+/* Mark-sweep GC: marks every object reachable from the closure of EVERY ref currently on
+ * disk (re-listed live, include_parents=false), then deletes the unmarked objects. To prune,
+ * delete the unwanted refs FIRST (harp_store_ref_delete) — GC only reclaims what no surviving
+ * ref reaches. FAIL-CLOSED: if any reachable object can't be read or fully walked, or the mark
+ * set can't be allocated, it sweeps NOTHING and returns -1 (never deletes against a partial
+ * mark). At most `max_sweep` objects are deleted per call (0 = unbounded); the rest drain on
+ * the next call. *reclaimed (may be NULL) receives the number deleted. */
+int harp_store_gc(harp_store *s, size_t max_sweep, size_t *reclaimed);
+/* Test seam (mirrors harp_store_fault_skip_rename): stop the sweep after the first delete,
+ * to prove GC is crash-resumable + idempotent. Default false; ONLY a test sets it. */
+extern bool harp_store_fault_skip_sweep;
 
 #endif
