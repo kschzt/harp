@@ -81,7 +81,11 @@ static int pump_one(harp_client *c, harp_env *ctl_env, bool *is_ctl) {
     *is_ctl = false;
     if (harp_link_recv(c->io, c->link, &stream, &c->msg) != 0) return -1;
     if (stream == HARP_STREAM_OBJ) {
-        if (c->store) harp_store_put(c->store, c->msg.buf, c->msg.len, NULL);
+        /* §11.2: verify each object on receipt — DISCARD a malformed object (harp_obj_kind
+         * < 0) rather than store unparseable bytes under a meaningless content hash; the
+         * closure walk re-requests anything genuinely missing. */
+        if (c->store && harp_obj_kind(c->msg.buf, c->msg.len) >= 0)
+            harp_store_put(c->store, c->msg.buf, c->msg.len, NULL);
         /* §4.2.1: re-grant the device on consume (sliding window, symmetric to the
          * device's handle_obj) so a long D->H pull never stalls once our grant drains. */
         uint64_t got = c->msg.len;

@@ -2080,8 +2080,14 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
 }
 
 static void handle_obj(device *d, const uint8_t *buf, size_t len) {
-    /* one object per obj-stream message; verify-on-receipt is intrinsic */
-    if (harp_store_put(&d->store, buf, len, NULL) != 0) CTR_INC(d->frame_errors);
+    /* §11.2: verify each object on receipt — a malformed object (not a valid object
+     * structure; harp_obj_kind < 0) is DISCARDED rather than stored under a meaningless
+     * content hash. (harp_store_put only hashes+stores raw bytes, so the old "verify-on-
+     * receipt is intrinsic" was wrong — verification is here.) The obj stream is one-way
+     * (no rid for an error rsp), so the discard + the frame_errors counter is the
+     * 'malformed' signal; credit is still consumed below so the window doesn't stall. */
+    if (harp_obj_kind(buf, len) < 0 || harp_store_put(&d->store, buf, len, NULL) != 0)
+        CTR_INC(d->frame_errors);
     if (d->granted >= len)
         d->granted -= len;
     else
