@@ -2,7 +2,7 @@
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 
-Specification, Draft 0.5.2 — 23 June 2026
+Specification, Draft 0.5.3 — 23 June 2026
 
 | | |
 |---|---|
@@ -13,6 +13,8 @@ Specification, Draft 0.5.2 — 23 June 2026
 | **Schema & reference code license** | Apache-2.0 |
 | **Patent policy** | Royalty-free; contributors sign a non-assertion covenant (§19) |
 | **Feedback** | via HARP Enhancement Proposals (HEPs), see §18 |
+
+> **Changes in 0.5.3** — Shell-side mDNS discovery: the reference runtime's device selection now browses `_harp._tcp` (§6.1, §4.4.3) — automatically when no USB device and no configured address are present, or explicitly via `HARP_ETH_DEVICE=mdns` — dialing the first resolved synth and pinning it for reconnect. §6.1 prose corrected: a network device's serial is not in its advertisement (§16), so network selection is **dial-then-identify** (dial a resolved/configured instance, then key it from `core.hello`), not a pre-dial serial-keyed pick. No wire change.
 
 > **Changes in 0.5.2** — §4.4.3: a device MUST advertise the base `_harp._tcp` service type for cross-vendor discovery interoperability (any conforming host finds any vendor's device, §1), and MAY *additionally* register vendor-specific DNS-SD subtypes (`_<vendor>._sub._harp._tcp`) or its own service types for vendor tooling — these MUST NOT replace the base advertisement. Vendor-specific discovery is additive, never a substitute. No wire change.
 
@@ -352,7 +354,7 @@ The device selects the highest mutually supported `major` and replies; differing
 
 ### 6.1 Discovery
 
-On USB, hosts discover HARP devices by the BOS platform capability (§4.3) where present, and MUST also support discovery by interface class triple — for gadget-framework devices (§4.3 item 2) the class-triple probe is the only discovery path. On the Ethernet/IP binding, the runtime discovers devices by browsing the `_harp._tcp` mDNS/DNS-SD service (§4.4.3), resolving each advertised instance to its `host:port`; it MAY additionally accept a directly-configured address. The runtime folds devices from every binding into one system-wide device list, which shells consume (§15.2) — a shell selects a USB or a network device uniformly and never binds a transport itself. Devices are keyed by `(vendor id, product id, serial)`; a device whose serial is unavailable MUST be treated as a distinct unit per physical port, and certification requires a serial.
+On USB, hosts discover HARP devices by the BOS platform capability (§4.3) where present, and MUST also support discovery by interface class triple — for gadget-framework devices (§4.3 item 2) the class-triple probe is the only discovery path. On the Ethernet/IP binding, the runtime discovers devices by browsing the `_harp._tcp` mDNS/DNS-SD service (§4.4.3), resolving each advertised instance to its `host:port`; it MAY additionally accept a directly-configured address. The runtime presents devices from every binding to shells (§15.2), which never bind a transport themselves. A USB device is keyed by `(vendor id, product id, serial)` from its descriptors; a network device advertises **no serial** (§4.4.3, §16), so its selection is **dial-then-identify** — the runtime dials a resolved `_harp._tcp` instance (or a directly-configured address) and learns the identity from `core.hello`, after which it is keyed and pinned for reconnect exactly like a USB device. A device whose serial is unavailable MUST be treated as a distinct unit per physical port, and certification requires a serial.
 
 ### 6.2 Identity descriptor
 

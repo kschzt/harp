@@ -123,6 +123,30 @@ if(SAMPLERATE_LIBRARY_DIRS)
   target_link_directories(harp_asrc INTERFACE ${SAMPLERATE_LIBRARY_DIRS})
 endif()
 
+# §4.4.3/§6.1 shell-side mDNS discovery (selectDevice browses `_harp._tcp`). A small static
+# lib wraps host/mdns.c with the dns_sd link so every runtime target links it uniformly:
+# dns_sd is native on macOS (libSystem), avahi-compat's libdns_sd on Linux; where neither is
+# present (Windows, a bare runner) harp_mdns_discover() is a -1 stub and the shell falls back
+# to USB / an explicit HARP_ETH_DEVICE. tools/vst3-host is a separate project(), so it needs
+# its OWN check_include_file — the root CMakeLists' result is not inherited here.
+include(CheckIncludeFile)
+check_include_file(dns_sd.h HARP_VST3_HAVE_DNS_SD_HDR)
+add_library(harp_mdns STATIC ${CMAKE_CURRENT_SOURCE_DIR}/../../host/mdns.c)
+target_include_directories(harp_mdns PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../host)
+if(HARP_VST3_HAVE_DNS_SD_HDR)
+  if(APPLE)
+    target_compile_definitions(harp_mdns PRIVATE HAVE_DNS_SD)
+    message(STATUS "harp_mdns: dns_sd (macOS native), shell mDNS discovery enabled")
+  else()
+    find_library(HARP_VST3_DNSSD_LIB dns_sd)
+    if(HARP_VST3_DNSSD_LIB)
+      target_compile_definitions(harp_mdns PRIVATE HAVE_DNS_SD)
+      target_link_libraries(harp_mdns PUBLIC ${HARP_VST3_DNSSD_LIB})
+      message(STATUS "harp_mdns: dns_sd (${HARP_VST3_DNSSD_LIB}), shell mDNS discovery enabled")
+    endif()
+  endif()
+endif()
+
 if(LIBUSB_FOUND)
   set(HARP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
   # Platform shim (harp/plat.h) compiled into the shell/AU like the core .c files.
@@ -169,7 +193,7 @@ if(LIBUSB_FOUND)
     ${LIBUSB_INCLUDE_DIRS})
   target_compile_definitions(harp-shell PRIVATE HAVE_LIBUSB)
   target_link_directories(harp-shell PRIVATE ${LIBUSB_LIBRARY_DIRS})
-  target_link_libraries(harp-shell PRIVATE sdk ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc)
+  target_link_libraries(harp-shell PRIVATE sdk ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc harp_mdns)
   if(WIN32)
     # static libusb pulls in the Win device-enumeration + COM GUID APIs; ws2_32 is
     # Winsock for the §8.7 Ethernet control + RTP sockets (host/sock_io.c +
@@ -205,7 +229,7 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/external/clap/include ${LIBUSB_INCLUDE_DIRS})
   target_compile_definitions(harp-clap PRIVATE HAVE_LIBUSB)
   target_link_directories(harp-clap PRIVATE ${LIBUSB_LIBRARY_DIRS})
-  target_link_libraries(harp-clap PRIVATE ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc)
+  target_link_libraries(harp-clap PRIVATE ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc harp_mdns)
   if(APPLE)
     # macOS DAWs load a .clap as a CFBundle (Contents/MacOS/<exe> + Info.plist),
     # exactly like the AU .component below — NOT a flat dylib. Mirror harp-au.
@@ -315,7 +339,7 @@ if(LIBUSB_FOUND)
     if(LIBUSB_LIBRARY_DIRS)
       target_link_directories(tsan-host PRIVATE ${LIBUSB_LIBRARY_DIRS})
     endif()
-    target_link_libraries(tsan-host ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc)
+    target_link_libraries(tsan-host ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc harp_mdns)
     message(STATUS "tsan-host: multi-instance shell-runtime harness (TSan: ${HARP_TSAN_SANITIZE})")
   endif()
 
@@ -363,7 +387,7 @@ if(LIBUSB_FOUND)
     ${LIBUSB_INCLUDE_DIRS})
   target_compile_definitions(registry-tests PRIVATE HAVE_LIBUSB)
   target_link_directories(registry-tests PRIVATE ${LIBUSB_LIBRARY_DIRS})
-  target_link_libraries(registry-tests ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc)
+  target_link_libraries(registry-tests ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc harp_mdns)
   add_test(NAME registry COMMAND registry-tests)
   set_tests_properties(registry PROPERTIES LABELS unit)
   message(STATUS "registry-tests: runtime registry keying/refcount unit test")
@@ -437,7 +461,7 @@ if(LIBUSB_FOUND)
     # harp_au.mm (ObjC++): force the C-struct flavor of OS objects
     target_compile_definitions(harp-au PRIVATE HAVE_LIBUSB OS_OBJECT_USE_OBJC=0)
     target_link_directories(harp-au PRIVATE ${LIBUSB_LIBRARY_DIRS})
-    target_link_libraries(harp-au PRIVATE ${LIBUSB_LIBRARIES} harp_asrc
+    target_link_libraries(harp-au PRIVATE ${LIBUSB_LIBRARIES} harp_asrc harp_mdns
       "-framework AudioToolbox" "-framework CoreFoundation" "-framework Foundation")
     set_target_properties(harp-au PROPERTIES
       BUNDLE TRUE
