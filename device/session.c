@@ -675,6 +675,101 @@ static void handle_state_send(device *d, const harp_env *e) {
     harp_cbuf_free(&m);
 }
 
+/* §10.3/§11.4 store hygiene — bound the archive/ + duplicate/ namespaces, then GC.
+ *
+ * Every recall archives the prior live ref; left unbounded the archive count grows
+ * until state.refs (one CTL message) overruns the §4.2.1a payload cap and recall
+ * breaks (debt #22). We retain only the newest HARP_ARCHIVE_KEEP refs per namespace
+ * (names are timestamps -> lexicographic == chronological), then reclaim the orphaned
+ * objects with the core mark-sweep. The whole cycle holds state_mu so a concurrent
+ * panel-thread do_snapshot can't have its freshly-put objects swept before its ref
+ * lands (GC and do_snapshot are the two state_mu critical sections that matter). */
+
+struct prune_keep {
+    const char *prefix;
+    size_t prefix_len;
+    char names[HARP_ARCHIVE_KEEP][HARP_REF_NAME_MAX]; /* the KEEP largest, ascending */
+    size_t n;     /* filled slots (<= KEEP) */
+    size_t total; /* matching refs seen */
+};
+static void prune_scan_cb(const harp_ref *r, void *ud) {
+    struct prune_keep *k = ud;
+    if (strncmp(r->name, k->prefix, k->prefix_len) != 0) return;
+    k->total++;
+    if (k->n < HARP_ARCHIVE_KEEP) { /* insert into the ascending top-KEEP buffer */
+        size_t i = k->n;
+        while (i > 0 && strcmp(k->names[i - 1], r->name) > 0) {
+            memcpy(k->names[i], k->names[i - 1], HARP_REF_NAME_MAX);
+            i--;
+        }
+        snprintf(k->names[i], HARP_REF_NAME_MAX, "%s", r->name);
+        k->n++;
+    } else if (strcmp(r->name, k->names[0]) > 0) { /* larger than smallest kept: drop it, insert */
+        size_t i = 0;
+        while (i + 1 < HARP_ARCHIVE_KEEP && strcmp(k->names[i + 1], r->name) < 0) {
+            memcpy(k->names[i], k->names[i + 1], HARP_REF_NAME_MAX);
+            i++;
+        }
+        snprintf(k->names[i], HARP_REF_NAME_MAX, "%s", r->name);
+    }
+}
+struct prune_del {
+    const char *prefix;
+    size_t prefix_len;
+    const char *threshold; /* delete matching refs lexicographically below this */
+    harp_store *store;
+    size_t deleted;
+};
+static void prune_del_cb(const harp_ref *r, void *ud) {
+    struct prune_del *p = ud;
+    if (strncmp(r->name, p->prefix, p->prefix_len) != 0) return;
+    if (strcmp(r->name, p->threshold) < 0 && harp_store_ref_delete(p->store, r->name) == 0) p->deleted++;
+}
+/* Keep only the newest HARP_ARCHIVE_KEEP refs under `prefix`. Two passes: find the
+ * KEEP-th-largest name (the retention threshold) without buffering every name, then
+ * delete everything below it. Bounded memory regardless of how bloated the store is. */
+static size_t prune_namespace(harp_store *s, const char *prefix) {
+    struct prune_keep k = {0};
+    k.prefix = prefix;
+    k.prefix_len = strlen(prefix);
+    harp_store_ref_list(s, prune_scan_cb, &k);
+    if (k.total <= HARP_ARCHIVE_KEEP) return 0;
+    struct prune_del p = {0};
+    p.prefix = prefix;
+    p.prefix_len = k.prefix_len;
+    p.threshold = k.names[0]; /* smallest of the KEEP largest -> the keep boundary */
+    p.store = s;
+    harp_store_ref_list(s, prune_del_cb, &p);
+    return p.deleted;
+}
+/* Called at the tail of a successful archive-class refset (session thread only). */
+static void maybe_gc(device *d, const char *refname) {
+    const char *prefix;
+    if (strncmp(refname, "archive/", 8) == 0)
+        prefix = "archive/";
+    else if (strncmp(refname, "duplicate/", 10) == 0)
+        prefix = "duplicate/";
+    else
+        return; /* live/ and other refs never trigger retention */
+
+    pthread_mutex_lock(&d->state_mu);
+    size_t pruned = prune_namespace(&d->store, prefix);
+    if (++d->archives_since_gc >= HARP_GC_INTERVAL) {
+        d->archives_since_gc = 0;
+        size_t reclaimed = 0;
+        int rc = harp_store_gc(&d->store, HARP_GC_MAX_SWEEP, &reclaimed);
+        pthread_mutex_unlock(&d->state_mu);
+        if (rc != 0) /* fail-closed: an incomplete closure or OOM left the store untouched */
+            fprintf(stderr, "harp-deviced: §10.3 GC aborted (pruned %zu %srefs) — store not swept\n",
+                    pruned, prefix);
+        else
+            fprintf(stderr, "harp-deviced: §10.3 GC pruned %zu %srefs, reclaimed %zu objects\n", pruned,
+                    prefix, reclaimed);
+        return;
+    }
+    pthread_mutex_unlock(&d->state_mu);
+}
+
 static void handle_state_refset(device *d, const harp_env *e) {
     char refname[HARP_REF_NAME_MAX] = "";
     bool expect_null = false, have_expect = false, have_new = false;
@@ -793,6 +888,7 @@ static void handle_state_refset(device *d, const harp_env *e) {
     send_ctl(d, &m);
     harp_cbuf_free(&m);
     ntf_state_changed(d, &r);
+    maybe_gc(d, refname); /* §10.3/§11.4: AFTER the response — never delay the host's ack on a sweep */
 }
 
 /* §14.2 counters MAP (the 16-pair, text-keyed map), emitted into `m`. SHARED by
@@ -1776,6 +1872,30 @@ static void handle_dev_txn(device *d, const harp_env *e) {
     harp_cbuf_free(&m);
 }
 
+/* x.harp-refdev.gc -> {0: reclaimed, 1: objects-remaining} — force the §10.3 retention+GC
+ * cycle NOW (unbounded sweep), bypassing the HARP_GC_INTERVAL gate. A test trigger so the
+ * e2e doesn't have to drive 32 recalls to observe a sweep; same code path maybe_gc runs. */
+static void handle_dev_gc(device *d, const harp_env *e) {
+    pthread_mutex_lock(&d->state_mu);
+    prune_namespace(&d->store, "archive/");
+    prune_namespace(&d->store, "duplicate/");
+    size_t reclaimed = 0;
+    harp_store_gc(&d->store, 0, &reclaimed); /* unbounded: a test wants the store fully drained */
+    d->archives_since_gc = 0;
+    size_t remaining = harp_store_obj_count(&d->store);
+    pthread_mutex_unlock(&d->state_mu);
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, true);
+    harp_cbor_map(&m, 2);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, reclaimed);
+    harp_cbor_uint(&m, 1);
+    harp_cbor_uint(&m, remaining);
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+
 /* ---------------- dispatch ---------------- */
 
 static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
@@ -1902,6 +2022,8 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
         handle_dev_meters(d, &e);
     else if (strcmp(e.method, "x.harp-refdev.txn") == 0)
         handle_dev_txn(d, &e); /* §9.6 reject meters — golden-free observability */
+    else if (strcmp(e.method, "x.harp-refdev.gc") == 0)
+        handle_dev_gc(d, &e); /* §10.3 force retention+GC — golden-free, drains the store */
     else if (strcmp(e.method, "x.harp-refdev.notify-changed") == 0) {
         /* §5.5 conformance seam: the refdev has no spontaneous identity mutation, so a test
          * drives the core.changed sender from here. body {0 => tstr topic}, default "identity".

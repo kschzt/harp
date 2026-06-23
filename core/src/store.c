@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef _WIN32
@@ -418,4 +419,174 @@ static int walk_refs(const harp_store *s, const char *rel, harp_ref_cb cb, void 
 
 int harp_store_ref_list(const harp_store *s, harp_ref_cb cb, void *ud) {
     return walk_refs(s, "", cb, ud);
+}
+
+int harp_store_ref_delete(harp_store *s, const char *name) {
+    char path[HARP_STORE_PATH_MAX];
+    if (ref_path(s, name, path, sizeof path) != 0) return -1; /* bad name */
+    remove(path);                                             /* absent is fine (idempotent) */
+    return 0;
+}
+
+/* ---------------- object iteration + garbage collection (§10.3) ---------------- */
+
+/* Iterate objects/<66-hex>. The dir is FLAT (no nesting), one file per object. */
+int harp_store_obj_foreach(const harp_store *s, harp_obj_cb cb, void *ud) {
+    char dir[HARP_STORE_PATH_MAX];
+    snprintf(dir, sizeof dir, "%s/objects", s->dir);
+#ifdef _WIN32
+    char glob[HARP_STORE_PATH_MAX + 8];
+    snprintf(glob, sizeof glob, "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(glob, &fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    do {
+        const char *name = fd.cFileName;
+#else
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        const char *name = e->d_name;
+#endif
+        if (name[0] == '.') continue;          /* ".", "..", dotfiles */
+        if (strstr(name, ".tmp.")) continue;   /* in-flight write_atomic temporary — NEVER a victim */
+        harp_hash hh;
+        if (!harp_hash_from_hex(name, &hh)) continue; /* not a 66-hex object name — leave it */
+        if (!cb(&hh, ud)) break;               /* caller asked to stop */
+#ifdef _WIN32
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    }
+    closedir(d);
+#endif
+    return 0;
+}
+
+static bool count_cb(const harp_hash *h, void *ud) {
+    (void)h;
+    (*(size_t *)ud)++;
+    return true;
+}
+size_t harp_store_obj_count(const harp_store *s) {
+    size_t n = 0;
+    harp_store_obj_foreach(s, count_cb, &n);
+    return n;
+}
+
+int harp_store_obj_delete(harp_store *s, const harp_hash *h) {
+    char path[HARP_STORE_PATH_MAX];
+    obj_path(s, h, path, sizeof path);
+    if (remove(path) != 0 && path_readable(path) == 0) return -1; /* still there after a failed remove */
+    return 0;
+}
+
+bool harp_store_fault_skip_sweep = false;
+
+/* Open-addressed set of object hashes (the GC mark set). Pre-sized so it never rehashes. */
+typedef struct {
+    harp_hash *keys;
+    uint8_t *used;
+    size_t cap; /* power of two */
+} hashset;
+
+static size_t hs_slot(const hashset *hs, const harp_hash *h) {
+    uint64_t k; /* the hash is already a digest — any 8 bytes are well-mixed */
+    memcpy(&k, h->b, sizeof k);
+    return (size_t)(k & (hs->cap - 1));
+}
+/* returns true if NEWLY added, false if already present */
+static bool hs_add(hashset *hs, const harp_hash *h) {
+    size_t i = hs_slot(hs, h);
+    for (;;) {
+        if (!hs->used[i]) {
+            hs->used[i] = 1;
+            hs->keys[i] = *h;
+            return true;
+        }
+        if (memcmp(hs->keys[i].b, h->b, HARP_HASH_LEN) == 0) return false;
+        i = (i + 1) & (hs->cap - 1);
+    }
+}
+static bool hs_has(const hashset *hs, const harp_hash *h) {
+    size_t i = hs_slot(hs, h);
+    for (;;) {
+        if (!hs->used[i]) return false;
+        if (memcmp(hs->keys[i].b, h->b, HARP_HASH_LEN) == 0) return true;
+        i = (i + 1) & (hs->cap - 1);
+    }
+}
+
+typedef struct {
+    harp_store *s;
+    hashset *set;
+    bool aborted; /* a reachable object couldn't be read/walked -> sweep NOTHING */
+} markctx;
+
+static void mark_obj(markctx *m, const harp_hash *h);
+static bool mark_child_cb(const harp_hash *h, void *ud) {
+    markctx *m = ud;
+    mark_obj(m, h);
+    return !m->aborted; /* stop the child walk once aborted */
+}
+static void mark_obj(markctx *m, const harp_hash *h) {
+    if (m->aborted) return;
+    if (!hs_add(m->set, h)) return; /* already marked — breaks DAG diamonds, bounds work at O(reachable) */
+    harp_cbuf enc;
+    harp_cbuf_init(&enc);
+    if (harp_store_get(m->s, h, &enc) != 0) {
+        m->aborted = true; /* a ref reaches an object we don't have: incomplete closure, fail closed */
+    } else if (!harp_obj_foreach_child(enc.buf, enc.len, false, mark_child_cb, m)) {
+        m->aborted = true; /* malformed object (or a deeper mark aborted) */
+    }
+    harp_cbuf_free(&enc);
+}
+static void mark_ref_cb(const harp_ref *r, void *ud) {
+    if (!r->unborn) mark_obj((markctx *)ud, &r->hash);
+}
+
+typedef struct {
+    harp_store *s;
+    const hashset *set;
+    size_t max;     /* 0 = unbounded */
+    size_t deleted;
+    bool done;      /* hit the per-call cap */
+} sweepctx;
+static bool sweep_cb(const harp_hash *h, void *ud) {
+    sweepctx *w = ud;
+    if (hs_has(w->set, h)) return true; /* reachable — keep */
+    if (w->max && w->deleted >= w->max) { w->done = true; return false; } /* batch cap: drain next call */
+    if (harp_store_obj_delete(w->s, h) == 0) w->deleted++;
+    if (harp_store_fault_skip_sweep) return false; /* test seam: prove resumability after one delete */
+    return true;
+}
+
+int harp_store_gc(harp_store *s, size_t max_sweep, size_t *reclaimed) {
+    if (reclaimed) *reclaimed = 0;
+    /* Pre-size the mark set from the object count (×2 -> load <= 0.5) so MARK never rehashes. */
+    size_t nobj = harp_store_obj_count(s);
+    size_t cap = 16;
+    while (cap < (nobj + 1) * 2) cap <<= 1;
+    hashset set = {calloc(cap, sizeof(harp_hash)), calloc(cap, 1), cap};
+    if (!set.keys || !set.used) { /* alloc failure: never sweep against a truncated mark set */
+        free(set.keys);
+        free(set.used);
+        return -1;
+    }
+    /* MARK: reachability from EVERY ref currently on disk (re-listed live, not a stale list). */
+    markctx m = {s, &set, false};
+    harp_store_ref_list(s, mark_ref_cb, &m);
+    if (m.aborted) { /* an incomplete closure -> a partial mark -> sweep NOTHING */
+        free(set.keys);
+        free(set.used);
+        return -1;
+    }
+    /* SWEEP: delete the unmarked. MARK fully completed before the first unlink. */
+    sweepctx w = {s, &set, max_sweep, 0, false};
+    harp_store_obj_foreach(s, sweep_cb, &w);
+    free(set.keys);
+    free(set.used);
+    if (reclaimed) *reclaimed = w.deleted;
+    return 0;
 }

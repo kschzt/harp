@@ -444,17 +444,26 @@ bool front_panel_set(device *d, uint32_t id, double v) {
 
 int do_snapshot(device *d, const char *msg, harp_hash *out, uint64_t *out_gen) {
     live_cache_flush(d);
+    /* state_mu spans put+ref_write: the snapshot's objects must become reachable
+     * (the ref written) before any GC can observe the store. GC also runs under
+     * state_mu (maybe_gc), so this mutual exclusion stops a session-thread GC from
+     * sweeping a panel-thread snapshot's freshly-put objects before its ref lands. */
+    pthread_mutex_lock(&d->state_mu);
     harp_ref r;
-    if (harp_store_ref_read(&d->store, LIVE_REF, &r) != 0) return -1;
     harp_hash snap;
-    if (engine_snapshot_objects(d, r.unborn ? NULL : &r.hash, msg, &snap) != 0) return -1;
-    r.unborn = false;
-    r.hash = snap;
-    r.generation++;
-    r.dirty = false;
-    if (harp_store_ref_write(&d->store, &r) != 0) return -1;
+    int rc = -1;
+    if (harp_store_ref_read(&d->store, LIVE_REF, &r) == 0 &&
+        engine_snapshot_objects(d, r.unborn ? NULL : &r.hash, msg, &snap) == 0) {
+        r.unborn = false;
+        r.hash = snap;
+        r.generation++;
+        r.dirty = false;
+        if (harp_store_ref_write(&d->store, &r) == 0) rc = 0;
+    }
+    pthread_mutex_unlock(&d->state_mu);
+    if (rc != 0) return -1;
     CTR_INC(d->snapshots_taken);
-    ntf_state_changed(d, &r);
+    ntf_state_changed(d, &r); /* notify + count OUTSIDE the store lock */
     *out = snap;
     if (out_gen) *out_gen = r.generation;
     return 0;

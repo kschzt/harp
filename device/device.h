@@ -47,6 +47,18 @@
 #define FW_VERSION "0.1.0"
 #define CREDIT_GRANT (16u << 20)
 #define HARP_SENDQ_CAP 1024 /* §4.2.1 bounded obj-send queue (FIFO of hashes); 1024*33B ≈ 33 KiB */
+
+/* §10.3/§11.4 store hygiene: every recall archives the prior live ref, so the
+ * archive/ + duplicate/ namespaces grow unbounded — left alone they bloat the
+ * store until state.refs (one CTL message) blows the §4.2.1a payload cap. The
+ * device retains only the newest HARP_ARCHIVE_KEEP refs per namespace (oldest
+ * pruned lexicographically == chronologically for timestamp names), then runs a
+ * bounded mark-sweep every HARP_GC_INTERVAL archive-class refsets to reclaim the
+ * now-unreachable objects (at most HARP_GC_MAX_SWEEP per pass; the rest drain on
+ * the next). §10.3 lets a device reclaim at will — hosts re-send on demand. */
+#define HARP_ARCHIVE_KEEP 32
+#define HARP_GC_INTERVAL 32
+#define HARP_GC_MAX_SWEEP 4096
 #define LIVE_REF "live/project"
 #define PARAMS_MEDIA "application/x.harp-refdev.params"
 
@@ -361,6 +373,7 @@ typedef struct {
     harp_ref live_cache;
     bool live_cache_valid;
     uint64_t last_live_ntf_ms;
+    uint64_t archives_since_gc; /* archive-class refsets since the last GC (state_mu-guarded) */
 
     /* knob sources are multi-threaded now (session loop, HTTP panel):
      * send_mu serializes link writes; state_mu guards the live-ref cache */

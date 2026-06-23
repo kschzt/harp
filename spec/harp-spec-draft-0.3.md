@@ -2,7 +2,7 @@
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 
-Specification, Draft 0.4.0 — 17 June 2026
+Specification, Draft 0.4.1 — 23 June 2026
 
 | | |
 |---|---|
@@ -13,6 +13,8 @@ Specification, Draft 0.4.0 — 17 June 2026
 | **Schema & reference code license** | Apache-2.0 |
 | **Patent policy** | Royalty-free; contributors sign a non-assertion covenant (§19) |
 | **Feedback** | via HARP Enhancement Proposals (HEPs), see §18 |
+
+> **Changes in 0.4.1** — Errata from running the reference device's state store to multi-hundred-megabyte scale. **Archive retention** (§10.3, §11.1): §11.4 mandates an archive on every overwrite and §10.2 already lets a device GC unreachable *objects*, but nothing bounded the host-created `archive/*` *refs* themselves — so a finite device grew without bound until `state.refs` (one control message returning the whole ref list) overran the §4.2.1 64 KiB payload cap and recall broke deterministically. Two clarifications close it: a device MAY bound the `archive/*`/duplicate namespaces, keeping a finite number of the most recent entries (the rest reclaimed per §10.2) — the host's own Recall Bundle is the system of record, so this is recoverable; and `state.refs` gains an optional `{0 => name}` filter so a host can resolve one known ref without pulling a list that may exceed the message bound. A device MUST keep its `state.refs` response within that bound. The reference device retains the newest 32 archives per namespace and mark-sweeps the orphaned objects (`include_parents = false`, so a superseded snapshot's parent history is reclaimable), the whole cycle serialized against snapshotting.
 
 > **Changes in 0.4.0** — The network transport binding lands; §4.4 is no longer reserved. The **Ethernet/IP binding** carries the framed link over TCP and the audio plane over RTP/UDP (§8.7), discovered by `_harp._tcp` mDNS, on a dedicated trusted segment. The clock model is host-side **receiver-side recovery** for a single device — the host is not a PTP node — and optional device-side **PTPv2** for multi-device timeline alignment (§7.3); software timestamping is sufficient. Real-time network audio is **free-running only**; offline bounce rides the reliable link, preserving deterministic through-hardware rendering. **The placeholder mandatory-TLS language of the old §4.4 is withdrawn**: the binding relies on segment isolation, not transport encryption — consistent with AES67/Dante/AVB — with signed firmware unchanged (§16). Full AES67/Dante interop is reserved as an optional, firmware-deliverable capability (`net.aes67-bridge`); AVB/gPTP is out of scope. New capabilities `net.tcp`/`net.rtp`/`net.offline`/`net.ptp`/`net.ptp.hw`/`net.aes67-bridge`. Informed by clock-correlation prototyping on reference hardware (software-timestamped PTP over a commodity switch: ~22 µs idle, ~140 µs under prioritized CPU load — an order of magnitude inside the §7.2 USB bounds; it collapses only under simultaneous CPU and link saturation).
 
@@ -749,6 +751,8 @@ ntf state.changed { 0 => tstr ref-name, 1 => hash/null, 2 => uint64 generation, 
 
 Notification rate MAY be coalesced (≥ 2 Hz under continuous editing is sufficient); the terminal state after edits stop MUST always be notified. Persistence follows the same shape: the clean→dirty transition MUST be durably stored before further edits are accepted (it is the loss-safety edge), but subsequent generation bumps MAY coalesce in memory provided the stored ref is brought current before any observer can read it — at `state.refs`, `state.snapshot`, `state.refset`, and session end. A synchronous storage write per edit is not required and, on slow media, starves the audio path in violation of §9.2's no-glitch rule.
 
+**Archive retention.** The `archive/*` namespace (and any device-visible duplicates, §11.4) gains one ref on every overwrite, so a device with finite storage cannot retain it without bound. A device MAY bound these host-created safety namespaces: it MAY retain an implementation-defined number of the most recent entries (ordered by their timestamped names) and delete older refs, whereupon the objects they alone reached become reclaimable under the §10.2 object-GC rule. This is not a loss of the host's saved state — a host persists its own Recall Bundle (§15.3) and re-sends on demand — but a device SHOULD retain enough recent archives that on-device "undo the last overwrite" stays useful. The `live/*`, `bank/*`, `lib/*`, and `sys/*` namespaces are never subject to this reclamation. A device MUST keep its `state.refs` response within the §4.2.1 control-message bound (filtering to a requested ref, paginating, or bounding the namespace as above); a response that overruns the bound is a malformed message and breaks recall.
+
 ### 10.4 Snapshot-on-demand
 
 `harp-recall` devices MUST implement:
@@ -767,9 +771,11 @@ The device serializes current live state of the named ref into objects, creates 
 ### 11.1 Inventory
 
 ```
-req state.refs  → { 0 => [* ref] }
+req state.refs  { ? 0 => tstr } → { 0 => [* ref] }       ; optional name filter (see below)
 req state.have  { 0 => [* hash] } → { 0 => [* bool] }     ; per-hash possession
 ```
+
+`state.refs` with no body (or an empty map) returns every ref. The optional `0 => name` narrows the response to just that ref — a one-element array, or empty if the ref is unborn/absent. A device with many refs (a large `archive/*` history) MUST offer the filtered form or otherwise keep the response within the §4.2.1 control bound (§10.3 archive retention); a host resolving a single known ref (e.g. `live/project` during recall) SHOULD use the filter rather than fetching and scanning the whole set.
 
 ### 11.2 Transfer
 
