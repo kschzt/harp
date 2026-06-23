@@ -66,6 +66,9 @@ struct ShellTransport {
      * assembler omits key 13. Read-only. */
     virtual const char *netEndpoint() const { return ""; }
 
+    /* §8.7 RTP/UDP packets the reader detected as lost (sequence gaps). 0 on non-RTP. */
+    virtual uint64_t rtpPacketsLost() const { return 0; }
+
     /* ---- binding mode. USB is host-paced (false); Ethernet/RTP is device
      * free-running (true). Cached into HarpRuntime::freeRunning_ at sessionUp
      * so the audio thread never pays a virtual call to branch on it. */

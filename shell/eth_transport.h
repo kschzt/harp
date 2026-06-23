@@ -155,6 +155,7 @@ struct EthTransport final : ShellTransport {
     /* The device host:port the host resolved (diag-bundle key 13.0 = HARP_ETH_DEVICE,
      * the dial target). §16-anonymizable. usbTopology() stays the base no-op stub. */
     const char *netEndpoint() const override { return hostport_.c_str(); }
+    uint64_t rtpPacketsLost() const override { return rtpLost_.load(std::memory_order_relaxed); }
 
     /* Reader thread: receive ONE RTP packet's slot-interleaved samples into `out`
      * (up to maxFloats), waiting up to timeout_ms. Returns FLOATS received (0 = none
@@ -171,6 +172,16 @@ struct EthTransport final : ShellTransport {
         size_t pln;
         if (harp_rtp_unpack(rxpkt_, (size_t)n, &h, &pl, &pln) != 0) return 0;
         if (dev_ts) *dev_ts = h.timestamp;
+        /* §8.7: count lost RTP packets from sequence gaps (loss MUST be counted, never
+         * silently concealed). 16-bit seq; a small forward gap = that many lost packets;
+         * a gap >= 0x8000 is a late/reordered packet, not loss (ignore). */
+        if (seqValid_) {
+            uint16_t gap = (uint16_t)(h.seq - (uint16_t)(lastSeq_ + 1));
+            if (gap && gap < 0x8000)
+                rtpLost_.fetch_add(gap, std::memory_order_relaxed);
+        }
+        lastSeq_ = h.seq;
+        seqValid_ = true;
         if (pln % sizeof(float)) return 0; /* whole float samples only */
         unsigned f = (unsigned)(pln / sizeof(float)); /* slot-interleaved floats */
         if (f > maxFloats) f = maxFloats; /* one packet always fits a sane out */
@@ -250,6 +261,11 @@ private:
     std::string     peer_;
     std::string     hostport_; /* the dial target (HARP_ETH_DEVICE) — diag-bundle key 13.0 */
     std::atomic<unsigned long long> lastArr_{0};
+    /* §8.7 RTP loss accounting. lastSeq_/seqValid_ are reader-thread private; rtpLost_ is
+     * read by the runtime for clock-stats key 7. A forward seq gap = that many lost packets. */
+    uint16_t lastSeq_ = 0;
+    bool seqValid_ = false;
+    std::atomic<uint64_t> rtpLost_{0};
     /* §8.3-over-§8.7 host-paced: live ONLY when hostPaced_. audioListen_ is the
      * ephemeral TCP listener (key 7) the device dials back; audioSock_ is the one
      * accepted connection carrying H->D pacing + D->H rendered frames. */

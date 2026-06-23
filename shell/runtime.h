@@ -712,6 +712,8 @@ private:
     std::atomic<uint64_t> asrcJitterBits_{0}; /* harp_freerun_stats.jitter_us (double, bit-punned) */
     std::atomic<double>   asrcEstPpm_{0.0};   /* harp_freerun_stats.est_ppm (recovered drift) */
     std::atomic<uint32_t> asrcFill_{0};       /* harp_freerun_stats.fill_frames */
+    std::atomic<uint32_t> asrcReanchors_{0};  /* §8.3 harp_freerun_stats.reanchors (clock-stats key 4) */
+    std::atomic<uint64_t> rtpLostSnap_{0};    /* §8.7 RTP packets lost, snapshot from the transport (clock-stats key 7) */
     std::atomic<uint32_t> asrcUnderflow_{0};  /* harp_freerun_stats.underflow_frames */
     std::atomic<uint32_t> asrcOverflow_{0};   /* harp_freerun_stats.overflow_frames */
     std::atomic<int32_t>  lastTrimPpb_{0};    /* last audio.trim ppb the feeder sent (rate-lock) */
