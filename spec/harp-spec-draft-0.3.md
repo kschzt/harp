@@ -2,7 +2,7 @@
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 
-Specification, Draft 0.5.3 — 23 June 2026
+Specification, Draft 0.5.4 — 23 June 2026
 
 | | |
 |---|---|
@@ -13,6 +13,8 @@ Specification, Draft 0.5.3 — 23 June 2026
 | **Schema & reference code license** | Apache-2.0 |
 | **Patent policy** | Royalty-free; contributors sign a non-assertion covenant (§19) |
 | **Feedback** | via HARP Enhancement Proposals (HEPs), see §18 |
+
+> **Changes in 0.5.4** — Reference-engine change, **no wire/protocol change** — recorded because it exercises the §6.2/§13.4 version + param-map machinery end to end. The reference synth's always-on part-0 **drone was removed**: every part is note-only now, silent until a note plays (the drone dominated the main mix and masked the multitimbral sibling parts). Consequently `engine.version` bumps `1.1.0 → 2.0.0` — a MAJOR change, since stored state now renders differently (the §13.4 "loads but sounds different" signal a host surfaces as a read-only-default reopen); the now-removed "Drone Mix" param drops from the §9.3 automatable set so `param-map-hash` changes; and the engine-id is renamed `refdev-null → refdev-synth` (it always made sound — "null" was a misnomer). This confirms a device MAY evolve its DSP and parameter set behind the engine-version + param-map-hash signals without touching the protocol.
 
 > **Changes in 0.5.3** — Shell-side mDNS discovery: the reference runtime's device selection now browses `_harp._tcp` (§6.1, §4.4.3) — automatically when no USB device and no configured address are present, or explicitly via `HARP_ETH_DEVICE=mdns` — dialing the first resolved synth and pinning it for reconnect. §6.1 prose corrected: a network device's serial is not in its advertisement (§16), so network selection is **dial-then-identify** (dial a resolved/configured instance, then key it from `core.hello`), not a pre-dial serial-keyed pick. No wire change.
 
