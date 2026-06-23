@@ -107,5 +107,28 @@ grep -q "not auto-applied" "$HOSTLOG" && { cat "$HOSTLOG"; fail "control run wro
 if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then assert_reason4 "$BUNDLE.ctl" 0 "control run wrongly recorded reason 4"; fi
 echo "   ✓ control (matching engine): auto-push fired (re-asserted) — no read-only, no reason-4"
 
+# ── 3) FRESH-OPEN bundle-baseline (§12.2, NO seam): a project saved against a major-1 engine,
+#       opened on this major-2 device, must default read-only WITHOUT HARP_FORCE_ENGINE_MAJOR.
+#       The baseline is the BUNDLE's recorded engine major — the central "loads but sounds
+#       different without consent" guarantee, distinct from the across-reconnect force path
+#       (1)/(2). The --engine-ver device seam stages the major-1 save.
 kill -9 "$DP" 2>/dev/null; DP=""
-echo "ENGINE-MISMATCH PASS (§12.2: engine-major change -> reason-4 recorded AND staged project state held read-only [auto-push skipped]; matching engine re-asserts normally)"
+rm -rf "$DEVDIR.v1"; : > "$DEVLOG"
+echo "── stage a major-1 bundle: device reporting engine 1.0.0 (--engine-ver)"
+"$DEVICED" --serial "$SERIAL" --port "$PORT" --engine-ver 1.0.0 --state-dir "$DEVDIR.v1" >>"$DEVLOG" 2>&1 & DP=$!
+wait_listen || { cat "$DEVLOG"; fail "v1 (engine 1.0.0) device didn't start on $PORT"; }
+run_host "" save-v1 --save-state "$STATE.v1"
+[ -s "$STATE.v1" ] || { cat "$HOSTLOG"; fail "save-state (engine 1.0.0) produced no fixture"; }
+kill -9 "$DP" 2>/dev/null; DP=""
+rm -rf "$DEVDIR.v2"; : > "$DEVLOG"
+echo "── open it on the default-engine (2.0.0) device with NO HARP_FORCE_ENGINE_MAJOR"
+"$DEVICED" --serial "$SERIAL" --port "$PORT" --state-dir "$DEVDIR.v2" >>"$DEVLOG" 2>&1 & DP=$!
+wait_listen || { cat "$DEVLOG"; fail "v2 (default engine) device didn't start on $PORT"; }
+run_host "" fresh-open --load-state "$STATE.v1" --diag-bundle "$BUNDLE.fresh"
+grep -q "not auto-applied" "$HOSTLOG" || { cat "$HOSTLOG"; fail "fresh-open: a major-1 project on a major-2 device was NOT held read-only (§12.2 fresh-open gate, no force)"; }
+grep -q "project state re-asserted" "$HOSTLOG" && { cat "$HOSTLOG"; fail "fresh-open: RE-ASSERTED a mismatched-engine project (read-only gate not taken)"; }
+if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then assert_reason4 "$BUNDLE.fresh" 1 "fresh-open history missing reason 4"; fi
+echo "   ✓ fresh-open major-1 bundle on major-2 device: held read-only WITHOUT force + reason-4"
+
+kill -9 "$DP" 2>/dev/null; DP=""
+echo "ENGINE-MISMATCH PASS (§12.2: engine-major change [across-reconnect force AND fresh-open bundle-baseline] -> reason-4 + project state held read-only [auto-push skipped]; matching engine re-asserts)"

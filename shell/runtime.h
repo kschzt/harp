@@ -990,6 +990,9 @@ private:
     bool wantUsb_ = false;
     uint16_t wantUsbVid_ = 0, wantUsbPid_ = 0;
     std::string wantUsbSerial_;
+    std::atomic<int> wantEngineMajor_{0}; /* §12.2: the loaded bundle's engine major (0 = none); the
+                                             fresh-open read-only baseline. Set in setStateBundle,
+                                             read in helloAndIdentity. */
 
     uint32_t rate_ = 48000;
 

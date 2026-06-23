@@ -268,7 +268,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, 0);
     harp_cbor_text(m, ENGINE_ID);
     harp_cbor_uint(m, 1);
-    harp_cbor_text(m, ENGINE_VERSION);
+    harp_cbor_text(m, d->engine_ver ? d->engine_ver : ENGINE_VERSION);
     harp_cbor_uint(m, 2);
     harp_cbor_bytes(m, d->param_map_hash.b, HARP_HASH_LEN);
     harp_cbor_uint(m, 5); /* protocol in effect */

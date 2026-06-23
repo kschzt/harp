@@ -86,6 +86,8 @@ run admission          scripts/admission-eth-test.sh         # §8.4 audio-bandw
 run loopback           scripts/loopback-eth-test.sh          # §14.3 round-trip RTT (probe-free)
 run reported-latency   scripts/reported-latency-test.sh      # §6.4 reported PDC latency (exact, all formats)
 run param-map-recall   scripts/param-map-recall-test.sh      # §13.4 recall warns on param-map drift
+run eth-rtfloor        scripts/eth-rtfloor-test.sh           # §6.4 rt-profile (key 14): declared floor/packet + clamps
+run hello-gate         scripts/hello-gate-test.sh            # §5.4 pre-hello request denied (gate regression guard)
 
 # §8.2 host-paced late-frame discard: the harp-eth-latefr-test tool is POSIX-only (raw
 # server socket for the device's connect-back), so it isn't built on Windows.

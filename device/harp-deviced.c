@@ -271,6 +271,7 @@ int main(int argc, char **argv) {
     bool no_rate_lock = false;                        /* --no-rate-lock: force host ASRC fallback */
     uint32_t rt_floor = 0;                            /* --rt-floor N: declared safe ethTargetFrames floor (frames), identity key 14 */
     uint32_t rt_nsamples = 0;                         /* --rt-nsamples N: declared RTP packet size (frames), identity key 14 sub-key 1 */
+    const char *engine_ver = NULL;                    /* --engine-ver X.Y.Z: §12.2 test seam, override reported engine semver */
     bool pmh_flip = false;                            /* --param-map-hash-flip: TEST seam (§9.3/§13.4) —
                                                        * advertise a 1-bit-altered param-map-hash to mimic
                                                        * an engine-update param-map change, so the shell's
@@ -308,10 +309,12 @@ int main(int argc, char **argv) {
             rt_floor = (uint32_t)atoi(argv[++i]); /* §6.4: declare the safe ethTargetFrames floor (identity key 14) */
         else if (strcmp(argv[i], "--rt-nsamples") == 0 && i + 1 < argc)
             rt_nsamples = (uint32_t)atoi(argv[++i]); /* §6.4: declare the RTP packet size (identity key 14 sub-key 1) */
+        else if (strcmp(argv[i], "--engine-ver") == 0 && i + 1 < argc)
+            engine_ver = argv[++i]; /* §12.2 test seam: report this engine semver instead of ENGINE_VERSION */
         else {
             fprintf(stderr,
                     "usage: harp-deviced [--state-dir DIR] [--serial S] "
-                    "[--panel-sock PATH] [--tone HZ] [--no-rate-lock] [--rt-floor N] [--rt-nsamples N] "
+                    "[--panel-sock PATH] [--tone HZ] [--no-rate-lock] [--rt-floor N] [--rt-nsamples N] [--engine-ver X.Y.Z] "
                     "[--port P | --ffs FFS_DIR [--gadget CONFIGFS_PATH]]\n");
             return 2;
         }
@@ -340,6 +343,7 @@ int main(int argc, char **argv) {
      * hardcoded here. Absent => 0 => the host keeps its conservative 2048/256 defaults. */
     d->rt_floor = rt_floor;       /* §6.4 rt-profile: emitted as identity key 14 sub-key 0 when nonzero */
     d->rt_nsamples = rt_nsamples; /* §6.4 rt-profile: emitted as identity key 14 sub-key 1 when nonzero */
+    d->engine_ver = engine_ver;   /* §12.2 test seam: NULL => ENGINE_VERSION */
     snprintf(d->serial, sizeof d->serial, "%s", serial);
     if (harp_store_open(&d->store, state_dir) != 0) {
         fprintf(stderr, "harp-deviced: cannot open state dir %s\n", state_dir);

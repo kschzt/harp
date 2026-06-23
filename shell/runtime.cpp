@@ -159,8 +159,15 @@ bool HarpRuntime::helloAndIdentity() {
     {
         int curMajor = atoi(engineVer_.c_str());
         if (!engineMajorSeeded_) {
+            /* §12.2 FRESH-OPEN: baseline to the PROJECT bundle's engine major if it carried one,
+             * so opening a project onto a device with a different engine major defaults to
+             * read-only ("loads but sounds different without consent") — not just on an
+             * across-reconnect change. HARP_FORCE_ENGINE_MAJOR overrides (conformance test); with
+             * no bundle we baseline to the device's own major (no spurious read-only). */
             const char *force = getenv("HARP_FORCE_ENGINE_MAJOR");
-            engineMajorSeen_ = (force && *force) ? atoi(force) : curMajor;
+            int bundleMajor = wantEngineMajor_.load(std::memory_order_relaxed);
+            engineMajorSeen_ = (force && *force) ? atoi(force)
+                               : (bundleMajor > 0 ? bundleMajor : curMajor);
             engineMajorSeeded_ = true;
         }
         if (curMajor != engineMajorSeen_) {
@@ -3689,6 +3696,7 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
     bool haveTarget = false;
     bool haveBundlePmh = false; /* §9.3/§13.4: the project's expected param-map-hash */
     harp_hash bundlePmh{};
+    int bundleEngineMajor = 0; /* §12.2: the project's engine major (from identity-expectation) */
     for (uint64_t i = 0; i < n && !d.err; i++) {
         uint64_t key;
         if (!harp_cdec_uint(&d, &key)) return false;
@@ -3723,6 +3731,14 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
                                     memcpy(bundlePmh.b, hp, HARP_HASH_LEN);
                                     haveBundlePmh = true;
                                 }
+                            } else if (ek == 1) { /* §12.2: engine semver -> retain the leading
+                                                   * major for the fresh-open read-only gate */
+                                const char *es;
+                                size_t esl;
+                                if (!harp_cdec_text(&d, &es, &esl)) return false;
+                                bundleEngineMajor = 0;
+                                for (size_t c = 0; c < esl && es[c] >= '0' && es[c] <= '9'; c++)
+                                    bundleEngineMajor = bundleEngineMajor * 10 + (es[c] - '0');
                             } else if (!harp_cdec_skip(&d))
                                 return false;
                         }
@@ -3793,6 +3809,7 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
         bundleTarget_ = target;
         bundleParamMapHashSet_ = haveBundlePmh; /* retained for the connect-apply re-check */
         if (haveBundlePmh) bundleParamMapHash_ = bundlePmh;
+        wantEngineMajor_.store(bundleEngineMajor, std::memory_order_relaxed); /* §12.2 read-only baseline */
         bundleParams_.clear();
         paramsFromStore(&store_, target, bundleParams_);
     }
