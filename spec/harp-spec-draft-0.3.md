@@ -2,7 +2,7 @@
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 
-Specification, Draft 0.5.4 — 23 June 2026
+Specification, Draft 0.5.5 — 23 June 2026
 
 | | |
 |---|---|
@@ -13,6 +13,8 @@ Specification, Draft 0.5.4 — 23 June 2026
 | **Schema & reference code license** | Apache-2.0 |
 | **Patent policy** | Royalty-free; contributors sign a non-assertion covenant (§19) |
 | **Feedback** | via HARP Enhancement Proposals (HEPs), see §18 |
+
+> **Changes in 0.5.5** — **Editorial reconciliation, no wire change.** Aligns the specification document with the consolidated `harp.cddl` and the reference implementation. (a) The in-document `identity` CDDL (§6.2 and Appendix A) gains **`? 14 => rt-profile`** — device-declared §8.7 RT setpoints (jitter-buffer floor + RTP packet size, capability `audio.rt-floor`); it was already in the consolidated `harp.cddl` and shipped on the reference device, so the in-document blocks were stale at key 13. (b) **§8.3.1 fence bound** is scoped to *real-time* host-paced rendering — a faster-than-real-time **offline** bounce has no wall clock to wedge and MUST render the exact fenced event set deterministically, so a deterministic device MAY block until the fenced events arrive (the bound and `fence_timeouts` do not apply offline). (c) **§14.4**'s normative diag-bundle schema lives in `docs/diag-bundle-design.md`, not Appendix A. (d) Document version, footer, README, and `harp.cddl` header now all read 0.5.5.
 
 > **Changes in 0.5.4** — Reference-engine change, **no wire/protocol change** — recorded because it exercises the §6.2/§13.4 version + param-map machinery end to end. The reference synth's always-on part-0 **drone was removed**: every part is note-only now, silent until a note plays (the drone dominated the main mix and masked the multitimbral sibling parts). Consequently `engine.version` bumps `1.1.0 → 2.0.0` — a MAJOR change, since stored state now renders differently (the §13.4 "loads but sounds different" signal a host surfaces as a read-only-default reopen); the now-removed "Drone Mix" param drops from the §9.3 automatable set so `param-map-hash` changes; and the engine-id is renamed `refdev-null → refdev-synth` (it always made sound — "null" was a misnomer). This confirms a device MAY evolve its DSP and parameter set behind the engine-version + param-map-hash signals without touching the protocol.
 
@@ -378,9 +380,11 @@ identity = {
   ? 11 => ump-group-map, ; §9.10; declared by `evt.ump` devices
   ? 12 => uint,          ; multitimbral part count (§9.4, §15.2); declared by `evt.multitimbral`, absent ⇒ 1
   ? 13 => txn-limits,    ; §9.6 transaction bounds; declared by `evt.txn`
+  ? 14 => rt-profile,    ; §8.7 device-declared RT setpoints (jitter buffer + RTP packet); declared by `audio.rt-floor`
 }
 ump-group-map = [* { 0 => uint group-index, 1 => tstr role }]
 txn-limits    = { 0 => uint max-concurrent, 1 => uint max-events }  ; MUST: max-concurrent ≥ 1, max-events ≥ 256
+rt-profile    = { ? 0 => uint, ? 1 => uint }  ; §8.7: 0 = safe ethTargetFrames floor (frames); 1 = RTP packet size (nsamples)
 semver = tstr            ; "MAJOR.MINOR.PATCH", SemVer 2.0.0
 hash   = bstr .size 33   ; 1 algorithm byte (0x01 = SHA-256) + digest
 ```
@@ -508,7 +512,7 @@ Host-paced mode creates an ordering problem the transmit-order rule of §9.2 can
 
 The fence closes it by construction. A host MAY set dirflags bit 2 on a host-paced pacing frame and append a 4-byte little-endian **event-sequence fence** immediately after the header: the count, modulo 2³², of event-stream messages the host has committed to the link for this stream so far. A device receiving a fenced frame MUST NOT render the frame's range until it has consumed at least that many event-stream messages since `audio.start` (comparison is wraparound-safe: the difference cast to a signed 32-bit value). Every received event message counts, including ones rejected as malformed — otherwise a bad message would wedge every subsequent fence.
 
-The wait is normally the wire-plus-parse time of events already in flight — microseconds, absorbed by the host's elastic buffer. Devices MUST bound the wait (a few milliseconds) so a host that fences beyond what it feeds cannot wedge the stream, and MUST count expirations (`fence_timeouts`, §14.2): an expired fence means the range may render with a late event, and `evt_late` remains the probe that tells the truth about it. Sequence space resets with the stream (`audio.start`), on both sides.
+The wait is normally the wire-plus-parse time of events already in flight — microseconds, absorbed by the host's elastic buffer. Devices MUST bound the wait (a few milliseconds) so a host that fences beyond what it feeds cannot wedge the stream, and MUST count expirations (`fence_timeouts`, §14.2): an expired fence means the range may render with a late event, and `evt_late` remains the probe that tells the truth about it. This bound applies to **real-time** host-paced rendering, where a running wall clock makes a stalled fence a wedged stream; a **faster-than-real-time offline bounce** (§8.3, no wall clock) has no real-time stream to wedge and MUST reproduce the exact fenced event set for bit-exact determinism, so a deterministic device MAY block until the fenced events arrive — it does not arm the bound or count `fence_timeouts` offline. Sequence space resets with the stream (`audio.start`), on both sides.
 
 Hosts SHOULD fence every pacing frame when they emit timestamped events at all (the fence is free when no events are in flight: the comparison already holds). Devices claiming `harp-perf` in host-paced mode SHOULD implement the fence; it converts the §9.2 headroom recommendation from a probabilistic safety margin into a correctness guarantee without adding reported latency.
 
@@ -958,7 +962,7 @@ In digital mode the device routes the host's output stream back as input with no
 
 ### 14.4 Logs and the diagnostic bundle
 
-Stream `log` carries structured records `{ 0 => uint64 msc-or-0, 1 => uint level, 2 => tstr tag, 3 => tstr msg }` from a device ring buffer (≥ 64 KiB RECOMMENDED). `req diag.bundle` triggers a full dump; the runtime then assembles the **HARP Diagnostic Bundle** — a CBOR file containing: identity, capabilities, counters (device + host), session state-machine history, recent logs (device + runtime), audio configuration, USB topology as visible to the host (controller, hub chain), correlation/drift statistics, and an optional anonymization pass that strips serials and names. The bundle schema is normative (Appendix A) so vendor support tooling can rely on it. The user-facing promise: *one button produces the file that ends the guessing*.
+Stream `log` carries structured records `{ 0 => uint64 msc-or-0, 1 => uint level, 2 => tstr tag, 3 => tstr msg }` from a device ring buffer (≥ 64 KiB RECOMMENDED). `req diag.bundle` triggers a full dump; the runtime then assembles the **HARP Diagnostic Bundle** — a CBOR file containing: identity, capabilities, counters (device + host), session state-machine history, recent logs (device + runtime), audio configuration, USB topology as visible to the host (controller, hub chain), correlation/drift statistics, and an optional anonymization pass that strips serials and names. The bundle schema is normative (its CDDL is maintained in `docs/diag-bundle-design.md`) so vendor support tooling can rely on it. The user-facing promise: *one button produces the file that ends the guessing*.
 
 ---
 
@@ -1096,9 +1100,10 @@ tstamp = [uint, uint64]            ; (epoch, msc)
 identity = { 0 => vendor, 1 => product, 2 => tstr, 3 => semver, 4 => engine,
              5 => [uint, uint], 6 => [* tstr], 7 => channel-map, 8 => latency-profile,
              ? 9 => tstr, ? 10 => uint,
-             ? 11 => ump-group-map, ? 12 => uint, ? 13 => txn-limits }
+             ? 11 => ump-group-map, ? 12 => uint, ? 13 => txn-limits, ? 14 => rt-profile }
 ump-group-map = [* { 0 => uint, 1 => tstr }]
 txn-limits    = { 0 => uint, 1 => uint }    ; max-concurrent ≥ 1, max-events ≥ 256
+rt-profile    = { ? 0 => uint, ? 1 => uint }    ; §8.7: 0 = ethTargetFrames floor; 1 = RTP packet size
 vendor   = { 0 => uint, 1 => tstr }
 product  = { 0 => uint, 1 => tstr }
 engine   = { 0 => tstr, 1 => semver, 2 => hash }
@@ -1226,4 +1231,4 @@ Suggested proving milestone, matching the protocol's own priorities: a VST3 shel
 
 ---
 
-*End of Draft 0.3.0. Earlier drafts of the ideas herein circulated as a product brief titled "Hardware Plugin Runtime"; this document is the open-standard formulation of that work.*
+*End of Draft 0.5.5. Earlier drafts of the ideas herein circulated as a product brief titled "Hardware Plugin Runtime"; this document is the open-standard formulation of that work.*

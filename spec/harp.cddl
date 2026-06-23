@@ -1,4 +1,4 @@
-; HARP — consolidated CDDL (extracted from spec draft 0.5.0, Appendix A)
+; HARP — consolidated CDDL (extracted from spec draft 0.5.5, Appendix A)
 ; Schemas are normative; see spec/harp-spec-draft-0.3.md for prose.
 
 ; --- framing (binary, not CBOR; given here for completeness) ---
