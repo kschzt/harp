@@ -128,7 +128,11 @@ if len(onsets) < min_onsets:
 bad = 0
 for i in range(1, len(onsets)):
     iv = onsets[i] - onsets[i - 1]
-    if abs(iv - grid) > rate // 400:
+    # ~3 ms interval tolerance (rate//300), matching the grid-deviation bound above:
+    # engine 2.0.0's clean inter-note silence shifted onset detection ~0.5 ms, so a
+    # consecutive interval (two onsets) can move up to ~1 ms — was 2.5 ms (rate//400).
+    # The wrap-anchor claim is intact: a mis-anchored wrap is a whole-grid error.
+    if abs(iv - grid) > rate // 300:
         bad += 1
 if bad:
     print(f"LOOP-WRAP FAIL: {bad} off-grid intervals across the wrap")
