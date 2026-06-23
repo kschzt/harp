@@ -1,11 +1,11 @@
 #!/bin/bash
 # part-filter-eth-test — §9.4: a plugin instance reflects device front-panel echoes for
 # ITS OWN part only. Over the §8.7 loopback (no hardware), a part-0 instance renders while
-# a part-0 knob (id 3) AND a part-1 knob (id 7) are injected through the panel socket. The
+# a part-0 knob (id 3) AND a part-1 knob (id 6) are injected through the panel socket. The
 # instance MUST surface the part-0 echo and MUST NOT surface the part-1 one.
 #
 # The device echoes EVERY front-panel edit unconditionally (front_panel_set_part always
-# evt_echo_param on the edited part), so the ABSENCE of param 7 is the part FILTER, not a
+# evt_echo_param on the edited part), so the ABSENCE of param 6 is the part FILTER, not a
 # missing echo. Pre-fix (popEcho ignored the echo's part) the instance surfaced BOTH ids —
 # the bug where one plugin instance mirrored every part's edits.
 #
@@ -36,11 +36,11 @@ for _ in $(seq 1 25); do [ -S "$SOCK" ] && break; sleep 0.2; done
 
 panel() { python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect('$SOCK'); s.send(sys.argv[1].encode()+b'\n'); s.recv(256); s.close()" "$1"; }
 
-# Inject a part-0 (id 3) and a part-1 (id 7) front-panel knob once the instance connects.
+# Inject a part-0 (id 3) and a part-1 (id 6) front-panel knob once the instance connects.
 ( for _ in $(seq 1 60); do grep -q "connected:" "$LOG" 2>/dev/null && break; sleep 0.1; done
   sleep 0.3
   panel "knob 0 3 0.90"   # part 0, id 3 -> the instance's OWN part: must be reflected
-  panel "knob 1 7 0.90"   # part 1, id 7 -> ANOTHER part: must be filtered out
+  panel "knob 1 6 0.90"   # part 1, id 6 -> ANOTHER part: must be filtered out
   sleep 0.3
   panel "knob 0 3 0.20" ) &
 INJ=$!
@@ -54,6 +54,6 @@ grep "echo: param [0-9]* " "$LOG" | grep -vE "param 40|param 41" | sort -u | sed
 grep -q "connected:" "$LOG" || fail "instance never connected to the loopback device (no oracle)"
 grep -q "echo: param 3 " "$LOG" \
     || fail "part-0 instance did NOT reflect its OWN part-0 edit (param 3) — echo broken?"
-grep -q "echo: param 7 " "$LOG" \
-    && fail "part-0 instance WRONGLY reflected the part-1 edit (param 7) — the part-filter bug"
-echo "PART-FILTER PASS (part-0 instance reflected its own param 3, ignored the part-1 param 7)"
+grep -q "echo: param 6 " "$LOG" \
+    && fail "part-0 instance WRONGLY reflected the part-1 edit (param 6) — the part-filter bug"
+echo "PART-FILTER PASS (part-0 instance reflected its own param 3, ignored the part-1 param 6)"

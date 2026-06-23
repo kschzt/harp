@@ -19,7 +19,7 @@ if pgrep -x "Live" >/dev/null 2>&1; then
     exit 3
 fi
 
-ARP="--set 9=0.25 --set 10=0.6 --set 11=0.5 --set 12=0.0 --set 7=0.0 \
+ARP="--set 9=0.25 --set 10=0.6 --set 11=0.5 --set 12=0.0 \
      --set 8=0.7 --set 5=0.05 --set 6=0.1 --set 1=0.5 --set 2=0.6 \
      --set 3=0.7 --set 4=0.5"
 

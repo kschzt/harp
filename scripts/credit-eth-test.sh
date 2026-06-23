@@ -41,9 +41,9 @@ export HARP_DEVICE_SERIAL="SIM-0001"
 
 echo "── §4.2.1b: recall round-trip under a ${HARP_FORCE_CREDIT_GRANT}-byte credit window (forces queue+flush)"
 # warm-up (settle metering/echo so HPRE is in the stable regime HPOST will also be in)
-"$HOSTBIN" "$PLUG" --set 3=0.81 --set 7=0.31 --set 1=0.61 --notes 62,69,74,65 --seconds 0.6 --hash >/dev/null 2>&1
+"$HOSTBIN" "$PLUG" --set 3=0.81 --set 6=0.31 --set 1=0.61 --notes 62,69,74,65 --seconds 0.6 --hash >/dev/null 2>&1
 # ground-truth render + DAW save
-HPRE=$("$HOSTBIN" "$PLUG" --set 3=0.81 --set 7=0.31 --set 1=0.61 --notes 62,69,74,65 \
+HPRE=$("$HOSTBIN" "$PLUG" --set 3=0.81 --set 6=0.31 --set 1=0.61 --notes 62,69,74,65 \
        --seconds 0.6 --hash --save-state "$STATEFILE" 2>/dev/null | sed -n 's/^output-hash: //p')
 [ -n "$HPRE" ] || fail "no pre-mutation render-hash (save render produced no output-hash)"
 # musician mutates the device, then DAW reopen -> recall PUSH: the closure travels through

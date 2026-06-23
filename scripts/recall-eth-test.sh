@@ -70,15 +70,15 @@ ARCH0=$(arch_count)
 # Warm-up: the FIRST full note-render after a fresh device start is a one-time cold transient
 # (metering/echo settle) — discard one so HPRE (the save render) is in the stable regime
 # HPOST will also be in.
-"$HOSTBIN" "$PLUG" --set 3=0.81 --set 7=0.31 --set 1=0.61 --notes 62,69,74,65 \
+"$HOSTBIN" "$PLUG" --set 3=0.81 --set 6=0.31 --set 1=0.61 --notes 62,69,74,65 \
     --seconds 0.6 --hash >/dev/null 2>&1   # warm: settle the device, discard
 # 1. known state, RENDERED (HPRE = ground-truth render) + saved (DAW save)
-HPRE=$("$HOSTBIN" "$PLUG" --set 3=0.81 --set 7=0.31 --set 1=0.61 --notes 62,69,74,65 \
+HPRE=$("$HOSTBIN" "$PLUG" --set 3=0.81 --set 6=0.31 --set 1=0.61 --notes 62,69,74,65 \
        --seconds 0.6 --hash --save-state "$STATEFILE" 2>/dev/null | sed -n 's/^output-hash: //p')
 [ -n "$HPRE" ] || fail "no pre-mutation render-hash (save render produced no output-hash)"
 # 2. musician mutates the device (front-panel path, via the probe)
 "$PROBE" $PD knob 3 0.10 >/dev/null 2>&1 || fail "knob 3 mutate"
-"$PROBE" $PD knob 7 0.95 >/dev/null 2>&1 || fail "knob 7 mutate"
+"$PROBE" $PD knob 6 0.95 >/dev/null 2>&1 || fail "knob 6 mutate"
 # 3. DAW reopen -> recall (auto-Push-with-archive); HPOST = render of the RESTORED device
 "$HOSTBIN" "$PLUG" --load-state "$STATEFILE" --notes 62,69,74,65 --seconds 0.6 --hash \
     >/tmp/recall-eth.log 2>&1 || fail "load render"
@@ -97,7 +97,7 @@ for ln in open(os.environ['PARAMS']):
     if len(a) == 2:
         try: v[int(a[0])] = float(a[1])
         except ValueError: pass
-ok = abs(v.get(3,9)-0.81) < 0.02 and abs(v.get(7,9)-0.31) < 0.02 and abs(v.get(1,9)-0.61) < 0.02
+ok = abs(v.get(3,9)-0.81) < 0.02 and abs(v.get(6,9)-0.31) < 0.02 and abs(v.get(1,9)-0.61) < 0.02
 import sys
 sys.exit(0 if ok else (print(f'RECALL-ETH FAIL: params not restored: {v}') or 1))" || exit 1
 ARCH1=$(arch_count)

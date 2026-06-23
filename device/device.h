@@ -35,15 +35,15 @@
 
 #define PROTO_MAJOR 1
 #define PROTO_MINOR 0
-#define ENGINE_ID "refdev-null"
-/* P2 (voice pool): bumped 1.0.0 -> 1.1.0. §6.4 names voice allocation as
- * render-affecting — the per-part pool means overlapping notes now ring out on
- * separate voices instead of retriggering one, so a render that contains note
- * overlap (the golden melody's release tails) can differ from the pre-pool
- * engine. The bump tells hosts the render contract moved. param-map-hash is
- * deliberately UNCHANGED (the modulatable capability bits are masked out of the
- * hash input, state.c), so stored automation and recall stay byte-identical. */
-#define ENGINE_VERSION "1.1.0"
+#define ENGINE_ID "refdev-synth"
+/* Drone removed: bumped 1.1.0 -> 2.0.0. §6.2/§6.4 name DSP + render contract as
+ * version-bearing — every part is note-only now, so stored state that relied on
+ * the continuous part-0 drone sounds different (silent until a note plays). The
+ * MAJOR bump signals the §13.4 "loads but sounds different" break; the "Drone
+ * Mix" param (id 7) is gone, so param-map-hash also moves (the automatable set is
+ * 12 params now). Renamed from "refdev-null": the engine has always made sound —
+ * "null" was a misnomer. (Prior bump: P2 voice-pool 1.0.0 -> 1.1.0.) */
+#define ENGINE_VERSION "2.0.0"
 #define FW_VERSION "0.1.0"
 #define CREDIT_GRANT (16u << 20)
 #define HARP_SENDQ_CAP 1024 /* §4.2.1 bounded obj-send queue (FIFO of hashes); 1024*33B ≈ 33 KiB */
@@ -82,9 +82,9 @@ typedef struct {
     float def;              /* factory default — every part's pval starts here */
 } dev_param;
 
-/* fixed count so sizeof tricks aren't needed across modules; the arp
- * session grows this to 12 (params 9-12) — one place to change */
-#define NPARAMS 13
+/* fixed count so sizeof tricks aren't needed across modules. 12 since the drone
+ * removal dropped "Drone Mix" (id 7); the arp added ids 9-12 earlier. */
+#define NPARAMS 12
 extern dev_param g_params[NPARAMS];
 
 /* Per-part param value access (P3). The atomic value lives in part::pval
@@ -119,10 +119,11 @@ void engine_part_param_put(int part_idx, uint32_t id, float v);
  * flushed-to-zero on silence / non-finite input (no denormals or NaN escape).
  *
  * COVERAGE CONTRACT (§9.9): a part is metered for a block iff its output is
- * actually produced that block — part 0 always (it carries the drone), parts
- * 1..15 only while active (held/ringing); an unrendered part's meters decay to
- * the silent floor (the pump emits 0 for it). The main-mix meter always covers
- * the summed stereo mix that the host hears on slots 0/1. */
+ * actually produced that block — part 0 always (it is the main-mix's first
+ * writer, rendering silence when idle now the drone is gone), parts 1..15 only
+ * while active (held/ringing); an unrendered part's meters decay to the silent
+ * floor (the pump emits 0 for it). The main-mix meter always covers the summed
+ * stereo mix that the host hears on slots 0/1. */
 #define METER_NSLOTS (NPARTS + 1) /* 16 parts + 1 main mix */
 #define METER_MAIN_IX NPARTS      /* the main-mix entry */
 

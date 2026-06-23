@@ -22,13 +22,14 @@
 #include "device.h"
 
 /* REAL: the parser matches blob ids against g_params[].id. Kept in lockstep
- * with device/engine.c (ids 1..13, ascending) — only the id field matters to
- * the codec, but the whole rows are mirrored so a drift is obvious. */
+ * with device/engine.c (ids 1..6, 8..13 — id 7 "Drone Mix" was removed with the
+ * drone, leaving a gap). Only the id field matters to the codec, but the whole
+ * rows are mirrored so a drift is obvious. */
 dev_param g_params[NPARAMS] = {
     {1, "Osc Pitch", 0, NULL, 0.5f},     {2, "Osc Shape", 0, NULL, 0.5f},
     {3, "Filter Cutoff", 0, NULL, 0.5f}, {4, "Filter Reso", 0, NULL, 0.5f},
     {5, "Env Attack", 0, NULL, 0.5f},    {6, "Env Release", 0, NULL, 0.5f},
-    {7, "Drone Mix", 0, NULL, 0.5f},     {8, "Master Level", 0, NULL, 0.5f},
+    {8, "Master Level", 0, NULL, 0.5f},
     {9, "Arp Mode", 5, NULL, 0.0f},      {10, "Arp Division", 6, NULL, 0.6f},
     {11, "Arp Gate", 0, NULL, 0.5f},     {12, "Arp Octaves", 4, NULL, 0.0f},
     {13, "Glide", 0, NULL, 0.0f},
@@ -36,7 +37,7 @@ dev_param g_params[NPARAMS] = {
 /* Drift tripwire: this mirror is hand-kept in lockstep with engine.c. A param
  * COUNT change there bumps NPARAMS and trips this assert, forcing the rows
  * above to be updated rather than silently zero-padded. */
-_Static_assert(NPARAMS == 13, "state_stubs.c g_params mirror is out of sync with engine.c");
+_Static_assert(NPARAMS == 12, "state_stubs.c g_params mirror is out of sync with engine.c");
 
 /* Never reached on the fuzz path (refdev_parse_params_blob touches none of
  * these). abort() rather than a quiet return so a wiring mistake surfaces. */

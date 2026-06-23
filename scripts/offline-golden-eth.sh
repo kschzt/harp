@@ -34,7 +34,7 @@ export HARP_RECONCILE_TIMEOUT_MS=0   # headless: no front panel to answer a reca
 # The canonical golden render (same musical content as scripts/golden-test.sh): a clean
 # patch (SETTLE) plus a 4-note line. Deterministic input => deterministic bounce.
 SETTLE="--set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 5=0.1 --set 6=0.2 \
-        --set 7=0.5 --set 8=0.6 --set 9=0 --set 10=0.6 --set 11=0.5 --set 12=0 --set 13=0"
+        --set 8=0.6 --set 9=0 --set 10=0.6 --set 11=0.5 --set 12=0 --set 13=0"
 SEQ="--notes 62,69,74,65 --seconds 2.6 --hash"
 
 PASS=0; FAIL=0

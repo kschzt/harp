@@ -23,9 +23,10 @@ if pgrep -x "Live" >/dev/null 2>&1; then
 fi
 
 echo "── replug: 20 s realtime render, daemon restart at t=6 s (device $SERIAL)"
-# pin to the board PI restarts (deterministic with multiple devices) and
-# continuous drone (param 7 up) so post-reconnect audio is provable
-HARP_DEVICE_SERIAL="$SERIAL" "$HOST" "$PLUG" --realtime --set 7=0.9 --set 8=0.7 --set 3=0.6 \
+# pin to the board PI restarts (deterministic with multiple devices) and hold a
+# sustained chord (drone removed: --chord notes ring from 0.1 s to the end) so
+# post-reconnect audio is provable across the whole 20 s, tail included.
+HARP_DEVICE_SERIAL="$SERIAL" "$HOST" "$PLUG" --realtime --chord 48,55,60 --set 8=0.7 --set 3=0.6 \
     --seconds 20 --out "$OUT" >"$LOG" 2>&1 &
 HOSTPID=$!
 

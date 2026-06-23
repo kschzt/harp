@@ -22,7 +22,7 @@ local function set_render_cfg()
   reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 0, true) -- custom time range
   reaper.GetSetProjectInfo(0, "RENDER_STARTPOS", 0.0, true)
   reaper.GetSetProjectInfo(0, "RENDER_ENDPOS", 2.0, true)
-  reaper.GetSetProjectInfo(0, "RENDER_TAILFLAG", 0, true)   -- no tail (drone never silent)
+  reaper.GetSetProjectInfo(0, "RENDER_TAILFLAG", 0, true)   -- no tail (notes are within the render window)
   reaper.GetSetProjectInfo(0, "RENDER_SRATE", 48000, true)
   reaper.GetSetProjectInfo(0, "RENDER_CHANNELS", 2, true)
   reaper.GetSetProjectInfo_String(0, "RENDER_FORMAT", "ZXZhdxgAAAA=", true) -- 24-bit WAV
