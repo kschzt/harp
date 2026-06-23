@@ -667,6 +667,24 @@ static void cmd_refs(probe *p) {
     for (size_t i = 0; i < n; i++) print_ref(&refs[i]);
 }
 
+/* find-ref <name>: resolve ONE ref by name via the filtered state.refs path (refsLocked's
+ * path). Exits 0 if found, 3 if not. Used by bloat-recall-eth-test to prove a device with
+ * many §11.4 archive refs still resolves the live ref (debt #22) — the filtered read returns
+ * a single-ref response, so it can't trip the §4.2.1 ctl bound the way the full list does. */
+static void cmd_find_ref(probe *p, const char *name) {
+    do_hello(p);
+    harp_ref r;
+    int rc = harp_client_find_ref(&p->client, name, &r);
+    if (rc != 0) {
+        fprintf(stderr, "find-ref: '%s' not resolved (rc=%d)\n", name, rc);
+        exit(3);
+    }
+    char hex[2 * HARP_HASH_LEN + 1] = "(unborn)";
+    if (!r.unborn) { harp_hash_hex(&r.hash, hex); hex[12] = 0; }
+    printf("find-ref: %s @ %s gen=%llu %s\n", r.name, hex, (unsigned long long)r.generation,
+           r.dirty ? "DIRTY" : "clean");
+}
+
 static void cmd_counters(probe *p) {
     do_hello(p);
     harp_cbuf req, rsp;
@@ -1969,6 +1987,8 @@ int main(int argc, char **argv) {
         cmd_ping(&p, i + 1 < argc ? atoi(argv[i + 1]) : 5);
     else if (strcmp(cmd, "refs") == 0)
         cmd_refs(&p);
+    else if (strcmp(cmd, "find-ref") == 0 && i + 1 < argc)
+        cmd_find_ref(&p, argv[i + 1]);
     else if (strcmp(cmd, "counters") == 0)
         cmd_counters(&p);
     else if (strcmp(cmd, "diag-bundle") == 0) {

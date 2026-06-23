@@ -499,16 +499,42 @@ int harp_client_refs(harp_client *c, harp_ref *out, size_t cap, size_t *count) {
 }
 
 int harp_client_find_ref(harp_client *c, const char *name, harp_ref *out) {
-    harp_ref refs[64];
-    size_t n;
-    int rc = harp_client_refs(c, refs, 64, &n);
-    if (rc != 0) return rc;
-    for (size_t i = 0; i < n; i++)
-        if (strcmp(refs[i].name, name) == 0) {
-            *out = refs[i];
-            return 0;
+    /* Ask the device to filter to just `name` (state.refs body { 0 => name }), so we don't
+     * pull the whole ref list — which grows with the §11.4 archive count and exceeds the ctl
+     * bound on a long-lived device, breaking refsLocked/getState (debt #22). We still SEARCH
+     * the returned array for `name`, so an OLD device that ignores the filter and returns the
+     * full list still works (as long as it fits the bound). */
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    harp_client_req_head(c, &req, "state.refs", true);
+    harp_cbor_map(&req, 1);
+    harp_cbor_uint(&req, 0);
+    harp_cbor_text(&req, name);
+    harp_env e;
+    int rc = harp_client_request(c, &req, &rsp, &e);
+    bool found = false;
+    if (rc == 0 && e.has_body) {
+        harp_cdec b;
+        harp_cdec_init(&b, e.body, e.body_len);
+        uint64_t n, key, alen;
+        if (harp_cdec_map(&b, &n) && n >= 1 && harp_cdec_uint(&b, &key) && key == 0 &&
+            harp_cdec_array(&b, &alen)) {
+            for (uint64_t i = 0; i < alen; i++) {
+                harp_ref r;
+                if (!harp_ref_decode(&b, &r)) break;
+                if (strcmp(r.name, name) == 0) {
+                    *out = r;
+                    found = true;
+                    break;
+                }
+            }
         }
-    return HARP_CLIENT_EIO;
+    }
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+    if (rc != 0) return rc;
+    return found ? 0 : HARP_CLIENT_EIO;
 }
 
 int harp_client_snapshot(harp_client *c, const char *refname, const char *msg,
