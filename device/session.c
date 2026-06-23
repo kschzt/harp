@@ -476,19 +476,50 @@ static void refs_cb(const harp_ref *r, void *ud) {
 
 static void handle_state_refs(device *d, const harp_env *e) {
     live_cache_flush(d);
-    struct refs_collect c = {{0}, 0};
-    harp_cbuf_init(&c.items);
-    harp_store_ref_list(&d->store, refs_cb, &c);
+    /* §11: an OPTIONAL body { 0 => tstr name } filters the response to the single named ref
+     * (or an empty list if absent). A host that only needs the live ref (refsLocked, every
+     * getState/save) sends the filter so it never pulls the WHOLE ref list — which grows with
+     * the §11.4 archive count and, past ~1,300 refs, exceeds the §4.2.1 ctl message bound and
+     * fails the recv (debt #22, the recall-breaker). No body = the full list, as before
+     * (backward compatible: an old device ignores the body and returns everything). */
+    char filter[HARP_REF_NAME_MAX] = "";
+    if (e->has_body) {
+        harp_cdec b;
+        harp_cdec_init(&b, e->body, e->body_len);
+        uint64_t n, key;
+        const char *s;
+        size_t sl;
+        if (harp_cdec_map(&b, &n) && n >= 1 && harp_cdec_uint(&b, &key) && key == 0 &&
+            harp_cdec_text(&b, &s, &sl) && sl < sizeof filter) {
+            memcpy(filter, s, sl);
+            filter[sl] = 0;
+        }
+    }
     harp_cbuf m;
     harp_cbuf_init(&m);
     rsp_head(&m, e->rid, e->method, true);
     harp_cbor_map(&m, 1);
     harp_cbor_uint(&m, 0);
-    harp_cbor_array(&m, c.count);
-    harp_cbuf_put(&m, c.items.buf, c.items.len);
+    if (filter[0]) {
+        /* return the one named ref iff it EXISTS — matching the old full-list semantics, where
+         * harp_store_ref_list only walks refs present on disk (a missing ref reads as unborn). */
+        harp_ref r;
+        if (harp_store_ref_read(&d->store, filter, &r) == 0 && !r.unborn) {
+            harp_cbor_array(&m, 1);
+            harp_ref_encode(&m, &r);
+        } else {
+            harp_cbor_array(&m, 0);
+        }
+    } else {
+        struct refs_collect c = {{0}, 0};
+        harp_cbuf_init(&c.items);
+        harp_store_ref_list(&d->store, refs_cb, &c);
+        harp_cbor_array(&m, c.count);
+        harp_cbuf_put(&m, c.items.buf, c.items.len);
+        harp_cbuf_free(&c.items);
+    }
     send_ctl(d, &m);
     harp_cbuf_free(&m);
-    harp_cbuf_free(&c.items);
 }
 
 static void handle_state_snapshot(device *d, const harp_env *e) {
