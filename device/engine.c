@@ -125,6 +125,12 @@ typedef struct {
      * golden path bit-for-bit, even when has_mod is set by a (cutoff) param mod. */
     float bend_semis;
     float z_gain;
+    /* §9.5 per-voice RAMP on the mod[] deviation — the per-voice analogue of the part
+     * ramps[]. A single in-flight ramp per voice (the latest per-voice ramp wins; a
+     * per-voice SET supersedes it). Gated on vramp.active (false for the golden, so the
+     * rendered bytes are unchanged when no per-voice ramp is in flight). */
+    dev_ramp vramp;
+    int vramp_idx;
     /* ---- DSP state ---- */
     /* control-rate-smoothed parameter values (§9.3: the device interpolates
      * at its declared control rate — instant steps are zipper clicks) */
@@ -328,6 +334,7 @@ static void voice_note_on(part *p, int note, float vel, uint32_t voice_id) {
     memset(v->mod, 0, sizeof v->mod);
     v->bend_semis = 0.0f; /* a fresh/stolen voice starts unbent + unpressured */
     v->z_gain = 0.0f;
+    v->vramp.active = false; /* ...and with no in-flight §9.5 per-voice ramp */
 }
 
 /* Release every active voice currently sounding `note` (set note=-1 so its env
@@ -508,6 +515,22 @@ static void ramps_advance(part *p, uint64_t pos) {
         } else if (pos > r->start) {
             float t = (float)(pos - r->start) / (float)(r->end - r->start);
             part_pput(p, i, r->start_val + (r->target - r->start_val) * t);
+        }
+    }
+    /* §9.5 per-voice ramps: tick each voice's in-flight ramp into its mod[] deviation —
+     * the per-voice analogue of the part ramps above. Inactive (vramp.active == false)
+     * for the golden, so the rendered bytes are unchanged when no per-voice ramp exists. */
+    for (int vi = 0; vi < NVOICES; vi++) {
+        synth_voice *v = &p->voices[vi];
+        dev_ramp *r = &v->vramp;
+        if (!r->active) continue;
+        int j = v->vramp_idx;
+        if (pos >= r->end || r->end <= r->start) {
+            v->mod[j] = r->target;
+            r->active = false;
+        } else if (pos > r->start) {
+            float t = (float)(pos - r->start) / (float)(r->end - r->start);
+            v->mod[j] = r->start_val + (r->target - r->start_val) * t;
         }
     }
 }
@@ -1300,8 +1323,25 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                     break;
                 }
                 case DEV_EV_PARAM_SET: {
-                    /* P3: apply to the ROUTED part's pval/ramps (was global) */
                     int j = param_index(ev->a);
+                    if (ev->voice) {
+                        /* §9.5 per-voice SET: affect ONLY the addressed sounding voice —
+                         * set its mod[] deviation so voice_param renders at ev->v, NOT the
+                         * part base (which would hit every voice). Transient like §9.4 mod,
+                         * so it does NOT touch stored state (no g_touch_pending). */
+                        if (j >= 0) {
+                            float base = part_pget(p, (size_t)j);
+                            for (int vi = 0; vi < NVOICES; vi++) {
+                                synth_voice *mv = &p->voices[vi];
+                                if (!harp_mod_targets_voice(ev->voice, mv->active, mv->voice_id)) continue;
+                                mv->mod[j] = ev->v - base;
+                                mv->vramp.active = false; /* set supersedes ramp (§9.4) */
+                                mv->has_mod = true;
+                            }
+                        }
+                        break;
+                    }
+                    /* P3: voice==0 -> the ROUTED part's pval/ramps (was global) */
                     if (j >= 0) {
                         part_pput(p, (size_t)j, ev->v);
                         p->ramps[j].active = false; /* set supersedes ramp (§9.4) */
@@ -1311,8 +1351,29 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
                     break;
                 }
                 case DEV_EV_RAMP: {
-                    /* P3: ramp the ROUTED part's value (was global) */
                     int j = param_index(ev->a);
+                    if (ev->voice) {
+                        /* §9.5 per-voice RAMP: ramp ONLY the addressed sounding voice's
+                         * mod[] deviation toward ev->v over [pos, ev->end] (ticked in
+                         * ramps_advance), NOT the part base. Transient like the per-voice
+                         * SET above — no g_touch_pending. */
+                        if (j >= 0) {
+                            float base = part_pget(p, (size_t)j);
+                            for (int vi = 0; vi < NVOICES; vi++) {
+                                synth_voice *mv = &p->voices[vi];
+                                if (!harp_mod_targets_voice(ev->voice, mv->active, mv->voice_id)) continue;
+                                mv->vramp.active = true;
+                                mv->vramp.start = pos;
+                                mv->vramp.end = ev->end;
+                                mv->vramp.start_val = mv->mod[j]; /* from the voice's current deviation */
+                                mv->vramp.target = ev->v - base;  /* to the deviation that renders at ev->v */
+                                mv->vramp_idx = j;
+                                mv->has_mod = true;
+                            }
+                        }
+                        break;
+                    }
+                    /* P3: voice==0 -> ramp the ROUTED part's value (was global) */
                     if (j >= 0) {
                         p->ramps[j].active = true;
                         p->ramps[j].start = pos;
