@@ -26,10 +26,11 @@ trap 'rm -rf "$T"' EXIT INT TERM
 [ -x "$HOST" ] || { echo "FAIL: harp-vst3-host not built at $HOST"; exit 1; }
 [ -e "$PLUGIN" ] || { echo "FAIL: shell not installed at $PLUGIN"; exit 1; }
 
-# pin the device to a known state via the front panel (knobs 1-8 = $1; arp off so
-# determinism doesn't depend on transport-anchored timing).
+# pin the device to a known state via the front panel (knobs 1-6,8 = $1; id 7
+# "Drone Mix" was removed with the drone — knob 7 errors and trips set -e; arp off
+# so determinism doesn't depend on transport-anchored timing).
 pin() {
-    for i in 1 2 3 4 5 6 7 8; do "$PROBE" -d usb knob "$i" "$1" >/dev/null 2>&1; done
+    for i in 1 2 3 4 5 6 8; do "$PROBE" -d usb knob "$i" "$1" >/dev/null 2>&1; done
     "$PROBE" -d usb knob 9 0.0 >/dev/null 2>&1
 }
 ohash() { "$HOST" "$PLUGIN" "$@" 2>/dev/null | sed -n 's/^output-hash: //p'; }

@@ -57,7 +57,7 @@ cp "$HERE/reaper-e2e.lua" "$SCRIPTS/__startup.lua"
 # pin the device to a known state. $1 = value for knobs 1-8 (arp/knob 9 stays off
 # so determinism does not depend on transport-anchored arp timing).
 pin() {
-    for i in 1 2 3 4 5 6 7 8; do "$PROBE" -d usb knob "$i" "$1" >/dev/null 2>&1; done
+    for i in 1 2 3 4 5 6 8; do "$PROBE" -d usb knob "$i" "$1" >/dev/null 2>&1; done  # id 7 (Drone Mix) removed
     "$PROBE" -d usb knob 9 0.0 >/dev/null 2>&1
 }
 ctr() { "$PROBE" -d usb counters 2>/dev/null | grep -E "[. ]$1 = " | grep -oE '[0-9]+$' | tail -1; }
