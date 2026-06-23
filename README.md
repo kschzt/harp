@@ -98,11 +98,12 @@ VST3 Note Expression, CLAP per-note parameter modulation, and MPE (CLAP, VST3,
 and raw 16-channel MIDI into the AU — Logic / Ableton Live). It is *not* yet an
 ecosystem of instruments; building richer synths and shipping real devices on
 top of the protocol is the roadmap, not a claim about the present. The spec is
-an **editor's draft** (0.5.1): breaking changes are expected and negotiated at
-`hello`. The four-actions recall UI is next, and the spec-conformance periphery
-(mDNS discovery, credit flow-control, event transactions, admission control, the
-version/update prompt) has been filled in over the §8.7 Ethernet/IP binding — the
-[Status](#status) section is the full breakdown.
+an **editor's draft** (0.5.3): breaking changes are expected and negotiated at
+`hello`. The four-actions recall UI (§11.4 reconcile — Push / Pull / Read-only / Duplicate)
+ships in the reference Electra front-panel sidecar, and the spec-conformance periphery (the
+`_harp._tcp` mDNS advertisement, credit flow-control, event transactions, admission control,
+the version/update prompt) has been filled in over the §8.7 Ethernet/IP binding; shell-side
+mDNS *browse* is still on the roadmap (§6.1). The [Status](#status) section is the full breakdown.
 
 ## Repository map
 
@@ -258,10 +259,10 @@ whatever is declared (floor to `[2·max-DAW-block, 12288]`, packet to `[32, kBlo
 free-running buffer latency from ~43 ms toward ~7–9 ms. See [`scripts/eth-rtfloor-test.sh`](scripts/eth-rtfloor-test.sh).
 
 Synths on a network advertise over mDNS (`_harp._tcp`); **`harp-probe discover`** browses the
-segment and resolves each to its `host:port`. The shell runtime doesn't browse automatically yet —
-it dials `HARP_ETH_DEVICE=HOST:PORT` at its first connect (`selectDevice`), so point it at an
-address you've discovered (folding that mDNS browse into the shell's device list, per §6.1, is on
-the roadmap).
+segment and resolves each to its `host:port`. The shell discovers them too: with no USB device
+and no `HARP_ETH_DEVICE`, `selectDevice` browses `_harp._tcp` and dials the first synth it finds
+(§6.1). Set **`HARP_ETH_DEVICE=mdns`** to force that browse explicitly, `HARP_ETH_DEVICE=HOST:PORT`
+to pin a literal address, or `HARP_NO_MDNS=1` to disable the auto-browse.
 A GUI DAW does **not** inherit your terminal's environment, so set it where the OS
 launcher sees it, *before* launching the DAW:
 
