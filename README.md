@@ -98,11 +98,12 @@ VST3 Note Expression, CLAP per-note parameter modulation, and MPE (CLAP, VST3,
 and raw 16-channel MIDI into the AU — Logic / Ableton Live). It is *not* yet an
 ecosystem of instruments; building richer synths and shipping real devices on
 top of the protocol is the roadmap, not a claim about the present. The spec is
-an **editor's draft** (0.5.1): breaking changes are expected and negotiated at
-`hello`. The four-actions recall UI is next, and the spec-conformance periphery
-(mDNS discovery, credit flow-control, event transactions, admission control, the
-version/update prompt) has been filled in over the §8.7 Ethernet/IP binding — the
-[Status](#status) section is the full breakdown.
+an **editor's draft** (0.5.2): breaking changes are expected and negotiated at
+`hello`. The four-actions recall UI (§11.4 reconcile — Push / Pull / Read-only / Duplicate)
+ships in the reference Electra front-panel sidecar, and the spec-conformance periphery (the
+`_harp._tcp` mDNS advertisement, credit flow-control, event transactions, admission control,
+the version/update prompt) has been filled in over the §8.7 Ethernet/IP binding; shell-side
+mDNS *browse* is still on the roadmap (§6.1). The [Status](#status) section is the full breakdown.
 
 ## Repository map
 

@@ -2,7 +2,7 @@
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 
-Specification, Draft 0.5.1 — 23 June 2026
+Specification, Draft 0.5.2 — 23 June 2026
 
 | | |
 |---|---|
@@ -13,6 +13,8 @@ Specification, Draft 0.5.1 — 23 June 2026
 | **Schema & reference code license** | Apache-2.0 |
 | **Patent policy** | Royalty-free; contributors sign a non-assertion covenant (§19) |
 | **Feedback** | via HARP Enhancement Proposals (HEPs), see §18 |
+
+> **Changes in 0.5.2** — §4.4.3: a device MUST advertise the base `_harp._tcp` service type for cross-vendor discovery interoperability (any conforming host finds any vendor's device, §1), and MAY *additionally* register vendor-specific DNS-SD subtypes (`_<vendor>._sub._harp._tcp`) or its own service types for vendor tooling — these MUST NOT replace the base advertisement. Vendor-specific discovery is additive, never a substitute. No wire change.
 
 > **Changes in 0.5.1** — §6.1 clarified for the network binding: the runtime discovers Ethernet/IP devices by browsing the `_harp._tcp` mDNS/DNS-SD service (§4.4.3) and folds them into the same system-wide device list shells consume, so discovery and selection are uniform across USB and network (a directly-configured address is allowed as a fallback). §4.4.3 already defined the advertisement and TXT contract; this ties it into the discovery / device-list model of §6.1. No wire change.
 
@@ -276,7 +278,7 @@ A HARP device on Ethernet/IP carries the framed link (§4.2) over TCP and the au
 
 1. **Framed link** (`ctl`/`evt`/`obj`/`log`) travels over one **TCP connection** carrying the §4.2 frame format verbatim. TCP satisfies the §4.1 reliable-ordered requirement; the §4.2.1 bulk-pair deadlock does not arise (socket buffering decouples the directions), though `core.credit` (§5.5) still governs the `obj` stream and the `ctl`/`evt`-ahead-of-`obj` scheduling rule is unchanged. `core.hello` (§5.4) completes before any other method; a connection reset is a session reset (§12.4). Capability `net.tcp`.
 2. **Audio plane** travels over **RTP/UDP** (§8.7), free-running, separate from the TCP connection. Capability `net.rtp`.
-3. **Discovery** is by mDNS/DNS-SD service type `_harp._tcp`. The instance name is advisory and carries no trust; the TXT record gives `proto` (= `bcdHARP`) and the framed-link TCP port, and MUST NOT carry the serial (§16 privacy) — identity is fetched via `core.hello`. Detach (§12.3) is signalled by connection close, `core.ping` timeout, or the mDNS goodbye record, whichever is first; the session-resume model is otherwise unchanged, only the detach trigger differs from USB unplug.
+3. **Discovery** is by mDNS/DNS-SD service type `_harp._tcp`. A device MUST advertise this base type so that any conforming host discovers it regardless of vendor — the cross-vendor interoperability contract (§1); a device MAY *additionally* register vendor-specific DNS-SD subtypes (e.g. `_acme._sub._harp._tcp`) or its own service types for vendor tooling, but these MUST NOT replace the base `_harp._tcp` advertisement (a vendor-only type would make the device invisible to a generic host). The instance name is advisory and carries no trust; the TXT record gives `proto` (= `bcdHARP`) and the framed-link TCP port, and MUST NOT carry the serial (§16 privacy) — identity is fetched via `core.hello`. Detach (§12.3) is signalled by connection close, `core.ping` timeout, or the mDNS goodbye record, whichever is first; the session-resume model is otherwise unchanged, only the detach trigger differs from USB unplug.
 4. **Security posture.** On the trusted segment the link and audio travel in clear — there is **no mandatory transport encryption**, consistent with every comparable audio-over-IP standard (none encrypt the media path). Signed firmware (§13.2) remains mandatory and is the one security guarantee this binding does not relax. The threat model widens from one cabled host to any node on the segment, so the parsing and DoS requirements of §16 bind harder. A device on a shared, untrusted LAN is out of model; the answer there is USB.
 5. **Clock.** A single device's clock is recovered host-side from the audio stream itself (§7.3) — the host is not required to be a PTP node. Multi-device timeline alignment MAY use device-side PTP (§7.3, capability `net.ptp`).
 6. **AES67/Dante interop** — full participation in an AES67/Dante fabric (PTPv2 media profile, SDP/SAP) is **reserved as an optional, firmware-deliverable capability `net.aes67-bridge`** (§8.7), not part of the base binding; its purpose is the live/install/computer-less world that the plugin path does not serve. AVB (802.1AS gPTP, Layer 2) is out of scope.
