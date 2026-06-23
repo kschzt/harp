@@ -120,6 +120,7 @@ if have "$PROBE"; then
   run credit           scripts/credit-eth-test.sh            # §4.2.1b obj credit queue/flush under starvation
   run txn              scripts/txn-test.sh                   # §9.6 event transactions: buffer/commit-atomic/abort
   run core             scripts/core-test.sh                  # §5.5 core methods: ping/identify/changed/bye
+  run conn-flood       scripts/conn-flood-test.sh            # §16 DoS: half-open drop + connect-storm survival
   run bloat-recall     scripts/bloat-recall-eth-test.sh      # debt #22: live ref resolves on a many-archive store (recall-breaker)
   run gc               scripts/gc-test.sh                    # debt #22a: §10.3 archive retention + mark-sweep GC (wired device path)
   run offline-edit     scripts/offline-edit-eth-test.sh      # §15.5 edit-while-absent reaches device
@@ -129,6 +130,7 @@ else
   skip credit       "harp-probe not built on $OSID"
   skip txn          "harp-probe not built on $OSID"
   skip core         "harp-probe not built on $OSID"
+  skip conn-flood   "harp-probe not built on $OSID"
   skip bloat-recall "harp-probe not built on $OSID"
   skip gc           "harp-probe not built on $OSID"
   skip offline-edit "harp-probe not built on $OSID"

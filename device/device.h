@@ -32,6 +32,7 @@
 #include "harp/link.h"
 #include "harp/object.h"
 #include "harp/store.h"
+#include "sock_io.h" /* harp_sockhandle / HARP_SOCK_INVALID / harp_sock_recv_timeout_ms (§16) */
 
 #define PROTO_MAJOR 1
 #define PROTO_MINOR 0
@@ -354,6 +355,11 @@ typedef struct {
                           drop the audio.rate-lock capability from hello so the host
                           can't host-lock and must resample (host/freerun) instead.
                           Models a real converter whose clock the host can't trim. */
+
+    harp_sockhandle ctl_sock; /* §16 DoS: the eth control socket for THIS session, or
+                                 HARP_SOCK_INVALID off the eth accept path (USB/FFS). The accept
+                                 loop arms a 5s pre-hello SO_RCVTIMEO on it; handle_hello clears it
+                                 (blocking) so a legitimate post-hello idle session is not dropped. */
 
     harp_io *io; /* NULL when no session transport is attached. Written by
                     the session loop and read by panel-thread echo paths:

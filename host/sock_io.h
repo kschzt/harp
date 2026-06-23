@@ -27,6 +27,8 @@
 typedef SOCKET harp_sockhandle;
 #  define HARP_SOCK_INVALID INVALID_SOCKET
 #else
+#  include <sys/socket.h> /* setsockopt / SO_RCVTIMEO */
+#  include <sys/time.h>   /* struct timeval */
 typedef int harp_sockhandle;
 #  define HARP_SOCK_INVALID (-1)
 #endif
@@ -49,5 +51,22 @@ harp_sockhandle harp_sock_dial(const char *hostport);
 
 /* Close a socket returned by harp_sock_dial (closesocket on Windows). */
 void harp_sock_close(harp_sockhandle s);
+
+/* Set SO_RCVTIMEO on a socket; ms==0 => blocking (no timeout). Platform-correct
+ * (POSIX struct timeval, Windows DWORD ms). The device bounds the pre-hello
+ * half-open window with this (§16 DoS) and clears it (ms=0) after core.hello so
+ * a legitimate idle session is never dropped. */
+static inline void harp_sock_recv_timeout_ms(harp_sockhandle s, int ms) {
+    if (s == HARP_SOCK_INVALID) return;
+#ifdef _WIN32
+    DWORD tmo = (DWORD)ms;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof tmo);
+#else
+    struct timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
+#endif
+}
 
 #endif /* HARP_SOCK_IO_H */
