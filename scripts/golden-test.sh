@@ -23,9 +23,9 @@
 set -e
 cd "$(dirname "$0")/.."
 
-GOLDEN_HASH="10e1667ec3b4a753"
-GROOVE_HASH="45e240e208179202"
-CHORD_HASH="85111387608a399a"
+GOLDEN_HASH="787947297e858ec3"  # re-baselined: drone removed (engine 2.0.0)
+GROOVE_HASH="45e240e208179202"  # TODO re-baseline (golden-test exits on GOLDEN first)
+CHORD_HASH="eaed2355f68db8ed"   # re-baselined: drone removed
 
 V=build-vst/harp-vst3-host
 A=build-vst/au-host

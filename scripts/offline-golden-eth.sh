@@ -65,9 +65,9 @@ case "$(uname -s)" in
     *)                    OSID=linux   ;;
 esac
 case "$OSID" in
-    linux)   PIN_BOUNCE=3c42af5bbed23919; PIN_TOGGLE=af70b91fab7cec29 ;;
-    macos)   PIN_BOUNCE=758a7d9d4b0d7dc0; PIN_TOGGLE=380ed2753cac6e6d ;;
-    windows) PIN_BOUNCE=aa8a8e71215b0b47; PIN_TOGGLE=2b1491f51f6be9a1 ;;
+    linux)   PIN_BOUNCE=6ee458d2297986a1; PIN_TOGGLE=7430e4d2d579b8ef ;;
+    macos)   PIN_BOUNCE=b31ef5f9c584b1b7; PIN_TOGGLE=36c236c0880cd20c ;;
+    windows) PIN_BOUNCE=698c41d27e6cb032; PIN_TOGGLE=24acfd550bf428c2 ;;
 esac
 # GOLDEN_PIN=0 disables the pin (for an intentional, in-progress DSP change whose new
 # value isn't captured yet). OPT-OUT and LOUD: default is enforced; a skip warns on

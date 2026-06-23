@@ -35,9 +35,9 @@ if [ -z "$CLAP" ]; then # locate the built module (its subdir differs across gen
 fi
 PROBE="${PROBE:-./build/harp-probe}"
 
-GOLDEN_HASH="10e1667ec3b4a753"  # melody, voice-pool era (== golden-test.sh)
-CHORD_HASH="85111387608a399a"   # chord 60,64,67 (== golden-test.sh)
-VST3_MOD_HASH="4d4c44e8470a1bd9" # VST3 Note Expression brightness 1.0 (== note-expr-test)
+GOLDEN_HASH="787947297e858ec3"  # re-baselined: drone removed (== golden-test.sh)
+CHORD_HASH="eaed2355f68db8ed"   # re-baselined: chord 60,64,67 (== golden-test.sh)
+VST3_MOD_HASH="4d4c44e8470a1bd9" # TODO re-baseline (clap exits on GOLDEN first)
 
 S="--set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 5=0.1 --set 6=0.2 \
    --set 8=0.6 --set 9=0 --set 10=0.6 --set 11=0.5 --set 12=0 --set 13=0"

@@ -32,9 +32,12 @@ C0=$(curl -s --max-time 3 "http://$HOST:8080/api/counters") || fail "panel unrea
     sleep 0.4
   done ) & KNOBPID=$!
 
+# A sustained low chord (held 0.1 s -> end) keeps the mix continuously audible now
+# the drone is gone — without it the gaps between the 0.6 s-spaced --notes read as
+# silent windows. The --notes flood + automation still drive the soak stress.
 "$HOSTBIN" "$VST" --realtime --block "${BLOCK:-256}" \
     --set 8=0.5 --ramp 3=0.15:0.9 --ramp 4=0.2:0.6 --ramp 1=0.35:0.6 \
-    --notes "$NOTES" --seconds "$S" --out "$OUT" > "$LOG" 2>&1
+    --chord 36,43 --notes "$NOTES" --seconds "$S" --out "$OUT" > "$LOG" 2>&1
 RC=$?
 kill $KNOBPID 2>/dev/null; wait $KNOBPID 2>/dev/null
 [ $RC -eq 0 ] || { cat "$LOG"; fail "host exited $RC"; }
