@@ -335,6 +335,9 @@ typedef struct {
 
 typedef struct {
     harp_store store;
+    const char *engine_ver; /* §12.2 TEST seam (--engine-ver X.Y.Z): override the reported engine
+                               semver in the identity; NULL => ENGINE_VERSION. Lets a test save a
+                               bundle at one engine major and open it on a device reporting another. */
     char serial[64];
     harp_hash param_map_hash;
     uint64_t boot_count;
