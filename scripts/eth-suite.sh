@@ -105,6 +105,12 @@ else run part-filter    scripts/part-filter-eth-test.sh; fi
 if [ "$OSID" = macos ]; then run mdns-discover scripts/mdns-discover-test.sh
 else skip mdns-discover "mDNS needs a live responder (macOS CI only; bench-proven on the KR260/avahi)"; fi
 
+# §6.1 SHELL-side mDNS auto-discovery: the runtime's selectDevice browses _harp._tcp (not just
+# harp-probe) — HARP_ETH_DEVICE=mdns. Same responder/dns_sd need -> macOS CI only; self-skips a
+# no-dns_sd build.
+if [ "$OSID" = macos ]; then run shell-mdns scripts/eth-shell-mdns-test.sh
+else skip shell-mdns "mDNS needs a live responder (macOS CI only; bench-proven on the fleet)"; fi
+
 # These mutate/inspect the device via harp-probe ("the musician"). harp-probe is not
 # built on every platform yet (Windows: pending); the gate auto-enables them when it is.
 if have "$PROBE"; then

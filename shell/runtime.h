@@ -127,6 +127,7 @@ extern "C" {
 #include "harp/store.h"
 #include "client.h"
 #include "usb_io.h"
+#include "mdns.h"
 }
 
 #include "transport.h" /* ShellTransport: the USB/Ethernet binding behind the runtime */
@@ -968,6 +969,8 @@ private:
     uint16_t usbVid_ = 0, usbPid_ = 0;
     std::string usbSerial_;
     std::string boundSerial_; /* once bound, reconnect targets this exactly (Step 5) */
+    std::string boundEthHostport_; /* §6.1: when bound over Ethernet, the "host:port" reconnect
+                                      re-dials (empty = USB); set in sessionUp from netEndpoint() */
     harp_hash paramMapHash_{};
 
     /* the project's recall bundle: PERSISTENT, not consumed — the DAW

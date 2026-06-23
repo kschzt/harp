@@ -1101,6 +1101,22 @@ void HarpRuntime::wgMaintain(WgState &st) {
  * elsewhere (next step). nullptr in => nullptr out (no device was claimed). */
 static ShellTransport *wrapUsb(harp_io *io) { return io ? new UsbTransport(io) : nullptr; }
 
+/* §6.1/§4.4.3 shell auto-discovery: browse `_harp._tcp` and return the first resolved
+ * "host:port" (empty if none, or where dns_sd is unavailable — then the shell just keeps
+ * supervising for a USB device). A short, bounded browse; the supervisor retries ~1 s, so it
+ * re-browses each cycle (this is how a network synth hot-plugs in). Opt out with HARP_NO_MDNS=1. */
+static std::string discoverEthDevice() {
+    if (const char *no = getenv("HARP_NO_MDNS"))
+        if (no[0] && no[0] != '0') return std::string();
+    harp_mdns_instance inst;
+    if (harp_mdns_discover(1200, &inst, 1) >= 1) {
+        char hp[300];
+        snprintf(hp, sizeof hp, "%s:%u", inst.host, (unsigned)inst.port);
+        return std::string(hp);
+    }
+    return std::string();
+}
+
 /* §8.3-over-§8.7 mid-stream live<->offline toggle. The shell calls this from its
  * offline-render hook (a host/main thread — never the audio thread). On a genuine mode
  * change on a LIVE Ethernet session, arm a re-dial and BLOCK (bounded) until the new-mode
@@ -1138,14 +1154,38 @@ ShellTransport *HarpRuntime::selectDevice() {
      * transport instead of USB. Unset (the default, and every golden run) falls
      * straight through to the USB path below — byte-identical. */
     if (const char *eth = getenv("HARP_ETH_DEVICE"))
-        if (eth[0]) /* host-paced (deterministic) when the DAW is rendering offline; else free-running RTP */
-            return EthTransport::dial(eth, wantHostPaced_.load(std::memory_order_relaxed));
+        if (eth[0]) {
+            /* "mdns"/"discover" => browse `_harp._tcp` and dial the first synth found — the
+             * EXPLICIT form of the no-USB auto-discovery below; anything else is a literal
+             * host:port. host-paced (deterministic) when the DAW renders offline, else free-run RTP. */
+            std::string target = eth;
+            if (target == "mdns" || target == "discover") {
+                target = discoverEthDevice();
+                if (target.empty()) return nullptr; /* none resolved this cycle — supervisor retries */
+                log_msg("mDNS: discovered network device %s — dialing", target.c_str());
+            }
+            return EthTransport::dial(target.c_str(), wantHostPaced_.load(std::memory_order_relaxed));
+        }
 
     /* reconnect: pinned to the exact unit this instance already owns — the
      * same-model fallback must NOT fire here, or a replug could let this
      * instance steal a sibling track's device. */
-    if (!boundSerial_.empty())
+    if (!boundSerial_.empty()) {
+        if (!boundEthHostport_.empty()) {
+            /* §4.4.3/§12.3: this instance is pinned to a NETWORK synth — re-dial the same
+             * address (a transient drop keeps it), and if the synth renumbered, re-browse for
+             * one. Never fall into the USB-only lookup below, which could never resume it. */
+            bool hp = wantHostPaced_.load(std::memory_order_relaxed);
+            if (ShellTransport *t = EthTransport::dial(boundEthHostport_.c_str(), hp)) return t;
+            std::string disc = discoverEthDevice();
+            if (!disc.empty()) {
+                log_msg("mDNS: re-discovered network device %s — dialing", disc.c_str());
+                return EthTransport::dial(disc.c_str(), hp);
+            }
+            return nullptr;
+        }
         return wrapUsb(harp_usb_open_match_ctx(usbCtx_, boundSerial_.c_str(), false, 0, 0));
+    }
 
     /* first bind: what does the loaded project want? */
     std::string wantSerial;
@@ -1191,7 +1231,17 @@ ShellTransport *HarpRuntime::selectDevice() {
     }
     /* else: first unclaimed HARP device of any model — adopts whatever is there and
      * records it on first save. */
-    return wrapUsb(harp_usb_open_match_ctx(usbCtx_, nullptr, false, 0, 0));
+    if (harp_io *io = harp_usb_open_match_ctx(usbCtx_, nullptr, false, 0, 0))
+        return wrapUsb(io);
+    /* §6.1/§4.4.3: nothing on USB and no explicit HARP_ETH_DEVICE — browse the segment for a
+     * network synth advertising `_harp._tcp` and dial the first one found. Keeps the shell's
+     * device list "USB + network" without the DAW having to know an address. */
+    std::string disc = discoverEthDevice();
+    if (!disc.empty()) {
+        log_msg("mDNS: discovered network device %s — dialing", disc.c_str());
+        return EthTransport::dial(disc.c_str(), wantHostPaced_.load(std::memory_order_relaxed));
+    }
+    return nullptr;
 }
 
 /* One connection attempt: claim, hello, re-assert the project bundle,
@@ -1221,7 +1271,12 @@ bool HarpRuntime::sessionUp() {
             usbVid_ = di.vendor_id;
             usbPid_ = di.product_id;
             usbSerial_ = di.serial;
-            if (boundSerial_.empty()) boundSerial_ = di.serial; /* pin for reconnect */
+            if (boundSerial_.empty()) {
+                boundSerial_ = di.serial; /* pin for reconnect */
+                /* §6.1: remember an Ethernet binding's dial target so reconnect re-dials the
+                 * network (not the USB-only lookup); netEndpoint() is "" on USB -> USB path. */
+                boundEthHostport_ = transport_->netEndpoint();
+            }
         }
         /* fresh per session: rid space, credit, AND the link reassembly
          * state — a half-assembled frame from a dead session must not

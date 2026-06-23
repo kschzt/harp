@@ -85,7 +85,7 @@ else()
   endif()
 endif()
 
-add_executable(harp-probe host/harp-probe.c host/client.c ${HARP_PLAT_SRC})
+add_executable(harp-probe host/harp-probe.c host/client.c host/mdns.c ${HARP_PLAT_SRC})
 target_link_libraries(harp-probe harpcore ${HARP_MATH_LIB} ${HARP_PLAT_LIBS})
 if(WIN32)
   target_link_libraries(harp-probe ws2_32) # Winsock for the TCP dev transport
