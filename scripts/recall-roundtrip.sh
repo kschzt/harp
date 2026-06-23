@@ -33,7 +33,11 @@ pin() {
     for i in 1 2 3 4 5 6 8; do "$PROBE" -d usb knob "$i" "$1" >/dev/null 2>&1; done
     "$PROBE" -d usb knob 9 0.0 >/dev/null 2>&1
 }
-ohash() { "$HOST" "$PLUGIN" "$@" 2>/dev/null | sed -n 's/^output-hash: //p'; }
+# Render a sustained chord (held to the end) so the pinned params actually SOUND:
+# with the drone gone an un-played render is pure silence, so state A and B would
+# hash identically (vacuous). The chord through the device's current filter/env
+# params makes A (knobs 0.5) and B (knobs 0.2) audibly — and hashably — distinct.
+ohash() { "$HOST" "$PLUGIN" --chord 60,64,67 "$@" 2>/dev/null | sed -n 's/^output-hash: //p'; }
 
 echo "[recall] pin state A, render + save the Recall Bundle ..."
 pin 0.5
