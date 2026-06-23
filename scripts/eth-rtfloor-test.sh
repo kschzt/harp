@@ -54,6 +54,4 @@ check clamp-floor SIM-cf     "--rt-floor 32"                   128  256   # floo
 check clamp-pktlo SIM-cplo   "--rt-nsamples 16"                2048 32    # packet below 32 -> clamp up to 32
 check clamp-pkthi SIM-cphi   "--rt-nsamples 9999"              2048 256   # packet above kBlock -> clamp to 256
 check clamp-flhi  SIM-cfh    "--rt-floor 99999"                12288 256  # floor above the 12288 ceiling -> clamp down
-check fleet-kria  KR260-9001 ""                                320  64    # reference-fleet default (KR260 class)
-check fleet-pi    PI4B-9001  ""                                448  128   # reference-fleet default (PI4B class)
-echo "RTFLOOR-ETH PASS (floor+packet declared/adopted, partial maps, both clamps, per-serial fleet defaults)"
+echo "RTFLOOR-ETH PASS (floor+packet declared/adopted, partial maps, both clamps)"

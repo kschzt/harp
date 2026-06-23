@@ -335,14 +335,9 @@ int main(int argc, char **argv) {
     d->audio.epoch = 1; /* §7.1: the device clock epoch starts at 1 — epoch 0 is reserved as the
                          * (0,0)="now" event-timestamp sentinel, so a live epoch is never 0. */
     d->no_rate_lock = no_rate_lock; /* §8.7 ASRC fallback test hook (hello capability gate) */
-    /* §6.4 rt-profile reference-fleet defaults: the lowest combined (jitter-buffer floor, RTP
-     * packet) measured glitch-free for each reference device class on its intended link — KR260
-     * over a direct 1Gbps cable -> 320/64; Pi over a switch -> 448/128. Applied only when NEITHER
-     * --rt-floor nor --rt-nsamples is given, so a deployment on a different link overrides via flags. */
-    if (rt_floor == 0 && rt_nsamples == 0) {
-        if (strncmp(serial, "KR260", 5) == 0)     { rt_floor = 320; rt_nsamples = 64;  }
-        else if (strncmp(serial, "PI4B", 4) == 0) { rt_floor = 448; rt_nsamples = 128; }
-    }
+    /* §6.4 rt-profile: a device's safe RT setpoints are device- AND link-specific, so they are
+     * supplied per-deployment via --rt-floor / --rt-nsamples (its on-device service config), not
+     * hardcoded here. Absent => 0 => the host keeps its conservative 2048/256 defaults. */
     d->rt_floor = rt_floor;       /* §6.4 rt-profile: emitted as identity key 14 sub-key 0 when nonzero */
     d->rt_nsamples = rt_nsamples; /* §6.4 rt-profile: emitted as identity key 14 sub-key 1 when nonzero */
     snprintf(d->serial, sizeof d->serial, "%s", serial);
