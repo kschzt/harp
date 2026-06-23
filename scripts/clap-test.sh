@@ -10,8 +10,8 @@
 # CLAP render that matches them is byte-identical across formats — plus the
 # per-voice mod relations (no baked mod hashes, so they hold on any board):
 #
-#   CROSS-FORMAT  CLAP melody == VST3/AU golden (10e1667e), CLAP chord == chord
-#                 golden (85111387). The third shell renders the SAME bytes.
+#   CROSS-FORMAT  CLAP melody == VST3/AU golden (78794729), CLAP chord == chord
+#                 golden (eaed2355). The third shell renders the SAME bytes.
 #   PER-VOICE     a per-note PARAM_MOD (Filter Cutoff, amount = brightness-0.5)
 #                 on chord note idx 0/1/2 gives THREE DISTINCT mixes — the mod
 #                 lands on the addressed voice, not the part. brightness 1.0 also
@@ -37,7 +37,7 @@ PROBE="${PROBE:-./build/harp-probe}"
 
 GOLDEN_HASH="787947297e858ec3"  # re-baselined: drone removed (== golden-test.sh)
 CHORD_HASH="eaed2355f68db8ed"   # re-baselined: chord 60,64,67 (== golden-test.sh)
-VST3_MOD_HASH="4d4c44e8470a1bd9" # TODO re-baseline (clap exits on GOLDEN first)
+VST3_MOD_HASH="bee1987d778baaaa" # re-baselined: drone removed
 
 S="--set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 5=0.1 --set 6=0.2 \
    --set 8=0.6 --set 9=0 --set 10=0.6 --set 11=0.5 --set 12=0 --set 13=0"
