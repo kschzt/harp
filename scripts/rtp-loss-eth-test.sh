@@ -17,6 +17,7 @@ DROP="${DROP:-25}"
 DEVDIR=rtploss-eth-state   # workspace-RELATIVE (Git Bash /tmp->C:\ trips the device mkdir; see eth-tests.sh)
 DEVLOG=/tmp/rtploss-eth-dev.log
 HOSTLOG=/tmp/rtploss-eth-host.log
+BUNDLE=/tmp/rtploss-eth.cbor
 fail() { echo "RTP-LOSS FAIL: $1"; exit 1; }
 [ -x "$DEVICED" ] || fail "$DEVICED not built"
 [ -x "$HOSTBIN" ] || fail "$HOSTBIN not built"
@@ -34,8 +35,9 @@ echo "── device drops ${DROP}% of outgoing RTP (440Hz tone); host renders 5s
 for _ in $(seq 1 25); do grep -q "listening on $PORT" "$DEVLOG" 2>/dev/null && break; sleep 0.2; done
 grep -q "listening on $PORT" "$DEVLOG" || { cat "$DEVLOG"; fail "device didn't start on $PORT"; }
 
+rm -f "$BUNDLE"
 HARP_ETH_DEVICE="127.0.0.1:$PORT" HARP_DEVICE_SERIAL="SIM-0001" \
-  perl -e 'alarm 20; exec @ARGV' "$HOSTBIN" "$PLUG" --seconds 5 --realtime >"$HOSTLOG" 2>&1 & HP=$!
+  perl -e 'alarm 20; exec @ARGV' "$HOSTBIN" "$PLUG" --seconds 5 --realtime --diag-bundle "$BUNDLE" >"$HOSTLOG" 2>&1 & HP=$!
 wait "$HP"; rc=$?; HP=""
 kill -9 "$DP" 2>/dev/null; DP=""
 
@@ -58,4 +60,24 @@ grep -q "connected:" "$HOSTLOG" || fail "host never connected (no oracle)"
 FLOOR=0.03
 awk "BEGIN{exit !(${rms:-0} > $FLOOR)}" \
   || fail "440Hz tone did not survive ${DROP}% loss (rms=${rms:-0} <= $FLOOR; healthy rate-locked recovery ~0.05) — §7.3 stream broke / clock unlocked"
-echo "RTP-LOSS PASS (recovered the 440Hz tone through ${DROP}% RTP loss: rms=$rms > $FLOOR, $nconn connect(s), clean exit rc=$rc)"
+# §8.7: loss MUST be COUNTED, never silently concealed — assert host-counters key 8 (rtp_loss) > 0.
+# Decoded with python3+cbor2 (installed in CI via eth.yml). On POSIX CI the decoder MUST be present,
+# so the skip path is a hard fail — a regression that stopped counting can't slip through green.
+# Windows MSYS2 python is unreliable, so it skip-logs there (the counting code is platform-independent).
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) ISWIN=1 ;; *) ISWIN=0 ;; esac
+if [ -s "$BUNDLE" ] && python3 -c "import cbor2" >/dev/null 2>&1; then
+  python3 - "$BUNDLE" <<'PY' || fail "RTP loss not counted/surfaced (§8.7 host-counters key 8)"
+import sys, cbor2
+b = cbor2.load(open(sys.argv[1], "rb"))
+hc = b.get(5) or {}
+lost = hc.get(8)
+if lost is None: sys.exit("host-counters key 8 (rtp_loss) absent — loss not surfaced")
+if not (lost > 0): sys.exit("host-counters key 8 = %r despite injected RTP loss — not counted" % (lost,))
+print("   ✓ host-counters key 8 (rtp_loss) = %d — counted (>0), not concealed" % lost)
+PY
+elif [ -n "${CI:-}" ] && [ "$ISWIN" = 0 ]; then
+  fail "cbor2 unavailable on POSIX CI — the §8.7 loss-count assertion cannot be skipped (install cbor2)"
+else
+  echo "   (cbor2 or bundle absent$( [ "$ISWIN" = 1 ] && echo ', Windows MSYS2' ) — skipped the host-counters key-8 assertion)"
+fi
+echo "RTP-LOSS PASS (recovered the 440Hz tone through ${DROP}% RTP loss: rms=$rms > $FLOOR, $nconn connect(s), clean exit rc=$rc; loss counted)"

@@ -51,6 +51,8 @@ struct harp_freerun {
     double     Sw, Sx, Sy, Sxx, Sxy, Syy;
     _Atomic uint64_t jitter_bits; /* residual arrival jitter, µs (bit-punned); diagnostic */
     _Atomic unsigned underflow, overflow;
+    _Atomic unsigned reanchors;   /* §8.3 stream re-anchors: count of starvation EPISODES */
+    int starving;                 /* consumer-private: in a starvation episode right now? */
 };
 
 static void   fr_store_target(harp_freerun *fr, double v) {
@@ -171,6 +173,17 @@ unsigned harp_freerun_pull(harp_freerun *fr, float *out, unsigned n) {
         memset(out + (size_t)made * fr->ch, 0,
                (size_t)(n - (unsigned)made) * fr->ch * sizeof(float));
         atomic_fetch_add_explicit(&fr->underflow, n - (unsigned)made, memory_order_relaxed);
+        /* §8.3: a FRESH starvation episode is a stream RE-ANCHOR — the elastic buffer
+         * emptied, so the recovered playback phase must re-establish. Count the episode
+         * (the warm->starved edge, not every silent frame); surfaced as host-counters key 7
+         * + clock-stats key 4, never silent. RT-safe: one relaxed atomic add on the
+         * consumer/reader thread (this runtime pulls on readerThread_, not the DAW callback). */
+        if (!fr->starving) {
+            fr->starving = 1;
+            atomic_fetch_add_explicit(&fr->reanchors, 1, memory_order_relaxed);
+        }
+    } else {
+        fr->starving = 0; /* buffer recovered — the next starvation is a new episode */
     }
     return (unsigned)made;
 }
@@ -188,6 +201,7 @@ void harp_freerun_get_stats(const harp_freerun *fr, harp_freerun_stats *st) {
     st->fill_frames = (unsigned)(head - tail);
     st->underflow_frames = atomic_load_explicit(&fr->underflow, memory_order_relaxed);
     st->overflow_frames = atomic_load_explicit(&fr->overflow, memory_order_relaxed);
+    st->reanchors = atomic_load_explicit(&fr->reanchors, memory_order_relaxed);
     uint64_t jb = atomic_load_explicit(&fr->jitter_bits, memory_order_relaxed);
     double ju; memcpy(&ju, &jb, sizeof ju); st->jitter_us = ju;
 }

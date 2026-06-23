@@ -208,9 +208,11 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: install libsamplerate (enables the freerun/rtp ASRC unit tests)
+        run: sudo apt-get update && sudo apt-get install -y libsamplerate0-dev
       - name: build
         run: cmake -B build && cmake --build build -j
-      - name: unit tests (core + device_codec params-blob)
+      - name: unit tests (core + device_codec + freerun/rtp ASRC stopband/reanchor)
         run: ctest --test-dir build --output-on-failure
       - name: ring tests under ThreadSanitizer
         run: |

@@ -47,6 +47,8 @@ jobs:
           else
             brew install libusb libsamplerate
           fi
+          # CBOR decoder for the diag-bundle conformance assertions (rtp-loss host-counters key 8, etc.)
+          python3 -m pip install cbor2 || python3 -m pip install --break-system-packages cbor2
       - name: build device (harp-deviced + harp-probe)
         if: runner.os != 'Windows'
         run: |

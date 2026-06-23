@@ -2607,6 +2607,7 @@ void HarpRuntime::reader() {
                 wgMaintain(wgf);
 #endif
                 unsigned floats = transport_->recvAudio(buf, kRtpBufFloats, 100, nullptr);
+                rtpLostSnap_.store(transport_->rtpPacketsLost(), std::memory_order_relaxed); /* §8.7 key 7 */
                 unsigned width = unionWidth_.load(std::memory_order_relaxed);
                 if (!width) width = 2;
                 if (floats >= width)
@@ -2642,7 +2643,9 @@ void HarpRuntime::reader() {
             cfg.dev_rate_hz = (double)rate_; /* nominal seed; recovered from RTP timestamps */
             cfg.target_frames = ethTargetFrames();
             cfg.capacity_frames = ethTargetFrames() * 4;
-            cfg.quality = SRC_SINC_FASTEST; /* still exceeds the §8.3 stopband floor */
+            cfg.quality = HARP_ASRC_QUALITY; /* §8.3: >=120 dB stopband (freerun.h; == SRC_SINC_
+                                              * MEDIUM_QUALITY). SRC_SINC_FASTEST (~97 dB) was BELOW
+                                              * the floor — the old "still exceeds" comment was wrong. */
             harp_freerun *fr = harp_freerun_new(&cfg);
             if (!fr) {
                 log_msg("ASRC: resampler init failed (libsamplerate?) — no audio");
@@ -2694,6 +2697,8 @@ void HarpRuntime::reader() {
                     asrcFill_.store(st.fill_frames, std::memory_order_relaxed);
                     asrcUnderflow_.store(st.underflow_frames, std::memory_order_relaxed);
                     asrcOverflow_.store(st.overflow_frames, std::memory_order_relaxed);
+                    asrcReanchors_.store(st.reanchors, std::memory_order_relaxed);
+                    rtpLostSnap_.store(transport_->rtpPacketsLost(), std::memory_order_relaxed); /* §8.7 key 7 */
                 } else if (floats == 0 && transport_->silentMs() > 1000) {
                     log_msg("RTP stream silent >1s; device gone?");
                     /* §12.1: implicit STREAMING -> DETACHED (transport-error), ASRC path. */
@@ -3138,7 +3143,10 @@ void HarpRuntime::emitClockStats(harp_cbuf *out) {
         ? (int64_t)llround(asrcEstPpm_.load(std::memory_order_relaxed) * 1000.0)
         : 0;
     uint64_t nkeys = 2; /* key 0 (drift) + key 3 (recovery) always */
-    if (haveAsrc || haveRatelock) nkeys++; /* key 5 or key 6 */
+    if (haveAsrc) nkeys += 2;              /* key 4 (reanchors) + key 5 (asrc-stats) */
+    else if (haveRatelock) nkeys++;        /* key 6 (ratelock-stats) */
+    /* NB: rtp_loss is NOT a clock-stats key — clock-stats key 7 is reserved for ptp-stats
+     * (a map). RTP loss lives at host-counters key 8; reanchors mirror at clock-stats key 4. */
     harp_cbor_uint(out, 11);
     harp_cbor_map(out, nkeys);
     harp_cbor_uint(out, 0);
@@ -3146,10 +3154,12 @@ void HarpRuntime::emitClockStats(harp_cbuf *out) {
     harp_cbor_uint(out, 3);
     harp_cbor_uint(out, (uint64_t)recovery); /* clock-recovery enum */
     if (haveAsrc) {
+        harp_cbor_uint(out, 4); /* §8.3 stream re-anchors (starvation episodes) — never silent */
+        harp_cbor_uint(out, asrcReanchors_.load(std::memory_order_relaxed));
         /* asrc-stats (CDDL): { 0 => ratio, ?3 => phase/fill error vs setpoint, ?4 =>
          * converter quality }. The ratio is the recovered out/in; the fill error is
          * the signed frame deviation from the setpoint (the loop's phase). Quality is
-         * the reader's SRC_SINC_FASTEST. (Keys 1/2 — input/output sample totals — are
+         * the reader's SRC_SINC_MEDIUM_QUALITY (§8.3 >=120 dB). (Keys 1/2 — in/out totals — are
          * not snapshotted by the freerun core, so a vN writer omits them.) */
         uint64_t rb = asrcRatioBits_.load(std::memory_order_relaxed);
         double ratio; memcpy(&ratio, &rb, sizeof ratio);
@@ -3162,7 +3172,7 @@ void HarpRuntime::emitClockStats(harp_cbuf *out) {
         harp_cbor_uint(out, 3);
         harp_cbor_float(out, fillErr);
         harp_cbor_uint(out, 4);
-        harp_cbor_uint(out, 2 /* SRC_SINC_FASTEST */);
+        harp_cbor_uint(out, (uint64_t)HARP_ASRC_QUALITY /* §8.3 >=120 dB */);
     } else if (haveRatelock) {
         /* ratelock-stats: { 0 => last audio.trim ppb, 1 => fill, 2 => setpoint,
          * 3 => trim messages sent this session }. */
@@ -3350,10 +3360,12 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
     harp_cbuf_free(&devReq);
     harp_cbuf_free(&devRsp);
 
-    /* KEY 5: host-counters (keys 0-6). Numeric leaves — no PII, unchanged by the
-     * anon pass. All read here under ctlMutex_. */
+    /* KEY 5: host-counters (keys 0-8). Numeric leaves — no PII, unchanged by the
+     * anon pass. All read here under ctlMutex_. (Keys 7/8 = §8.3 stream_reanchors /
+     * §8.7 rtp_loss — the canonical host-section homes per docs/diag-bundle-design.md;
+     * clock-stats key 4 mirrors reanchors, key 7 there is reserved for ptp-stats.) */
     harp_cbor_uint(&out, 5);
-    harp_cbor_map(&out, 7);
+    harp_cbor_map(&out, 9);
     harp_cbor_uint(&out, 0);
     harp_cbor_uint(&out, underruns_.load(std::memory_order_relaxed)); /* host_underruns */
     harp_cbor_uint(&out, 1);
@@ -3368,6 +3380,10 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
     harp_cbor_uint(&out, sessionGen_.load(std::memory_order_relaxed)); /* session_generation */
     harp_cbor_uint(&out, 6);
     harp_cbor_uint(&out, renegCount_.load(std::memory_order_acquire)); /* audio_renegotiations */
+    harp_cbor_uint(&out, 7);
+    harp_cbor_uint(&out, asrcReanchors_.load(std::memory_order_relaxed)); /* §8.3 stream_reanchors */
+    harp_cbor_uint(&out, 8);
+    harp_cbor_uint(&out, rtpLostSnap_.load(std::memory_order_relaxed)); /* §8.7 rtp_loss (RTP seq gaps) */
 
     /* KEY 6: session-history — the §12.1 state-machine transition ring. Each
      * record is { 0 => [epoch, msc], 1 => from-state, 2 => to-state, 3 =>
