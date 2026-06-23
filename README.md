@@ -247,6 +247,16 @@ at it with an env var:
 ./build/harp-deviced --port 47987 --serial SIM-0001 --state-dir /tmp/refdev
 ```
 
+On the network path a device declares its safe real-time setpoints in its identity
+(`rt-profile`, capability `audio.rt-floor`) and the shell adopts them in place of the
+conservative `2048`-frame jitter buffer / `256`-sample RTP packet: **`--rt-floor N`** (buffer
+floor) and **`--rt-nsamples N`** (RTP packet size). Each device supplies its own measured values
+through its on-device service config (the systemd unit) — kria over a direct 1 Gbps cable runs
+`--rt-floor 320 --rt-nsamples 64`, a Pi over a switch `--rt-floor 448 --rt-nsamples 128`; with no
+flag a device declares nothing and the host keeps the safe `2048`/`256` default. The host clamps
+whatever is declared (floor to `[2·max-DAW-block, 12288]`, packet to `[32, kBlock]`). This cuts
+free-running buffer latency from ~43 ms toward ~7–9 ms. See [`scripts/eth-rtfloor-test.sh`](scripts/eth-rtfloor-test.sh).
+
 The shell dials `HARP_ETH_DEVICE=HOST:PORT` at its first connect (`selectDevice`).
 A GUI DAW does **not** inherit your terminal's environment, so set it where the OS
 launcher sees it, *before* launching the DAW:

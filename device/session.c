@@ -246,7 +246,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
      * map is well-formed CBOR and every advertised key is actually parseable.
      * Identity is not byte-constrained by the golden (which checks rendered
      * audio) nor by param-map-hash (computed from encode_param_array). */
-    harp_cbor_map(m, 14); /* §9.6 adds key 13 (txn limits) */
+    harp_cbor_map(m, (d->rt_floor || d->rt_nsamples) ? 15 : 14); /* §9.6 key 13 (txn limits); §6.4 +key 14 (rt-profile) when --rt-floor/--rt-nsamples set */
     harp_cbor_uint(m, 0); /* vendor */
     harp_cbor_map(m, 2);
     harp_cbor_uint(m, 0);
@@ -276,7 +276,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, PROTO_MAJOR);
     harp_cbor_uint(m, PROTO_MINOR);
     harp_cbor_uint(m, 6); /* capabilities */
-    harp_cbor_array(m, d->no_rate_lock ? 18 : 19); /* §9.6: +evt.txn; P3: +evt.multitimbral; §9.9: +evt.param.meter;
+    harp_cbor_array(m, (d->no_rate_lock ? 18 : 19) + ((d->rt_floor || d->rt_nsamples) ? 1 : 0)); /* §6.4: +audio.rt-floor when rt-profile declared. §9.6: +evt.txn; P3: +evt.multitimbral; §9.9: +evt.param.meter;
                                +evt.param.mod; §8.7: +audio.rate-lock (dropped under
                                --no-rate-lock to force the host ASRC fallback);
                                §14.4: +diag.bundle; §14.3: +diag.loopback.digital */
@@ -315,6 +315,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_text(m, "diag.loopback.digital"); /* §14.3: pure-DSP H->D-in -> D->H-out echo
                                                    (no analog stage) for round-trip latency */
     harp_cbor_text(m, "x.harp-refdev.sim");
+    if (d->rt_floor || d->rt_nsamples) harp_cbor_text(m, "audio.rt-floor"); /* §6.4 rt-profile cap; pairs with identity key 14 */
     harp_cbor_uint(m, 7); /* channel map (§6.3): 34 slots, all D→H. §P2.2
                              exposes per-part outputs: slots 0/1 are the stereo
                              main mix; slots 2+2k/3+2k are part k+1's stereo
@@ -388,6 +389,15 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, DEV_TXN_MAX);
     harp_cbor_uint(m, 1);
     harp_cbor_uint(m, DEV_TXN_EVENTS_MAX);
+    if (d->rt_floor || d->rt_nsamples) {
+        harp_cbor_uint(m, 14); /* §6.4 rt-profile: device-declared safe Ethernet RT setpoints —
+                                  { ?0: ethTargetFrames floor, ?1: RTP packet (nsamples) }. The host
+                                  MAY adopt each (clamped) instead of its 2048/256 defaults; a smaller
+                                  packet smooths delivery on a clean link. Pairs with cap "audio.rt-floor". */
+        harp_cbor_map(m, (d->rt_floor ? 1 : 0) + (d->rt_nsamples ? 1 : 0));
+        if (d->rt_floor)    { harp_cbor_uint(m, 0); harp_cbor_uint(m, d->rt_floor); }
+        if (d->rt_nsamples) { harp_cbor_uint(m, 1); harp_cbor_uint(m, d->rt_nsamples); }
+    }
 }
 
 /* ---------------- method handlers ---------------- */

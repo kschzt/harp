@@ -348,6 +348,22 @@ static bool parse_identity(harp_cdec *b, harp_client_identity *id) {
                 }
                 break;
             }
+            case 14: { /* §6.4 rt-profile: { ?0: eth-target-floor frames, ?1: RTP packet nsamples } */
+                uint64_t tn, k, v;
+                if (!harp_cdec_map(b, &tn)) return false;
+                for (uint64_t j = 0; j < tn; j++) {
+                    if (!harp_cdec_uint(b, &k)) return false;
+                    if (k == 0) {
+                        if (!harp_cdec_uint(b, &v)) return false;
+                        id->eth_target_floor = (uint32_t)v;
+                    } else if (k == 1) {
+                        if (!harp_cdec_uint(b, &v)) return false;
+                        id->eth_nsamples = (uint32_t)v;
+                    } else if (!harp_cdec_skip(b))
+                        return false;
+                }
+                break;
+            }
             default:
                 if (!harp_cdec_skip(b)) return false;
         }

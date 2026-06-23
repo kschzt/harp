@@ -337,6 +337,15 @@ typedef struct {
     char serial[64];
     harp_hash param_map_hash;
     uint64_t boot_count;
+    uint32_t rt_floor; /* harp-deviced --rt-floor N: device-declared safe ethTargetFrames floor
+                          in frames (0 = unset). Emitted as identity key 14 (rt-profile); the host
+                          adopts it as the RTP jitter-buffer setpoint instead of the conservative
+                          2048 default, clamped by the host structural floor. */
+    uint32_t rt_nsamples; /* harp-deviced --rt-nsamples N: device-declared RTP packet size in
+                             frames (0 = unset). Emitted as identity key 14 sub-key 1; the host
+                             adopts it as the audio.start packet size instead of the 256 default.
+                             Smaller = lower latency + smoother delivery on a clean link; the host
+                             clamps it to [32, kBlock]. */
     bool no_rate_lock; /* §8.7 ASRC fallback test hook (harp-deviced --no-rate-lock):
                           drop the audio.rate-lock capability from hello so the host
                           can't host-lock and must resample (host/freerun) instead.
