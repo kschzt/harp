@@ -323,7 +323,19 @@ public:
      * territory at queue time — no wire ordering can save an event whose
      * covering frame already went out (measured at block 64: evt_late
      * ~100 per 45 s flood; blocks >= 256 unaffected). */
-    uint32_t latencySamples() const { return targetFrames_ + eventHeadroom(); }
+    /* §8.3/§8.7: on the FREE-RUNNING (RTP/ASRC) path the constant path latency is the jitter
+     * buffer (ethTargetFrames), NOT the USB ring (targetFrames_) — reporting the USB figure
+     * under-stated network-audio PDC and mis-aligned DAW automation against other tracks.
+     * start() connects synchronously (sessionUp) for a present device, so freeRunning_ is set
+     * before the host first reads getLatencySamples (setActive -> start -> sessionUp). The
+     * device's analog out-path latency is 0 for the digital refdev; the ASRC group delay
+     * (sub-ms) is within the event headroom. (Hot-plug async-connect would need a
+     * restartComponent(kLatencyChanged) notification — a documented follow-up.) */
+    uint32_t latencySamples() const {
+        uint32_t buf = freeRunning_.load(std::memory_order_relaxed) ? ethTargetFrames()
+                                                                    : targetFrames_;
+        return buf + eventHeadroom();
+    }
     uint64_t underruns() const { return underruns_.load(std::memory_order_relaxed); }
 
     /* ---- state (main thread; blocking, not RT-safe) ---- */
