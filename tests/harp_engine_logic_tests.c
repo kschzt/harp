@@ -116,7 +116,9 @@ static void test_arp_select(void) {
 }
 
 /* §P2.1 event routing + §9.4/§9.5 modulation target + per-voice addressing. These are
- * exactly the helpers engine.c's evq_apply_due() routing + DEV_EV_MOD case call. */
+ * exactly the helpers engine.c's evq_apply_due() routing + the DEV_EV_MOD and the §9.5
+ * per-voice DEV_EV_PARAM_SET / DEV_EV_RAMP cases call (per-voice addressing: voice!=0 lands
+ * on the addressed sounding voice, not the whole part). */
 static void test_evq_mod(void) {
     /* channel -> part: modulo the part count; ch0 -> part 0; wraps past nparts */
     CHECK(harp_evt_part(0, 16) == 0);
