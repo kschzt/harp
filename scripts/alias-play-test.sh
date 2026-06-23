@@ -94,12 +94,12 @@ cmake -B "$BUILD" -S tools/vst3-host -DHARP_TSAN=ON -DHARP_TSAN_SANITIZE=OFF >/d
 cmake --build "$BUILD" --target tsan-host -j >/dev/null
 [ -x "$BUILD/tsan-host" ] || { echo "ALIAS-PLAY FAIL: harness build produced no binary"; exit 1; }
 
-# Pin a known AUDIBLE voice on the device via the front panel (persists past the
-# session, like flood-stress.sh): drone on (7), level up (8), a tone (3), and a
-# FAST envelope (5/6). The drone (part 0, the panel's only part) gives a steady
-# energy floor so a capture is never silent. The CHORD note below is held for the
-# whole capture (sustained), not struck repeatedly.
-for kv in "7 0.5" "8 0.6" "3 0.7" "5 0.05" "6 0.1"; do
+# Prime the patch on the device via the front panel (persists past the session,
+# like flood-stress.sh): level up (8), a tone (3), and a FAST envelope (5/6). The
+# drone is gone, so all the energy comes from the sustained CHORD note below (held
+# for the whole capture, not struck repeatedly) — each alias's note on its own
+# channel is what makes the group mix separate from the single-channel one.
+for kv in "8 0.6" "3 0.7" "5 0.05" "6 0.1"; do
     "$PROBE" -d "usb:$SERIAL" knob $kv >/dev/null 2>&1 || true
 done
 

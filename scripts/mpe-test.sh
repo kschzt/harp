@@ -40,9 +40,9 @@ if [ -z "$CLAP" ]; then
     [ -z "$CLAP" ] && CLAP="build-vst/harp-clap.clap"
 fi
 PROBE="${PROBE:-./build/harp-probe}"
-CHORD_HASH="85111387608a399a"   # plain chord 60,64,67 (== golden-test.sh / clap-test.sh)
+CHORD_HASH="eaed2355f68db8ed"   # re-baselined: drone removed (== golden-test.sh / clap-test.sh)
 S="--set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 5=0.1 --set 6=0.2 \
-   --set 7=0.5 --set 8=0.6 --set 9=0 --set 10=0.6 --set 11=0.5 --set 12=0 --set 13=0"
+   --set 8=0.6 --set 9=0 --set 10=0.6 --set 11=0.5 --set 12=0 --set 13=0"
 fail() { echo "MPE FAIL: $1"; exit 1; }
 
 if pgrep -x "Live" >/dev/null 2>&1; then

@@ -533,6 +533,89 @@ static double render_host_paced(probe *p, size_t want_frames, uint32_t nsamples,
     return (double)(t1 - t0) / 1e9;
 }
 
+/* Send one MIDI-1.0-in-UMP packet on the evt stream at ts 0 (= asap, §9.2). The
+ * device routes channel->part (§15.2) and applies note-on/off immediately. */
+static void send_ump_note(probe *p, uint32_t word) {
+    uint8_t b[4] = {(uint8_t)(word >> 24), (uint8_t)(word >> 16), (uint8_t)(word >> 8),
+                    (uint8_t)word};
+    harp_cbuf ev;
+    harp_cbuf_init(&ev);
+    harp_cbor_array(&ev, 3);
+    harp_cbor_array(&ev, 2);
+    harp_cbor_uint(&ev, 0); /* epoch 0 = now */
+    harp_cbor_uint(&ev, 0); /* msc 0 = asap */
+    harp_cbor_uint(&ev, 0); /* etype 0 = UMP carriage (§9.10) */
+    harp_cbor_bytes(&ev, b, 4);
+    harp_link_send(p->io, HARP_STREAM_EVT, ev.buf, ev.len);
+    harp_cbuf_free(&ev);
+}
+
+/* note <pitch> <duration_ms> [velocity=80] [-p part=0]: hold a sustained note so the
+ * device renders AUDIBLE audio for the duration — the §9.9 meter folds it and a
+ * concurrent record hears it. Replaces the drone as the test suite's note source now
+ * the drone is gone. USB only: the note must be rendered, so the stream has to run and
+ * be drained (a free-running device backpressures if the host stops reading). */
+static void cmd_note(probe *p, int pitch, int duration_ms, int velocity, int part) {
+    if (pitch < 0 || pitch > 127) die("note pitch must be 0..127");
+    if (velocity < 1 || velocity > 127) velocity = 80;
+    if (part < 0 || part > 15) part = 0;
+    do_hello(p);
+    bool usb = harp_usb_has_audio(p->io); /* USB: drain the bulk stream; eth: RTP free-runs */
+
+    harp_cbuf req, rsp;
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    if (usb) {
+        /* drain stale stream bytes BEFORE audio.start (a free-running device streams at once) */
+        uint8_t junk[16384];
+        while (harp_usb_audio_read(p->io, junk, sizeof junk, 50) > 0) {}
+        req_head(p, &req, "audio.start", true);
+        harp_cbor_map(&req, 5);
+        harp_cbor_uint(&req, 0); harp_cbor_uint(&req, 48000); /* rate */
+        harp_cbor_uint(&req, 1); harp_cbor_uint(&req, 256);   /* nsamples */
+        harp_cbor_uint(&req, 2); harp_cbor_uint(&req, 8);     /* target depth */
+        harp_cbor_uint(&req, 3);
+        harp_cbor_array(&req, 2); harp_cbor_uint(&req, 0); harp_cbor_uint(&req, 1); /* main mix slots */
+        harp_cbor_uint(&req, 4); harp_cbor_array(&req, 0);
+    } else {
+        req_head(p, &req, "audio.start", true);
+        harp_cbor_map(&req, 4);
+        harp_cbor_uint(&req, 0); harp_cbor_uint(&req, 48000); /* rate */
+        harp_cbor_uint(&req, 1); harp_cbor_uint(&req, 256);   /* nsamples */
+        harp_cbor_uint(&req, 5); harp_cbor_uint(&req, 0);     /* free-running */
+        harp_cbor_uint(&req, 6); harp_cbor_uint(&req, 47900); /* RTP dest (dummy: nothing consumes it) */
+    }
+    request(p, &req, &rsp);
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+
+    uint32_t chan = (uint32_t)part << 16;
+    send_ump_note(p, 0x20900000u | chan | ((uint32_t)pitch << 8) | (uint32_t)velocity); /* note-on */
+
+    /* hold the note for the duration so the device renders it (the §9.9 meter folds it).
+     * USB: drain the bulk stream so the free-running device never backpressures and stalls
+     * the render; eth: the device sends RTP into the void (no backpressure), so just wait. */
+    uint8_t acc[65536];
+    uint64_t t0 = harp_now_ns();
+    while ((harp_now_ns() - t0) / 1000000 < (uint64_t)duration_ms) {
+        if (usb) {
+            if (harp_usb_audio_read(p->io, acc, sizeof acc, 100) < 0) break;
+        } else {
+            harp_sleep_ns(20ull * 1000000ull); /* 20 ms — portable (nanosleep is POSIX-only) */
+        }
+    }
+
+    send_ump_note(p, 0x20800000u | chan | ((uint32_t)pitch << 8) | (uint32_t)velocity); /* note-off */
+    harp_cbuf_init(&req);
+    harp_cbuf_init(&rsp);
+    req_head(p, &req, "audio.stop", false);
+    request(p, &req, &rsp);
+    harp_cbuf_free(&req);
+    harp_cbuf_free(&rsp);
+    printf("note: pitch %d vel %d part %d held %d ms (%s)\n", pitch, velocity, part, duration_ms,
+           usb ? "usb" : "eth");
+}
+
 static void cmd_render(probe *p, double seconds, const char *path) {
     if (!harp_usb_has_audio(p->io)) die("render needs -d usb");
     do_hello(p);
@@ -1927,7 +2010,7 @@ int main(int argc, char **argv) {
     if (i >= argc) {
         fprintf(stderr,
                 "usage: harp-probe [-d HOST:PORT|usb|usb:SERIAL] [-s STOREDIR] "
-                "identify|refs|find-ref NAME|counters|diag-bundle [--anonymize] [OUT.cbor]|params|meters|gc|knob ID V|save|restore|record SECS WAV|demo\n");
+                "identify|refs|find-ref NAME|counters|diag-bundle [--anonymize] [OUT.cbor]|params|meters|gc|knob ID V|note PITCH MS [VEL] [-p PART]|save|restore|record SECS WAV|demo\n");
         return 2;
     }
     const char *cmd = argv[i];
@@ -2034,6 +2117,19 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "record") == 0 && i + 2 < argc) {
 #ifdef HAVE_LIBUSB
         cmd_record(&p, strtod(argv[i + 1], NULL), argv[i + 2]);
+#else
+        die("built without libusb");
+#endif
+    } else if (strcmp(cmd, "note") == 0 && i + 2 < argc) {
+#ifdef HAVE_LIBUSB
+        int npitch = atoi(argv[i + 1]), nms = atoi(argv[i + 2]), nvel = 80, npart = 0;
+        for (int j = i + 3; j < argc; j++) {
+            if (strcmp(argv[j], "-p") == 0 && j + 1 < argc)
+                npart = atoi(argv[++j]);
+            else
+                nvel = atoi(argv[j]); /* a bare number = velocity */
+        }
+        cmd_note(&p, npitch, nms, nvel, npart);
 #else
         die("built without libusb");
 #endif

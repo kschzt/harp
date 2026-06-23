@@ -324,7 +324,7 @@ else
   # CANNOT prove product-name clearing; instead we grep the host transition/log
   # context "harp-refdev (serial" (produced only by the hello-ok detail/msg, which
   # the anon pass clears). Likewise the channel-map name uses the full "Part 1 L"
-  # (not "part1"), and the engine-id "refdev-null" (retained, hyphen) does not
+  # (not "part1"), and the engine-id "refdev-synth" (retained, hyphen) does not
   # collide with the build-id "refdev sim " (cleared, space).
   #
   # EMITTED PII (device-section identity + host rings + net-topology), PRESENT in
@@ -354,7 +354,7 @@ else
   # RETAINED tokens (reveal whether/type, NOT value) — PRESENT in BOTH bundles:
   #   session            log-record tag (key 8 log-record.2) — greppable identifier
   #   usb_errors         device-section counter key (key 4 -> device-section key 1)
-  #   refdev-null        engine-id (identity key 4.0) — class id, the "vid/pid"-grade
+  #   refdev-synth       engine-id (identity key 4.0) — class id, the "vid/pid"-grade
   #                      device-section text token (the numeric VID 0x1209 is not
   #                      ASCII-greppable; the decode path asserts vid/pid + clock
   #                      recovery numerics)
@@ -366,7 +366,7 @@ else
   }
   retained_both "session"           "log tag (key 8 log-record.2)"
   retained_both "usb_errors"        "device counter key (key 4 device-section.1)"
-  retained_both "refdev-null"       "engine-id (identity key 4.0, vid/pid-grade text token)"
+  retained_both "refdev-synth"      "engine-id (identity key 4.0, vid/pid-grade text token)"
   retained_both "x.harp-refdev.sim" "capability token (identity key 6)"
   echo "   anon grep OK: all 9 emitted PII strings cleared in anon; all 4 retained tokens kept in both"
 fi

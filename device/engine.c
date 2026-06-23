@@ -38,15 +38,17 @@ static const double ARP_DIV_PPQ[] = {1.0, 0.5, 1.0 / 3, 0.25, 1.0 / 6, 0.125};
 /* P3: g_params is the GLOBAL param DEFINITIONS table (id/name/steps/labels/
  * default). The per-part VALUE lives in part::pval (below); the last field of
  * each row is the factory default that every part's pval[] starts from. The
- * map SHAPE (13 params) is unchanged — param-map-hash is unaffected. */
+ * each row is the factory default that every part's pval[] starts from. The
+ * Drone Mix param (id 7) was REMOVED with the drone at engine 2.0.0, leaving a
+ * gap in the id space (1..6, 8..13) — param_index() resolves by id, not slot, so
+ * the arp's 9..12 and Master Level's 8 are unchanged; only id 7 is gone (and the
+ * param-map-hash moves, since the automatable set is now 12 params). */
 dev_param g_params[NPARAMS] = {
     {1, "Osc Pitch", 0, NULL, 0.5f},    {2, "Osc Shape", 0, NULL, 0.5f},
     {3, "Filter Cutoff", 0, NULL, 0.5f}, {4, "Filter Reso", 0, NULL, 0.5f},
     {5, "Env Attack", 0, NULL, 0.5f},   {6, "Env Release", 0, NULL, 0.5f},
-    {7, "Drone Mix", 0, NULL, 0.5f},    {8, "Master Level", 0, NULL, 0.5f},
-    /* the arp (params 9-12): first param-map-hash change since freeze —
-     * the §9.3 mismatch path gets exercised for real. Mode defaults OFF
-     * so pre-arp behavior (and the golden render) is bit-preserved. */
+    {8, "Master Level", 0, NULL, 0.5f},
+    /* the arp (params 9-12). Mode defaults OFF so pre-arp behavior is preserved. */
     {9, "Arp Mode", 5, ARP_MODES, 0.0f},
     {10, "Arp Division", 6, ARP_DIVS, 0.6f}, /* index 3 = 1/16 */
     {11, "Arp Gate", 0, NULL, 0.5f},
@@ -62,7 +64,7 @@ dev_param g_params[NPARAMS] = {
  * no ordering hazard before the factory snapshot). MUST stay in lockstep with
  * the table above; compute_param_map_hash() asserts it at boot (state.c). */
 #define PVAL_DEFAULTS \
-    {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.0f, 0.6f, 0.5f, 0.0f, 0.0f}
+    {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.0f, 0.6f, 0.5f, 0.0f, 0.0f}
 
 /* slot of a param id in g_params, or -1. The per-part value is p->pval[idx]. */
 int param_index(uint32_t id) {
@@ -91,9 +93,10 @@ typedef struct {
  * ramps into the part (pval[]/ramps[]) — the event queue stays global, events
  * route to a part only on APPLICATION (evq_apply_due). */
 
-/* A small stereo drone synth: blended sine/saw oscillator (R detuned for
- * width) through a Chamberlin state-variable lowpass. Every voice parameter
- * is one of the 8 recallable params — the point is recall you can hear.
+/* A small stereo note synth: blended sine/saw oscillator (R detuned for
+ * width) through a Chamberlin state-variable lowpass, envelope-gated per note.
+ * Every voice parameter is one of the recallable params — the point is recall
+ * you can hear.
  *
  * P2 (voice pool): the NOTE IDENTITY moved INTO the voice (was per-part mono).
  * Each part owns NVOICES of these and allocates one per sounding note for real
@@ -122,12 +125,10 @@ typedef struct {
      * golden path bit-for-bit, even when has_mod is set by a (cutoff) param mod. */
     float bend_semis;
     float z_gain;
-    /* ---- DSP state (VERBATIM from the pre-pool mono voice) ---- */
-    float phase_l, phase_r;
-    float low_l, band_l, low_r, band_r;
+    /* ---- DSP state ---- */
     /* control-rate-smoothed parameter values (§9.3: the device interpolates
      * at its declared control rate — instant steps are zipper clicks) */
-    float s_pitch, s_shape, s_cutoff, s_reso, s_master, s_drone;
+    float s_pitch, s_shape, s_cutoff, s_reso, s_master;
     bool s_init;
     /* note voice: envelope-gated, portamento via smoothed frequency */
     float n_phase_l, n_phase_r;
@@ -168,7 +169,7 @@ typedef struct {
 
 /* P2 voice pool: per-part polyphony. NVOICES sounding/ringing notes per part,
  * allocated deterministically (index-first, steal-oldest by alloc_seq — see
- * voice_alloc). Voice 0 is also the DRONE voice for part 0 (with_drone). */
+ * voice_alloc). Every voice is note-only now (the drone is gone). */
 #define NVOICES 8
 
 /* One multitimbral part: a POOL of voices, a per-part allocation clock, its
@@ -511,21 +512,16 @@ static void ramps_advance(part *p, uint64_t pos) {
     }
 }
 
-/* with_drone: part 0 renders the full voice (drone + note); parts 1..15 are
- * NOTE-ONLY (no drone). The drone-only smoothed params/coeffs are still
- * computed when !with_drone (harmless, unused) so coefficient ORDER and the
- * note filter's f/q/shape/master are byte-identical across parts (§P2.1).
+/* Every part is note-only now the drone is gone (engine 2.0.0): one note voice's
+ * oscillator pair + state-variable filter, gated by the envelope.
  *
- * accumulate: false WRITES the stereo scratch with a direct '=' (the first
- * voice into a buffer, signed zero preserved); true sums onto it with '+='.
- * §P2.2 DECOUPLES this from with_drone — the per-part output branch needs a
- * fresh '=' write for each isolated part (which has no drone), while the
- * main mix still wants part0(with_drone, accumulate=false) + active note-only
- * parts(accumulate=true). The main-mix call pattern is byte-identical to P2.1
- * (which keyed write/+= off with_drone): part0 is the only with_drone caller
- * and is also the only accumulate=false caller there. */
+ * accumulate: false WRITES the stereo scratch with a direct '=' (the first voice
+ * into a buffer, signed zero preserved); true sums onto it with '+='. The per-part
+ * output branch writes each isolated part with a fresh '='; the main mix calls
+ * part0(accumulate=false) as the first writer, then active parts(accumulate=true).
+ * part0 is the only accumulate=false caller in the main-mix path. */
 static void engine_render(part *p, synth_voice *v, float *interleaved, uint32_t n,
-                          float rate, uint64_t pos, bool with_drone, bool accumulate) {
+                          float rate, uint64_t pos, bool accumulate) {
     /* P2: the note identity (note/note_vel/note_seq) reads from THIS VOICE now,
      * not the part. param reads go through VP(p,v,id): when no mod has addressed
      * the voice (has_mod==false, ALWAYS for the golden) VP collapses to the
@@ -538,7 +534,6 @@ static void engine_render(part *p, synth_voice *v, float *interleaved, uint32_t 
         v->s_cutoff = VP(p, v, 3);
         v->s_reso = VP(p, v, 4);
         v->s_master = VP(p, v, 8);
-        v->s_drone = VP(p, v, 7);
         v->n_freq = 220.0f;
         v->s_init = true;
     }
@@ -557,7 +552,6 @@ static void engine_render(part *p, synth_voice *v, float *interleaved, uint32_t 
         v->s_cutoff += alpha * (VP(p, v, 3) - v->s_cutoff);
         v->s_reso += alpha * (VP(p, v, 4) - v->s_reso);
         v->s_master += alpha * (VP(p, v, 8) - v->s_master);
-        v->s_drone += alpha * (VP(p, v, 7) - v->s_drone);
 
         /* note voice control: gate + envelope. Pitch SNAPS on a fresh
          * attack and glides only when legato (env still high): a fixed-tau
@@ -613,40 +607,16 @@ static void engine_render(part *p, synth_voice *v, float *interleaved, uint32_t 
             v->env += env_alpha * (env_target - v->env);
         }
 
-        float freq = 55.0f * exp2f(v->s_pitch * 4.0f); /* drone: 55 Hz .. 880 Hz */
         float fc = 60.0f * exp2f(v->s_cutoff * 6.0f);
         float f = 2.0f * sinf((float)M_PI * fc / rate);
         float q = 1.0f - 0.9f * v->s_reso;
         float shape = v->s_shape, master = v->s_master;
-        float drone_lvl = v->s_drone, env = v->env;
+        float env = v->env;
         float nfreq = v->n_freq;
 
         for (; i < end; i++) {
-            /* drone oscillator pair + its state-variable lowpass: PART 0 ONLY
-             * (parts 1..15 are note-only). Gating the phase-advance and the
-             * drone filter together leaves the drone state (phase_*, low_*,
-             * band_*) frozen for note-only parts and keeps osc_l/osc_r local
-             * to this branch (no unused-variable warning when !with_drone). */
-            if (with_drone) {
-                v->phase_l += freq / rate;
-                if (v->phase_l >= 1.0f) v->phase_l -= 1.0f;
-                v->phase_r += freq * detune / rate;
-                if (v->phase_r >= 1.0f) v->phase_r -= 1.0f;
-                float osc_l = sinf(2.0f * (float)M_PI * v->phase_l);
-                osc_l += ((2.0f * v->phase_l - 1.0f) - osc_l) * shape;
-                float osc_r = sinf(2.0f * (float)M_PI * v->phase_r);
-                osc_r += ((2.0f * v->phase_r - 1.0f) - osc_r) * shape;
-
-                v->low_l += f * v->band_l;
-                float high_l = osc_l - v->low_l - q * v->band_l;
-                v->band_l += f * high_l;
-                v->low_r += f * v->band_r;
-                float high_r = osc_r - v->low_r - q * v->band_r;
-                v->band_r += f * high_r;
-            }
-
-            /* note oscillator pair (own filter state, same patch character) —
-             * runs for ALL parts */
+            /* note oscillator pair (own filter state) — every part is note-only
+             * now the continuous drone is gone (engine 2.0.0). */
             v->n_phase_l += nfreq / rate;
             if (v->n_phase_l >= 1.0f) v->n_phase_l -= 1.0f;
             v->n_phase_r += nfreq * detune / rate;
@@ -663,22 +633,14 @@ static void engine_render(part *p, synth_voice *v, float *interleaved, uint32_t 
             float nhigh_r = nosc_r - v->n_low_r - q * v->n_band_r;
             v->n_band_r += f * nhigh_r;
 
-            /* The PRIMARY voice into a scratch buffer WRITES every sample with
-             * a direct '=' (accumulate=false), bit-identical to P2.0's store —
-             * signed zero included (the groove render legitimately produces
-             * -0.0f samples; a memset+accumulate would flip them to +0.0f and
-             * break the byte hash). Voices that mix ON TOP ACCUMULATE with '+='
-             * (accumulate=true). The sample EXPRESSION is char-for-char P2.0's,
-             * keyed off with_drone (drone+note vs note-only), and `float out`
-             * is float-typed so the rounding matches. §P2.2 split the write/+=
-             * decision out into `accumulate` (was keyed off with_drone): the
-             * main mix still calls part0(with_drone, accumulate=false) then
-             * note-only parts(accumulate=true) — same bytes as P2.1 — while the
-             * per-part branch WRITES each isolated part with accumulate=false. */
-            float out_l =
-                with_drone ? (v->low_l * drone_lvl + v->n_low_l * env) : (v->n_low_l * env);
-            float out_r =
-                with_drone ? (v->low_r * drone_lvl + v->n_low_r * env) : (v->n_low_r * env);
+            /* The PRIMARY voice into a scratch buffer WRITES every sample with a
+             * direct '=' (accumulate=false), signed zero included (a render can
+             * legitimately produce -0.0f; a memset+accumulate would flip them to
+             * +0.0f and break the byte hash). Voices that mix ON TOP ACCUMULATE
+             * with '+=' (accumulate=true). This is the former note-only branch —
+             * every part renders the same note expression now the drone is gone. */
+            float out_l = v->n_low_l * env;
+            float out_r = v->n_low_r * env;
             if (!accumulate) {
                 interleaved[2 * i] = out_l * master * 0.5f;
                 interleaved[2 * i + 1] = out_r * master * 0.5f;
@@ -703,12 +665,12 @@ static void engine_render(part *p, synth_voice *v, float *interleaved, uint32_t 
  * BOTH render_with_events (main mix) and render_part_slots (per-part slot) so
  * the two paths CANNOT drift — they share this exact summation.
  *
- * Drone: stays on VOICE 0 (rendered with with_drone). For part 0 voice 0 ALWAYS
- * renders (it carries the continuous drone, env contributes ~0 when no note) so
- * the buffer is initialised even with the whole pool idle — bit-identical to the
- * pre-pool part-0 write. Other voices render only when active (a free note-only
+ * No drone now: a voice renders only while allocated/ringing. An idle part writes
+ * nothing here, so render_part_voices memsets its buffer to silence for the first
+ * writer (accumulate=false) — see below — instead of relying on a continuous
+ * voice 0 to initialise it as the pre-drone-removal engine did. A free note-only
  * voice is silence; skipping it is the same as adding zero, AND it preserves the
- * signed-zero write of the first writer).
+ * signed-zero write of the first writer.
  *
  * `accumulate` is the PART-LEVEL flag (false = this part is the first writer of
  * `out`, so its first rendered voice WRITES with '='; subsequent voices and all
@@ -719,32 +681,26 @@ static void engine_render(part *p, synth_voice *v, float *interleaved, uint32_t 
  * Voices released long enough to fall under VOICE_IDLE_THRESH are freed here
  * (after rendering, so the final tail sample is still emitted). */
 static void render_part_voices(part *p, float *out, uint32_t n, float rate,
-                               uint64_t pos, bool with_drone, bool accumulate) {
+                               uint64_t pos, bool accumulate) {
     bool wrote = false; /* has any voice written `out` yet this call? */
     for (int vi = 0; vi < NVOICES; vi++) {
         synth_voice *v = &p->voices[vi];
-        /* voice 0 of a drone part always renders (the drone never idles); every
-         * other voice renders only while allocated/ringing */
-        bool drone_v = with_drone && vi == 0;
-        if (!drone_v && !v->active) continue;
+        /* every part is note-only now: a voice renders only while allocated/ringing */
+        if (!v->active) continue;
         /* first writer uses the part-level accumulate; later voices always '+=' */
-        engine_render(p, v, out, n, rate, pos, drone_v, wrote ? true : accumulate);
+        engine_render(p, v, out, n, rate, pos, wrote ? true : accumulate);
         wrote = true;
-        /* reclaim a released voice once its tail has decayed, freeing its slot
-         * for re-allocation. This applies to voice 0 too (the drone voice keeps
-         * rendering via drone_v even when its NOTE slot is free) — so a
-         * NON-OVERLAPPING note re-allocates voice 0 and retriggers it, exactly
-         * the pre-pool mono voice. active=false leaves the DSP state in place;
-         * a future allocation/steal preserves phase (no click). */
+        /* reclaim a released voice once its tail has decayed, freeing its slot for
+         * re-allocation. active=false leaves the DSP state in place; a future
+         * allocation/steal preserves phase (no click). */
         if (v->active && v->note < 0 && v->env <= VOICE_IDLE_THRESH)
             v->active = false;
     }
-    /* accumulate=false promises the buffer is fully written (it is the first
-     * writer). A note-only part with no active voice wrote nothing — define the
-     * buffer as silence so the consumer (render_part_slots' scratch, packed into
-     * a requested-but-idle part slot) never reads stale samples. With_drone part
-     * 0 always writes voice 0, and accumulate=true sums onto an already-written
-     * buffer, so neither needs this. */
+    /* accumulate=false promises the buffer is fully written (it is the first writer).
+     * A part with no active voice wrote nothing — define the buffer as silence so the
+     * consumer never reads stale samples. Part 0 is no longer special (no drone), so
+     * an idle main mix legitimately hits this and renders silence. accumulate=true
+     * sums onto an already-written buffer, so it never needs this. */
     if (!wrote && !accumulate) memset(out, 0, (size_t)2 * n * sizeof(float));
 }
 
@@ -1147,9 +1103,8 @@ static void arp_stream_reset(part *p) {
  * pre-pool mono engine used — rather than the polyphonic allocator, so a step
  * RETRIGGERS the one voice (env reset, phase continuous) instead of ringing a
  * fresh voice out. That keeps "one note at a time" byte-identical to the mono
- * groove render: the arp never produces tail-overlap polyphony. (For part 0,
- * voice 0 is also the drone voice — exactly as the mono engine carried drone +
- * arp note on its single voice.) */
+ * groove render: the arp never produces tail-overlap polyphony. (Voice 0 is just
+ * the first voice slot now — no drone rides on it.) */
 static void arp_voice_off(part *p) {
     synth_voice *v0 = &p->voices[0];
     if (p->arp.sounding >= 0 && v0->note == p->arp.sounding) v0->note = -1;
@@ -1432,9 +1387,9 @@ static bool part_active(const part *p) {
 /* Render n samples starting at stream position `pos`, splitting at event
  * timestamps so application is sample-accurate (§9.2). Multi-part now (§P2.1):
  * arp steps fire for every part and the segment deadline is the min over all
- * parts. Each segment is ZEROED, then part 0 ALWAYS renders the full voice
- * (drone+note) and parts 1..15 accumulate NOTE-ONLY when active. For ch0-only
- * input this is zero + part0(full) == P2.0's direct write, byte for byte. */
+ * parts. part 0 renders FIRST as the segment's first writer (its notes, or
+ * silence when idle now the drone is gone) and parts 1..15 accumulate when
+ * active. For ch0-only input this is part0's note render, byte for byte. */
 static void render_with_events(float *interleaved, uint32_t n,
                                float rate, uint64_t pos) {
     uint32_t done = 0;
@@ -1451,19 +1406,18 @@ static void render_with_events(float *interleaved, uint32_t n,
         uint32_t seg = next ? (uint32_t)(next - (pos + done)) : n - done;
         if (seg == 0) seg = 1; /* paranoia: guarantee forward progress */
         if (seg > n - done) seg = n - done;
-        /* part 0 ALWAYS renders first via the single voice-pool summation helper
-         * with a direct write (no pre-zero needed — voice 0 initialises every
-         * sample of the segment, bit-identical to P2.0). accumulate=!is_part0:
-         * part0 WRITES (=), parts 1..15 sum (+=) — the P2.1 write/+= behaviour,
-         * now applied across each part's POOL in index order (render_part_voices
-         * shared with render_part_slots so they cannot drift). */
+        /* part 0 renders FIRST (accumulate=false) so it initialises the segment —
+         * with its own notes when active, else render_part_voices memsets silence.
+         * parts 1..15 then sum (+=) when active. Every part is note-only now the
+         * drone is gone; part 0 is the first writer purely by index, not because it
+         * carries a continuous voice. (render_part_voices is shared with
+         * render_part_slots so the two summations cannot drift.) */
         render_part_voices(&g_parts[0], interleaved + 2 * done, seg, rate, pos + done,
-                           true, false); /* part 0 ALWAYS: drone voice + notes, WRITE */
+                           false); /* part 0: WRITE (notes, or silence when idle) */
         for (size_t pi = 1; pi < NPARTS; pi++)
             if (part_active(&g_parts[pi]))
                 render_part_voices(&g_parts[pi], interleaved + 2 * done, seg, rate,
-                                   pos + done, false,
-                                   true); /* parts 1..15: note-only voices, accumulate */
+                                   pos + done, true); /* parts 1..15: accumulate when active */
         done += seg;
     }
 }
@@ -1529,12 +1483,12 @@ static void render_part_slots(audio_state *a, float *out, uint32_t n, float rate
         for (size_t pi = 0; pi < NPARTS; pi++) {
             bool in_mix = need_main && (pi == 0 || part_active(&g_parts[pi]));
             if (!in_mix && !need_part[pi]) continue; /* this part isn't wanted */
-            /* part 0 carries the drone; 1..15 are note-only. WRITE the scratch
-             * (accumulate=false) — signed-zero-preserving, like P2.1's part0 —
-             * via the SHARED voice-pool summation helper (same as the main mix,
-             * so the two paths can't drift). An idle requested part renders to
-             * silence (render_part_voices zero-fills its unwritten scratch). */
-            render_part_voices(&g_parts[pi], pscr, seg, rate, pos + done, pi == 0, false);
+            /* Every part is note-only now (no drone). WRITE the scratch
+             * (accumulate=false) — signed-zero-preserving — via the SHARED
+             * voice-pool summation helper (same as the main mix, so the two paths
+             * can't drift). An idle requested part renders to silence
+             * (render_part_voices zero-fills its unwritten scratch). */
+            render_part_voices(&g_parts[pi], pscr, seg, rate, pos + done, false);
             /* §9.9: fold this part's just-written stereo into its block meter.
              * A pure read of pscr — does not alter pscr, mix, or any slot. */
             meter_acc_fold(&pacc[pi], pscr, seg);

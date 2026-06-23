@@ -12,20 +12,20 @@
 # say why in the commit. History:
 #   76470294cdee6393  golden, cushion-5 era (sync transport)
 #   65770cc8ddcbd7c2  golden, MONO engine (one voice; overlapping notes stole it)
-#   10e1667ec3b4a753  golden, VOICE POOL (NVOICES=8; overlapping note-tails ring on
+#   787947297e858ec3  golden, VOICE POOL (NVOICES=8; overlapping note-tails ring on
 #                     their own voices instead of cutting off — the §9.5 poly change)
-#   45e240e208179202  groove, arp era — HELD byte-identical across the voice-pool
+#   3b5a16e234168457  groove, arp era — HELD byte-identical across the voice-pool
 #                     change: the arp is monophonic on voice 0, so its path is the
 #                     control proving the core DSP is untouched (only note-overlap moved)
-#   85111387608a399a  chord, polyphony oracle (added with the voice pool): 60,64,67
+#   eaed2355f68db8ed  chord, polyphony oracle (added with the voice pool): 60,64,67
 #                     sounded TOGETHER. A mono steal would render only the last note
 #                     (≈ single-note energy); the pool sums 3 voices (~1.6x rms)
 set -e
 cd "$(dirname "$0")/.."
 
-GOLDEN_HASH="10e1667ec3b4a753"
-GROOVE_HASH="45e240e208179202"
-CHORD_HASH="85111387608a399a"
+GOLDEN_HASH="787947297e858ec3"  # re-baselined: drone removed (engine 2.0.0)
+GROOVE_HASH="3b5a16e234168457"  # re-baselined: drone removed (engine 2.0.0)
+CHORD_HASH="eaed2355f68db8ed"   # re-baselined: drone removed
 
 V=build-vst/harp-vst3-host
 A=build-vst/au-host
@@ -38,8 +38,8 @@ if pgrep -x "Live" >/dev/null 2>&1; then
 fi
 
 SETTLE="--set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 5=0.1 --set 6=0.2 \
-        --set 7=0.5 --set 8=0.6 --set 9=0 --set 10=0.6 --set 11=0.5 --set 12=0 --set 13=0"
-ARP="--set 9=0.25 --set 10=0.6 --set 11=0.5 --set 12=0.0 --set 7=0.0 --set 8=0.7 \
+        --set 8=0.6 --set 9=0 --set 10=0.6 --set 11=0.5 --set 12=0 --set 13=0"
+ARP="--set 9=0.25 --set 10=0.6 --set 11=0.5 --set 12=0.0 --set 8=0.7 \
      --set 5=0.05 --set 6=0.1 --set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 13=0"
 
 check() { # check NAME EXPECTED CMD...

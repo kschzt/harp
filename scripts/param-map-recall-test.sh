@@ -42,7 +42,7 @@ rm -rf "$STATEDIR" "$STATEFILE"
 
 # 1. device with the REAL param map: set known params + save a recall bundle (records the hash)
 start_dev
-"$HOSTBIN" "$PLUG" --set 3=0.81 --set 7=0.31 --seconds 0.6 --save-state "$STATEFILE" >/tmp/pmh-save.log 2>&1 \
+"$HOSTBIN" "$PLUG" --set 3=0.81 --set 6=0.31 --seconds 0.6 --save-state "$STATEFILE" >/tmp/pmh-save.log 2>&1 \
     || { cat /tmp/pmh-save.log; fail "save render"; }
 load_check /tmp/pmh-save.log
 stop_dev

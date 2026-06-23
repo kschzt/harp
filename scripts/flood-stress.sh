@@ -26,10 +26,11 @@ PROBE=${HARP_PROBE:-./build/harp-probe}
 SECS=${HARP_FLOOD_SECONDS:-90}
 
 # Pin a known start state on the device (front-panel sets persist past the
-# session and are not thinned). Params 1-8 to mid; arp off so the flood's
+# session and are not thinned). Params 1-6,8 to mid (id 7 "Drone Mix" was removed
+# with the drone — knob 7 would error and trip set -e); arp off so the flood's
 # determinism doesn't depend on transport-anchored arp timing.
 pin_state() {
-    for i in 1 2 3 4 5 6 7 8; do "$PROBE" -d usb knob "$i" 0.5 >/dev/null 2>&1; done
+    for i in 1 2 3 4 5 6 8; do "$PROBE" -d usb knob "$i" 0.5 >/dev/null 2>&1; done
     "$PROBE" -d usb knob 9 0.0 >/dev/null 2>&1
 }
 flood_hash() {

@@ -75,12 +75,13 @@ fi
 echo "── alias-group-e2e: $INSTANCES plugin instances on $SERIAL, one part each — expect a multi-part mix"
 
 # SETTLE once into a known, AUDIBLE, deterministic voice through the plugin
-# (mirrors multitimbral-test.sh): drone ON (param 7), audible level (8), a chosen
-# tone (3), and a FAST envelope (attack 5, release 6) so each struck note's full
-# attack+decay lands inside the capture and the hash is stable run-to-run. Without
-# this the mix could be silent and single==group trivially. Single-instance, so it
+# (mirrors multitimbral-test.sh): audible level (8), a chosen tone (3), and a FAST
+# envelope (attack 5, release 6) so each struck note's full attack+decay lands
+# inside the capture and the hash is stable run-to-run. The drone is gone, so the
+# struck notes are the only sound — without an audible patch the mix would be
+# silent and single==group trivially. Single-instance, so it
 # warms the owner part cleanly before the group run.
-SETTLE="--set 7=0.5 --set 8=0.6 --set 3=0.7 --set 5=0.05 --set 6=0.1"
+SETTLE="--set 8=0.6 --set 3=0.7 --set 5=0.05 --set 6=0.1"
 $V "$PLUG" $SETTLE --seconds 0.5 >/dev/null 2>&1 \
     || { echo "ALIAS-GROUP-E2E FAIL: settle render did not complete (device busy/absent?)"; exit 3; }
 

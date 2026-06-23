@@ -110,14 +110,15 @@ static void test_params_blob_codec(void) {
     memset(lpresent, 0, sizeof lpresent);
     CHECK(refdev_parse_params_blob(legacy.buf, legacy.len, lv, lpresent));
 
-    /* the two ids landed in part 0, with the right values */
+    /* the two ids landed in part 0, with the right values. NB id 8 is column 6
+     * now, not 7: removing id 7 (Drone Mix) shifted Master Level down one slot. */
     CHECK(lpresent[0][2] && lv[0][2] == 0.25f); /* id 3 -> column index 2 */
-    CHECK(lpresent[0][7] && lv[0][7] == 0.75f); /* id 8 -> column index 7 */
+    CHECK(lpresent[0][6] && lv[0][6] == 0.75f); /* id 8 -> column index 6 (was 7 pre-drone-removal) */
 
     /* nothing else in part 0 is marked present (only the two carried ids) */
     int p0_only_two = 1;
     for (int i = 0; i < NPARAMS; i++)
-        if (i != 2 && i != 7 && lpresent[0][i]) p0_only_two = 0;
+        if (i != 2 && i != 6 && lpresent[0][i]) p0_only_two = 0;
     CHECK(p0_only_two);
 
     /* parts 1..15 untouched: present false everywhere */

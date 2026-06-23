@@ -30,8 +30,8 @@ if [ -x "$PROBE" ]; then
 fi
 
 # ---- 1+2: offline render, mixed intervals up to 15 semitones ----
-# settle device into a known state first (drone off, sine, fast envelope)
-"$HOSTBIN" "$VST" --set 7=0 --set 2=0 --set 3=0.8 --set 5=0.05 --set 6=0.15 \
+# settle device into a known state first (sine, fast envelope; drone removed)
+"$HOSTBIN" "$VST" --set 2=0 --set 3=0.8 --set 5=0.05 --set 6=0.15 \
     --set 8=0.6 --seconds 0.5 > /dev/null 2>&1 || fail "settle render"
 "$HOSTBIN" "$VST" --notes "62,64,62,72,60,67,59,74,62,63" --seconds 6.2 \
     --out /tmp/harp-timing.wav > /dev/null 2>&1 || fail "render did not complete"
@@ -77,7 +77,7 @@ EOF
 # ---- 3: realtime storm, evt_late must stay flat ----
 C0=$(curl -s --max-time 3 "http://$HOST:8080/api/counters" | python3 -c "import json,sys; print(json.load(sys.stdin)['evt_late'])") || fail "panel unreachable"
 NOTES=$(python3 -c "print(','.join(['62','67','74','62']*24))")
-"$HOSTBIN" "$VST" --realtime --block 512 --set 7=0 --set 8=0.6 \
+"$HOSTBIN" "$VST" --realtime --block 512 --set 8=0.6 \
     --notes "$NOTES" --note-period 0.125 --seconds 13 > /tmp/harp-timing.log 2>&1 \
     || fail "realtime run failed"
 C1=$(curl -s --max-time 3 "http://$HOST:8080/api/counters" | python3 -c "import json,sys; print(json.load(sys.stdin)['evt_late'])")

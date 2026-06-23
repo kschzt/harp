@@ -62,7 +62,7 @@ wait_listen || { cat "$DEVLOG"; fail "device didn't start on $PORT"; }
 
 # A clean patch + a 4-note line on part 0 (main mix {0,1}); the loopback rides the UNUSED
 # pair {IN_SLOT,OUT_SLOT}. host-paced (default kOffline) is what diag.loopback.digital needs.
-SETTLE="--set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 5=0.1 --set 6=0.2 --set 7=0.5"
+SETTLE="--set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 5=0.1 --set 6=0.2"
 echo "── run the host (§8.7 host-paced offline) with --loopback $IN_SLOT,$OUT_SLOT"
 HARP_ETH_DEVICE="127.0.0.1:$PORT" HARP_DEVICE_SERIAL="$SERIAL" \
   perl -e 'alarm 40; exec @ARGV' "$HOSTBIN" "$PLUG" $SETTLE \

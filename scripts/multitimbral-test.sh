@@ -43,11 +43,12 @@ if pgrep -x "Live" >/dev/null 2>&1; then
     exit 3
 fi
 
-# SETTLE once into a known, fully-deterministic voice: drone ON (param 7),
-# audible level (8), a chosen tone (3), and a FAST envelope (attack 5,
-# release 6) so a 1.5 s window fully captures each note's attack+decay and
-# the hash is stable run-to-run. Done once; every render below inherits it.
-SETTLE="--set 7=0.5 --set 8=0.6 --set 3=0.7 --set 5=0.05 --set 6=0.1"
+# SETTLE once into a known, fully-deterministic voice: audible level (8), a
+# chosen tone (3), and a FAST envelope (attack 5, release 6) so a 1.5 s window
+# fully captures each note's attack+decay and the hash is stable run-to-run.
+# (The drone is gone — a part is silent until a note plays.) Done once; every
+# render below inherits it.
+SETTLE="--set 8=0.6 --set 3=0.7 --set 5=0.05 --set 6=0.1"
 $V "$PLUG" $SETTLE --seconds 0.5 >/dev/null 2>&1 \
     || { echo "MULTITIMBRAL FAIL: settle render did not complete (device absent?)"; exit 3; }
 
@@ -65,9 +66,9 @@ echo "── multitimbral: 16 parts, exclusive channel->part routing ($HARP_DEVI
 
 # ---- 1: every part plays a note on its own channel ----
 # For each part k: render part k WITH a note on channel k (A) and part k with
-# NO notes (Z). A!=Z proves the note reached part k and made sound. Part 0 is
-# special: the always-on drone means its silence baseline Z is already
-# non-empty, but a struck note still moves the mix, so A!=Z holds there too.
+# NO notes (Z). A!=Z proves the note reached part k and made sound. Part 0 is no
+# longer special (the drone is gone): its Z baseline is silence like every other
+# part, and a struck note still moves the mix, so A!=Z holds there too.
 k=0
 while [ "$k" -le 15 ]; do
     A=$(hash --channel "$k" --notes "$NOTE" --seconds "$DUR" --part "$k")
@@ -87,8 +88,8 @@ done
 # ---- 2: exclusive routing — no cross-part leak ----
 # Play a note on channel k but OBSERVE part j (k != j). Part j must render its
 # own silence baseline Zj: L==Zj proves channel k did NOT bleed into part j.
-# Both k and j avoid 0 — part 0's always-on drone would mask any leak (its
-# baseline is already busy) and is covered by the play-test above instead.
+# Both k and j avoid 0 — part 0 is the main-mix's first writer (always rendered,
+# silence when idle) and is covered by the play-test above instead.
 leak_check() { # leak_check K J
     k=$1; j=$2
     L=$(hash --channel "$k" --notes "$NOTE" --seconds "$DUR" --part "$j")

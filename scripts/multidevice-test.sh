@@ -76,7 +76,7 @@ case "$(claimed /tmp/md-c.log)" in
 esac
 
 # D. forced-absent serial -> no bind, no cross-model grab, silence
-HARP_DEVICE_SERIAL=PI4B-7777 "$V" "$PLUG" --set 7=0.9 --seconds 0.4 \
+HARP_DEVICE_SERIAL=PI4B-7777 "$V" "$PLUG" --notes 60 --seconds 0.4 \
     --out /tmp/md-d.wav >/tmp/md-d.log 2>&1 || true
 grep -q "no HARP device with serial PI4B-7777" /tmp/md-d.log || {
     echo "MULTIDEV FAIL(D): forced-absent serial did not report a miss"; exit 1; }
