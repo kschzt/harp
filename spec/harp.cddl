@@ -1,4 +1,4 @@
-; HARP — consolidated CDDL (extracted from spec draft 0.3.0, Appendix A)
+; HARP — consolidated CDDL (extracted from spec draft 0.5.0, Appendix A)
 ; Schemas are normative; see spec/harp-spec-draft-0.3.md for prose.
 
 ; --- framing (binary, not CBOR; given here for completeness) ---
@@ -16,7 +16,12 @@ tstamp = [uint, uint64]            ; (epoch, msc)
 ; --- identity ---
 identity = { 0 => vendor, 1 => product, 2 => tstr, 3 => semver, 4 => engine,
              5 => [uint, uint], 6 => [* tstr], 7 => channel-map, 8 => latency-profile,
-             ? 9 => tstr, ? 10 => uint, ? 11 => ump-group-map }
+             ? 9 => tstr, ? 10 => uint, ? 11 => ump-group-map,
+             ? 12 => uint, ? 13 => txn-limits, ? 14 => rt-profile }
+  ; 12 = multitimbral part count (P3, cap evt.multitimbral); 13 = txn limits (§9.6, cap evt.txn);
+  ; 14 = device-declared RT setpoints, jitter buffer + RTP packet (§8.7, cap audio.rt-floor)
+txn-limits = { 0 => uint, 1 => uint }   ; 0 = max concurrent txns, 1 = max events per txn
+rt-profile = { ? 0 => uint, ? 1 => uint } ; 0 = safe ethTargetFrames floor (frames); 1 = RTP packet size (nsamples)
 ump-group-map = [* { 0 => uint, 1 => tstr }]   ; group index -> role (evt.ump)
 vendor   = { 0 => uint, 1 => tstr }
 product  = { 0 => uint, 1 => tstr }

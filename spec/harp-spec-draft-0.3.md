@@ -2,7 +2,7 @@
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 
-Specification, Draft 0.4.1 — 23 June 2026
+Specification, Draft 0.5.0 — 23 June 2026
 
 | | |
 |---|---|
@@ -13,6 +13,8 @@ Specification, Draft 0.4.1 — 23 June 2026
 | **Schema & reference code license** | Apache-2.0 |
 | **Patent policy** | Royalty-free; contributors sign a non-assertion covenant (§19) |
 | **Feedback** | via HARP Enhancement Proposals (HEPs), see §18 |
+
+> **Changes in 0.5.0** — Device-declared RTP jitter-buffer floor (§8.7). A device MAY advertise capability `audio.rt-floor` and identity key 14 `rt-profile { ?0 => floor_frames, ?1 => packet_nsamples }`, declaring the lowest jitter-buffer setpoint (`ethTargetFrames`, sub-key 0) and RTP packet size (`nsamples`, sub-key 1) it sustains glitch-free; the host adopts it in place of the conservative ~2048-frame default, always clamped up by the host structural floor (2·max-DAW-block), so an absent or too-low declaration stays safe and the offline/host-paced path is untouched. Reference-hardware sweeps show the 2048 default (~43 ms) is ~5–6× over-provisioned on a 1 Gbps link — a KR260 over a direct cable holds ~320 frames, a Pi over a switch ~448 — and that smaller RTP packets (`audio.start` key 1, the device packet size) smooth delivery further. Backward-compatible: hosts ignore unknown identity keys (§6.2). Also reconciles the CDDL with the already-shipped identity keys 12 (part count) and 13 (txn limits), which had drifted out of Appendix A.
 
 > **Changes in 0.4.1** — Errata from running the reference device's state store to multi-hundred-megabyte scale. **Archive retention** (§10.3, §11.1): §11.4 mandates an archive on every overwrite and §10.2 already lets a device GC unreachable *objects*, but nothing bounded the host-created `archive/*` *refs* themselves — so a finite device grew without bound until `state.refs` (one control message returning the whole ref list) overran the §4.2.1 64 KiB payload cap and recall broke deterministically. Two clarifications close it: a device MAY bound the `archive/*`/duplicate namespaces, keeping a finite number of the most recent entries (the rest reclaimed per §10.2) — the host's own Recall Bundle is the system of record, so this is recoverable; and `state.refs` gains an optional `{0 => name}` filter so a host can resolve one known ref without pulling a list that may exceed the message bound. A device MUST keep its `state.refs` response within that bound. The reference device retains the newest 32 archives per namespace and mark-sweeps the orphaned objects (`include_parents = false`, so a superseded snapshot's parent history is reclaimable), the whole cycle serialized against snapshotting.
 
