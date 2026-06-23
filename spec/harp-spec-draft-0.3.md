@@ -2,7 +2,7 @@
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 
-Specification, Draft 0.5.0 — 23 June 2026
+Specification, Draft 0.5.1 — 23 June 2026
 
 | | |
 |---|---|
@@ -13,6 +13,8 @@ Specification, Draft 0.5.0 — 23 June 2026
 | **Schema & reference code license** | Apache-2.0 |
 | **Patent policy** | Royalty-free; contributors sign a non-assertion covenant (§19) |
 | **Feedback** | via HARP Enhancement Proposals (HEPs), see §18 |
+
+> **Changes in 0.5.1** — §6.1 clarified for the network binding: the runtime discovers Ethernet/IP devices by browsing the `_harp._tcp` mDNS/DNS-SD service (§4.4.3) and folds them into the same system-wide device list shells consume, so discovery and selection are uniform across USB and network (a directly-configured address is allowed as a fallback). §4.4.3 already defined the advertisement and TXT contract; this ties it into the discovery / device-list model of §6.1. No wire change.
 
 > **Changes in 0.5.0** — Device-declared RTP jitter-buffer floor (§8.7). A device MAY advertise capability `audio.rt-floor` and identity key 14 `rt-profile { ?0 => floor_frames, ?1 => packet_nsamples }`, declaring the lowest jitter-buffer setpoint (`ethTargetFrames`, sub-key 0) and RTP packet size (`nsamples`, sub-key 1) it sustains glitch-free; the host adopts it in place of the conservative ~2048-frame default, always clamped up by the host structural floor (2·max-DAW-block), so an absent or too-low declaration stays safe and the offline/host-paced path is untouched. Reference-hardware sweeps show the 2048 default (~43 ms) is ~5–6× over-provisioned on a 1 Gbps link — a KR260 over a direct cable holds ~320 frames, a Pi over a switch ~448 — and that smaller RTP packets (`audio.start` key 1, the device packet size) smooth delivery further. Backward-compatible: hosts ignore unknown identity keys (§6.2). Also reconciles the CDDL with the already-shipped identity keys 12 (part count) and 13 (txn limits), which had drifted out of Appendix A.
 
@@ -348,7 +350,7 @@ The device selects the highest mutually supported `major` and replies; differing
 
 ### 6.1 Discovery
 
-On USB, hosts discover HARP devices by the BOS platform capability (§4.3) where present, and MUST also support discovery by interface class triple — for gadget-framework devices (§4.3 item 2) the class-triple probe is the only discovery path. The runtime maintains the system-wide device list; shells consume it (§15.2). Devices are keyed by `(vendor id, product id, serial)`; a device whose serial is unavailable MUST be treated as a distinct unit per physical port, and certification requires a serial.
+On USB, hosts discover HARP devices by the BOS platform capability (§4.3) where present, and MUST also support discovery by interface class triple — for gadget-framework devices (§4.3 item 2) the class-triple probe is the only discovery path. On the Ethernet/IP binding, the runtime discovers devices by browsing the `_harp._tcp` mDNS/DNS-SD service (§4.4.3), resolving each advertised instance to its `host:port`; it MAY additionally accept a directly-configured address. The runtime folds devices from every binding into one system-wide device list, which shells consume (§15.2) — a shell selects a USB or a network device uniformly and never binds a transport itself. Devices are keyed by `(vendor id, product id, serial)`; a device whose serial is unavailable MUST be treated as a distinct unit per physical port, and certification requires a serial.
 
 ### 6.2 Identity descriptor
 

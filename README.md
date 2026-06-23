@@ -98,7 +98,7 @@ VST3 Note Expression, CLAP per-note parameter modulation, and MPE (CLAP, VST3,
 and raw 16-channel MIDI into the AU — Logic / Ableton Live). It is *not* yet an
 ecosystem of instruments; building richer synths and shipping real devices on
 top of the protocol is the roadmap, not a claim about the present. The spec is
-an **editor's draft** (0.4.0): breaking changes are expected and negotiated at
+an **editor's draft** (0.5.1): breaking changes are expected and negotiated at
 `hello`. The four-actions recall UI is next, and the spec-conformance periphery
 (mDNS discovery, credit flow-control, event transactions, admission control, the
 version/update prompt) has been filled in over the §8.7 Ethernet/IP binding — the
@@ -257,7 +257,11 @@ flag a device declares nothing and the host keeps the safe `2048`/`256` default.
 whatever is declared (floor to `[2·max-DAW-block, 12288]`, packet to `[32, kBlock]`). This cuts
 free-running buffer latency from ~43 ms toward ~7–9 ms. See [`scripts/eth-rtfloor-test.sh`](scripts/eth-rtfloor-test.sh).
 
-The shell dials `HARP_ETH_DEVICE=HOST:PORT` at its first connect (`selectDevice`).
+Synths on a network advertise over mDNS (`_harp._tcp`); **`harp-probe discover`** browses the
+segment and resolves each to its `host:port`. The shell runtime doesn't browse automatically yet —
+it dials `HARP_ETH_DEVICE=HOST:PORT` at its first connect (`selectDevice`), so point it at an
+address you've discovered (folding that mDNS browse into the shell's device list, per §6.1, is on
+the roadmap).
 A GUI DAW does **not** inherit your terminal's environment, so set it where the OS
 launcher sees it, *before* launching the DAW:
 
