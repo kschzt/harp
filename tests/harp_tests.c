@@ -224,6 +224,11 @@ static void test_objects(void) {
     harp_obj_encode_tree(&t2, e2, 3);
     CHECK(t1.len == t2.len && memcmp(t1.buf, t2.buf, t1.len) == 0);
     CHECK(harp_obj_kind(t1.buf, t1.len) == HARP_OBJ_TREE);
+    /* §11.2 verify-on-receipt: harp_obj_kind REJECTS a non-object (< 0), so the obj receivers
+     * (device handle_obj, host pump_one) discard it with 'malformed' rather than store garbage
+     * under a meaningless content hash. */
+    { uint8_t junk[] = {0xff, 0x00, 0x9a, 0x42}; CHECK(harp_obj_kind(junk, sizeof junk) < 0); }
+    CHECK(harp_obj_kind(t1.buf, 1) < 0); /* truncated object header */
 
     /* blob parse roundtrip */
     const char *media;

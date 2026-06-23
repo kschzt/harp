@@ -2878,11 +2878,14 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
         recordLog(HARP_LOG_INFO, "reconcile",
                   live.unborn ? "first push (archive-then-CAS)" : "Push (archive-then-CAS)");
     }
-    /* The archive is loss-prevention for the interactive Push/Duplicate. Headless
-     * (timeout 0) skips it: under the per-part-audio stress a per-push archive/<ts>
-     * ref (5x/s across the whole cluster) is pure churn that can wedge the gadget,
-     * and a CI stress run has no displaced state worth keeping. */
-    if (!live.unborn && timeout_ms > 0) {
+    /* §11.4: archive the DISPLACED device head before the CAS swaps the live ref to the
+     * target — a named archive/<ts> ref keeps the old state from §10.2 GC (the live CAS is
+     * force=false, so a SUCCEEDING push still swaps deviceHead->target and, without the
+     * archive, the displaced deviceHead becomes unreferenced and is lost). Gated on an ACTUAL
+     * displacement (deviceHead != target), NOT on timeout_ms: a headless Push that displaces
+     * MUST still archive (the §11.4 MUST), while the common re-assert / per-part-audio stress
+     * re-pushes the SAME state (deviceHead == target) — a no-op here, so no archive churn. */
+    if (!live.unborn && memcmp(deviceHead.b, target.b, HARP_HASH_LEN) != 0) {
         char archive[96];
         time_t now = time(nullptr);
         struct tm tm;
