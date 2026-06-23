@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "device.h"
+#include "harp/plat.h" /* harp_now_ns: §16 DoS pre-hello deadline */
 
 #ifdef __linux__
 extern _Atomic uint64_t g_usb_errors; /* §14.2: FunctionFS transport errors — device/ffs_link.c */
@@ -453,6 +454,9 @@ static void handle_hello(device *d, const harp_env *e) {
     /* §5.4: hello resets all per-session state — including a running stream */
     audio_stop(d);
     atomic_store_explicit(&d->hello_done, true, memory_order_release);
+    /* §16 DoS: hello completed — clear the pre-hello half-open SO_RCVTIMEO so a legitimate
+     * idle session (the host->device direction is often quiet during playback) is NOT dropped. */
+    if (d->ctl_sock != HARP_SOCK_INVALID) harp_sock_recv_timeout_ms(d->ctl_sock, 0);
     d->peer_credit = 0;
     d->granted = 0;
     d->sendq_head = d->sendq_tail = d->sendq_count = 0; /* §4.2.1: drop any backlog from a dead session */
@@ -2104,14 +2108,21 @@ void harp_deviced_run_session(device *d, harp_io *io) {
     harp_link_init(&d->link);
     harp_cbuf msg;
     harp_cbuf_init(&msg);
+    uint64_t t_start = harp_now_ns(); /* §16 DoS: pre-hello total deadline base */
     for (;;) {
         uint8_t stream;
         int rc = harp_link_recv(io, &d->link, &stream, &msg);
-        if (rc == -1) break; /* peer gone */
+        if (rc == -1) break; /* peer gone (or the pre-hello SO_RCVTIMEO fired -> drop the half-open) */
         if (rc == -2) {      /* protocol violation: session reset (§12.4) */
             CTR_INC(d->session_resets);
             break;
         }
+        /* §16 DoS: a peer that keeps the link busy (a slow trickle the per-recv SO_RCVTIMEO
+         * misses) without ever completing core.hello is dropped after 10s. Once hello_done
+         * flips this is a no-op (handle_hello cleared the recv timeout). */
+        if (!atomic_load_explicit(&d->hello_done, memory_order_acquire) &&
+            harp_now_ns() - t_start > 10000000000ull)
+            break;
         if (stream == HARP_STREAM_CTL)
             handle_ctl(d, msg.buf, msg.len);
         else if (stream == HARP_STREAM_OBJ)

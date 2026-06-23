@@ -109,6 +109,7 @@ int harp_ffs_serve(const char *ffs_dir, const char *gadget_path,
                    void (*session)(void *ud, harp_io *io), void *ud);
 
 static void ffs_session_cb(void *ud, harp_io *io) {
+    ((device *)ud)->ctl_sock = HARP_SOCK_INVALID; /* §16: USB/FFS has no eth control socket */
     harp_deviced_run_session(ud, io);
     fprintf(stderr, "harp-deviced: usb session ended; awaiting reattach\n");
 }
@@ -344,6 +345,7 @@ int main(int argc, char **argv) {
     d->rt_floor = rt_floor;       /* §6.4 rt-profile: emitted as identity key 14 sub-key 0 when nonzero */
     d->rt_nsamples = rt_nsamples; /* §6.4 rt-profile: emitted as identity key 14 sub-key 1 when nonzero */
     d->engine_ver = engine_ver;   /* §12.2 test seam: NULL => ENGINE_VERSION */
+    d->ctl_sock = HARP_SOCK_INVALID; /* §16: armed per-connection by the eth accept loop */
     snprintf(d->serial, sizeof d->serial, "%s", serial);
     if (harp_store_open(&d->store, state_dir) != 0) {
         fprintf(stderr, "harp-deviced: cannot open state dir %s\n", state_dir);
@@ -422,6 +424,14 @@ int main(int argc, char **argv) {
     (void)mdns; /* mDNS advertise is POSIX-only (Windows is host-side, not a refdev target) */
 #endif
 
+    /* §16 DoS: the half-open bound IS the per-connection time limit — a 5s pre-hello
+     * SO_RCVTIMEO (armed below) plus a 10s total pre-hello deadline (run_session) drop a
+     * connection that never completes core.hello, so no peer can tie up the single-threaded
+     * accept loop indefinitely. (A global connection-COUNT rate limit was evaluated and
+     * removed: a token bucket false-sheds a legitimate client arriving right after a burst —
+     * e.g. the T9 abuse-test's post-flood recovery probe — while a flood of quick connect/
+     * close is not a DoS, since each is accepted, handled, and closed immediately. For a
+     * single-threaded daemon the per-connection TIME bound is what prevents the hang.) */
     for (;;) {
         harp_sockhandle cfd = accept(sfd, NULL, NULL);
         if (cfd == HARP_SOCK_INVALID) {
@@ -431,6 +441,11 @@ int main(int argc, char **argv) {
             break;
         }
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+        /* §16 DoS: arm a 5s pre-hello recv timeout — a half-open peer that never sends
+         * core.hello is dropped (harp_link_recv returns -1 on the timeout, run_session
+         * breaks) instead of blocking the single-threaded accept loop forever. */
+        d->ctl_sock = cfd;
+        harp_sock_recv_timeout_ms(cfd, 5000);
         /* §8.7: remember the peer's IP so a TCP-session audio.start can negotiate
          * an RTP audio destination (its host:port = peer-IP + key-6 port). */
         struct sockaddr_in peer;
@@ -449,6 +464,7 @@ int main(int argc, char **argv) {
 #endif
         tio.io.corrupt_pct = g_corrupt_ctl_pct; /* §8.7 fault injection: device->host frames only */
         harp_deviced_run_session(d, &tio.io);
+        d->ctl_sock = HARP_SOCK_INVALID; /* §16: session over — disarm the pre-hello timeout */
         d->rtp_peer_ip = 0; /* session over — forget the peer */
         HARP_CLOSESOCK(cfd);
         fprintf(stderr, "harp-deviced: session ended; awaiting reattach\n");

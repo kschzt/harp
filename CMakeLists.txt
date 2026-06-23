@@ -66,9 +66,10 @@ add_executable(harp-deviced
   device/state.c        # engine <-> content-addressed objects
   device/session.c      # protocol handlers + session loop
   host/rtp.c            # §8.7 RTP packetization (--rtp-out emit)
+  ${HARP_PLAT_SRC}      # §16 DoS: harp_now_ns for the accept rate limit + pre-hello deadline
 )
 target_include_directories(harp-deviced PRIVATE host)
-target_link_libraries(harp-deviced harpcore ${HARP_MATH_LIB})
+target_link_libraries(harp-deviced harpcore ${HARP_MATH_LIB} ${HARP_PLAT_LIBS})
 if(WIN32)
   # On Windows the device daemon is a MinGW build (winpthreads + winsock); the MSVC
   # target is the plugin/host, not this. panel.c (AF_UNIX) is gated out — POSIX-only;
@@ -175,7 +176,7 @@ set_tests_properties(engine_logic PROPERTIES LABELS unit)
 # (no functionfs.h), so this builds on Linux AND macOS; POSIX only (socketpair).
 if(NOT WIN32)
   add_executable(harp-ffs-link-tests tests/harp_ffs_link_tests.c device/ffs_link.c)
-  target_include_directories(harp-ffs-link-tests PRIVATE device core/include)
+  target_include_directories(harp-ffs-link-tests PRIVATE device host core/include) # host/: device.h -> sock_io.h
   add_test(NAME ffs_link COMMAND harp-ffs-link-tests)
   set_tests_properties(ffs_link PROPERTIES LABELS unit)
 
@@ -211,7 +212,7 @@ if(NOT MSVC)
     device/state.c
     fuzz/state_stubs.c
   )
-  target_include_directories(harp-device-tests PRIVATE device)
+  target_include_directories(harp-device-tests PRIVATE device host) # host/: device.h -> sock_io.h (§16 ctl_sock)
   target_link_libraries(harp-device-tests harpcore ${HARP_MATH_LIB} Threads::Threads)
   add_test(NAME device_codec COMMAND harp-device-tests)
   set_tests_properties(device_codec PROPERTIES LABELS unit)
@@ -316,7 +317,7 @@ if(HARP_FUZZ)
   # pure-parser fuzzer. Needs the device/ include dir for device.h.
   add_executable(fuzz-state fuzz/fuzz_state.c device/state.c fuzz/state_stubs.c ${FUZZ_DRIVER})
   target_link_libraries(fuzz-state harpcore m)
-  target_include_directories(fuzz-state PRIVATE device)
+  target_include_directories(fuzz-state PRIVATE device host) # host/: device.h -> sock_io.h (§16 ctl_sock)
   if(NOT APPLE)
     target_compile_options(fuzz-state PRIVATE -fsanitize=fuzzer)
     target_link_options(fuzz-state PRIVATE -fsanitize=fuzzer)
