@@ -46,6 +46,8 @@ typedef struct {
     harp_hash param_map_hash;
     uint64_t boot_count;
     uint64_t txn_max, txn_events; /* §9.6 transaction limits (identity key 13); 0 if not advertised */
+    uint32_t eth_target_floor; /* §6.4 rt-profile (identity key 14 sub-key 0): device-declared safe ethTargetFrames floor (frames); 0 if not advertised */
+    uint32_t eth_nsamples;     /* §6.4 rt-profile (identity key 14 sub-key 1): device-declared RTP packet size (frames); 0 if not advertised */
     char caps[HARP_CLIENT_MAX_CAPS][32]; /* capability strings (identity key 6) */
     size_t ncaps;
     /* §6.4 latency-profile (identity key 8): one entry per negotiated rate. Each

@@ -451,6 +451,14 @@ private:
      * the device PREFILLS this many frames in a startup burst — otherwise the
      * ppm-limited trim takes seconds to fill from empty (startup silence). */
     static constexpr uint32_t kEthTargetFrames = 2048;
+    /* §6.4 rt-profile (identity key 14): the device-declared safe RTP jitter-buffer floor
+     * (frames); 0 = undeclared. Set in helloAndIdentity(); when present it replaces the
+     * kEthTargetFrames default in ethTargetFrames() (still clamped by the structural floor). */
+    uint32_t deviceEthFloor_ = 0;
+    /* §6.4 rt-profile (identity key 14 sub-key 1): the device-declared RTP packet size (frames);
+     * 0 = undeclared. Set in helloAndIdentity(); when present it replaces the kBlock default in
+     * ethNsamples() (clamped to [32, kBlock]). */
+    uint32_t deviceEthNsamples_ = 0;
 
     /* §8.7 latency knobs (measurement / clean-direct-link low-latency mode). The
      * default 2048-frame setpoint + 256-frame packet is the consumer-LAN-safe pair
@@ -462,6 +470,10 @@ private:
      * loop critically/well damped at ANY target with NO retuning (see feeder()). */
     uint32_t ethTargetFrames() const {
         uint32_t t = kEthTargetFrames;
+        if (deviceEthFloor_) /* §6.4 declared floor, capped at the SAME 12288 ceiling the env path
+                                below enforces — keeps capacity (4·target) under the audioRing_
+                                elastic-buffer write-cap, so a misdeclaring device can't overrun it */
+            t = deviceEthFloor_ > 12288u ? 12288u : deviceEthFloor_;
         if (const char *e = getenv("HARP_ETH_TARGET")) {
             int v = atoi(e);
             /* env range: floor 64, ceil 12288. The ceil keeps the audioRing_
@@ -479,8 +491,12 @@ private:
         uint32_t floor_ = 2u * maxDawBlock_;
         return t > floor_ ? t : floor_;
     }
-    static uint32_t ethNsamples() {
+    uint32_t ethNsamples() const {
         uint32_t n = kBlock;
+        if (deviceEthNsamples_) { /* §6.4 rt-profile sub-key 1: device-declared packet, clamped to [32, kBlock] */
+            n = deviceEthNsamples_ < 32 ? 32u
+              : (deviceEthNsamples_ > kBlock ? kBlock : deviceEthNsamples_);
+        }
         if (const char *e = getenv("HARP_ETH_NSAMPLES")) {
             int v = atoi(e);
             /* [32, kBlock]: this knob only LOWERS the packet to cut latency. The
@@ -500,6 +516,14 @@ private:
      * configure() and the static latencyFor(). */
     static uint32_t targetFramesFor(uint32_t maxDawBlock) {
         uint32_t needed = 2 * maxDawBlock;
+        /* measurement override: HARP_CUSHION_FRAMES=N sets the jitter cushion
+         * absolutely (bypasses the 2-block floor; keeps the structural 2*DAW
+         * floor) — for the per-link jitter-floor sweep. Default-off. */
+        if (const char *ef = getenv("HARP_CUSHION_FRAMES")) {
+            int v = atoi(ef);
+            if (v >= 32 && v <= 16384)
+                return (uint32_t)v > needed ? (uint32_t)v : needed;
+        }
         uint32_t depth = kTargetDepthFrames;
         /* measurement/field override: HARP_CUSHION_BLOCKS=N (min 2). The
          * default is data-driven per transport generation — see the

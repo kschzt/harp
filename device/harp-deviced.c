@@ -269,6 +269,8 @@ int main(int argc, char **argv) {
     const char *rtp_out = NULL;                       /* §8.7 emit dest HOST:PORT */
     double tone_hz = 0.0;                             /* --tone HZ: SINAD test tone, 0=engine */
     bool no_rate_lock = false;                        /* --no-rate-lock: force host ASRC fallback */
+    uint32_t rt_floor = 0;                            /* --rt-floor N: declared safe ethTargetFrames floor (frames), identity key 14 */
+    uint32_t rt_nsamples = 0;                         /* --rt-nsamples N: declared RTP packet size (frames), identity key 14 sub-key 1 */
     bool pmh_flip = false;                            /* --param-map-hash-flip: TEST seam (§9.3/§13.4) —
                                                        * advertise a 1-bit-altered param-map-hash to mimic
                                                        * an engine-update param-map change, so the shell's
@@ -302,10 +304,14 @@ int main(int argc, char **argv) {
             pmh_flip = true; /* §13.4 test seam: advertise a drifted param-map-hash */
         else if (strcmp(argv[i], "--mdns") == 0)
             mdns = true; /* §4.4.3: advertise _harp._tcp (--port mode; avahi on Linux, dns-sd on macOS) */
+        else if (strcmp(argv[i], "--rt-floor") == 0 && i + 1 < argc)
+            rt_floor = (uint32_t)atoi(argv[++i]); /* §6.4: declare the safe ethTargetFrames floor (identity key 14) */
+        else if (strcmp(argv[i], "--rt-nsamples") == 0 && i + 1 < argc)
+            rt_nsamples = (uint32_t)atoi(argv[++i]); /* §6.4: declare the RTP packet size (identity key 14 sub-key 1) */
         else {
             fprintf(stderr,
                     "usage: harp-deviced [--state-dir DIR] [--serial S] "
-                    "[--panel-sock PATH] [--tone HZ] [--no-rate-lock] "
+                    "[--panel-sock PATH] [--tone HZ] [--no-rate-lock] [--rt-floor N] [--rt-nsamples N] "
                     "[--port P | --ffs FFS_DIR [--gadget CONFIGFS_PATH]]\n");
             return 2;
         }
@@ -329,6 +335,16 @@ int main(int argc, char **argv) {
     d->audio.epoch = 1; /* §7.1: the device clock epoch starts at 1 — epoch 0 is reserved as the
                          * (0,0)="now" event-timestamp sentinel, so a live epoch is never 0. */
     d->no_rate_lock = no_rate_lock; /* §8.7 ASRC fallback test hook (hello capability gate) */
+    /* §6.4 rt-profile reference-fleet defaults: the lowest combined (jitter-buffer floor, RTP
+     * packet) measured glitch-free for each reference device class on its intended link — KR260
+     * over a direct 1Gbps cable -> 320/64; Pi over a switch -> 448/128. Applied only when NEITHER
+     * --rt-floor nor --rt-nsamples is given, so a deployment on a different link overrides via flags. */
+    if (rt_floor == 0 && rt_nsamples == 0) {
+        if (strncmp(serial, "KR260", 5) == 0)     { rt_floor = 320; rt_nsamples = 64;  }
+        else if (strncmp(serial, "PI4B", 4) == 0) { rt_floor = 448; rt_nsamples = 128; }
+    }
+    d->rt_floor = rt_floor;       /* §6.4 rt-profile: emitted as identity key 14 sub-key 0 when nonzero */
+    d->rt_nsamples = rt_nsamples; /* §6.4 rt-profile: emitted as identity key 14 sub-key 1 when nonzero */
     snprintf(d->serial, sizeof d->serial, "%s", serial);
     if (harp_store_open(&d->store, state_dir) != 0) {
         fprintf(stderr, "harp-deviced: cannot open state dir %s\n", state_dir);

@@ -146,6 +146,11 @@ bool HarpRuntime::helloAndIdentity() {
     engineVer_ = id.engine_ver;
     paramMapHash_ = id.param_map_hash;
     deviceRateLock_ = harp_client_has_cap(&id, "audio.rate-lock"); /* §8.7: honors audio.trim */
+    deviceEthFloor_ = id.eth_target_floor; /* §6.4 rt-profile (key 14): device-declared RTP
+                                              jitter-buffer floor (frames); 0 = undeclared, so
+                                              ethTargetFrames() keeps the conservative default. */
+    deviceEthNsamples_ = id.eth_nsamples;  /* §6.4 rt-profile (key 14 sub-key 1): device-declared RTP
+                                              packet size; 0 = undeclared -> ethNsamples() keeps 256. */
     /* §12.2: if the device's engine MAJOR changed across this (re)connect, the staged
      * project state may not fit the new engine — record it and hold the state read-only
      * (sessionUp then skips the auto-push). engineVer_ is "MAJOR.MINOR.PATCH"; atoi reads
@@ -281,6 +286,8 @@ bool HarpRuntime::audioStart(uint32_t rate) {
     harp_cbuf_init(&rsp);
     harp_client_req_head(&client_, &req, "audio.start", true);
     if (freeRunning_) {
+        log_msg("eth audio.start: packet=%u prefill/target=%u frames (deviceEthFloor=%u)",
+                ethNsamples(), ethTargetFrames(), deviceEthFloor_);
         /* §8.7 Ethernet: free-running (key 5 = 0) to the RTP dest port (key 6),
          * carrying the SAME slot union (key 4) the USB path sends — so the device
          * RTP-streams main {0,1} PLUS every per-part sink pair, and reader()
