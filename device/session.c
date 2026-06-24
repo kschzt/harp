@@ -258,7 +258,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, 0);
     harp_cbor_uint(m, 0x0001);
     harp_cbor_uint(m, 1);
-    harp_cbor_text(m, "harp-refdev");
+    harp_cbor_text(m, d->product ? d->product : "harp-refdev"); /* --product override; default refdev */
     harp_cbor_uint(m, 2); /* serial */
     harp_cbor_text(m, d->serial);
     harp_cbor_uint(m, 3); /* firmware */
@@ -266,7 +266,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, 4); /* engine */
     harp_cbor_map(m, 3);
     harp_cbor_uint(m, 0);
-    harp_cbor_text(m, ENGINE_ID);
+    harp_cbor_text(m, d->engine_name ? d->engine_name : ENGINE_ID); /* --engine-name override; PARAMS_MEDIA unaffected */
     harp_cbor_uint(m, 1);
     harp_cbor_text(m, d->engine_ver ? d->engine_ver : ENGINE_VERSION);
     harp_cbor_uint(m, 2);

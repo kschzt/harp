@@ -53,9 +53,10 @@ static void panel_json_params(device *d, int part, char *body, size_t sz) {
      * selector). `dirty` is the live ref's, shared across parts. The param NAMES
      * and ids are the same for every part — only the values differ. */
     off += (size_t)snprintf(body + off, sz - off,
-                            "{\"product\":\"harp-refdev\",\"serial\":\"%s\",\"part\":%d,"
+                            "{\"product\":\"%s\",\"serial\":\"%s\",\"part\":%d,"
                             "\"dirty\":%s,\"params\":[",
-                            d->serial, part, dirty ? "true" : "false");
+                            d->product ? d->product : "harp-refdev", d->serial, part,
+                            dirty ? "true" : "false");
     for (size_t i = 0; i < NPARAMS; i++)
         off += (size_t)snprintf(body + off, sz - off,
                                 "%s{\"id\":%u,\"name\":\"%s\",\"value\":%.4f}",

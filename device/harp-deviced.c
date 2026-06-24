@@ -79,8 +79,9 @@ static void on_term(int sig) {
  * platform mDNS responder (avahi on Linux, dns-sd on macOS); a missing responder simply
  * means no advertisement. The child is killed on shutdown (on_term) so the responder emits
  * the mDNS goodbye record (§12.3 detach signal). */
-static void mdns_advertise(int port) {
+static void mdns_advertise(int port, const char *name) {
     char ports[16], txtproto[24], txtport[24];
+    if (!name || !name[0]) name = "HARP refdev"; /* default instance name (the refdev's) */
     snprintf(ports, sizeof ports, "%d", port);
     snprintf(txtproto, sizeof txtproto, "proto=%d.%d", PROTO_MAJOR, PROTO_MINOR);
     snprintf(txtport, sizeof txtport, "port=%d", port);
@@ -91,10 +92,10 @@ static void mdns_advertise(int port) {
         int n = open("/dev/null", O_RDWR);
         if (n >= 0) { dup2(n, 1); dup2(n, 2); }
 #ifdef __APPLE__
-        execlp("dns-sd", "dns-sd", "-R", "HARP refdev", "_harp._tcp", "local", ports,
+        execlp("dns-sd", "dns-sd", "-R", name, "_harp._tcp", "local", ports,
                txtproto, txtport, (char *)NULL);
 #else
-        execlp("avahi-publish-service", "avahi-publish-service", "HARP refdev", "_harp._tcp",
+        execlp("avahi-publish-service", "avahi-publish-service", name, "_harp._tcp",
                ports, txtproto, txtport, (char *)NULL);
 #endif
         _exit(127); /* responder tool absent */
@@ -272,6 +273,8 @@ int main(int argc, char **argv) {
     uint32_t rt_floor = 0;                            /* --rt-floor N: declared safe ethTargetFrames floor (frames), identity key 14 */
     uint32_t rt_nsamples = 0;                         /* --rt-nsamples N: declared RTP packet size (frames), identity key 14 sub-key 1 */
     const char *engine_ver = NULL;                    /* --engine-ver X.Y.Z: §12.2 test seam, override reported engine semver */
+    const char *product = NULL;                       /* --product STRING: identity product/model + panel + mDNS instance name (NULL => harp-refdev) */
+    const char *engine_name = NULL;                   /* --engine-name STRING: identity engine name (NULL => ENGINE_ID; media-type unaffected) */
     bool pmh_flip = false;                            /* --param-map-hash-flip: TEST seam (§9.3/§13.4) —
                                                        * advertise a 1-bit-altered param-map-hash to mimic
                                                        * an engine-update param-map change, so the shell's
@@ -311,9 +314,13 @@ int main(int argc, char **argv) {
             rt_nsamples = (uint32_t)atoi(argv[++i]); /* §6.4: declare the RTP packet size (identity key 14 sub-key 1) */
         else if (strcmp(argv[i], "--engine-ver") == 0 && i + 1 < argc)
             engine_ver = argv[++i]; /* §12.2 test seam: report this engine semver instead of ENGINE_VERSION */
+        else if (strcmp(argv[i], "--product") == 0 && i + 1 < argc)
+            product = argv[++i]; /* identity product/model + panel product + mDNS instance name */
+        else if (strcmp(argv[i], "--engine-name") == 0 && i + 1 < argc)
+            engine_name = argv[++i]; /* identity engine name (PARAMS_MEDIA / recall format unaffected) */
         else {
             fprintf(stderr,
-                    "usage: harp-deviced [--state-dir DIR] [--serial S] "
+                    "usage: harp-deviced [--state-dir DIR] [--serial S] [--product NAME] [--engine-name NAME] "
                     "[--panel-sock PATH] [--tone HZ] [--no-rate-lock] [--rt-floor N] [--rt-nsamples N] [--engine-ver X.Y.Z] "
                     "[--port P | --ffs FFS_DIR [--gadget CONFIGFS_PATH]]\n");
             return 2;
@@ -344,6 +351,8 @@ int main(int argc, char **argv) {
     d->rt_floor = rt_floor;       /* §6.4 rt-profile: emitted as identity key 14 sub-key 0 when nonzero */
     d->rt_nsamples = rt_nsamples; /* §6.4 rt-profile: emitted as identity key 14 sub-key 1 when nonzero */
     d->engine_ver = engine_ver;   /* §12.2 test seam: NULL => ENGINE_VERSION */
+    d->product = product;         /* identity product/model + panel + mDNS name; NULL => "harp-refdev" */
+    d->engine_name = engine_name; /* identity engine name; NULL => ENGINE_ID (media-type unaffected) */
     snprintf(d->serial, sizeof d->serial, "%s", serial);
     if (harp_store_open(&d->store, state_dir) != 0) {
         fprintf(stderr, "harp-deviced: cannot open state dir %s\n", state_dir);
@@ -417,7 +426,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "harp-deviced: serial %s, state %s, listening on %d (boot %llu)\n",
             d->serial, state_dir, port, (unsigned long long)d->boot_count);
 #ifndef _WIN32
-    if (mdns) mdns_advertise(port); /* §4.4.3: advertise _harp._tcp now the port is bound */
+    if (mdns) mdns_advertise(port, d->product); /* §4.4.3: advertise _harp._tcp (instance name = --product, default "HARP refdev") */
 #else
     (void)mdns; /* mDNS advertise is POSIX-only (Windows is host-side, not a refdev target) */
 #endif
