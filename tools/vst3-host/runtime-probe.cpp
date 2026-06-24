@@ -17,9 +17,10 @@ static void writeWav(const char *path, const std::vector<float> &mono, uint32_t 
     FILE *f = fopen(path, "wb");
     if (!f) return;
     uint32_t nd = (uint32_t)mono.size() * 2, rate = sr, br = sr * 2, chunk = 36 + nd;
-    uint16_t ch = 1, bps = 16, ba = 2, fmt = 1, af = 16;
+    uint16_t ch = 1, bps = 16, ba = 2, fmt = 1;
+    uint32_t fmtsz = 16;  /* fmt-chunk size is a uint32 — writing it from a uint16 (&af,4) corrupted the header */
     fwrite("RIFF", 1, 4, f); fwrite(&chunk, 4, 1, f); fwrite("WAVE", 1, 4, f);
-    fwrite("fmt ", 1, 4, f); fwrite(&af, 4, 1, f); fwrite(&fmt, 2, 1, f); fwrite(&ch, 2, 1, f);
+    fwrite("fmt ", 1, 4, f); fwrite(&fmtsz, 4, 1, f); fwrite(&fmt, 2, 1, f); fwrite(&ch, 2, 1, f);
     fwrite(&rate, 4, 1, f); fwrite(&br, 4, 1, f); fwrite(&ba, 2, 1, f); fwrite(&bps, 2, 1, f);
     fwrite("data", 1, 4, f); fwrite(&nd, 4, 1, f);
     for (float s : mono) { int v = (int)(s * 32767.0f); if (v > 32767) v = 32767; if (v < -32768) v = -32768;
@@ -174,6 +175,63 @@ int main(int argc, char **argv) {
         double rms = capL.size() ? std::sqrt(sq / capL.size()) : 0.0;
         fprintf(stderr, "runtime-probe(engines): wrote /tmp/runtime-probe-engines.wav, RMS=%.4f%s\n",
                 rms, rms > 0.001 ? "  <-- AUDIBLE" : "  <-- SILENT");
+        rt.stop();
+        return 0;
+    }
+    /* sparse mode: a slow, spaced phrase (single notes + one held interval + a final
+     * sustained triad with a long tail) on a CHOSEN engine — exposes the per-note
+     * character + field response that dense material (Avril) masks. Optional id/val
+     * overrides apply AFTER the engine-select (which reloads that engine's defaults),
+     * so a "stronger/shaped" variant is one CLI call. Usage:
+     *   harp-runtime-probe sparse <engIdx> <numEng> <tag> [paramId val]... */
+    if (argc > 1 && strcmp(argv[1], "sparse") == 0) {
+        int engIdx = argc > 2 ? atoi(argv[2]) : 5;
+        int numEng = argc > 3 ? atoi(argv[3]) : 18;
+        const char *tag = argc > 4 ? argv[4] : "sparse";
+        uint32_t ssr = 44100;
+        HarpRuntime rt; rt.configure(ssr, 256); rt.start(ssr);
+        for (int i = 0; i < 100 && !rt.connected(); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        fprintf(stderr, "runtime-probe(sparse): connected=%d engine=%d/%d tag=%s\n",
+                rt.connected(), engIdx, numEng, tag);
+        if (!rt.connected()) { rt.stop(); return 1; }
+        uint64_t ts0 = rt.streamPos() + rt.latencySamples();
+        rt.queueParamSet(rt.ownerSource(), 1, (engIdx + 0.5f) / numEng, ts0); /* select -> loads its defaults */
+        for (int a = 5; a + 1 < argc; a += 2)                                  /* optional overrides, post-select */
+            rt.queueParamSet(rt.ownerSource(), (uint32_t)atoi(argv[a]), (float)atof(argv[a + 1]), ts0);
+        struct Ev { int pitch, vel; double on, off; };
+        const Ev phrase[] = {
+            {64, 102, 0.5, 1.6}, {71, 86, 2.1, 3.2}, {67, 95, 3.7, 5.4},   /* spaced singles */
+            {64, 90, 5.8, 6.9}, {72, 90, 5.9, 7.0},                        /* a held two-note interval */
+            {69, 66, 7.4, 8.2}, {65, 74, 8.6, 9.4},                        /* soft (dynamics) */
+            {60, 112, 10.0, 15.5}, {64, 106, 10.05, 15.5}, {67, 102, 10.1, 15.5}, /* final triad + long tail */
+        };
+        const int nev = (int)(sizeof(phrase) / sizeof(phrase[0]));
+        const double total = 16.0;
+        bool onF[32] = {false}, offF[32] = {false};
+        std::vector<float> capL; float buf[256 * 2];
+        auto t0 = std::chrono::steady_clock::now();
+        int settle = (int)(ssr / 256.0 * 0.5);                             /* let the engine switch + field reset settle */
+        for (int b = 0; b < settle; b++) { rt.pullAudio(buf, 256);
+            for (int i = 0; i < 256; i++) capL.push_back(buf[i * 2]);
+            std::this_thread::sleep_until(t0 + std::chrono::microseconds((long long)(b + 1) * 256 * 1000000LL / ssr)); }
+        auto p0 = std::chrono::steady_clock::now();
+        int pblocks = (int)((double)ssr / 256.0 * total);
+        for (int b = 0; b < pblocks; b++) {
+            double elapsed = b * 256.0 / ssr;
+            for (int e = 0; e < nev; e++) {
+                if (!onF[e] && elapsed >= phrase[e].on)  { rt.queueNote(rt.ownerSource(), 0x20900000u | ((uint32_t)(phrase[e].pitch & 0x7f) << 8) | (uint32_t)phrase[e].vel, rt.streamPos() + rt.latencySamples()); onF[e] = true; }
+                if (!offF[e] && elapsed >= phrase[e].off) { rt.queueNote(rt.ownerSource(), 0x20800000u | ((uint32_t)(phrase[e].pitch & 0x7f) << 8) | 0u, rt.streamPos() + rt.latencySamples()); offF[e] = true; }
+            }
+            rt.pullAudio(buf, 256);
+            for (int i = 0; i < 256; i++) capL.push_back(buf[i * 2]);
+            std::this_thread::sleep_until(p0 + std::chrono::microseconds((long long)(b + 1) * 256 * 1000000LL / ssr));
+        }
+        char path[160]; snprintf(path, sizeof(path), "/tmp/sparse-%s.wav", tag);
+        writeWav(path, capL, ssr);
+        double sq = 0; for (float s : capL) sq += (double)s * s;
+        double rms = capL.size() ? std::sqrt(sq / capL.size()) : 0.0;
+        fprintf(stderr, "runtime-probe(sparse): wrote %s (%.1fs), RMS=%.4f\n", path, capL.size() / (double)ssr, rms);
         rt.stop();
         return 0;
     }
