@@ -18,16 +18,17 @@
 #define HARP_FRAME_MAX_PAYLOAD 65536u
 #define HARP_FLAG_FIN 0x0001u
 
-/* §4.2.1 per-stream reassembled-MESSAGE bounds. ctl is 64 KiB (small RPC envelopes —
- * the largest in practice is a ~3 KiB diag.bundle; bulk data rides OBJ); evt and log
- * are 4 KiB (single events / single log records). OBJ is flow-controlled by core.credit, but
- * ALSO carries a generous hard cap (16 MiB) so a peer that IGNORES its credit window cannot grow
- * the reassembly accumulator without bound (§16/§4.2.1 memory safety). Enforced in harp_link_recv
- * during reassembly: an over-cap message is malformed -> session reset (§12.4), and capping
- * mid-reassembly also bounds the accumulator against a peer that never sends FIN. */
+/* §4.2.1 per-stream reassembled-MESSAGE receive bounds. The spec MUST is the SAME for all of
+ * ctl/evt/log: individual messages <= 64 KiB — this is the receive REJECT threshold. The <= 4 KiB
+ * in §4.2.1 is only a SHOULD send-side target for ctl/evt, NOT a receive cap, so a conforming
+ * 4-64 KiB evt, or a log record up to the >=64 KiB device log ring (§9), MUST be accepted and never
+ * session-reset. OBJ carries arbitrarily large credit-controlled transfers but ALSO a hard 16 MiB
+ * safety cap so a peer ignoring its credit window cannot grow the accumulator without bound
+ * (§16/§4.2.1). Enforced in harp_link_recv during reassembly: an over-cap message is malformed ->
+ * session reset (§12.4); capping mid-reassembly also bounds a peer that never sends FIN. */
 #define HARP_CTL_MAX_PAYLOAD 65536u
-#define HARP_EVT_MAX_PAYLOAD 4096u
-#define HARP_LOG_MAX_PAYLOAD 4096u
+#define HARP_EVT_MAX_PAYLOAD 65536u /* §4.2.1 MUST <=64 KiB (4 KiB is a sender SHOULD, not a recv cap) */
+#define HARP_LOG_MAX_PAYLOAD 65536u /* §4.2.1 MUST <=64 KiB (device log ring is >=64 KiB RECOMMENDED) */
 #define HARP_OBJ_MAX_PAYLOAD (16u * 1024 * 1024) /* §16: finite safety cap; credit is the primary bound */
 
 #define HARP_STREAM_CTL 0

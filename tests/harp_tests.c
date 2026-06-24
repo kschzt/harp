@@ -747,10 +747,11 @@ static void test_link_fragmentation(void) {
     }
 }
 
-/* §4.2.1: harp_link_recv enforces the per-stream reassembled-message caps (ctl 64KiB,
- * evt/log 4KiB; OBJ uncapped — credit-gated). An over-cap message is malformed (-2 ->
- * session reset), and the cap is checked DURING reassembly so a peer cannot grow the
- * accumulator past the bound by withholding FIN. */
+/* §4.2.1: harp_link_recv enforces the per-stream reassembled-message caps. ctl/evt/log share the
+ * 64 KiB MUST receive bound (the 4 KiB in §4.2.1 is a sender SHOULD, not a recv cap); OBJ is
+ * credit-gated but carries a 16 MiB hard safety cap. An over-cap message is malformed (-2 ->
+ * session reset), checked DURING reassembly so a peer cannot grow the accumulator past the bound by
+ * withholding FIN. */
 static void check_stream_cap(uint8_t stream, size_t cap) {
     uint8_t *buf = (uint8_t *)malloc(cap);
     memset(buf, 0xab, cap);
@@ -799,15 +800,45 @@ static void check_stream_cap(uint8_t stream, size_t cap) {
     free(buf);
 }
 
+/* Send exactly `n` bytes (n <= 64 KiB) as one FIN frame on `stream` and assert it reassembles
+ * byte-exact (rc 0) — the accept partner to check_stream_cap's over-cap reject. */
+static void accept_one_frame(uint8_t stream, size_t n) {
+    uint8_t *buf = (uint8_t *)malloc(n);
+    memset(buf, 0x3c, n);
+    mem_io m;
+    m.io.read_exact = mem_read;
+    m.io.write_all = mem_write;
+    harp_cbuf_init(&m.wire);
+    m.rpos = 0;
+    write_frame(&m, stream, true, (const char *)buf, n);
+    harp_link l;
+    harp_link_init(&l);
+    uint8_t s = 0xff;
+    harp_cbuf msg;
+    harp_cbuf_init(&msg);
+    CHECK(harp_link_recv(&m.io, &l, &s, &msg) == 0);
+    CHECK(s == stream && msg.len == n);
+    harp_cbuf_free(&msg);
+    harp_cbuf_free(&m.wire);
+    harp_link_free(&l);
+    free(buf);
+}
+
 static void test_link_stream_caps(void) {
     check_stream_cap(HARP_STREAM_CTL, HARP_CTL_MAX_PAYLOAD);
     check_stream_cap(HARP_STREAM_EVT, HARP_EVT_MAX_PAYLOAD);
     check_stream_cap(HARP_STREAM_LOG, HARP_LOG_MAX_PAYLOAD);
 
-    /* OBJ is exempt (credit-gated): a multi-frame message far past 64KiB reassembles to
-     * 0, NOT -2 — the cap path must not touch the bulk-object stream. */
+    /* §4.2.1: evt/log share the 64 KiB MUST recv bound. A mid-range 8 KiB message — well past the
+     * 4 KiB ctl/evt SHOULD send-target, and a hardcoded size independent of the cap constants — MUST
+     * still be ACCEPTED, not session-reset. Guards against a regression to a 4 KiB recv cap. */
+    accept_one_frame(HARP_STREAM_EVT, 8192);
+    accept_one_frame(HARP_STREAM_LOG, 8192);
+
+    /* OBJ is credit-gated AND has a 16 MiB hard safety cap: an UNDER-cap multi-frame message far
+     * past 64 KiB reassembles to 0 (the message-cap path is OBJ-aware but generous, 16 MiB). */
     {
-        size_t big = HARP_CTL_MAX_PAYLOAD * 2 + 5; /* 131077: spans three frames */
+        size_t big = HARP_CTL_MAX_PAYLOAD * 2 + 5; /* 131077: spans three frames, well under 16 MiB */
         uint8_t *p = (uint8_t *)malloc(big);
         memset(p, 0x5a, big);
         mem_io m;
@@ -827,6 +858,32 @@ static void test_link_stream_caps(void) {
         harp_cbuf_free(&m.wire);
         harp_link_free(&l);
         free(p);
+    }
+
+    /* ...but OBJ OVER the 16 MiB HARP_OBJ_MAX_PAYLOAD hard cap IS rejected (-2). Built from
+     * (16 MiB / 64 KiB) + 1 = 257 no-FIN 64 KiB frames so the MESSAGE cap trips mid-reassembly
+     * (link.c), not the per-FRAME 64 KiB limit; recv returns -2 before any FIN. */
+    {
+        uint8_t *chunk = (uint8_t *)malloc(HARP_FRAME_MAX_PAYLOAD);
+        memset(chunk, 0x5a, HARP_FRAME_MAX_PAYLOAD);
+        mem_io m;
+        m.io.read_exact = mem_read;
+        m.io.write_all = mem_write;
+        harp_cbuf_init(&m.wire);
+        m.rpos = 0;
+        size_t nframes = HARP_OBJ_MAX_PAYLOAD / HARP_FRAME_MAX_PAYLOAD + 1; /* 257: crosses 16 MiB */
+        for (size_t i = 0; i < nframes; i++)
+            write_frame(&m, HARP_STREAM_OBJ, false, (const char *)chunk, HARP_FRAME_MAX_PAYLOAD);
+        harp_link l;
+        harp_link_init(&l);
+        uint8_t s = 0xff;
+        harp_cbuf msg;
+        harp_cbuf_init(&msg);
+        CHECK(harp_link_recv(&m.io, &l, &s, &msg) == -2);
+        harp_cbuf_free(&msg);
+        harp_cbuf_free(&m.wire);
+        harp_link_free(&l);
+        free(chunk);
     }
 }
 
