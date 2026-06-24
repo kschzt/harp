@@ -26,6 +26,29 @@ static void writeWav(const char *path, const std::vector<float> &mono, uint32_t 
 }
 
 int main(int argc, char **argv) {
+    /* echo-monitor mode: connect a HELD session and log inbound device param echoes
+     * (Electra/front-panel edits -> evt.param.echo -> the SAME popEcho() the VST owner
+     * drains into outputParameterChanges). Usage: harp-runtime-probe echo [secs] */
+    if (argc > 1 && strcmp(argv[1], "echo") == 0) {
+        int secs = argc > 2 ? atoi(argv[2]) : 8;
+        HarpRuntime ert;
+        ert.configure(44100, 256);
+        ert.start(44100);
+        for (int i = 0; i < 100 && !ert.connected(); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        fprintf(stderr, "runtime-probe(echo): connected=%d — logging param echoes for %ds\n",
+                ert.connected(), secs);
+        if (!ert.connected()) { ert.stop(); return 1; }
+        int count = 0;
+        for (int t = 0; t < secs * 20; t++) {
+            uint32_t id; float v;
+            while (ert.popEcho(0, id, v)) { printf("ECHO id=%u v=%.4f\n", id, v); fflush(stdout); count++; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        fprintf(stderr, "runtime-probe(echo): %d param echoes received\n", count);
+        ert.stop();
+        return count > 0 ? 0 : 2;
+    }
     int pitch = argc > 1 ? atoi(argv[1]) : 60; /* C4 */
     uint32_t sr = argc > 2 ? (uint32_t)atoi(argv[2]) : 48000; /* Live is usually 44100 */
     int nonblock = argc > 3 ? atoi(argv[3]) : 0; /* 1 = pullAudio (non-blocking) like Live */
