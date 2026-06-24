@@ -258,7 +258,7 @@ bool harp_obj_parse_snapshot_root(const uint8_t *enc, size_t len, harp_hash *roo
 }
 
 /* §13.4: extract the snapshot's engine semver (key 5). The device's state.refset load gate
- * compares its MAJOR to the device's engine major. False if not a snapshot or no engine field. */
+ * compares its MAJOR.MINOR to the device's engine version. False if not a snapshot or no engine field. */
 bool harp_obj_parse_snapshot_engine(const uint8_t *enc, size_t len, char *out, size_t outsz) {
     struct snap_out o = {0};
     o.kind = -1;

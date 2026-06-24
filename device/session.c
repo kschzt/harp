@@ -240,14 +240,13 @@ void send_error(device *d, uint64_t rid, const char *method, const char *code,
 /* ---------------- identity (§6.2) ---------------- */
 
 static void encode_identity(device *d, harp_cbuf *m) {
-    /* P3: top-level identity keys 0..12 (13 pairs). The count was previously
-     * 11 while 12 keys (0..11) were emitted — harmless only because the host
-     * (host/client.c parse_identity) reads exactly `n` pairs and identity is
-     * the last value in the hello body, so the under-counted tail was silently
-     * ignored. P3 adds key 12 (part count) and corrects the count to 13 so the
-     * map is well-formed CBOR and every advertised key is actually parseable.
-     * Identity is not byte-constrained by the golden (which checks rendered
-     * audio) nor by param-map-hash (computed from encode_param_array). */
+    /* Top-level identity keys 0..14. The map arity below MUST equal the keys actually emitted:
+     * 0..12 (P3, incl. key 12 part-count) + key 13 (§9.6 txn limits) + key 14 (§6.4 rt-profile,
+     * only when --rt-floor/--rt-nsamples is set) -> 14, or 15 with the rt-profile. (An arity that
+     * under-counts is silently tolerated — the host reads exactly `n` pairs and identity is the
+     * last value in the hello body — but it MUST stay in lockstep so every advertised key parses.)
+     * Identity is not byte-constrained by the golden (rendered audio) nor by param-map-hash
+     * (computed from encode_param_array). */
     harp_cbor_map(m, (d->rt_floor || d->rt_nsamples) ? 15 : 14); /* §9.6 key 13 (txn limits); §6.4 +key 14 (rt-profile) when --rt-floor/--rt-nsamples set */
     harp_cbor_uint(m, 0); /* vendor */
     harp_cbor_map(m, 2);
@@ -1557,10 +1556,10 @@ static void txn_abort(device *d, uint64_t id) {
     t->open = false;
 }
 
-/* evt stream (§9.2): timestamped event messages. Slice 1: etype 1 (param
- * set) applied at "now"; other types skipped. Events have no responses.
- * Host-driven sets do NOT echo (§9.4). §9.6: events MAY carry a txn-id (body key 4);
- * etypes 2/3/4 are txn-begin/commit/abort. */
+/* evt stream (§9.2): timestamped event messages. Handled: param sets + ramps applied at the
+ * stamped instant, non-destructive per-voice/whole-part mod (§9.4, etype 6), and the §9.6 txn
+ * begin/commit/abort (etypes 2/3/4); events MAY carry a txn-id (body key 4). Events have no
+ * responses; host-driven sets do NOT echo (§9.4). */
 static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
     harp_cdec dec;
     harp_cdec_init(&dec, buf, len);
@@ -1681,8 +1680,8 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
     }
     if (etype == 6) { /* mod (§9.4): {0 param, 1 signed offset, ?3 voice, ?4 txn,
                        * ?5 channel}. NON-DESTRUCTIVE — decoded here; the per-voice
-                       * mod layer that APPLIES it is Phase 2, so the engine ignores
-                       * DEV_EV_MOD for now (no render effect → golden byte-identical).
+                       * mod layer that APPLIES it (engine.c DEV_EV_MOD, §9.4/§9.5) sums it
+                       * onto the part base for the targeted voice(s) at render — non-destructive.
                        * MUST NOT alter the base value / dirty state (§9.4): no
                        * live_ref_touch, and the offset is NOT clamped to [0,1] (it is
                        * signed, clamped only after summation onto the base). */
