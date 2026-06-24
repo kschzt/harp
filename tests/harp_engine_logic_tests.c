@@ -18,6 +18,7 @@
 
 #include "arp_select.h"
 #include "evq_mod.h"
+#include "fence_wait.h"
 #include "usb_select.h"
 #include "voice_alloc.h"
 
@@ -146,6 +147,24 @@ static void test_evq_mod(void) {
     CHECK(harp_mod_target(BEND_ID, 5, BEND_ID, PRESS_ID) == HARP_MODT_BEND);
 }
 
+/* §8.3.1 fence-wait predicate (device/fence_wait.h) — exactly what host_paced_loop's fence
+ * barrier calls. Real-time host-paced MUST bound the wait (a few ms, then render late + count
+ * fence_timeouts); the deterministic offline bounce stays an unbounded barrier. */
+static void test_fence(void) {
+    /* consumed (pending<=0) or session stopping -> never wait, on either path */
+    CHECK(!harp_fence_keep_waiting(0, true, false, 100, 200));
+    CHECK(!harp_fence_keep_waiting(-1, true, true, 100, 200));
+    CHECK(!harp_fence_keep_waiting(5, false, false, 100, 200));
+    CHECK(!harp_fence_keep_waiting(5, false, true, 100, 200));
+    /* OFFLINE deterministic bounce: pending + running -> wait UNBOUNDED (ignores the deadline) */
+    CHECK(harp_fence_keep_waiting(5, true, true, 100, 200));
+    CHECK(harp_fence_keep_waiting(5, true, true, 999999, 200)); /* now past deadline, still waits */
+    /* REAL-TIME (USB): wait only BEFORE the deadline; at/after it the §8.3.1 bound is hit -> stop */
+    CHECK(harp_fence_keep_waiting(5, true, false, 100, 200));
+    CHECK(!harp_fence_keep_waiting(5, true, false, 200, 200)); /* deadline reached */
+    CHECK(!harp_fence_keep_waiting(5, true, false, 250, 200)); /* past deadline */
+}
+
 /* §15.2 multi-device SELECTION (host/usb_select.h) — the "never bind a different
  * synth" rule, the safety core of multi-device. The fallback CHAIN (try exact serial,
  * then same-model, then any) is the caller's orchestration + the hardware
@@ -176,6 +195,7 @@ int main(void) {
     test_voice_pick();
     test_arp_select();
     test_evq_mod();
+    test_fence();
     test_usb_select();
     printf("harp-engine-logic-tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
