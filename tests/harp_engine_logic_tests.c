@@ -166,6 +166,23 @@ static void test_fence(void) {
     CHECK(!harp_fence_keep_waiting(5, true, false, 250, 200)); /* past deadline */
 }
 
+/* §8.3.1 fence-timeout COUNT predicate (device/fence_wait.h) — evaluated AFTER the wait loop. Counts
+ * a fence_timeout ONLY for a genuine real-time deadline expiry; NOT a teardown (running went false,
+ * which also unwinds the loop) and NEVER offline ("the device does not count fence_timeouts offline"). */
+static void test_fence_count_timeout(void) {
+    /* real-time + running + still pending -> the bounded loop can only have exited via the deadline -> COUNT */
+    CHECK(harp_fence_count_timeout(1, true, false));
+    CHECK(harp_fence_count_timeout(5, true, false));
+    /* teardown: a stop set running=false and unwound the loop -> NOT a render-late, do NOT count */
+    CHECK(!harp_fence_count_timeout(1, false, false));
+    /* offline = the unbounded deterministic barrier -> never a timeout (§8.3.1) */
+    CHECK(!harp_fence_count_timeout(1, true, true));
+    CHECK(!harp_fence_count_timeout(5, false, true));
+    /* consumed (pending <= 0) -> nothing late, nothing to count */
+    CHECK(!harp_fence_count_timeout(0, true, false));
+    CHECK(!harp_fence_count_timeout(-3, true, false));
+}
+
 /* §15.2 multi-device SELECTION (host/usb_select.h) — the "never bind a different
  * synth" rule, the safety core of multi-device. The fallback CHAIN (try exact serial,
  * then same-model, then any) is the caller's orchestration + the hardware
@@ -236,6 +253,7 @@ int main(void) {
     test_evt_epoch_stale();
     test_evt_dirties();
     test_fence();
+    test_fence_count_timeout();
     test_usb_select();
     test_peer_ratelimit();
     printf("harp-engine-logic-tests: %d passed, %d failed\n", g_pass, g_fail);
