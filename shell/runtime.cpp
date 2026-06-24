@@ -3265,7 +3265,8 @@ void HarpRuntime::emitClockStats(harp_cbuf *out) {
         /* asrc-stats (CDDL): { 0 => ratio, ?3 => phase/fill error vs setpoint, ?4 =>
          * converter quality }. The ratio is the recovered out/in; the fill error is
          * the signed frame deviation from the setpoint (the loop's phase). Quality is
-         * the reader's SRC_SINC_MEDIUM_QUALITY (§8.3 >=120 dB). (Keys 1/2 — in/out totals — are
+         * the reader's HARP_ASRC_QUALITY == SRC_SINC_BEST_QUALITY (0; ~145 dB, clearing the §8.3
+         * >=120 dB floor). (Keys 1/2 — in/out totals — are
          * not snapshotted by the freerun core, so a vN writer omits them.) */
         uint64_t rb = asrcRatioBits_.load(std::memory_order_relaxed);
         double ratio; memcpy(&ratio, &rb, sizeof ratio);
@@ -3563,7 +3564,7 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
         harp_cbor_uint(&out, 5);
         harp_cbor_uint(&out, targetFrames_); /* target ring depth (frames) */
         harp_cbor_uint(&out, 6);
-        harp_cbor_uint(&out, 0); /* DAW PDC latency (not reported in v1) */
+        harp_cbor_uint(&out, (uint64_t)latencySamples()); /* §6.4 DAW-domain PDC latency = buffer depth + event headroom; byte-identical to getLatencySamples() reported to the DAW */
         harp_cbor_uint(&out, 7);
         harp_cbor_bool(&out, bitExact_); /* 1:1 rate-lock vs ASRC */
         harp_cbor_uint(&out, 8);
