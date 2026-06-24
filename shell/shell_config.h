@@ -51,6 +51,15 @@
     {13, "Glide", 0, 0.0, nullptr}
 #endif
 
+/* HARP_SHELL_ENGINE_TABLES + HARP_SHELL_ENGINE_PARAM_ID (optional, for a multi-engine
+ * product whose param NAMES change with the selected engine): ENGINE_TABLES = a comma-
+ * separated list of per-engine rows (each row = number-of-params "Name" strings, "—"
+ * marks a hidden slot); ENGINE_PARAM_ID = the Engine picker's param id. The controller
+ * then re-titles the param slots to the selected engine's names on each Engine change
+ * (restartComponent kParamTitlesChanged). Slot IDs/defaults never change (automation +
+ * recall hold) — only the displayed names. Undefined (default) = one static name set
+ * (the refdev). The rows should mirror the device's per-engine param map. */
+
 /* HARP_SHELL_ENGINE_FILTER (optional): if a product defines it to a §12 engine-id
  * string, the shell auto-binds ONLY a network device reporting that engine (browse
  * _harp._tcp, hello each candidate, keep the match) — so a single-engine product

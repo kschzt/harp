@@ -61,6 +61,16 @@ struct DevParam {
 };
 static const DevParam kParams[] = { HARP_SHELL_PARAMS };
 static constexpr int kNumParams = sizeof(kParams) / sizeof(kParams[0]);
+#ifdef HARP_SHELL_ENGINE_TABLES
+/* Per-engine slot labels (a product that defines HARP_SHELL_ENGINE_TABLES): row e =
+ * engine e's titles, column k = the title for param id (k+1); "—" hides the slot. The
+ * controller re-titles ids 2..kNumParams from this when the Engine param changes, so
+ * the UI shows the selected engine's REAL controls. Mirrors the device's per-engine
+ * param map; harp ships none — the refdev keeps its single static name set. */
+static const char *const kEngineTables[][kNumParams] = { HARP_SHELL_ENGINE_TABLES };
+static constexpr int kNumEngineTables = (int)(sizeof(kEngineTables) / sizeof(kEngineTables[0]));
+static inline bool engSlotHidden(const char *s) { return s && strcmp(s, "—") == 0; }
+#endif
 /* HOST-SIDE routing parameter (NOT a device param): which multitimbral PART
  * (§9.4 channel 0..15) this plugin instance owns. Stepped+automatable so a DAW
  * can show/persist it per-instance and several aliases each pick a distinct
@@ -998,6 +1008,42 @@ public:
                 setParamNormalized(kv.first, kv.second);
         return kResultOk;
     }
+#ifdef HARP_SHELL_ENGINE_TABLES
+    /* PER-ENGINE PARAM RELABEL. The device's param NAMES change with the selected
+     * engine (slot IDs stay fixed, so automation/recall survive). The controller tracks
+     * the Engine param and re-titles ids 2..kNumParams from kEngineTables[engine]; on a
+     * change it asks the host to re-read titles. The engine index uses the device's
+     * (int)(v*N) select so the shown labels match the rendered engine. */
+    int currentEngine_ = 0;
+    static int engineIndexFor(double norm) {
+        int e = (int)(norm * kNumEngineTables);
+        return e < 0 ? 0 : (e >= kNumEngineTables ? kNumEngineTables - 1 : e);
+    }
+    tresult PLUGIN_API setParamNormalized(ParamID id, ParamValue value) override {
+        tresult r = EditController::setParamNormalized(id, value);
+        if (id == (ParamID)(HARP_SHELL_ENGINE_PARAM_ID)) {
+            int e = engineIndexFor(value);
+            if (e != currentEngine_) {
+                currentEngine_ = e;
+                if (componentHandler)
+                    componentHandler->restartComponent(Steinberg::Vst::kParamTitlesChanged);
+            }
+        }
+        return r;
+    }
+    tresult PLUGIN_API getParameterInfo(int32 paramIndex, ParameterInfo &info) override {
+        tresult r = EditController::getParameterInfo(paramIndex, info);
+        if (r != kResultOk) return r;
+        if (info.id >= 2 && info.id <= (ParamID)kNumParams && currentEngine_ < kNumEngineTables) {
+            const char *t = kEngineTables[currentEngine_][info.id - 1];
+            if (t) {
+                if (engSlotHidden(t)) info.flags |= ParameterInfo::kIsHidden;
+                else { UString(info.title, 128).fromAscii(t); info.flags &= ~ParameterInfo::kIsHidden; }
+            }
+        }
+        return r;
+    }
+#endif
 };
 
 /* ---------------- factory ---------------- */
