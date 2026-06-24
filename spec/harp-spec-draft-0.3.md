@@ -813,7 +813,7 @@ The only way to change device state from the host:
 req state.refset { 0 => tstr ref-name,
                    1 => hash / null,     ; expect: required current target (null = expect unborn)
                    2 => hash,            ; new target (objects must be fully present)
-                   ? 3 => uint flags }   ; bit 0 create-if-unborn; bit 1 force (see below)
+                   ? 3 => uint flags }   ; bit 0 create-if-unborn; bit 1 force; bit 2 (0x4) engine-version consent (§13.4)
 rsp              { 0 => uint64 new-generation }
 err conflict     { details: { 0 => hash/null actual, 1 => uint64 generation, 2 => bool dirty } }
 ```
@@ -918,7 +918,7 @@ Devices MUST verify the vendor signature (Ed25519 RECOMMENDED) over the image ma
 
 ### 13.4 Engine version and recall validity
 
-The contract restated as requirements: state objects record the `engine` version that produced them (snapshot field 5). A device asked to load a snapshot whose engine **major** differs from its own MUST refuse with `incompatible` unless the request carries the explicit-consent flag, in which case it MAY migrate (declaring `state.migrate` capability) or load best-effort with a `state.changed` note. Engine **minor** differences MUST load exactly or refuse — "loads but sounds different" without consent is the single outcome this specification exists to prevent.
+The contract restated as requirements: state objects record the `engine` version that produced them (snapshot field 5). A device asked to load a snapshot whose engine **major** differs from its own MUST refuse with `incompatible` unless the request carries the explicit-consent flag (`state.refset` flags bit 2, `0x4`), in which case it MAY migrate (declaring `state.migrate` capability) or load best-effort with a `state.changed` note. Engine **minor** differences MUST load exactly or refuse — "loads but sounds different" without consent is the single outcome this specification exists to prevent.
 
 ---
 

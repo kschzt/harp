@@ -173,6 +173,10 @@ if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then
     # key 9 key 12: transport enum. Over the §8.7 loopback the binding is ETHERNET (1).
     exists $b->{9}{12} or die "audio-config missing transport enum (key 12) — host-context-C not emitted?\n";
     $b->{9}{12} == 1   or die "audio-config transport (key 12) != 1 (ethernet) over §8.7 loopback: $b->{9}{12}\n";
+    # §6.4 key 9 key 6: DAW-domain PDC latency, samples — the real composed figure (ethTargetFrames
+    # + event headroom over the rate-locked §8.7 loopback), now reported (was a stale literal 0).
+    exists $b->{9}{6} or die "audio-config missing PDC latency (key 6)\n";
+    $b->{9}{6} =~ /^\d+$/ && $b->{9}{6} > 0 or die "audio-config PDC latency (key 6) not a positive int: $b->{9}{6}\n";
 
     # §14.4 host-context-C — key 11: clock-stats, ALWAYS present, with a recovery mode.
     # Over §8.7 the device rate-locks (bit-exact) => recovery 2 (rate-lock) + ratelock-stats(6);
