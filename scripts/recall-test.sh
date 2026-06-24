@@ -22,8 +22,11 @@ fail() { echo "RECALL FAIL: $1"; exit 1; }
 "$HOSTBIN" "$VST" --seconds 0.05 2>&1 | grep -q "connected:" \
     || { echo "RECALL FAIL: cannot claim device — the rig must own it exclusively (busy/absent?)"; exit 3; }
 
-ARCH0=$(curl -s "http://$HOST:8080/api/refs" | python3 -c \
-    "import json,sys; print(sum(1 for r in json.load(sys.stdin)['refs'] if r['name'].startswith('archive/')))")
+# §10.3 GC caps the retained archive count, so a NEW archive can evict an old one and leave the
+# COUNT unchanged. Snapshot the archive ref NAMES (sorted) and assert a NEW name appears on reopen.
+arch_names() { curl -s "http://$HOST:8080/api/refs" | python3 -c \
+    "import json,sys; [print(r['name']) for r in json.load(sys.stdin).get('refs',[]) if r['name'].startswith('archive/')]" | sort; }
+arch_names > /tmp/harp-arch0.txt
 
 # 1. known state, saved
 "$HOSTBIN" "$VST" --set 3=0.81 --set 6=0.31 --set 1=0.61 --seconds 0.6 \
@@ -44,7 +47,9 @@ import json, sys
 p = {x['id']: x['value'] for x in json.load(sys.stdin)['params']}
 ok = abs(p[3]-0.81) < 0.02 and abs(p[6]-0.31) < 0.02 and abs(p[1]-0.61) < 0.02
 sys.exit(0 if ok else (print(f'RECALL FAIL: params not restored: {p}') or 1))" || exit 1
-ARCH1=$(curl -s "http://$HOST:8080/api/refs" | python3 -c \
-    "import json,sys; print(sum(1 for r in json.load(sys.stdin)['refs'] if r['name'].startswith('archive/')))")
-[ "$ARCH1" -gt "$ARCH0" ] || fail "mutation was not archived before push"
-echo "RECALL PASS (params restored, mutation archived: $ARCH0 -> $ARCH1 archives)"
+arch_names > /tmp/harp-arch1.txt
+# A NEW archive name (not in the before-set) = the displaced state was archived. Robust to the §10.3
+# GC cap, which can evict an old archive on the same push so the bare COUNT stays flat (the old bug).
+NEW=$(comm -13 /tmp/harp-arch0.txt /tmp/harp-arch1.txt)
+[ -n "$NEW" ] || fail "mutation was not archived before push (no new archive ref appeared)"
+echo "RECALL PASS (params restored; mutation archived as $(echo "$NEW" | head -1))"
