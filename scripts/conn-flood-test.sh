@@ -40,6 +40,23 @@ python3 - "$PORT" <<'EOF' || { echo "CONN-FLOOD FAIL: a half-open was NOT droppe
 import socket, sys, time, threading
 port = int(sys.argv[1])
 
+# (§5.4) a PRE-HELLO OBJ frame MUST be dropped — the device must NOT process it (no content-store
+# write, no core.credit grant) before core.hello. Without the gate, handle_obj would grant credit
+# and reply, so ANY response within the window means the gate is missing.
+s0 = socket.create_connection(("127.0.0.1", port), timeout=3); s0.settimeout(1.5)
+# one OBJ frame (stream 2), FIN, 4-byte payload, sent before any core.hello. Frame fields are
+# LITTLE-endian: fver(1) stream(2) flags(01 00 = FIN) length(04 00 00 00 = 4); then 4 payload bytes.
+s0.sendall(bytes([1, 2, 1, 0, 4, 0, 0, 0, 0, 0, 0, 0]))
+try:
+    resp = s0.recv(256)
+    if resp:
+        sys.exit("§5.4 FAIL: device RESPONDED to a pre-hello OBJ frame (handle_obj ran + granted credit before core.hello)")
+    # b'' EOF = device closed without crediting -> dropped (OK)
+except (socket.timeout, ConnectionResetError):
+    pass  # no response (timeout) or closed without responding = the OBJ was dropped (OK)
+s0.close()
+print("   pre-hello OBJ dropped — no store-write / credit before core.hello (§5.4 gate OK)")
+
 # (a) sequential half-opens — each MUST be dropped within ~the 5s pre-hello timeout, proving the
 #     daemon reliably reclaims its single session slot instead of blocking forever. recv() returns
 #     b'' (EOF) when the daemon closes its side; on an UNFIXED daemon it blocks until our 15s cap.

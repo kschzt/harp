@@ -889,37 +889,41 @@ static void handle_state_refset(device *d, const harp_env *e) {
             harp_cbuf se;
             harp_cbuf_init(&se);
             char snap_eng[24] = "";
-            if (harp_store_get(&d->store, &newh, &se) == 0 &&
-                harp_obj_parse_snapshot_engine(se.buf, se.len, snap_eng, sizeof snap_eng)) {
-                const char *dev_eng = d->engine_ver ? d->engine_ver : ENGINE_VERSION;
-                /* §13.4: refuse on a MAJOR *or MINOR* engine difference. Any engine.version bump
-                 * changes rendering of stored state (§6.2), so a minor diff "loads but sounds
-                 * different" unless the user consents (bit 2). PATCH is non-behavioral per SemVer
-                 * and loads exactly. semver is MAJOR.MINOR.PATCH (§6.2). */
-                int sm = 0, sn = 0, dm = 0, dn = 0;
+            bool have_eng = (harp_store_get(&d->store, &newh, &se) == 0 &&
+                             harp_obj_parse_snapshot_engine(se.buf, se.len, snap_eng, sizeof snap_eng));
+            const char *dev_eng = d->engine_ver ? d->engine_ver : ENGINE_VERSION;
+            /* §13.4: refuse on a MAJOR *or MINOR* engine difference, OR if the snapshot carries no
+             * engine field at all — an unverifiable foreign/legacy object. Any engine.version bump
+             * changes rendering of stored state (§6.2), so a minor diff "loads but sounds different"
+             * unless the user consents (bit 2); a missing field can't be verified compatible, which is
+             * the same outcome §13.4 exists to prevent. PATCH is non-behavioral (SemVer) -> loads
+             * exactly. semver MAJOR.MINOR.PATCH (§6.2). */
+            int sm = 0, sn = 0, dm = 0, dn = 0;
+            if (have_eng) {
                 sscanf(snap_eng, "%d.%d", &sm, &sn);
                 sscanf(dev_eng, "%d.%d", &dm, &dn);
-                if (sm != dm || sn != dn) {
-                    harp_cbuf_free(&se);
-                    /* details = {0 snapshot-engine, 1 device-engine}; set flags bit 2 to override. */
-                    harp_cbuf m;
-                    harp_cbuf_init(&m);
-                    harp_env_head(&m, HARP_MSG_ERROR, e->rid, e->method, true);
-                    harp_cbor_map(&m, 3);
-                    harp_cbor_uint(&m, 0);
-                    harp_cbor_text(&m, "incompatible");
-                    harp_cbor_uint(&m, 1);
-                    harp_cbor_text(&m, "snapshot engine version differs; set consent flag 0x4 to override");
-                    harp_cbor_uint(&m, 2);
-                    harp_cbor_map(&m, 2);
-                    harp_cbor_uint(&m, 0);
-                    harp_cbor_text(&m, snap_eng);
-                    harp_cbor_uint(&m, 1);
-                    harp_cbor_text(&m, dev_eng);
-                    send_ctl(d, &m);
-                    harp_cbuf_free(&m);
-                    return;
-                }
+            }
+            if (!have_eng || sm != dm || sn != dn) {
+                harp_cbuf_free(&se);
+                /* details = {0 snapshot-engine, 1 device-engine}; set flags bit 2 to override. */
+                harp_cbuf m;
+                harp_cbuf_init(&m);
+                harp_env_head(&m, HARP_MSG_ERROR, e->rid, e->method, true);
+                harp_cbor_map(&m, 3);
+                harp_cbor_uint(&m, 0);
+                harp_cbor_text(&m, "incompatible");
+                harp_cbor_uint(&m, 1);
+                harp_cbor_text(&m, have_eng ? "snapshot engine version differs; set consent flag 0x4 to override"
+                                            : "snapshot has no engine field; set consent flag 0x4 to override");
+                harp_cbor_uint(&m, 2);
+                harp_cbor_map(&m, 2);
+                harp_cbor_uint(&m, 0);
+                harp_cbor_text(&m, have_eng ? snap_eng : "");
+                harp_cbor_uint(&m, 1);
+                harp_cbor_text(&m, dev_eng);
+                send_ctl(d, &m);
+                harp_cbuf_free(&m);
+                return;
             }
             harp_cbuf_free(&se);
         }
@@ -2181,8 +2185,14 @@ void harp_deviced_run_session(device *d, harp_io *io) {
             harp_now_ns() - t_start > 10000000000ull)
             break;
         if (stream == HARP_STREAM_CTL)
-            handle_ctl(d, msg.buf, msg.len);
-        else if (stream == HARP_STREAM_OBJ)
+            handle_ctl(d, msg.buf, msg.len); /* §5.4 hello gate lives inside handle_ctl (core.hello first) */
+        else if (!atomic_load_explicit(&d->hello_done, memory_order_acquire)) {
+            /* §5.4: OBJ and EVT carry NO pre-hello meaning. Before core.hello, drop them — else a
+             * pre-hello peer could write the content store (handle_obj -> harp_store_put) and elicit a
+             * core.credit grant, or inject events, all UNAUTHENTICATED on the §4.4 Ethernet binding.
+             * The ctl REQUEST gate already requires core.hello first; this extends it to OBJ/EVT. */
+            CTR_INC(d->frame_errors);
+        } else if (stream == HARP_STREAM_OBJ)
             handle_obj(d, msg.buf, msg.len);
         else if (stream == HARP_STREAM_EVT) {
             handle_evt_msg(d, msg.buf, msg.len);
