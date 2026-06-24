@@ -92,20 +92,24 @@ echo "   ✓ staged a project-state fixture ($(wc -c <"$STATE") bytes)"
 
 # ── 1) FORCED mismatch WITH the staged bundle: detection logged, enforcement gates the
 #       auto-push (state held read-only, NOT re-asserted), reason-4 recorded.
-run_host 99 forced --load-state "$STATE" --diag-bundle "$BUNDLE"
-grep -q "engine major 99 ->" "$HOSTLOG" || { cat "$HOSTLOG"; fail "host did not detect the forced engine-major change (helloAndIdentity)"; }
+# --set-at 1.0:3=0.9 is a LIVE mid-render param write (§15.5): while held read-only it MUST be
+# dropped (re-audit HIGH #1 — the write gate), surfaced by the sessionDown "suppressed" summary.
+run_host 99 forced --load-state "$STATE" --diag-bundle "$BUNDLE" --set-at 1.0:3=0.9
+grep -q "engine major 99 " "$HOSTLOG" || { cat "$HOSTLOG"; fail "host did not detect the forced engine-major change (helloAndIdentity)"; }
 grep -q "not auto-applied" "$HOSTLOG"    || { cat "$HOSTLOG"; fail "host did not SKIP the auto-push (sessionUp enforcement line absent — read-only gate not taken)"; }
 grep -q "project state re-asserted" "$HOSTLOG" && { cat "$HOSTLOG"; fail "host RE-ASSERTED the project state despite the engine-major change (auto-push not held)"; }
+grep -q "read-only: suppressed" "$HOSTLOG" || { cat "$HOSTLOG"; fail "host did NOT block the live --set-at param write while read-only (§11.4/§12.2 write gate not taken — HIGH #1)"; }
 if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then assert_reason4 "$BUNDLE" 1 "forced-mismatch history missing reason 4"
 else echo "   (CBOR::XS absent — host-log gate only; CI runs the decode)"; fi
-echo "   ✓ forced engine-major change: detected + auto-push HELD read-only + reason-4 recorded"
+echo "   ✓ forced engine-major change: detected + auto-push HELD read-only + live writes BLOCKED + reason-4 recorded"
 
 # ── 2) CONTROL: same staged bundle, NO seam => matching engine => auto-push FIRES, no gate.
-run_host "" control --load-state "$STATE" --diag-bundle "$BUNDLE.ctl"
+run_host "" control --load-state "$STATE" --diag-bundle "$BUNDLE.ctl" --set-at 1.0:3=0.9
 grep -q "project state re-asserted" "$HOSTLOG" || { cat "$HOSTLOG"; fail "control run did NOT re-assert the staged project state (auto-push should fire on a matching engine)"; }
 grep -q "not auto-applied" "$HOSTLOG" && { cat "$HOSTLOG"; fail "control run wrongly held state read-only (false positive on a matching engine)"; }
+grep -q "read-only: suppressed" "$HOSTLOG" && { cat "$HOSTLOG"; fail "control run wrongly SUPPRESSED a live param write on a matching engine (false read-only — write gate over-fired)"; }
 if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then assert_reason4 "$BUNDLE.ctl" 0 "control run wrongly recorded reason 4"; fi
-echo "   ✓ control (matching engine): auto-push fired (re-asserted) — no read-only, no reason-4"
+echo "   ✓ control (matching engine): auto-push fired (re-asserted) + live writes ALLOWED — no read-only, no reason-4"
 
 # ── 3) FRESH-OPEN bundle-baseline (§12.2, NO seam): a project saved against a major-1 engine,
 #       opened on this major-2 device, must default read-only WITHOUT HARP_FORCE_ENGINE_MAJOR.

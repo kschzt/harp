@@ -689,13 +689,15 @@ private:
                                    * audio.trim). Captured in helloAndIdentity. */
     bool needsFirmwareUpdate_ = false; /* §5.4: device rejected hello as 'incompatible' — set in
                                         * helloAndIdentity so the UI can prompt for a firmware/host update. */
-    int engineMajorSeen_ = 0;      /* §12.2: engine major from the last (re)connect. */
-    bool engineMajorSeeded_ = false; /* §12.2: has engineMajorSeen_ been seeded yet? (an explicit
-                                      * flag, not a sentinel value, so a pathological negative major
-                                      * can't re-arm the HARP_FORCE_ENGINE_MAJOR seam on reconnect). */
-    bool readOnlyDefault_ = false; /* §12.2: the engine major changed across (re)connect — the staged
-                                    * project state may not fit the new engine, so HOLD it read-only
-                                    * (don't auto-apply on connect); the user re-applies explicitly. */
+    int engineMajorSeen_ = 0;      /* §12.2: the project's expected engine major (diagnostics). */
+    /* §12.2 read-only hold: the loaded project expects a different engine major than the device
+     * reports, so the staged state may not fit — HOLD it read-only: don't auto-apply on connect
+     * AND drop live param/automation writes (queueParamSet/queueRamp) so they can't reach the
+     * mismatched engine (§11.4 "no writes either way"). Computed from the PROJECT's expected major
+     * each hello, so it PERSISTS across reconnect and self-clears only when the device matches.
+     * Atomic: read on the audio/plugin thread (the queue writers), written on the session thread. */
+    std::atomic<bool> readOnlyDefault_{false};
+    std::atomic<uint64_t> roWrDrops_{0}; /* live writes dropped by the read-only hold (diagnostics). */
     /* §8.4 admission: the bandwidth reservation this runtime currently holds in the
      * process-global ledger. admittedBps_==0 means "no live reservation"; the cached
      * path/key let release run against a half-torn-down transport_. Touched only under
