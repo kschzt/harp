@@ -126,12 +126,18 @@ int harp_rtp_rx_poll(harp_rtp_rx *rx, int timeout_ms) {
             atomic_fetch_add_explicit(&rx->c_bad, 1, memory_order_relaxed); continue;
         }
 
-        if (rx->have_seq) {                        /* seq-gap loss accounting      */
-            uint16_t gap = (uint16_t)(h.seq - rx->last_seq - 1);
-            if (gap && gap < 0x8000)
-                atomic_fetch_add_explicit(&rx->c_lost, gap, memory_order_relaxed);
+        if (rx->have_seq) {                        /* §8.7 seq-gap loss accounting */
+            bool advance;
+            uint16_t lost = harp_rtp_loss_gap(rx->last_seq, h.seq, &advance);
+            if (lost)
+                atomic_fetch_add_explicit(&rx->c_lost, lost, memory_order_relaxed);
+            if (advance) rx->last_seq = h.seq;     /* advance ONLY on a forward packet — a reordered or
+                                                      duplicate one must NOT rewind the high-water seq,
+                                                      else the next in-order packet over-counts loss */
+        } else {
+            rx->last_seq = h.seq;                  /* first packet: seed the sequence */
         }
-        rx->last_seq = h.seq; rx->have_seq = 1;
+        rx->have_seq = 1;
 
         rx->ts64 = rx->have_ts ? harp_rtp_unwrap_ts(h.timestamp, rx->ts64) : h.timestamp;
         rx->have_ts = 1;

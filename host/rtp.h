@@ -11,6 +11,7 @@
 #ifndef HARP_RTP_H
 #define HARP_RTP_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -40,5 +41,20 @@ int harp_rtp_unpack(const uint8_t *pkt, size_t len, harp_rtp_hdr *h,
  * 32-bit field wraps every ~25 h at 48 kHz but recovery must stay continuous).
  * Pass prev64 = 0 and prev32 unused on the first call. */
 uint64_t harp_rtp_unwrap_ts(uint32_t ts32, uint64_t prev64);
+
+/* §8.7 RTP sequence/loss accounting (PURE, host-unit-tested in harp_engine_logic_tests.c).
+ * gap = seq - last_seq - 1 (uint16, wraparound-safe). A FORWARD packet — gap < 0x8000, i.e.
+ * in-order (gap 0) or a genuine skip (0 < gap < 0x8000) — reports `gap` lost packets and sets
+ * *advance = true (the caller advances its high-water last_seq). A reordered or duplicate packet —
+ * gap >= 0x8000, the seq went BACKWARD — reports 0 loss and sets *advance = false, so the caller
+ * must NOT rewind last_seq; rewinding would make the NEXT in-order packet compute a huge spurious
+ * loss. (§8.7 forbids CONCEALING loss, not over-reporting, so the prior unconditional-rewind bug
+ * was bounded — it over-counted rather than hid loss.) */
+static inline uint16_t harp_rtp_loss_gap(uint16_t last_seq, uint16_t seq, bool *advance) {
+    uint16_t gap = (uint16_t)(seq - last_seq - 1);
+    if (gap < 0x8000) { *advance = true; return gap; } /* forward: in-order or a real skip */
+    *advance = false;                                  /* reorder/duplicate: keep last_seq */
+    return 0;
+}
 
 #endif /* HARP_RTP_H */
