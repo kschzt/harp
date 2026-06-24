@@ -90,6 +90,49 @@ int main(int argc, char **argv) {
         rt.stop();
         return 0;
     }
+    /* engines mode: cycle the Engine picker (param id 1) through all five, playing a
+     * C-major chord on each → WAV. Demonstrates the picker + each engine's voice via the
+     * SAME queueParamSet/queueNote path the VST uses. Usage: harp-runtime-probe engines [sr] */
+    if (argc > 1 && strcmp(argv[1], "engines") == 0) {
+        uint32_t esr = argc > 2 ? (uint32_t)atoi(argv[2]) : 44100;
+        HarpRuntime rt;
+        rt.configure(esr, 256);
+        rt.start(esr);
+        for (int i = 0; i < 100 && !rt.connected(); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        fprintf(stderr, "runtime-probe(engines): connected=%d\n", rt.connected());
+        if (!rt.connected()) { rt.stop(); return 1; }
+        const float ev[5] = {0.1f, 0.3f, 0.5f, 0.7f, 0.9f};                 /* -> engines 0..4 */
+        const char *en[5] = {"Additive","FM","Strings","Vox","Bell"};
+        const int chord[3] = {60, 64, 67}; const double per = 1.7;
+        auto on  = [&](int nn){ rt.queueNote(rt.ownerSource(), 0x20900000u | ((uint32_t)(nn&0x7f)<<8) | 96u, rt.streamPos()+rt.latencySamples()); };
+        auto off = [&](int nn){ rt.queueNote(rt.ownerSource(), 0x20800000u | ((uint32_t)(nn&0x7f)<<8) | 0u,  rt.streamPos()+rt.latencySamples()); };
+        std::vector<float> capL; float buf[256 * 2]; int cur = -1;
+        int blocks = (int)((double)esr / 256.0 * (per * 5 + 0.8));
+        auto e0 = std::chrono::steady_clock::now();
+        for (int b = 0; b < blocks; b++) {
+            double elapsed = b * 256.0 / esr; int e = (int)(elapsed / per);
+            if (e != cur && e < 5) {
+                if (cur >= 0) for (int k = 0; k < 3; k++) off(chord[k]);
+                rt.queueParamSet(rt.ownerSource(), 1, ev[e], rt.streamPos()+rt.latencySamples()); /* Engine */
+                for (int k = 0; k < 3; k++) on(chord[k]);
+                fprintf(stderr, "  -> engine %d: %s\n", e, en[e]);
+                cur = e;
+            } else if (elapsed >= per * 5 && cur >= 0) {
+                for (int k = 0; k < 3; k++) off(chord[k]); cur = -1;
+            }
+            rt.pullAudio(buf, 256);
+            for (int i = 0; i < 256; i++) capL.push_back(buf[i * 2]);
+            std::this_thread::sleep_until(e0 + std::chrono::microseconds((long long)(b + 1) * 256 * 1000000LL / esr));
+        }
+        writeWav("/tmp/runtime-probe-engines.wav", capL, esr);
+        double sq = 0; for (float s : capL) sq += (double)s * s;
+        double rms = capL.size() ? std::sqrt(sq / capL.size()) : 0.0;
+        fprintf(stderr, "runtime-probe(engines): wrote /tmp/runtime-probe-engines.wav, RMS=%.4f%s\n",
+                rms, rms > 0.001 ? "  <-- AUDIBLE" : "  <-- SILENT");
+        rt.stop();
+        return 0;
+    }
     int pitch = argc > 1 ? atoi(argv[1]) : 60; /* C4 */
     uint32_t sr = argc > 2 ? (uint32_t)atoi(argv[2]) : 48000; /* Live is usually 44100 */
     int nonblock = argc > 3 ? atoi(argv[3]) : 0; /* 1 = pullAudio (non-blocking) like Live */
