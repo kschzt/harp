@@ -100,6 +100,13 @@ else skip latefr "harp-eth-latefr-test not built (POSIX-only host-paced tool)"; 
 if [ "$OSID" = windows ]; then skip part-filter "MinGW device panel is a stub (§9.4 multi-instance demux pending Windows panel transport)"
 else run part-filter    scripts/part-filter-eth-test.sh; fi
 
+# §11.4 action 3 "Open read-only": dirty the live (harp-probe) + pick choice 2 via the device
+# --panel-sock, then assert the explicit read-only pick SUPPRESSES live writes (med-open-ro-noop).
+# POSIX-only (MinGW device panel is a stub) + probe-gated; auto-enables when both land on a platform.
+if [ "$OSID" = windows ]; then skip reconcile-readonly "MinGW device panel is a stub (§11.4 reconcile pick needs the panel transport)"
+elif have "$PROBE"; then run reconcile-readonly scripts/reconcile-readonly-eth-test.sh
+else skip reconcile-readonly "harp-probe not built on $OSID"; fi
+
 # §4.4.3 mDNS _harp._tcp discovery round-trip: needs a LIVE mDNS responder + a dns_sd-built
 # harp-probe. macOS CI has mDNSResponder always up; Linux/Windows runners don't reliably, so
 # they SKIP — the path is bench-proven on the KR260 (avahi over the direct cable). The script

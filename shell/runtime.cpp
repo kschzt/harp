@@ -1363,13 +1363,16 @@ bool HarpRuntime::sessionUp() {
             bundlePmhSet = bundleParamMapHashSet_;
             bundlePmh = bundleParamMapHash_;
         }
-        if (haveBundle && readOnlyDefault_.load(std::memory_order_relaxed)) {
-            /* §12.2: the engine major changed across this (re)connect — do NOT auto-apply
-             * the staged project state (it may not fit the new engine). Hold it read-only;
-             * the user re-applies explicitly once they've confirmed it still fits. */
-            log_msg("project state held read-only (engine major changed) — not auto-applied");
+        if (haveBundle && (readOnlyDefault_.load(std::memory_order_relaxed) ||
+                           roExplicit_.load(std::memory_order_relaxed))) {
+            /* §12.2/§13.4/§11.4: a read-only hold is in effect — the §12.2 engine/serial auto-hold,
+             * a §13.4 device refusal, OR the user's explicit §11.4 Open-read-only pick. Do NOT
+             * auto-apply the staged project; the user re-applies explicitly (or exits read-only).
+             * Skipping the push here is also WHY roExplicit_ persists across reconnect — a held
+             * session never reaches pushStateLocked's choice logic via a headless reconnect. */
+            log_msg("project state held read-only — not auto-applied");
             recordLog(HARP_LOG_WARN, "recall",
-                      "project state read-only: engine major changed, not auto-applied");
+                      "project state read-only — not auto-applied (§12.2/§13.4 mismatch or §11.4 explicit)");
         } else if (haveBundle) {
             /* §9.3/§13.4: a bundle that staged while offline applies now — warn if the
              * device's automatable param map drifted from what the project expects
@@ -1377,8 +1380,18 @@ bool HarpRuntime::sessionUp() {
             if (bundlePmhSet && memcmp(bundlePmh.b, paramMapHash_.b, HARP_HASH_LEN) != 0)
                 log_param_map_drift();
             if (pushStateLocked(target)) {
-                log_msg("project state re-asserted");
-                recordLog(HARP_LOG_INFO, "recall", "project state re-asserted");
+                if (readOnlyDefault_.load(std::memory_order_relaxed) ||
+                    roExplicit_.load(std::memory_order_relaxed)) {
+                    /* §11.4/§13.4: the reconcile resolved to a READ-ONLY outcome — the user picked
+                     * Open-read-only (choice 2) or the device refused the push (incompatible) — so
+                     * pushStateLocked held WITHOUT writing. Don't claim a re-assert (it would mislead
+                     * the user + the recall tests into thinking the project was pushed). */
+                    log_msg("project state held read-only (reconcile: no write)");
+                    recordLog(HARP_LOG_INFO, "recall", "project state held read-only (reconcile)");
+                } else {
+                    log_msg("project state re-asserted");
+                    recordLog(HARP_LOG_INFO, "recall", "project state re-asserted");
+                }
             } else {
                 log_msg("project state apply failed (will retry on reconnect)");
                 recordLog(HARP_LOG_WARN, "recall",
@@ -1705,7 +1718,7 @@ void HarpRuntime::stop() {
  * so the event is simply dropped (logged once via dormantSrcLogged_). */
 void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t ts) {
     if (!src) return noteDormant();
-    if (readOnlyDefault_.load(std::memory_order_relaxed)) {
+    if (readOnlyDefault_.load(std::memory_order_relaxed) || roExplicit_.load(std::memory_order_relaxed)) {
         /* §12.2/§11.4: read-only hold — a live param edit MUST NOT reach a mismatched-engine
          * device; drop + count (the user exits read-only to make changes). The fresh-open default
          * held the STORED state read-only; this closes the live-edit leak (re-audit HIGH #1). */
@@ -1720,7 +1733,7 @@ void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t
 void HarpRuntime::queueRamp(EventSource *src, uint32_t id, float target, uint64_t start,
                             uint64_t end) {
     if (!src) return noteDormant();
-    if (readOnlyDefault_.load(std::memory_order_relaxed)) {
+    if (readOnlyDefault_.load(std::memory_order_relaxed) || roExplicit_.load(std::memory_order_relaxed)) {
         /* §12.2/§11.4: read-only hold — drop the automation write so it can't reach the
          * mismatched engine (re-audit HIGH #1). */
         roWrDrops_.fetch_add(1, std::memory_order_relaxed);
@@ -2889,6 +2902,12 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
         }
     }
 
+    /* §11.4: set the explicit Open-read-only hold on the Read-only pick (choice 2), clear it on any
+     * WRITE pick (Push/Pull/Duplicate/Force-consent). Safe to set unconditionally here: gate 1366
+     * skips the auto-push for an roExplicit_ session, so this line is reached only via a real user
+     * reconcile pick — a headless reconnect never gets here for such a session. */
+    roExplicit_.store(choice == 2, std::memory_order_relaxed);
+
     if (choice == 1) { /* Pull to DAW: the host adopts the device state; device untouched */
         log_msg("recall: reconcile -> Pull (host adopts the device state)");
         /* §11.4 safe action — SYNCED -> SYNCED (state class unchanged; the
@@ -2988,6 +3007,7 @@ void HarpRuntime::consentEngineMajorOverride() {
     consentEngineMajor_.store(true, std::memory_order_relaxed);
     engineRefused_.store(false, std::memory_order_relaxed);
     readOnlyDefault_.store(false, std::memory_order_relaxed);
+    roExplicit_.store(false, std::memory_order_relaxed); /* §11.4: consent is a write action — exit read-only */
     bool haveBundle = false;
     harp_hash target{};
     { std::lock_guard<std::mutex> blk(bundleMutex_); haveBundle = hasBundle_; target = bundleTarget_; }
