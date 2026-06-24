@@ -340,7 +340,7 @@ typedef struct {
                                bundle at one engine major and open it on a device reporting another. */
     const char *product;     /* --product STRING: override the §12 identity product/model name +
                                 the front-panel product + the mDNS instance name. NULL => "harp-refdev"
-                                ("HARP refdev" for mDNS). Lets a downstream daemon (e.g. the GPU synth)
+                                ("HARP refdev" for mDNS). Lets a downstream daemon
                                 identify as itself without touching the protocol media-types. */
     const char *engine_name; /* --engine-name STRING: override the reported engine NAME in the §12
                                 identity; NULL => ENGINE_ID. The recall media-type (PARAMS_MEDIA) is
@@ -421,7 +421,7 @@ void audio_stop(device *d);
 /* The render seam: audio_thread/host_paced_loop (audio_loop.c, in harpdevice)
  * reach the synth ONLY through these two — render n samples at stream position
  * pos, and reset every part's voices. engine.c implements the refdev's pair; a
- * downstream daemon (the GPU synth) supplies its own. */
+ * downstream daemon supplies its own. */
 uint16_t render_output(audio_state *a, float *out, uint32_t n, float rate, uint64_t pos);
 void engine_voices_cold(void);   /* audio.start: cold-reset voices */
 void engine_voices_quiet(void);  /* audio_stop: free voices + clear panic */

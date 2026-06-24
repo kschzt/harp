@@ -1218,8 +1218,7 @@ static void render_part_slots(audio_state *a, float *out, uint32_t n, float rate
 
 /* The render seam (device.h): the audio render+emit loop lives in audio_loop.c
  * (harpdevice) and reaches the synth ONLY through these two — reset every part's
- * voices, and render n samples at stream position pos. A downstream daemon (the
- * GPU synth) supplies its own pair; the refdev's are below, unchanged. */
+ * voices, and render n samples at stream position pos. A downstream daemon supplies its own pair; the refdev's are below, unchanged. */
 void engine_voices_cold(void) { for (size_t i = 0; i < NPARTS; i++) part_voices_cold(&g_parts[i]); }
 
 /* stream-stop quieting (called by audio_stop after the render thread is joined):

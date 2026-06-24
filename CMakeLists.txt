@@ -63,7 +63,7 @@ target_include_directories(harpcore PUBLIC core/include)
 # harpdevice: the reusable device-protocol library — the §5/§9/§11 session loop +
 # content-addressed state, with NO CPU-synth coupling. session.c/state.c reach the
 # engine only through the seam (g_params[] + engine_*, device.h) and the front panel
-# only through front_panel_set — so a downstream daemon (e.g. a GPU synth) links this
+# only through front_panel_set — so a downstream daemon links this
 # lib and supplies its own engine + panel. harp-deviced is just one such daemon.
 add_library(harpdevice STATIC
   device/state.c        # engine <-> content-addressed objects
