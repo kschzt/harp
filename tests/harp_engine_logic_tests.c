@@ -191,10 +191,21 @@ static void test_usb_select(void) {
     CHECK(!harp_usb_dev_matches("S1", V, (uint16_t)(P + 1), "S1", true, V, P));  /* wrong model  */
 }
 
+static void test_evt_epoch_stale(void) {
+    /* §7.1: epoch 0 = "now" (never stale); an older epoch is stale; current/future is live. The
+     * outer envelope guard and both inner instants (ramp-end §9.4, txn-commit §9.6) share this. */
+    CHECK(!harp_evt_epoch_stale(0, 5)); /* "now" sentinel — never stale */
+    CHECK(harp_evt_epoch_stale(3, 5));  /* older epoch -> stale */
+    CHECK(!harp_evt_epoch_stale(5, 5)); /* current -> live */
+    CHECK(!harp_evt_epoch_stale(7, 5)); /* future (shouldn't arrive) -> not stale */
+    CHECK(!harp_evt_epoch_stale(1, 0)); /* device epoch 0 -> nothing stale yet */
+}
+
 int main(void) {
     test_voice_pick();
     test_arp_select();
     test_evq_mod();
+    test_evt_epoch_stale();
     test_fence();
     test_usb_select();
     printf("harp-engine-logic-tests: %d passed, %d failed\n", g_pass, g_fail);
