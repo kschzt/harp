@@ -1506,7 +1506,8 @@ void HarpRuntime::sessionDown() {
     /* §12.2/§11.4: report how many live param/automation writes the read-only hold suppressed
      * this session (logged here, on the supervisor thread — NOT from the RT queue writers). */
     if (uint64_t rod = roWrDrops_.exchange(0, std::memory_order_relaxed))
-        log_msg("read-only: suppressed %llu live param/automation write(s) (engine major mismatch)",
+        log_msg("read-only: suppressed %llu live param/automation write(s) "
+                "(§12.2 engine/serial mismatch or §11.4 explicit read-only)",
                 (unsigned long long)rod);
     bool wasConnected = connected_.exchange(false, std::memory_order_acq_rel);
     /* §12.1: orderly detach. Record the transition off the audio path (this runs
@@ -2666,7 +2667,7 @@ void HarpRuntime::reader() {
                 wgMaintain(wgf);
 #endif
                 unsigned floats = transport_->recvAudio(buf, kRtpBufFloats, 100, nullptr);
-                rtpLostSnap_.store(transport_->rtpPacketsLost(), std::memory_order_relaxed); /* §8.7 key 7 */
+                rtpLostSnap_.store(transport_->rtpPacketsLost(), std::memory_order_relaxed); /* §8.7 clock-stats key 8 (rtp_loss) */
                 unsigned width = unionWidth_.load(std::memory_order_relaxed);
                 if (!width) width = 2;
                 if (floats >= width)
@@ -2757,7 +2758,7 @@ void HarpRuntime::reader() {
                     asrcUnderflow_.store(st.underflow_frames, std::memory_order_relaxed);
                     asrcOverflow_.store(st.overflow_frames, std::memory_order_relaxed);
                     asrcReanchors_.store(st.reanchors, std::memory_order_relaxed);
-                    rtpLostSnap_.store(transport_->rtpPacketsLost(), std::memory_order_relaxed); /* §8.7 key 7 */
+                    rtpLostSnap_.store(transport_->rtpPacketsLost(), std::memory_order_relaxed); /* §8.7 clock-stats key 8 (rtp_loss) */
                 } else if (floats == 0 && transport_->silentMs() > 1000) {
                     log_msg("RTP stream silent >1s; device gone?");
                     /* §12.1: implicit STREAMING -> DETACHED (transport-error), ASRC path. */
