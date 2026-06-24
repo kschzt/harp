@@ -80,6 +80,7 @@ run offline-golden     scripts/offline-golden-eth.sh         # deterministic hos
 run corrupt-cbor       scripts/corrupt-cbor-eth-test.sh      # §8.7 hostile-frame fault injection
 run reconnect          scripts/reconnect-eth-test.sh         # §8.7 mid-session disconnect survival
 run rtp-loss           scripts/rtp-loss-eth-test.sh          # §8.7 RTP/UDP packet-loss tolerance
+run rtp-reorder        scripts/rtp-reorder-eth-test.sh       # §8.7 RTP reorder: no loss over-count (shipped path)
 run diag-bundle-host   scripts/diag-bundle-host-eth-test.sh  # §14.4 runtime getDiagBundle (probe-free)
 run engine-mismatch    scripts/engine-mismatch-eth-test.sh   # §12.2 engine-major change -> read-only default
 run admission          scripts/admission-eth-test.sh         # §8.4 audio-bandwidth admission + refuse-with-budget

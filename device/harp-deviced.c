@@ -142,6 +142,10 @@ static uint64_t bump_boot_count(const char *dir) {
 /* §8.7 fault injection: --drop-rtp-pct N deterministically drops ~N% of outgoing RTP
  * datagrams (0 = off), to exercise the host's free-running RTP loss tolerance. */
 static int g_rtp_drop_pct = 0;
+/* §8.7 fault injection: --reorder-rtp-pct N holds ~N% of outgoing RTP datagrams one deep and sends
+ * each AFTER the next, so the host sees seq N+1 before seq N (a genuine out-of-order arrival, not
+ * loss) — exercising the host's reorder handling (it must not rewind its high-water seq). */
+static int g_rtp_reorder_pct = 0;
 /* §8.7 fault injection: --corrupt-ctl-pct N flips one byte in ~N% of outgoing FRAMED CBOR
  * (ctl + echo + evt, via harp_link_send), set per-io on the device's host link only. */
 static int g_corrupt_ctl_pct = 0;
@@ -181,16 +185,10 @@ static bool device_prehello_read_exact(harp_io *io, void *buf, size_t n) {
     return true;
 }
 
-void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, uint64_t msc) {
-    if (a->rtp_fd < 0) return;
-    uint16_t seq = a->rtp_seq++;
-    /* drop ~N% of datagrams, but ADVANCE the seq first so the host sees a genuine gap
-     * (real loss), not a stall. Knuth multiplicative hash = reproducible (no rand) yet
-     * well-spread across the sequence. */
-    if (g_rtp_drop_pct > 0 && (seq * 2654435761u) % 100u < (uint32_t)g_rtp_drop_pct) return;
+/* Send one RTP packet (header + samples) as a single datagram (the 2-buffer gather is platform-specific). */
+static void rtp_send_one(audio_state *a, const harp_rtp_hdr *h, const float *samples, size_t payload_bytes) {
     uint8_t hdr[HARP_RTP_HDR_BYTES];
-    harp_rtp_hdr h = {96, 0, seq, (uint32_t)msc, a->rtp_ssrc};
-    harp_rtp_pack(hdr, sizeof hdr, &h, NULL, 0);
+    harp_rtp_pack(hdr, sizeof hdr, h, NULL, 0);
 #ifdef _WIN32
     /* WSASend with a 2-element WSABUF gathers header+samples into ONE datagram on a
      * connected UDP socket — the Winsock equivalent of sendmsg's 2-iovec gather. */
@@ -205,6 +203,38 @@ void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, 
     m.msg_iovlen = 2;
     (void)sendmsg(a->rtp_fd, &m, 0);
 #endif
+}
+
+void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, uint64_t msc) {
+    if (a->rtp_fd < 0) return;
+    uint16_t seq = a->rtp_seq++;
+    /* drop ~N% of datagrams, but ADVANCE the seq first so the host sees a genuine gap
+     * (real loss), not a stall. Knuth multiplicative hash = reproducible (no rand) yet
+     * well-spread across the sequence. */
+    if (g_rtp_drop_pct > 0 && (seq * 2654435761u) % 100u < (uint32_t)g_rtp_drop_pct) return;
+    harp_rtp_hdr h = {96, 0, seq, (uint32_t)msc, a->rtp_ssrc};
+    /* §8.7 reorder injection (test only): hold this packet ONE deep and send it AFTER the next, so
+     * the host sees seq N+1 before seq N (out-of-order arrival, not loss). The render thread is the
+     * sole caller, so a static one-deep hold (float-aligned for the sample copy) is safe. */
+    static harp_rtp_hdr held_h;
+    static float held_pl[2048];
+    static size_t held_n = 0;
+    static int held_countdown = 0; /* >0: a packet is held, released after this many later packets */
+    if (held_countdown > 0) {
+        rtp_send_one(a, &h, samples, payload_bytes);   /* the in-order stream keeps flowing */
+        if (--held_countdown == 0)                      /* release the held packet — now well out of order */
+            rtp_send_one(a, &held_h, held_pl, held_n);
+        return;
+    }
+    if (g_rtp_reorder_pct > 0 && payload_bytes <= sizeof held_pl &&
+        (seq * 2654435761u) % 100u < (uint32_t)g_rtp_reorder_pct) {
+        held_h = h;
+        memcpy(held_pl, samples, payload_bytes);
+        held_n = payload_bytes;
+        held_countdown = 3; /* release after 3 later packets — a deep enough rewind to expose the bug */
+        return;
+    }
+    rtp_send_one(a, &h, samples, payload_bytes);
 }
 
 /* §8.7: open the negotiated RTP audio destination — a UDP socket connect()'d to
@@ -333,6 +363,8 @@ int main(int argc, char **argv) {
             rtp_out = argv[++i];
         else if (strcmp(argv[i], "--drop-rtp-pct") == 0 && i + 1 < argc)
             g_rtp_drop_pct = atoi(argv[++i]); /* §8.7 fault injection: drop ~N% of RTP */
+        else if (strcmp(argv[i], "--reorder-rtp-pct") == 0 && i + 1 < argc)
+            g_rtp_reorder_pct = atoi(argv[++i]); /* §8.7 fault injection: reorder ~N% of RTP */
         else if (strcmp(argv[i], "--corrupt-ctl-pct") == 0 && i + 1 < argc)
             g_corrupt_ctl_pct = atoi(argv[++i]); /* §8.7 fault injection: flip ~N% of framed CBOR */
         else if (strcmp(argv[i], "--tone") == 0 && i + 1 < argc)
