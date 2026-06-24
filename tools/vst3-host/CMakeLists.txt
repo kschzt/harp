@@ -202,6 +202,34 @@ if(LIBUSB_FOUND)
   endif()
   message(STATUS "harp-shell: building VST3 shell with libusb")
 
+  # ---- harp-runtime-probe: headless HarpRuntime driver (test tool, no VST3 host) ----
+  # Drives the SAME runtime core Live uses (connect, audio.start, note, pullAudio) so the
+  # shell's eth audio path can be tested end-to-end without a DAW.
+  find_package(Threads REQUIRED)
+  add_executable(harp-runtime-probe
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime-probe.cpp
+    ${HARP_ROOT}/shell/runtime.cpp
+    ${HARP_ROOT}/shell/runtime_registry.cpp
+    ${HARP_ROOT}/host/usb_io.c
+    ${HARP_ROOT}/host/sock_io.c
+    ${HARP_ROOT}/host/rtp.c
+    ${HARP_ROOT}/host/freerun.c
+    ${HARP_ROOT}/host/client.c
+    ${HARP_ROOT}/core/src/cbor.c
+    ${HARP_ROOT}/core/src/sha256.c
+    ${HARP_ROOT}/core/src/frame.c
+    ${HARP_ROOT}/core/src/object.c
+    ${HARP_ROOT}/core/src/store.c
+    ${HARP_ROOT}/core/src/envelope.c
+    ${HARP_ROOT}/core/src/link.c
+    ${HARP_ROOT}/core/src/audio.c
+    ${HARP_PLAT_SRC})
+  target_include_directories(harp-runtime-probe PRIVATE
+    ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell ${LIBUSB_INCLUDE_DIRS})
+  target_compile_definitions(harp-runtime-probe PRIVATE HAVE_LIBUSB)
+  target_link_directories(harp-runtime-probe PRIVATE ${LIBUSB_LIBRARY_DIRS})
+  target_link_libraries(harp-runtime-probe PRIVATE ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc harp_mdns Threads::Threads)
+
   # ---- the HARP CLAP shell (shell/clap) — the SAME runtime core, CLAP-only ----
   # A third shell over HarpRuntime (no VST3 SDK; CLAP is a header-only ABI). Built
   # as a MODULE named harp-clap.clap that the host dlopen()s. CLAP's per-note

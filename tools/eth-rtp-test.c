@@ -104,6 +104,7 @@ int main(int argc, char **argv) {
     const char *hostport = argv[1];
     double secs = argc > 2 ? atof(argv[2]) : 8.0;
     int rtp_port = argc > 3 ? atoi(argv[3]) : 47811;
+    int note_pitch = argc > 4 ? atoi(argv[4]) : 0; /* >0: send a held note-on (single-session audibility test) */
     uint32_t rate = 48000, nsamples = 256;
 
     /* 1. dial the device's TCP framed link */
@@ -152,6 +153,24 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "eth-rtp: audio.start ok -> device RTP -> us:%d (48k stereo, free-running)\n",
             rtp_port);
+
+    /* 3b. SINGLE-SESSION audibility: send a held note-on on THIS session's evt stream
+     * (§9.10 MIDI-1.0-in-UMP at ts 0 = asap), same encoding as harp-probe's send_ump_note. */
+    if (note_pitch > 0) {
+        uint32_t word = 0x20900000u | ((uint32_t)(note_pitch & 0x7f) << 8) | 100u; /* ch0 note-on vel100 */
+        uint8_t nb[4] = {(uint8_t)(word >> 24), (uint8_t)(word >> 16), (uint8_t)(word >> 8), (uint8_t)word};
+        harp_cbuf ev;
+        harp_cbuf_init(&ev);
+        harp_cbor_array(&ev, 3);
+        harp_cbor_array(&ev, 2);
+        harp_cbor_uint(&ev, 0); /* epoch 0 = now */
+        harp_cbor_uint(&ev, 0); /* msc 0 = asap */
+        harp_cbor_uint(&ev, 0); /* etype 0 = UMP carriage */
+        harp_cbor_bytes(&ev, nb, 4);
+        harp_link_send(&tio.io, HARP_STREAM_EVT, ev.buf, ev.len);
+        harp_cbuf_free(&ev);
+        fprintf(stderr, "eth-rtp: sent note-on pitch=%d vel=100 (single session)\n", note_pitch);
+    }
 
     /* 4. prebuffer the elastic buffer to ~target before output starts */
     harp_freerun_stats pre;
