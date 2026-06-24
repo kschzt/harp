@@ -2132,6 +2132,18 @@ void harp_deviced_run_session(device *d, harp_io *io) {
         if (engine_param_map_dirty_take()) {
             refresh_param_map_hash(d);
             ntf_core_changed(d, "identity");
+            /* A multi-engine synth that swaps engines also LOADS the new engine's
+             * default param values (per-engine value memory). core.changed only
+             * tells the host to re-read the descriptor SET (labels/hash); it does
+             * NOT carry values, and the new defaults are device-side state the
+             * host's automation lane doesn't know about. So echo every automatable
+             * param's CURRENT value (the new engine's defaults/remembered tweaks)
+             * via the same evt.param.echo path a front-panel edit uses — a connected
+             * VST then updates its knobs to the new engine's bank. Generic: the
+             * refdev's seam returns 0, so this never fires there (map stays static).
+             * g_params holds ONLY automatable params (meters are separate ids). */
+            for (size_t i = 0; i < NPARAMS; i++)
+                evt_echo_param(d, g_params[i].id, engine_part_param_get(0, g_params[i].id), 0);
         }
         if (d->closing) break;
     }

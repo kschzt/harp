@@ -10,6 +10,8 @@
 #include <thread>
 #include <chrono>
 #include <vector>
+#include <atomic>
+#include <cstring>
 
 static void writeWav(const char *path, const std::vector<float> &mono, uint32_t sr) {
     FILE *f = fopen(path, "wb");
@@ -48,6 +50,48 @@ int main(int argc, char **argv) {
         fprintf(stderr, "runtime-probe(echo): %d param echoes received\n", count);
         ert.stop();
         return count > 0 ? 0 : 2;
+    }
+    /* echoswitch mode: connect, then SWITCH the Engine param across several engines on this
+     * session and log the inbound param echoes. A multi-engine device (the Jetson GPU synth)
+     * LOADS the newly-selected engine's default param bank and echoes every automatable param
+     * (via core.changed's companion evt.param.echo loop in device/session.c) so the VST's knobs
+     * follow the engine's defaults. This proves that path end to end. Usage:
+     *   harp-runtime-probe echoswitch [nengines]  (default 18) */
+    if (argc > 1 && strcmp(argv[1], "echoswitch") == 0) {
+        int neng = argc > 2 ? atoi(argv[2]) : 18;
+        HarpRuntime rt;
+        rt.configure(44100, 256);
+        rt.start(44100);
+        for (int i = 0; i < 100 && !rt.connected(); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        fprintf(stderr, "runtime-probe(echoswitch): connected=%d (switching across %d engines)\n",
+                rt.connected(), neng);
+        if (!rt.connected()) { rt.stop(); return 1; }
+        /* keep the audio stream alive in a background thread (the device's session loop only
+         * polls the param-map dirty flag + fires echoes while a stream is running) */
+        std::atomic<bool> run{true};
+        std::thread audio([&]{ float buf[256 * 2];
+            while (run.load()) { rt.pullAudio(buf, 256);
+                std::this_thread::sleep_for(std::chrono::microseconds(256 * 1000000LL / 44100)); } });
+        int total = 0;
+        for (int e = 0; e < neng; e++) {
+            float v = (e + 0.5f) / (float)neng;          /* land squarely on engine e */
+            rt.queueParamSet(rt.ownerSource(), 1, v, rt.streamPos() + rt.latencySamples());
+            fprintf(stderr, "  -> Engine param=%.4f (engine %d)\n", v, e);
+            int got = 0;
+            for (int t = 0; t < 16; t++) {               /* drain echoes for ~0.8 s */
+                uint32_t id; float ev;
+                while (rt.popEcho(0, id, ev)) {
+                    printf("ECHO engine=%d id=%u v=%.4f\n", e, id, ev); fflush(stdout); got++; total++;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            fprintf(stderr, "     echoes after switch to engine %d: %d\n", e, got);
+        }
+        run.store(false); audio.join();
+        fprintf(stderr, "runtime-probe(echoswitch): %d total param echoes across %d switches\n", total, neng);
+        rt.stop();
+        return total > 0 ? 0 : 2;
     }
     /* melody mode: play a real-time I-vi-IV-V chord progression through the SAME runtime
      * path Live uses, capture a WAV to listen to (proves polyphony + the synth voice end
