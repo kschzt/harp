@@ -172,16 +172,20 @@ struct EthTransport final : ShellTransport {
         size_t pln;
         if (harp_rtp_unpack(rxpkt_, (size_t)n, &h, &pl, &pln) != 0) return 0;
         if (dev_ts) *dev_ts = h.timestamp;
-        /* §8.7: count lost RTP packets from sequence gaps (loss MUST be counted, never
-         * silently concealed). 16-bit seq; a small forward gap = that many lost packets;
-         * a gap >= 0x8000 is a late/reordered packet, not loss (ignore). */
-        if (seqValid_) {
-            uint16_t gap = (uint16_t)(h.seq - (uint16_t)(lastSeq_ + 1));
-            if (gap && gap < 0x8000)
-                rtpLost_.fetch_add(gap, std::memory_order_relaxed);
+        /* §8.7: count lost RTP packets from sequence gaps (loss MUST be counted, never silently
+         * concealed) through the SHARED pure helper (host/rtp.h) so the live shell streaming path
+         * and the CLI agree. A forward gap (< 0x8000) = that many lost packets AND advances the
+         * high-water seq; a reordered/duplicate packet (gap >= 0x8000) reports 0 loss and must NOT
+         * rewind lastSeq_ — rewinding makes the NEXT in-order packet over-count a huge spurious gap. */
+        if (!seqValid_) {
+            lastSeq_ = h.seq;
+            seqValid_ = true;
+        } else {
+            bool advance = true;
+            uint16_t lost = harp_rtp_loss_gap(lastSeq_, h.seq, &advance);
+            if (lost) rtpLost_.fetch_add(lost, std::memory_order_relaxed);
+            if (advance) lastSeq_ = h.seq;
         }
-        lastSeq_ = h.seq;
-        seqValid_ = true;
         if (pln % sizeof(float)) return 0; /* whole float samples only */
         unsigned f = (unsigned)(pln / sizeof(float)); /* slot-interleaved floats */
         if (f > maxFloats) f = maxFloats; /* one packet always fits a sane out */
