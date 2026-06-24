@@ -134,5 +134,19 @@ grep -q "project state re-asserted" "$HOSTLOG" && { cat "$HOSTLOG"; fail "fresh-
 if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then assert_reason4 "$BUNDLE.fresh" 1 "fresh-open history missing reason 4"; fi
 echo "   ✓ fresh-open major-1 bundle on major-2 device: held read-only WITHOUT force + reason-4"
 
+# ── 4) SERIAL DIFFERS (§12.2, re-audit HIGH #4): the SAME project (saved on $SERIAL) opened on a
+#       DIFFERENT physical unit (different serial, SAME engine) MUST default read-only — the
+#       project must not silently auto-push onto another unit (it has its own state).
 kill -9 "$DP" 2>/dev/null; DP=""
-echo "ENGINE-MISMATCH PASS (§12.2: engine-major change [across-reconnect force AND fresh-open bundle-baseline] -> reason-4 + project state held read-only [auto-push skipped]; matching engine re-asserts)"
+rm -rf "$DEVDIR.alt"; : > "$DEVLOG"
+echo "── open the $SERIAL project on a DIFFERENT unit (serial SIM-ALT-0002, same engine)"
+"$DEVICED" --serial "SIM-ALT-0002" --port "$PORT" --state-dir "$DEVDIR.alt" >>"$DEVLOG" 2>&1 & DP=$!
+wait_listen || { cat "$DEVLOG"; fail "alt-serial device didn't start on $PORT"; }
+run_host "" serial-differs --load-state "$STATE" --diag-bundle "$BUNDLE.serial"
+grep -q "bound a different unit" "$HOSTLOG" || { cat "$HOSTLOG"; fail "serial-differs: host did not detect the different unit (serial mismatch undetected)"; }
+grep -q "not auto-applied" "$HOSTLOG"        || { cat "$HOSTLOG"; fail "serial-differs: project NOT held read-only on a different unit (auto-push not skipped — HIGH #4)"; }
+grep -q "project state re-asserted" "$HOSTLOG" && { cat "$HOSTLOG"; fail "serial-differs: RE-ASSERTED the project onto a DIFFERENT unit (the §12.2 serial gate was not taken)"; }
+echo "   ✓ serial differs: $SERIAL project on SIM-ALT-0002 held read-only (not auto-pushed onto another unit)"
+
+kill -9 "$DP" 2>/dev/null; DP=""
+echo "ENGINE-MISMATCH PASS (§12.2: engine-major change [force + fresh-open] AND serial-differs [different unit] -> held read-only [auto-push skipped]; matching engine re-asserts)"

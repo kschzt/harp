@@ -1006,6 +1006,8 @@ private:
     bool wantUsb_ = false;
     uint16_t wantUsbVid_ = 0, wantUsbPid_ = 0;
     std::string wantUsbSerial_;
+    std::string wantSerial_; /* §12.2: the device serial the loaded bundle was saved on (identity-
+                              * expectation key 2). Holds read-only if a DIFFERENT unit is bound (HIGH #4). */
     std::atomic<int> wantEngineMajor_{0}; /* §12.2: the loaded bundle's engine major (0 = none); the
                                              fresh-open read-only baseline. Set in setStateBundle,
                                              read in helloAndIdentity. */

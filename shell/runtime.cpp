@@ -170,14 +170,30 @@ bool HarpRuntime::helloAndIdentity() {
         int expectMajor = (force && *force) ? atoi(force)
                           : wantEngineMajor_.load(std::memory_order_relaxed);
         bool mismatch = (expectMajor > 0 && curMajor != expectMajor);
-        if (mismatch && !readOnlyDefault_.load(std::memory_order_relaxed)) {
+        bool wasRO = readOnlyDefault_.load(std::memory_order_relaxed);
+        if (mismatch && !wasRO) {
             char d[96];
             snprintf(d, sizeof d, "engine major %d (project) != %d (device): project state held read-only",
                      expectMajor, curMajor);
             recordTransition(HARP_ST_ATTACHED, HARP_ST_ATTACHED, HARP_TR_ENGINE_MAJOR_MISMATCH, d);
             log_msg("%s", d);
         }
-        readOnlyDefault_.store(mismatch, std::memory_order_relaxed);
+        /* §12.2 (re-audit HIGH #4): ALSO hold read-only when a DIFFERENT physical unit was bound
+         * than the project's — selectDevice's same-model fallback can bind another unit, and the
+         * project must NOT silently auto-push onto it (it has its own state); the user pushes to
+         * bind it here. Compares the bound device serial to the unit the bundle was saved on
+         * (§15.3 identity-expectation key 2). */
+        std::string wantSer;
+        { std::lock_guard<std::mutex> blk(bundleMutex_); wantSer = wantSerial_; }
+        bool serialDiffers = !wantSer.empty() && !serial_.empty() && serial_ != wantSer;
+        if (serialDiffers && !wasRO) {
+            char d[160];
+            snprintf(d, sizeof d, "serial %s (project) != %s (device): bound a different unit — project state held read-only",
+                     wantSer.c_str(), serial_.c_str());
+            recordTransition(HARP_ST_ATTACHED, HARP_ST_ATTACHED, HARP_TR_SERIAL_MISMATCH, d);
+            log_msg("%s", d);
+        }
+        readOnlyDefault_.store(mismatch || serialDiffers, std::memory_order_relaxed);
         engineMajorSeen_ = expectMajor;
     }
     /* §6.4 latency-profile (key 8): cache for the §14.3 LoopbackMeasurer's expected-
@@ -3732,6 +3748,7 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
     bool haveBundlePmh = false; /* §9.3/§13.4: the project's expected param-map-hash */
     harp_hash bundlePmh{};
     int bundleEngineMajor = 0; /* §12.2: the project's engine major (from identity-expectation) */
+    std::string bundleSerial;  /* §12.2: the device serial the project was saved on (HIGH #4) */
     for (uint64_t i = 0; i < n && !d.err; i++) {
         uint64_t key;
         if (!harp_cdec_uint(&d, &key)) return false;
@@ -3777,6 +3794,11 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
                             } else if (!harp_cdec_skip(&d))
                                 return false;
                         }
+                    } else if (ik == 2) { /* §12.2: the device serial the project was saved on */
+                        const char *ss;
+                        size_t ssl;
+                        if (!harp_cdec_text(&d, &ss, &ssl)) return false;
+                        bundleSerial.assign(ss, ssl);
                     } else if (!harp_cdec_skip(&d))
                         return false;
                 }
@@ -3845,6 +3867,7 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
         bundleParamMapHashSet_ = haveBundlePmh; /* retained for the connect-apply re-check */
         if (haveBundlePmh) bundleParamMapHash_ = bundlePmh;
         wantEngineMajor_.store(bundleEngineMajor, std::memory_order_relaxed); /* §12.2 read-only baseline */
+        wantSerial_ = bundleSerial; /* §12.2 serial-differs read-only baseline (HIGH #4) */
         bundleParams_.clear();
         paramsFromStore(&store_, target, bundleParams_);
     }
