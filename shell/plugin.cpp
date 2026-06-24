@@ -30,6 +30,7 @@
 #include "note_voice_map.h"
 #include "runtime.h"
 #include "runtime_registry.h"
+#include "shell_config.h" /* per-product identity/params/device-filter (default = refdev) */
 #include "shell_constants.h"
 #include "ump.h"
 
@@ -42,28 +43,23 @@ static_assert(HARP_MPE_MOD_TIMBRE == 3u, "MPE timbre must be Filter Cutoff (para
 using namespace Steinberg;
 using namespace Steinberg::Vst;
 
-/* Frozen identity — see docs/vst3-shell-plan.md. NEVER change. */
-static const FUID kHarpProcessorUID(0xB520EC1F, 0x856F4A80, 0xA09D6455, 0x12430ACB);
-static const FUID kHarpControllerUID(0x3AF7D698, 0x0DB04F6E, 0x8F107EEF, 0x7480467A);
+/* Frozen identity — see docs/vst3-shell-plan.md. NEVER change. Values come from
+ * shell_config.h (default = these refdev UIDs; a downstream product overrides). */
+static const FUID kHarpProcessorUID(HARP_SHELL_PROC_FUID);
+static const FUID kHarpControllerUID(HARP_SHELL_CTRL_FUID);
 
-/* Mirrors the refdev's parameter set; replaced by evt.params descriptors
- * once the event plane lands. */
+/* The device parameter set (shell_config.h HARP_SHELL_PARAMS; default = refdev).
+ * `labels` is nullptr for a plain param, or a "A|B|C" pipe-delimited enum for a
+ * named picker (registered as a StringListParameter when HARP_SHELL_LABELED_PARAMS
+ * is defined). Replaced by evt.params descriptors once the event plane lands. */
 struct DevParam {
     uint32_t id;
     const char *name;
     int32 stepCount;   /* 0 = continuous (VST3: stepCount = steps - 1) */
     double defaultVal; /* must mirror the device defaults (recall sanity) */
+    const char *labels; /* nullptr, or "A|B|C" enum labels (stepCount+1 of them) */
 };
-static const DevParam kParams[] = {
-    {1, "Osc Pitch", 0, 0.5},    {2, "Osc Shape", 0, 0.5},
-    {3, "Filter Cutoff", 0, 0.5}, {4, "Filter Reso", 0, 0.5},
-    {5, "Env Attack", 0, 0.5},   {6, "Env Release", 0, 0.5},
-    {7, "FX Send", 0, 0.5},      {8, "Master Level", 0, 0.5},
-    /* the arp (device params 9-12; param-map-hash changed with these) */
-    {9, "Arp Mode", 4, 0.0},     {10, "Arp Division", 5, 0.6},
-    {11, "Arp Gate", 0, 0.5},    {12, "Arp Octaves", 3, 0.0},
-    {13, "Glide", 0, 0.0}, /* 0 = off; portamento is opt-in now */
-};
+static const DevParam kParams[] = { HARP_SHELL_PARAMS };
 static constexpr int kNumParams = sizeof(kParams) / sizeof(kParams[0]);
 /* HOST-SIDE routing parameter (NOT a device param): which multitimbral PART
  * (§9.4 channel 0..15) this plugin instance owns. Stepped+automatable so a DAW
@@ -861,6 +857,25 @@ public:
         tresult r = EditController::initialize(context);
         if (r != kResultOk) return r;
         for (auto &p : kParams) {
+#ifdef HARP_SHELL_LABELED_PARAMS
+            if (p.labels) { /* a NAMED picker: register the enum labels so the DAW shows them */
+                auto *sl = new Steinberg::Vst::StringListParameter(UString256(p.name), p.id);
+                const char *s = p.labels;
+                while (*s) {
+                    const char *e = strchr(s, '|');
+                    size_t len = e ? (size_t)(e - s) : strlen(s);
+                    char buf[64];
+                    if (len >= sizeof buf) len = sizeof buf - 1;
+                    memcpy(buf, s, len);
+                    buf[len] = 0;
+                    sl->appendString(UString256(buf));
+                    if (!e) break;
+                    s = e + 1;
+                }
+                parameters.addParameter(sl);
+                continue;
+            }
+#endif
             UString256 title(p.name);
             parameters.addParameter(title, nullptr, p.stepCount, p.defaultVal,
                                     ParameterInfo::kCanAutomate, p.id);
@@ -987,7 +1002,7 @@ public:
 
 /* ---------------- factory ---------------- */
 
-#define stringPluginName "HARP RefDev"
+#define stringPluginName HARP_SHELL_PLUGIN_NAME
 
 BEGIN_FACTORY_DEF("HARP Project", "https://github.com/kschzt/harp",
                   "mailto:harp@example.invalid")

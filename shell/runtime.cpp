@@ -1,5 +1,6 @@
 #include "runtime.h"
 #include "runtime_registry.h" /* §8.4 admission ledger (ledger_reserve/release/reserved) */
+#include "shell_config.h" /* HARP_SHELL_ENGINE_FILTER / HARP_SHELL_ETHERNET_ONLY (default = refdev) */
 #include "ump.h"
 #include "usb_transport.h" /* the concrete USB binding selectDevice() wraps */
 #include "eth_transport.h" /* the §8.7 Ethernet binding (bit-exact host-locked) */
@@ -1112,9 +1113,44 @@ static ShellTransport *wrapUsb(harp_io *io) { return io ? new UsbTransport(io) :
  * "host:port" (empty if none, or where dns_sd is unavailable — then the shell just keeps
  * supervising for a USB device). A short, bounded browse; the supervisor retries ~1 s, so it
  * re-browses each cycle (this is how a network synth hot-plugs in). Opt out with HARP_NO_MDNS=1. */
+#ifdef HARP_SHELL_ENGINE_FILTER
+/* A product built with HARP_SHELL_ENGINE_FILTER binds ONLY a network device whose
+ * §12 engine id matches — so it skips the other HARP devices on the bus without the
+ * user picking. mDNS resolves host:port but not the engine, so briefly hello each
+ * candidate and read its engine id: cheap (a few LAN devices), stateless (store=NULL). */
+static bool ethEngineIs(const char *hostport, const char *want) {
+    harp_sockhandle s = harp_sock_dial(hostport);
+    if (s == HARP_SOCK_INVALID) return false;
+    harp_sock_io t;
+    harp_sock_io_init(&t, s);
+    harp_link link;
+    harp_link_init(&link);
+    harp_client c;
+    harp_client_init(&c, &t.io, &link, nullptr, nullptr, nullptr);
+    harp_client_identity id;
+    bool ok = harp_client_hello(&c, "harp-shell (engine probe)", &id) == 0 &&
+              strcmp(id.engine_id, want) == 0;
+    harp_client_free(&c);
+    harp_link_free(&link);
+    harp_sock_close(s);
+    return ok;
+}
+#endif
+
 static std::string discoverEthDevice() {
     if (const char *no = getenv("HARP_NO_MDNS"))
         if (no[0] && no[0] != '0') return std::string();
+#ifdef HARP_SHELL_ENGINE_FILTER
+    /* browse ALL `_harp._tcp`, keep the first that reports the wanted engine */
+    harp_mdns_instance inst[16];
+    int n = harp_mdns_discover(1200, inst, sizeof inst / sizeof inst[0]);
+    for (int i = 0; i < n; i++) {
+        char hp[300];
+        snprintf(hp, sizeof hp, "%s:%u", inst[i].host, (unsigned)inst[i].port);
+        if (ethEngineIs(hp, HARP_SHELL_ENGINE_FILTER)) return std::string(hp);
+    }
+    return std::string();
+#else
     harp_mdns_instance inst;
     if (harp_mdns_discover(1200, &inst, 1) >= 1) {
         char hp[300];
@@ -1122,6 +1158,7 @@ static std::string discoverEthDevice() {
         return std::string(hp);
     }
     return std::string();
+#endif
 }
 
 /* §8.3-over-§8.7 mid-stream live<->offline toggle. The shell calls this from its
@@ -1194,6 +1231,7 @@ ShellTransport *HarpRuntime::selectDevice() {
         return wrapUsb(harp_usb_open_match_ctx(usbCtx_, boundSerial_.c_str(), false, 0, 0));
     }
 
+#ifndef HARP_SHELL_ETHERNET_ONLY /* a network-only product never claims a USB unit */
     /* first bind: what does the loaded project want? */
     std::string wantSerial;
     bool wantModel = false;
@@ -1240,6 +1278,7 @@ ShellTransport *HarpRuntime::selectDevice() {
      * records it on first save. */
     if (harp_io *io = harp_usb_open_match_ctx(usbCtx_, nullptr, false, 0, 0))
         return wrapUsb(io);
+#endif /* !HARP_SHELL_ETHERNET_ONLY */
     /* §6.1/§4.4.3: nothing on USB and no explicit HARP_ETH_DEVICE — browse the segment for a
      * network synth advertising `_harp._tcp` and dial the first one found. Keeps the shell's
      * device list "USB + network" without the DAW having to know an address. */
