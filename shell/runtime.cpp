@@ -2954,11 +2954,15 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
     /* §11.4: archive the DISPLACED device head before the CAS swaps the live ref to the
      * target — a named archive/<ts> ref keeps the old state from §10.2 GC (the live CAS is
      * force=false, so a SUCCEEDING push still swaps deviceHead->target and, without the
-     * archive, the displaced deviceHead becomes unreferenced and is lost). Gated on an ACTUAL
-     * displacement (deviceHead != target), NOT on timeout_ms: a headless Push that displaces
-     * MUST still archive (the §11.4 MUST), while the common re-assert / per-part-audio stress
-     * re-pushes the SAME state (deviceHead == target) — a no-op here, so no archive churn. */
-    if (!live.unborn && memcmp(deviceHead.b, target.b, HARP_HASH_LEN) != 0) {
+     * archive, the displaced deviceHead becomes unreferenced and is lost). Fires on an ACTUAL
+     * content displacement (deviceHead != target) OR a DIRTY live head: front-panel edits dirty
+     * the live ref but need NOT change its content hash (snapshotLocked above folds them into
+     * deviceHead, which can still equal target), so "every overwrite preceded by a free snapshot"
+     * (§11.4) requires archiving a dirty head too — else a reopen-Push silently discards the
+     * musician's tweaks (the hw recall-test's MUST; the prior interactive-only gate archived
+     * these). The common re-assert / per-part-audio stress re-pushes the SAME state CLEAN
+     * (deviceHead == target AND !dirty) — a no-op here, so no archive churn. */
+    if (!live.unborn && (live.dirty || memcmp(deviceHead.b, target.b, HARP_HASH_LEN) != 0)) {
         char tsname[96];
         time_t now = time(nullptr);
         struct tm tm;
