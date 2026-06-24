@@ -394,6 +394,10 @@ public:
      * (spec wants a user choice; the shell has no UI yet — the archive
      * step keeps it loss-free). */
     bool setStateBundle(const uint8_t *data, size_t len);
+    /* §13.4: the user consents to the staged project's engine-version difference — lift the engine
+     * read-only hold, mark consent (so the push carries flags bit 2), and re-apply the project. The
+     * §11.4 "Force (consent)" front-panel action / HARP_CONSENT_ENGINE_MAJOR route here. */
+    void consentEngineMajorOverride();
     /* Knob values from the project's bundle, for controller display. */
     bool bundleParam(uint32_t id, float &value);
     static void paramsFromStore(harp_store *store, const harp_hash &target,
@@ -698,6 +702,15 @@ private:
      * Atomic: read on the audio/plugin thread (the queue writers), written on the session thread. */
     std::atomic<bool> readOnlyDefault_{false};
     std::atomic<uint64_t> roWrDrops_{0}; /* live writes dropped by the read-only hold (diagnostics). */
+    /* §13.4 engine-version consent for the CURRENT staged project (flags bit 2 / 0x4). Per-project
+     * (reset on setStateBundle); when set, the engine read-only hold lifts and the push carries
+     * consent so the device loads. Seeded by HARP_CONSENT_ENGINE_MAJOR (conformance seam, mirrors
+     * HARP_FORCE_ENGINE_MAJOR) or the §11.4 Force (consent) action via consentEngineMajorOverride(). */
+    std::atomic<bool> consentEngineMajor_{false};
+    /* §13.4: the device REFUSED the staged project (incompatible engine version) on a push — a
+     * MINOR diff the host's major-based hold did not catch. Sticky: holds read-only across reconnect
+     * (so the host stops retry-pushing) until consent or a new bundle clears it. */
+    std::atomic<bool> engineRefused_{false};
     /* §8.4 admission: the bandwidth reservation this runtime currently holds in the
      * process-global ledger. admittedBps_==0 means "no live reservation"; the cached
      * path/key let release run against a half-torn-down transport_. Touched only under

@@ -511,7 +511,7 @@ void *panel_main(void *arg); /* arg: struct panel_args*, must outlive the thread
 
 /* Recall-reconcile mailbox (panel.c), §11.4. Shared by the panel verbs and
  * session.c's x.harp.reconcile.* methods; locked internally. expect12/live12 must
- * be char[16]. reconcile_set_choice returns 0 if n is out of 0..3. */
+ * be char[16]. reconcile_set_choice returns 0 if n is out of 0..4 (0..3 §11.4 + 4 §13.4 force-consent). */
 void reconcile_post_offer(const char *expect, const char *live, int dirty);
 void reconcile_read(int *pending, char *expect12, char *live12, int *dirty, int *choice);
 int reconcile_set_choice(int n);

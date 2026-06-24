@@ -231,7 +231,7 @@ void reconcile_read(int *pending, char *expect12, char *live12, int *dirty, int 
     pthread_mutex_unlock(&g_reconcile_mu);
 }
 int reconcile_set_choice(int n) {
-    if (n < 0 || n > 3) return 0;
+    if (n < 0 || n > 4) return 0; /* §11.4 0..3 + §13.4 force-consent (4) */
     pthread_mutex_lock(&g_reconcile_mu);
     g_reconcile.choice = n;
     g_reconcile.pending = 0;

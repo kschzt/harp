@@ -159,7 +159,7 @@ int harp_client_refset(harp_client *c, const char *name, const harp_hash *expect
 /* ---- §11.4 reconcile relay (front-panel-mediated) ----
  * offer: POST a conflict for the front panel (expect/live are short-hex DISPLAY
  * strings — the shell owns the real hashes). poll: read pending + the user's pick
- * (*choice: -1 none, 0 push / 1 pull / 2 read-only / 3 duplicate). */
+ * (*choice: -1 none, 0 push / 1 pull / 2 read-only / 3 duplicate / 4 force-consent §13.4). */
 int harp_client_reconcile_offer(harp_client *c, const char *expect, const char *live,
                                 bool dirty);
 int harp_client_reconcile_poll(harp_client *c, bool *pending, int *choice);

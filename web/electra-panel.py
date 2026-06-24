@@ -232,7 +232,9 @@ def build_preset(params):
     # one is harmless — only the press matters.
     pages.append({"id": 3, "name": "Reconcile"})
     actions = [("Push to Synth", "F49500"), ("Pull to DAW", "529DEC"),
-               ("Read-only", "9AA0A6"), ("Duplicate", "C44795")]
+               ("Read-only", "9AA0A6"), ("Duplicate", "C44795"),
+               ("Force (consent)", "7AC07A")]  # §13.4 engine-version consent (choice 4)
+    rw = CANVAS_W // len(actions)  # adaptive column width so the 5th pad fits the 800px panel
     for j, (nm, color) in enumerate(actions):
         controls.append({
             # pad, not fader: a pad fires on CLICK (the Electra's "select"); a fader
@@ -240,7 +242,7 @@ def build_preset(params):
             # bounce back. Momentary -> sends onValue (127) on press, caught below.
             "id": 200 + j, "type": "pad", "name": nm, "color": color,
             "mode": "momentary",
-            "bounds": [j * COL_W + PADX, TOP_Y, COL_W - 2 * PADX, ROW_H],
+            "bounds": [j * rw + PADX, TOP_Y, rw - 2 * PADX, ROW_H],
             "pageId": 3, "controlSetId": 1,
             "inputs": [{"potId": j + 1, "valueId": "value"}],
             "values": [{"id": "value",
@@ -274,11 +276,13 @@ function harpPush() midi.sendControlChange(PORT_1, 1, 110, 127) end
 function harpPull() midi.sendControlChange(PORT_1, 1, 111, 127) end
 function harpReadOnly() midi.sendControlChange(PORT_1, 1, 112, 127) end
 function harpDuplicate() midi.sendControlChange(PORT_1, 1, 113, 127) end
+function harpForceConsent() midi.sendControlChange(PORT_1, 1, 114, 127) end
 preset.userFunctions = {
   pot1 = {call = harpPush, name = "Push to Synth"},
   pot2 = {call = harpPull, name = "Pull to DAW"},
   pot3 = {call = harpReadOnly, name = "Read-only"},
   pot4 = {call = harpDuplicate, name = "Duplicate"},
+  pot5 = {call = harpForceConsent, name = "Force (consent)"},
 }
 -- Host page-switch over MIDI is unreliable while the sidecar holds the ports
 -- (09 0A is dropped; a control CC just drags focus). So switch ON-DEVICE: the
@@ -378,8 +382,8 @@ def main():
     # "select"; a fader's turn bleeds into the next page's knob after the bounce).
     # The pad sends CC 110-113, caught in the port reader -> reconcile-choose.
     RECONCILE_PAGE = 3
-    ACTIONS = ["Push to Synth", "Pull to DAW", "Read-only", "Duplicate"]
-    ACTION_CC = {110: 0, 111: 1, 112: 2, 113: 3}  # pad-fired CC -> action index
+    ACTIONS = ["Push to Synth", "Pull to DAW", "Read-only", "Duplicate", "Force (consent)"]
+    ACTION_CC = {110: 0, 111: 1, 112: 2, 113: 3, 114: 4}  # pad-fired CC -> action index
     recon = {"active": False}
 
     # Multitimbral: the 8 knobs edit the FOCUSED part; the "Part" knob (CC 116) on
