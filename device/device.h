@@ -33,6 +33,7 @@
 #include "harp/object.h"
 #include "harp/store.h"
 #include "sock_io.h" /* harp_sockhandle / HARP_SOCK_INVALID / harp_sock_recv_timeout_ms (§16) */
+#include "conn_ratelimit.h" /* §16(b): harp_peer_penalty — per-peer pre-hello rate-limit ring */
 
 #define PROTO_MAJOR 1
 #define PROTO_MINOR 0
@@ -383,6 +384,11 @@ typedef struct {
                                the session is not over TCP (USB gadget). It is the
                                RTP audio destination when audio.start negotiates a
                                port (key 6); set once at accept, never on USB. */
+    /* §16(b): per-peer pre-hello rate-limit ring — a NON-loopback peer that fails pre-hello (a
+       slow-loris that held the slot without core.hello) is shed for a short window; a hello-
+       completing client is never penalized. Accept-loop-private (no lock). */
+    harp_peer_penalty prehello_penalty[16];
+    size_t prehello_penalty_idx;
 
     audio_state audio;
 
