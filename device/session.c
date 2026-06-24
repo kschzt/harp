@@ -891,11 +891,17 @@ static void handle_state_refset(device *d, const harp_env *e) {
             char snap_eng[24] = "";
             if (harp_store_get(&d->store, &newh, &se) == 0 &&
                 harp_obj_parse_snapshot_engine(se.buf, se.len, snap_eng, sizeof snap_eng)) {
-                int snap_major = atoi(snap_eng);
-                int dev_major = atoi(d->engine_ver ? d->engine_ver : ENGINE_VERSION);
-                if (snap_major != dev_major) {
+                const char *dev_eng = d->engine_ver ? d->engine_ver : ENGINE_VERSION;
+                /* §13.4: refuse on a MAJOR *or MINOR* engine difference. Any engine.version bump
+                 * changes rendering of stored state (§6.2), so a minor diff "loads but sounds
+                 * different" unless the user consents (bit 2). PATCH is non-behavioral per SemVer
+                 * and loads exactly. semver is MAJOR.MINOR.PATCH (§6.2). */
+                int sm = 0, sn = 0, dm = 0, dn = 0;
+                sscanf(snap_eng, "%d.%d", &sm, &sn);
+                sscanf(dev_eng, "%d.%d", &dm, &dn);
+                if (sm != dm || sn != dn) {
                     harp_cbuf_free(&se);
-                    /* details = {0 snapshot-major, 1 device-major}; set flags bit 2 to override. */
+                    /* details = {0 snapshot-engine, 1 device-engine}; set flags bit 2 to override. */
                     harp_cbuf m;
                     harp_cbuf_init(&m);
                     harp_env_head(&m, HARP_MSG_ERROR, e->rid, e->method, true);
@@ -903,13 +909,13 @@ static void handle_state_refset(device *d, const harp_env *e) {
                     harp_cbor_uint(&m, 0);
                     harp_cbor_text(&m, "incompatible");
                     harp_cbor_uint(&m, 1);
-                    harp_cbor_text(&m, "snapshot engine major differs; set consent flag 0x4 to override");
+                    harp_cbor_text(&m, "snapshot engine version differs; set consent flag 0x4 to override");
                     harp_cbor_uint(&m, 2);
                     harp_cbor_map(&m, 2);
                     harp_cbor_uint(&m, 0);
-                    harp_cbor_uint(&m, (uint64_t)snap_major);
+                    harp_cbor_text(&m, snap_eng);
                     harp_cbor_uint(&m, 1);
-                    harp_cbor_uint(&m, (uint64_t)dev_major);
+                    harp_cbor_text(&m, dev_eng);
                     send_ctl(d, &m);
                     harp_cbuf_free(&m);
                     return;

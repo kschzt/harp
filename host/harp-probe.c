@@ -277,7 +277,7 @@ static void fetch_closure(probe *p, const harp_hash *root) {
 static uint64_t refset(probe *p, const char *name, const harp_hash *expect /* NULL = unborn */,
                        const harp_hash *newh, bool create) {
     uint64_t gen = 0;
-    ck(p, harp_client_refset(&p->client, name, expect, newh, create, false, &gen));
+    ck(p, harp_client_refset(&p->client, name, expect, newh, create, false, false, &gen));
     return gen;
 }
 
@@ -1261,7 +1261,7 @@ static void cmd_cas_test(probe *p) {
      * already-pushed target must be REJECTED with code "conflict". */
     harp_hash bogus = head;
     bogus.b[HARP_HASH_LEN - 1] ^= 0xff; /* wrong digest, valid algorithm byte (§10.2) */
-    int rc = harp_client_refset(&p->client, LIVE_REF, &bogus, &head, false, false, &gen);
+    int rc = harp_client_refset(&p->client, LIVE_REF, &bogus, &head, false, false, false, &gen);
     if (rc == 0 || strcmp(p->client.err_code, "conflict") != 0) {
         fprintf(stderr, "   FAIL (a): expected 'conflict', got rc=%d code='%s'\n", rc,
                 rc ? p->client.err_code : "ok (accepted!)");
@@ -1271,7 +1271,7 @@ static void cmd_cas_test(probe *p) {
 
     /* (b) FORCE overrides the mismatch: the SAME wrong expect with force succeeds
      * (the §11.4 "DAW wins, archive-before-push" override). */
-    rc = harp_client_refset(&p->client, LIVE_REF, &bogus, &head, false, true, &gen);
+    rc = harp_client_refset(&p->client, LIVE_REF, &bogus, &head, false, true, false, &gen);
     if (rc != 0) {
         fprintf(stderr, "   FAIL (b): force refset rejected rc=%d code='%s'\n", rc,
                 p->client.err_code);
@@ -1285,7 +1285,7 @@ static void cmd_cas_test(probe *p) {
     harp_hash absent;
     memset(absent.b, 0xab, sizeof absent.b);
     absent.b[0] = HARP_HASH_ALG_SHA256; /* valid algorithm byte; the digest is just never pushed */
-    rc = harp_client_refset(&p->client, LIVE_REF, &head, &absent, false, true, &gen);
+    rc = harp_client_refset(&p->client, LIVE_REF, &head, &absent, false, true, false, &gen);
     if (rc == 0 || strcmp(p->client.err_code, "not-found") != 0) {
         fprintf(stderr, "   FAIL (c): expected 'not-found', got rc=%d code='%s'\n", rc,
                 rc ? p->client.err_code : "ok (accepted!)");
@@ -1297,7 +1297,7 @@ static void cmd_cas_test(probe *p) {
      * must be rejected as "malformed" — before any conflict/closure check. */
     harp_hash badalg = head;
     badalg.b[0] = 0x02; /* not 0x01 = SHA-256 */
-    rc = harp_client_refset(&p->client, LIVE_REF, &badalg, &head, false, false, &gen);
+    rc = harp_client_refset(&p->client, LIVE_REF, &badalg, &head, false, false, false, &gen);
     if (rc == 0 || strcmp(p->client.err_code, "malformed") != 0) {
         fprintf(stderr, "   FAIL (d): expected 'malformed', got rc=%d code='%s'\n", rc,
                 rc ? p->client.err_code : "ok (accepted!)");
@@ -1311,6 +1311,47 @@ static void cmd_cas_test(probe *p) {
     }
     printf("CAS-TEST PASS: conflict rejected, force overrides, unpushed -> not-found, "
            "bad-alg -> malformed\n");
+}
+
+/* engine-gate (§13.4): against a device whose REPORTED engine (--engine-ver) differs from the
+ * compile-time ENGINE_VERSION its snapshots are stamped with, a state.refset of such a snapshot to
+ * LIVE_REF MUST be refused 'incompatible' WITHOUT the consent flag (bit 0x4) and MUST load WITH it.
+ * Run against `harp-deviced --engine-ver 2.1.0` (minor mismatch) or `--engine-ver 1.0.0` (major). */
+static void cmd_engine_gate(probe *p) {
+    do_hello(p);
+    /* Snapshot the live engine state -> a fresh head stamped with the device's compile-time
+     * ENGINE_VERSION; snapshot sets the live ref, so the ref now == head and the CAS below passes,
+     * leaving the §13.4 engine gate as the only thing that can trip. */
+    harp_hash head = remote_snapshot(p, "engine-gate baseline");
+    printf("── engine-gate: §13.4 foreign-engine snapshot refused without consent, loads with it\n");
+    int fails = 0;
+    uint64_t gen = 0;
+
+    /* (a) NO consent: the snapshot's stamped engine differs from the device's reported engine ->
+     * REJECT 'incompatible' (expect == current head, so the CAS passes; the GATE is what trips). */
+    int rc = harp_client_refset(&p->client, LIVE_REF, &head, &head, false, false, false, &gen);
+    if (rc == 0 || strcmp(p->client.err_code, "incompatible") != 0) {
+        fprintf(stderr, "   FAIL (a): expected 'incompatible', got rc=%d code='%s'\n", rc,
+                rc ? p->client.err_code : "ok (accepted!)");
+        fails++;
+    } else
+        printf("   (a) foreign-engine snapshot, no consent -> incompatible: OK\n");
+
+    /* (b) WITH consent (flags bit 0x4): the same refset is accepted — the gate is overridden. */
+    rc = harp_client_refset(&p->client, LIVE_REF, &head, &head, false, false, true, &gen);
+    if (rc != 0) {
+        fprintf(stderr, "   FAIL (b): consent refset rejected rc=%d code='%s'\n", rc,
+                p->client.err_code);
+        fails++;
+    } else
+        printf("   (b) consent (0x4) overrides the gate -> loaded: OK (gen %llu)\n",
+               (unsigned long long)gen);
+
+    if (fails) {
+        fprintf(stderr, "ENGINE-GATE FAIL (%d of 2)\n", fails);
+        exit(1);
+    }
+    printf("ENGINE-GATE PASS: §13.4 refuses a foreign-engine snapshot, consent flag (0x4) overrides\n");
 }
 
 /* version-test (§5.4): force a protocol-major mismatch and assert the device
@@ -2151,6 +2192,8 @@ int main(int argc, char **argv) {
         cmd_epoch_test(&p);
     else if (strcmp(cmd, "txn-test") == 0)
         cmd_txn_test(&p);
+    else if (strcmp(cmd, "engine-gate") == 0)
+        cmd_engine_gate(&p);
     else if (strcmp(cmd, "notif-test") == 0)
         cmd_notif_test(&p);
     else if (strcmp(cmd, "format-test") == 0)
