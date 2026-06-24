@@ -200,15 +200,18 @@ int main(int argc, char **argv) {
         for (int a = 5; a + 1 < argc; a += 2)                                  /* optional overrides, post-select */
             rt.queueParamSet(rt.ownerSource(), (uint32_t)atoi(argv[a]), (float)atof(argv[a + 1]), ts0);
         struct Ev { int pitch, vel; double on, off; };
-        const Ev phrase[] = {
-            {64, 102, 0.5, 1.6}, {71, 86, 2.1, 3.2}, {67, 95, 3.7, 5.4},   /* spaced singles */
-            {64, 90, 5.8, 6.9}, {72, 90, 5.9, 7.0},                        /* a held two-note interval */
-            {69, 66, 7.4, 8.2}, {65, 74, 8.6, 9.4},                        /* soft (dynamics) */
-            {60, 112, 10.0, 15.5}, {64, 106, 10.05, 15.5}, {67, 102, 10.1, 15.5}, /* final triad + long tail */
+        const Ev phrase[] = {   /* jazz ii-V-I in C + a turnaround: Dm9 - G13 - Cmaj9 .. Am9 - D9 - Cmaj9 (rootless 9th/13th voicings) */
+            {53,82,0.5,1.5},{57,82,0.5,1.5},{60,82,0.5,1.5},{64,82,0.5,1.5},        /* Dm9   F A C E */
+            {53,78,1.9,2.9},{57,78,1.9,2.9},{59,78,1.9,2.9},{64,78,1.9,2.9},        /* G13   F A B E */
+            {52,90,3.3,5.2},{55,90,3.3,5.2},{59,90,3.3,5.2},{62,90,3.3,5.2},        /* Cmaj9 E G B D (held) */
+            {74,74,5.5,6.1},{71,70,6.2,6.8},{67,76,6.9,7.6},                        /* melodic tag D5 B4 G4 */
+            {60,80,8.0,9.0},{64,80,8.0,9.0},{67,80,8.0,9.0},{71,80,8.0,9.0},        /* Am9   C E G B */
+            {54,80,9.3,10.3},{57,80,9.3,10.3},{60,80,9.3,10.3},{64,80,9.3,10.3},    /* D9    F#A C E */
+            {48,96,10.7,15.5},{52,94,10.7,15.5},{55,92,10.7,15.5},{59,92,10.7,15.5},{62,90,10.7,15.5}, /* Cmaj9 final, lush */
         };
         const int nev = (int)(sizeof(phrase) / sizeof(phrase[0]));
         const double total = 16.0;
-        bool onF[32] = {false}, offF[32] = {false};
+        bool onF[40] = {false}, offF[40] = {false};
         std::vector<float> capL; float buf[256 * 2];
         auto t0 = std::chrono::steady_clock::now();
         int settle = (int)(ssr / 256.0 * 0.5);                             /* let the engine switch + field reset settle */
