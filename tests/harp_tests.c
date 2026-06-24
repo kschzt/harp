@@ -247,6 +247,13 @@ static void test_objects(void) {
     CHECK(harp_obj_parse_snapshot_root(snap.buf, snap.len, &root));
     CHECK(harp_hash_eq(&root, &tree_h));
     CHECK(harp_obj_kind(snap.buf, snap.len) == HARP_OBJ_SNAPSHOT);
+    /* §13.4: the device's state.refset load gate extracts the snapshot's engine semver (key 5)
+     * and refuses a major mismatch. The parser returns the embedded engine + rejects a
+     * non-snapshot (a tree has no engine field). */
+    char snap_eng[24] = "";
+    CHECK(harp_obj_parse_snapshot_engine(snap.buf, snap.len, snap_eng, sizeof snap_eng));
+    CHECK(strcmp(snap_eng, "1.0.0") == 0);
+    CHECK(!harp_obj_parse_snapshot_engine(t1.buf, t1.len, snap_eng, sizeof snap_eng));
 
     harp_cbuf_free(&b1);
     harp_cbuf_free(&b2);

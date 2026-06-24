@@ -70,6 +70,9 @@ bool harp_obj_parse_blob(const uint8_t *enc, size_t len, const char **media,
 
 /* Extracts the root tree hash of a snapshot. */
 bool harp_obj_parse_snapshot_root(const uint8_t *enc, size_t len, harp_hash *root);
+/* §13.4: extract a snapshot's engine semver (key 5) — the device's state.refset load gate
+ * compares its MAJOR to the device's engine major. False if not a snapshot or no engine field. */
+bool harp_obj_parse_snapshot_engine(const uint8_t *enc, size_t len, char *out, size_t outsz);
 
 typedef bool (*harp_tree_cb)(const char *name, size_t name_len, const harp_hash *h,
                              uint32_t kind, void *ud); /* return false to stop */
