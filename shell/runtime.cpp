@@ -3800,7 +3800,11 @@ std::string HarpRuntime::bundleWantedSerial(const uint8_t *data, size_t len) {
                 } else if (!harp_cdec_skip(&d))
                     return std::string();
             }
-            return std::string(s ? s : "", s ? sl : 0);
+            std::string ser(s ? s : "", s ? sl : 0);
+            /* §15.3: an EthTransport-synthesized "eth:<peer>:<port>" serial is NOT a USB selection
+             * target — return empty so the registry maps an eth bundle to a fresh runtime (not a
+             * phantom USB-serial shared instance), matching setStateBundle's wantUsb_ guard. */
+            return ser.rfind("eth:", 0) == 0 ? std::string() : ser;
         }
         if (!harp_cdec_skip(&d)) return std::string();
     }
@@ -3905,7 +3909,11 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
                     wantUsbVid_ = (uint16_t)vid;
                     wantUsbPid_ = (uint16_t)pid;
                     wantUsbSerial_.assign(s ? s : "", s ? sl : 0);
-                    wantUsb_ = !wantUsbSerial_.empty();
+                    /* §15.3: an "eth:<peer>:<port>" serial (EthTransport identity over the §8.7 link)
+                     * is NOT a USB target — keep wantUsb_ false so selectDevice falls through to
+                     * mDNS/eth discovery on reopen instead of looping on an impossible USB bind
+                     * (med-bundle-key-reconnect). */
+                    wantUsb_ = (!wantUsbSerial_.empty() && wantUsbSerial_.rfind("eth:", 0) != 0);
                 }
                 break;
             }

@@ -33,6 +33,8 @@
 #endif
 
 #include "runtime_registry.h"
+#include "runtime.h"   /* HarpRuntime::bundleWantedSerial (public static) */
+#include "harp/cbor.h" /* build a minimal §15.3 bundle for the eth-serial selection test */
 
 static int g_fail = 0, g_pass = 0;
 #define CHECK(cond)                                                        \
@@ -206,6 +208,27 @@ static void test_admission_ledger() {
     }
 }
 
+/* §15.3 med-bundle-key-reconnect: an EthTransport-synthesized "eth:<peer>:<port>" key-5 serial is
+ * NOT a USB selection target — bundleWantedSerial must return "" so an eth bundle maps to a FRESH
+ * runtime + selectDevice falls through to mDNS discovery (not an impossible USB bind that loops).
+ * A real USB serial still returns as the target. */
+static void test_eth_bundle_not_usb_target() {
+    auto wanted = [](const char *serial) {
+        harp_cbuf b;
+        harp_cbuf_init(&b);
+        harp_cbor_map(&b, 1);  /* top map: 1 entry */
+        harp_cbor_uint(&b, 5); /* key 5: usb-identity (the selection key) */
+        harp_cbor_map(&b, 1);  /* sub-map: 1 entry */
+        harp_cbor_uint(&b, 2); /* sub-key 2: serial */
+        harp_cbor_text(&b, serial);
+        std::string r = HarpRuntime::bundleWantedSerial(b.buf, b.len);
+        harp_cbuf_free(&b);
+        return r;
+    };
+    CHECK(wanted("eth:127.0.0.1:47990").empty()); /* eth serial -> NOT a USB target */
+    CHECK(wanted("PI4B-0001") == "PI4B-0001");     /* a real USB serial -> the target */
+}
+
 int main() {
     /* Hermetic store: keep the ctor's harp_store_open out of the real cache.
      * POSIX only; on Windows the default store dir is used (harmless — the
@@ -221,6 +244,7 @@ int main() {
     test_empty_serial_always_fresh();
     test_release_of_zeroed_handle_is_noop();
     test_admission_ledger();
+    test_eth_bundle_not_usb_target();
 
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
