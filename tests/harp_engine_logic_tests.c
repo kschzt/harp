@@ -20,6 +20,7 @@
 #include "conn_ratelimit.h"
 #include "evq_mod.h"
 #include "fence_wait.h"
+#include "rtp.h"
 #include "usb_select.h"
 #include "voice_alloc.h"
 
@@ -229,6 +230,21 @@ static void test_peer_ratelimit(void) {
     CHECK(!harp_peer_penalized(ring, 4, 0, 1500));
 }
 
+static void test_rtp_loss_gap(void) {
+    /* §8.7: a forward packet reports the skip + advances; a reordered/duplicate one reports 0 and
+     * does NOT advance, so it cannot rewind the high-water seq and mis-count the next packet. */
+    bool adv;
+    CHECK(harp_rtp_loss_gap(10, 11, &adv) == 0 && adv);   /* in-order: no loss, advance */
+    CHECK(harp_rtp_loss_gap(11, 15, &adv) == 3 && adv);   /* forward skip of 3 (12,13,14 lost) */
+    CHECK(harp_rtp_loss_gap(65534, 1, &adv) == 2 && adv); /* wraparound forward (65535,0 lost) */
+    CHECK(harp_rtp_loss_gap(15, 12, &adv) == 0 && !adv);  /* reorder (late): no loss, do NOT advance */
+    CHECK(harp_rtp_loss_gap(15, 15, &adv) == 0 && !adv);  /* duplicate: no loss, do not advance */
+    /* the bug scenario: a reorder must not rewind, so the next in-order packet stays clean.
+     * last=100; a late seq=98 -> !advance (caller keeps last=100); then seq=101 -> gap 0, advance. */
+    CHECK(harp_rtp_loss_gap(100, 98, &adv) == 0 && !adv);
+    CHECK(harp_rtp_loss_gap(100, 101, &adv) == 0 && adv);
+}
+
 int main(void) {
     test_voice_pick();
     test_arp_select();
@@ -238,6 +254,7 @@ int main(void) {
     test_fence();
     test_usb_select();
     test_peer_ratelimit();
+    test_rtp_loss_gap();
     printf("harp-engine-logic-tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
