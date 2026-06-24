@@ -49,6 +49,47 @@ int main(int argc, char **argv) {
         ert.stop();
         return count > 0 ? 0 : 2;
     }
+    /* melody mode: play a real-time I-vi-IV-V chord progression through the SAME runtime
+     * path Live uses, capture a WAV to listen to (proves polyphony + the synth voice end
+     * to end). Notes are queued in real time (the bridge applies events at the current
+     * render pos). Usage: harp-runtime-probe melody [sr] */
+    if (argc > 1 && strcmp(argv[1], "melody") == 0) {
+        uint32_t msr = argc > 2 ? (uint32_t)atoi(argv[2]) : 44100;
+        HarpRuntime rt;
+        rt.configure(msr, 256);
+        rt.start(msr);
+        for (int i = 0; i < 100 && !rt.connected(); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        fprintf(stderr, "runtime-probe(melody): connected=%d sr=%u\n", rt.connected(), msr);
+        if (!rt.connected()) { rt.stop(); return 1; }
+        const int chords[4][3] = {{60,64,67},{57,60,64},{53,57,60},{55,59,62}}; /* C  Am  F  G */
+        const double chordDur = 1.6; const int nChords = 4; const double tail = 1.8;
+        auto on  = [&](int nn){ rt.queueNote(rt.ownerSource(), 0x20900000u | ((uint32_t)(nn&0x7f)<<8) | 92u, rt.streamPos()+rt.latencySamples()); };
+        auto off = [&](int nn){ rt.queueNote(rt.ownerSource(), 0x20800000u | ((uint32_t)(nn&0x7f)<<8) | 0u,  rt.streamPos()+rt.latencySamples()); };
+        std::vector<float> capL; float buf[256 * 2]; int cur = -1;
+        int blocks = (int)((double)msr / 256.0 * (chordDur * nChords + tail));
+        auto m0 = std::chrono::steady_clock::now();
+        for (int b = 0; b < blocks; b++) {
+            double elapsed = b * 256.0 / msr; int ch = (int)(elapsed / chordDur);
+            if (ch != cur && ch < nChords) {
+                if (cur >= 0) for (int k = 0; k < 3; k++) off(chords[cur][k]);
+                for (int k = 0; k < 3; k++) on(chords[ch][k]);
+                cur = ch;
+            } else if (elapsed >= chordDur * nChords && cur >= 0) {
+                for (int k = 0; k < 3; k++) off(chords[cur][k]); cur = -1;
+            }
+            rt.pullAudio(buf, 256);
+            for (int i = 0; i < 256; i++) capL.push_back(buf[i * 2]);
+            std::this_thread::sleep_until(m0 + std::chrono::microseconds((long long)(b + 1) * 256 * 1000000LL / msr));
+        }
+        writeWav("/tmp/runtime-probe-melody.wav", capL, msr);
+        double sq = 0; for (float s : capL) sq += (double)s * s;
+        double rms = capL.size() ? std::sqrt(sq / capL.size()) : 0.0;
+        fprintf(stderr, "runtime-probe(melody): wrote /tmp/runtime-probe-melody.wav (%zu samples), RMS=%.4f%s\n",
+                capL.size(), rms, rms > 0.001 ? "  <-- AUDIBLE" : "  <-- SILENT");
+        rt.stop();
+        return 0;
+    }
     int pitch = argc > 1 ? atoi(argv[1]) : 60; /* C4 */
     uint32_t sr = argc > 2 ? (uint32_t)atoi(argv[2]) : 48000; /* Live is usually 44100 */
     int nonblock = argc > 3 ? atoi(argv[3]) : 0; /* 1 = pullAudio (non-blocking) like Live */
