@@ -46,6 +46,7 @@
 #include "rtp.h"
 #include "sock_io.h" /* harp_sock_io: recv/send accept path (Winsock SOCKETs reject _read/_write) */
 #include "harp/plat.h" /* harp_now_ns: the §16 pre-hello read deadline */
+#include "conn_ratelimit.h" /* §16(b): harp_peer_penalized / harp_peer_penalize */
 
 /* THE device. One per daemon; modules share it via device.h. */
 device g_dev;
@@ -490,6 +491,20 @@ int main(int argc, char **argv) {
                           peer.sin_family == AF_INET)
                              ? peer.sin_addr.s_addr
                              : 0;
+        /* §16(b) rate-limit: a NON-loopback peer that just failed pre-hello (held the slot without
+         * completing core.hello) is shed for ~2s — capping a serial slow-loris from one segment node
+         * without false-shedding a hello-completing reconnect (the per-IP key is exact). Loopback (the
+         * local refdev / host+device on one machine / CI) is trusted + never rate-limited, so the
+         * shared 127.0.0.1 cannot confound the per-IP key. The first network-order byte is the first
+         * octet (127.* = loopback), endian-independent. */
+        uint32_t peer_ip = d->rtp_peer_ip;
+        bool rl_peer = peer_ip && ((const unsigned char *)&peer_ip)[0] != 127u;
+        if (rl_peer && harp_peer_penalized(d->prehello_penalty, 16, peer_ip, harp_now_ns())) {
+            d->ctl_sock = HARP_SOCK_INVALID;
+            d->rtp_peer_ip = 0;
+            HARP_CLOSESOCK(cfd);
+            continue;
+        }
         /* §16 DoS: ONE recv/send io on both platforms (Winsock rejects _read/_write anyway), with a
          * deadline-bounded pre-hello read so a slow-trickle half-open can't hold the accept loop. */
         harp_sock_io tio;
@@ -499,6 +514,11 @@ int main(int argc, char **argv) {
         d->ctl_io = &tio;
         tio.io.corrupt_pct = g_corrupt_ctl_pct; /* §8.7 fault injection: device->host frames only */
         harp_deviced_run_session(d, &tio.io);
+        /* §16(b): penalize ONLY a connection that failed PRE-HELLO (a half-open / slow-loris) — a
+         * hello-completing session is never shed, so a legitimate reconnect is always admitted. */
+        if (rl_peer && !atomic_load_explicit(&d->hello_done, memory_order_acquire))
+            harp_peer_penalize(d->prehello_penalty, 16, &d->prehello_penalty_idx, peer_ip,
+                               harp_now_ns(), 2000000000ull);
         d->ctl_io = NULL;
         d->ctl_sock = HARP_SOCK_INVALID; /* §16: session over — disarm the pre-hello timeout */
         d->rtp_peer_ip = 0; /* session over — forget the peer */

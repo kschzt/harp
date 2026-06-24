@@ -17,6 +17,7 @@
 #include <stdio.h>
 
 #include "arp_select.h"
+#include "conn_ratelimit.h"
 #include "evq_mod.h"
 #include "fence_wait.h"
 #include "usb_select.h"
@@ -213,6 +214,21 @@ static void test_evt_dirties(void) {
     CHECK(!harp_evt_dirties_live(6, 0, false));   /* mod -> non-destructive */
 }
 
+static void test_peer_ratelimit(void) {
+    /* §16(b): a pre-hello failure sheds that peer-IP for the window; a different IP is unaffected;
+     * the shed expires at the deadline; ip 0 (USB, no peer) is never penalized. */
+    harp_peer_penalty ring[4] = {0};
+    size_t idx = 0;
+    uint32_t a = 0x0a000001u, b = 0x0a000002u; /* two distinct peers */
+    CHECK(!harp_peer_penalized(ring, 4, a, 1000));    /* nothing shed yet */
+    harp_peer_penalize(ring, 4, &idx, a, 1000, 2000); /* shed a until t=3000 */
+    CHECK(harp_peer_penalized(ring, 4, a, 1500));     /* a is shed inside the window */
+    CHECK(!harp_peer_penalized(ring, 4, b, 1500));    /* a DIFFERENT peer is not shed */
+    CHECK(!harp_peer_penalized(ring, 4, a, 3000));    /* the window expired (now >= until) */
+    harp_peer_penalize(ring, 4, &idx, 0, 1000, 2000); /* ip 0 (USB) -> no-op */
+    CHECK(!harp_peer_penalized(ring, 4, 0, 1500));
+}
+
 int main(void) {
     test_voice_pick();
     test_arp_select();
@@ -221,6 +237,7 @@ int main(void) {
     test_evt_dirties();
     test_fence();
     test_usb_select();
+    test_peer_ratelimit();
     printf("harp-engine-logic-tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
