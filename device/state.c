@@ -296,7 +296,7 @@ static uint64_t param_flags(const dev_param *p, bool include_caps) {
 /* Encode ONE automatable device-param descriptor (§9.3) into `b`. Shared by
  * the hash input (automatable subset, include_caps=false) and the full
  * advertised array (include_caps=true) so the two cannot drift in shape — the
- * 13 params are byte-identical in both EXCEPT the flag word (key 8), which the
+ * 12 params (NPARAMS) are byte-identical in both EXCEPT the flag word (key 8), which the
  * hash path emits WITHOUT the P2 capability bits (see param_flags). */
 static void encode_one_param(harp_cbuf *b, const dev_param *p, bool include_caps) {
     bool stepped = p->steps > 0;
@@ -318,7 +318,7 @@ static void encode_one_param(harp_cbuf *b, const dev_param *p, bool include_caps
     }
 }
 
-/* The AUTOMATABLE subset (§9.3): the 13 device params, in id order, EXACTLY as
+/* The AUTOMATABLE subset (§9.3): the 12 device params (NPARAMS), in id order, EXACTLY as
  * before metering existed — byte-for-byte. This is the SOLE input to
  * param-map-hash (see compute_param_map_hash): the readonly meter params are
  * deliberately excluded so the hash is unchanged from pre-meter firmware. */
@@ -330,7 +330,7 @@ void encode_param_array_automatable(harp_cbuf *b) {
     for (size_t i = 0; i < NPARAMS; i++) encode_one_param(b, &g_params[i], false);
 }
 
-/* The FULL advertised array (§9.3 + §9.9): the 13 automatable params FOLLOWED
+/* The FULL advertised array (§9.3 + §9.9): the 12 automatable params (NPARAMS) FOLLOWED
  * BY the readonly output meters. Emitted on identity / evt.params so hosts can
  * present meters in their UI; NOT fed to param-map-hash. Each meter descriptor
  * is readonly (key 8 flag bit 1 = output) with a meter-rate hint (key 11), in
@@ -380,7 +380,7 @@ void compute_param_map_hash(device *d) {
      * protects stored automation lanes ("change iff invalidates stored
      * automation"); readonly outputs are never automation targets, so adding /
      * removing meters does NOT invalidate any lane and MUST NOT move the hash.
-     * Hashing the 13 automatable params keeps param-map-hash byte-identical to
+     * Hashing the 12 automatable params keeps param-map-hash byte-identical to
      * pre-meter firmware -> identity + recall stay byte-identical. */
     encode_param_array_automatable(&b);
     d->param_map_hash = harp_hash_compute(b.buf, b.len);

@@ -370,7 +370,7 @@ def main():
     if ELECTRA_SYSEX + b"\x7e\x00" in lack:
         sys.stderr.write("electra-panel: Lua upload NACK [%s]\n" % lack.hex())
     else:
-        sys.stderr.write("electra-panel: reconcile Lua uploaded (Push/Pull/Read-only/Duplicate)\n")
+        sys.stderr.write("electra-panel: reconcile Lua uploaded (Push/Pull/Read-only/Duplicate/Force)\n")
 
     port = RawMidi(port_name, want_in=True, want_out=True)
     by_cc = {p["id"] for p in params}

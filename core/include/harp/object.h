@@ -79,7 +79,7 @@ typedef bool (*harp_tree_cb)(const char *name, size_t name_len, const harp_hash 
 bool harp_obj_tree_foreach(const uint8_t *enc, size_t len, harp_tree_cb cb, void *ud);
 
 /* All hashes directly referenced by an object (tree entries, list chunks,
- * snapshot root — parents excluded by default, see harp_obj_refs_opts). */
+ * snapshot root — parents excluded unless the include_parents argument is set). */
 typedef bool (*harp_hash_cb)(const harp_hash *h, void *ud);
 bool harp_obj_foreach_child(const uint8_t *enc, size_t len, bool include_parents,
                             harp_hash_cb cb, void *ud);
