@@ -73,4 +73,16 @@ static inline bool harp_evt_epoch_stale(uint64_t ev_epoch, uint32_t cur_epoch) {
     return ev_epoch != 0 && ev_epoch < cur_epoch;
 }
 
+/* §9.5/§9.6: does a decoded set/ramp/mod event DIRTY the persistent live ref (firing state.changed
+ * + advancing the §11.3 closure hash)? Pure over the wire scalars. Only a WHOLE-PART (voice == 0)
+ * set (etype 1) or ramp (etype 5) dirties; a per-voice (voice != 0) set/ramp is transient (§9.5) and
+ * a mod (etype 6) is non-destructive (§9.4) — neither dirties; a txn-buffered edit (have_txn) defers
+ * all dirtying to commit (§9.6). Mirrors engine.c's apply side, which sets g_touch_pending only for
+ * voice == 0. */
+static inline bool harp_evt_dirties_live(uint32_t etype, uint32_t voice, bool have_txn) {
+    if (have_txn) return false;      /* §9.6: buffered — dirties only at commit */
+    if (voice != 0) return false;    /* §9.5: per-voice is transient */
+    return etype == 1 || etype == 5; /* whole-part set or ramp (mod/etype 6 is non-destructive) */
+}
+
 #endif /* HARP_DEVICE_EVQ_MOD_H */

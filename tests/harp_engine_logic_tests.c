@@ -201,11 +201,24 @@ static void test_evt_epoch_stale(void) {
     CHECK(!harp_evt_epoch_stale(1, 0)); /* device epoch 0 -> nothing stale yet */
 }
 
+static void test_evt_dirties(void) {
+    /* §9.5/§9.6: only a WHOLE-PART (voice 0) set/ramp dirties the live ref. Per-voice (voice != 0)
+     * is transient, mod (etype 6) is non-destructive, and a txn-buffered edit defers to commit. */
+    CHECK(harp_evt_dirties_live(1, 0, false));    /* whole-part set -> dirties */
+    CHECK(harp_evt_dirties_live(5, 0, false));    /* whole-part ramp -> dirties */
+    CHECK(!harp_evt_dirties_live(1, 777, false)); /* per-voice set -> transient */
+    CHECK(!harp_evt_dirties_live(5, 777, false)); /* per-voice ramp -> transient */
+    CHECK(!harp_evt_dirties_live(1, 0, true));    /* buffered -> defers to commit */
+    CHECK(!harp_evt_dirties_live(5, 0, true));    /* buffered -> defers to commit */
+    CHECK(!harp_evt_dirties_live(6, 0, false));   /* mod -> non-destructive */
+}
+
 int main(void) {
     test_voice_pick();
     test_arp_select();
     test_evq_mod();
     test_evt_epoch_stale();
+    test_evt_dirties();
     test_fence();
     test_usb_select();
     printf("harp-engine-logic-tests: %d passed, %d failed\n", g_pass, g_fail);

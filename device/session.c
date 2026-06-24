@@ -1526,7 +1526,8 @@ static bool txn_commit(device *d, uint64_t id, uint64_t commit_msc) {
     bool had_dirty = false;
     for (uint16_t i = 0; i < t->n; i++) {
         t->ev[i].ts = commit_msc; /* collapse the batch onto one instant */
-        if (t->ev[i].kind == DEV_EV_PARAM_SET || t->ev[i].kind == DEV_EV_RAMP) had_dirty = true;
+        if ((t->ev[i].kind == DEV_EV_PARAM_SET || t->ev[i].kind == DEV_EV_RAMP) && t->ev[i].voice == 0)
+            had_dirty = true; /* §9.5: a per-voice edit in the batch is transient — don't dirty on commit */
     }
     /* All-or-nothing: if the evq can't hold the whole batch it lands NOTHING (evq_push_batch counts
      * the dropped events in g_evq_drops — no separate meter, so the commit-time drop isn't double-
@@ -1643,7 +1644,7 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
         dev_event ev = {msc, DEV_EV_RAMP, (uint32_t)id, (float)target, ets, 0,
                         (uint8_t)(channel & 0xf), (uint32_t)voice};
         txn_submit(d, have_txn ? txn_id : 0, ev);
-        if (!have_txn) live_ref_touch(d, true); /* §9.6: buffered -> no early dirty */
+        if (harp_evt_dirties_live(5, (uint32_t)voice, have_txn)) live_ref_touch(d, true); /* §9.5: per-voice transient, §9.6: buffered -> no dirty */
         return;
     }
     if (etype == 7) { /* transport (§9.7): the (ts, ppq, tempo) anchor */
@@ -1780,7 +1781,7 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
     dev_event ev = {msc, DEV_EV_PARAM_SET, (uint32_t)id, (float)v, 0, 0,
                     (uint8_t)(channel & 0xf), (uint32_t)voice};
     txn_submit(d, have_txn ? txn_id : 0, ev);
-    if (!have_txn) live_ref_touch(d, true); /* §9.6: a buffered edit must not dirty until commit */
+    if (harp_evt_dirties_live(1, (uint32_t)voice, have_txn)) live_ref_touch(d, true); /* §9.5: per-voice transient, §9.6: buffered -> no dirty */
 }
 
 /* x.harp-refdev.knob {0: param-id, 1: value} — front-panel simulation */
