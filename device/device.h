@@ -411,6 +411,13 @@ void evq_push(dev_event ev);
 void evq_reset_for_new_stream(void);
 void *audio_thread(void *arg);
 void audio_stop(device *d);
+/* The render seam: audio_thread/host_paced_loop (audio_loop.c, in harpdevice)
+ * reach the synth ONLY through these two — render n samples at stream position
+ * pos, and reset every part's voices. engine.c implements the refdev's pair; a
+ * downstream daemon (the GPU synth) supplies its own. */
+uint16_t render_output(audio_state *a, float *out, uint32_t n, float rate, uint64_t pos);
+void engine_voices_cold(void);   /* audio.start: cold-reset voices */
+void engine_voices_quiet(void);  /* audio_stop: free voices + clear panic */
 /* §8.7 RTP/UDP emit of one rendered block; no-op unless a->rtp_fd >= 0.
  * Defined in harp-deviced.c so engine.c stays free of socket code. */
 void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, uint64_t msc);

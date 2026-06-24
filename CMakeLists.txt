@@ -68,6 +68,7 @@ target_include_directories(harpcore PUBLIC core/include)
 add_library(harpdevice STATIC
   device/state.c        # engine <-> content-addressed objects
   device/session.c      # protocol handlers + session loop
+  device/audio_loop.c   # the §8.7/§8.3 render+emit loop (render_output seam)
 )
 target_include_directories(harpdevice PUBLIC device host)
 target_link_libraries(harpdevice PUBLIC harpcore ${HARP_MATH_LIB})
