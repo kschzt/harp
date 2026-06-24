@@ -31,9 +31,11 @@
 
 #define FR_SMOOTH  0.002     /* one-pole LPF on the applied ratio (low FM)       */
 #define FR_MAXADJ  0.05      /* ratio may deviate +/- 5% from nominal            */
-#define FR_WINDOW_S 4.0      /* §7.3/§8.3: re-anchor the fit every ~4s so it tracks the CURRENT
-                              * (drifting) device rate, not the lifetime average, and the regression
-                              * sums stay bounded (the old unbounded fit's Syy -> ~1e22 over a soak) */
+#define FR_FORGET  0.999     /* §7.3/§8.3: per-observation forgetting factor (effective ~1000-sample
+                              * window) so the fit tracks the CURRENT drifting rate, not the lifetime
+                              * average — yet decays SMOOTHLY (no ratio step, unlike a hard reset). */
+#define FR_SHIFT_S 8.0       /* re-express the fit about a fresh origin once x grows past this, to keep
+                              * x,y small (the old unbounded fit's Syy -> ~1e22 = SSE cancellation) */
 
 struct harp_freerun {
     SRC_STATE *src;
@@ -116,18 +118,30 @@ void harp_freerun_observe(harp_freerun *fr, unsigned long long dev_ts,
                           unsigned long long host_ns) {
     if (!fr->obs_primed) { fr->obs_primed = 1; fr->ts0 = dev_ts; fr->host0 = host_ns; return; }
     double x = (double)(host_ns - fr->host0) / 1e9;       /* host seconds since anchor */
-    /* §7.3/§8.3: bound the fit to a sliding ~FR_WINDOW_S window by re-anchoring the origin. The old
-     * unbounded cumulative fit recovered only the LIFETIME-AVERAGE rate (could not track a drifting
-     * device clock — §8.3 "recover continuously", T14) and grew Syy to ~1e22 (catastrophic SSE
-     * cancellation over the long soaks). On re-anchor the recovered target HOLDS (the sums restart;
-     * denom <= 0 until >2 fresh samples), then the slope re-fits the recent window's current rate. */
-    if (x > FR_WINDOW_S) {
-        fr->ts0 = dev_ts; fr->host0 = host_ns;
-        fr->Sw = fr->Sx = fr->Sy = fr->Sxx = fr->Sxy = fr->Syy = 0;
-        return;
-    }
     double y = (double)(dev_ts - fr->ts0);                /* device samples since anchor */
-    fr->Sw += 1; fr->Sx += x; fr->Sy += y; fr->Sxx += x*x; fr->Sxy += x*y; fr->Syy += y*y;
+    /* §7.3/§8.3: once x grows past FR_SHIFT_S, SHIFT the origin to the current point and re-express the
+     * sums EXACTLY. The slope is origin-invariant, so this is CONTINUOUS — no ratio step (a hard reset
+     * FM-modulated the tone and crushed SINAD). Keeping x,y small also kills the old fit's Syy -> ~1e22
+     * SSE cancellation over a soak. The old fit was also UNBOUNDED in time, so it recovered only the
+     * lifetime-average rate; the forgetting factor below makes it track the CURRENT drifting rate. */
+    if (x > FR_SHIFT_S) {
+        double dx = x, dy = y;
+        fr->Sxx += -2.0*dx*fr->Sx + fr->Sw*dx*dx;
+        fr->Sxy += -dx*fr->Sy - dy*fr->Sx + fr->Sw*dx*dy;
+        fr->Syy += -2.0*dy*fr->Sy + fr->Sw*dy*dy;
+        fr->Sx  -= fr->Sw*dx;
+        fr->Sy  -= fr->Sw*dy;
+        fr->ts0 = dev_ts; fr->host0 = host_ns;
+        x = 0; y = 0;                                     /* the current obs is now the new origin */
+    }
+    /* FORGETTING: decay each sum per observation so the fit weights an effective ~1/(1-FR_FORGET)
+     * recent samples — tracking the current rate (T14 drift), smoothly (no step). */
+    fr->Sw  = FR_FORGET*fr->Sw  + 1.0;
+    fr->Sx  = FR_FORGET*fr->Sx  + x;
+    fr->Sy  = FR_FORGET*fr->Sy  + y;
+    fr->Sxx = FR_FORGET*fr->Sxx + x*x;
+    fr->Sxy = FR_FORGET*fr->Sxy + x*y;
+    fr->Syy = FR_FORGET*fr->Syy + y*y;
     double denom = fr->Sw * fr->Sxx - fr->Sx * fr->Sx;
     if (denom <= 0) return;
     double slope = (fr->Sw * fr->Sxy - fr->Sx * fr->Sy) / denom;   /* dev samples/sec */

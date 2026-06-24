@@ -75,7 +75,7 @@ static int test_drift_tracking(void) {
         harp_freerun_observe(fr, (unsigned long long)dev, (unsigned long long)hns);
     }
     harp_freerun_stats a; harp_freerun_get_stats(fr, &a);
-    for (int i = 0; i < 2000; i++) {        /* 10 s @ +100 ppm */
+    for (int i = 0; i < 6000; i++) {        /* 30 s @ +100 ppm — let the forgetting window settle on it */
         hns += DT; dev += STEP * (1.0 + 100e-6);
         harp_freerun_observe(fr, (unsigned long long)dev, (unsigned long long)hns);
     }
