@@ -119,6 +119,7 @@ if have "$PROBE"; then
   run recall           scripts/recall-eth-test.sh            # §11.4 recall round-trip + archive
   run credit           scripts/credit-eth-test.sh            # §4.2.1b obj credit queue/flush under starvation
   run txn              scripts/txn-test.sh                   # §9.6 event transactions: buffer/commit-atomic/abort
+  run engine-gate      scripts/engine-gate-eth-test.sh       # §13.4 device refuses foreign-engine snapshot; consent (0x4) overrides
   run core             scripts/core-test.sh                  # §5.5 core methods: ping/identify/changed/bye
   run conn-flood       scripts/conn-flood-test.sh            # §16 DoS: half-open drop + connect-storm survival
   run bloat-recall     scripts/bloat-recall-eth-test.sh      # debt #22: live ref resolves on a many-archive store (recall-breaker)

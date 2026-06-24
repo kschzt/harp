@@ -750,16 +750,17 @@ out:
 }
 
 int harp_client_refset(harp_client *c, const char *name, const harp_hash *expect,
-                       const harp_hash *target, bool create, bool force,
+                       const harp_hash *target, bool create, bool force, bool consent,
                        uint64_t *new_gen) {
     harp_cbuf req, rsp;
     harp_cbuf_init(&req);
     harp_cbuf_init(&rsp);
     harp_client_req_head(c, &req, "state.refset", true);
-    /* flags (key 3): bit 0 create-if-unborn, bit 1 force (§11.3 CAS override).
-     * Omitted when 0, so a plain CAS is byte-identical to before (the device
+    /* flags (key 3): bit 0 create-if-unborn, bit 1 force (§11.3 CAS override), bit 2
+     * (0x4) §13.4 engine-version consent (override the device's incompatible-engine load
+     * gate). Omitted when 0, so a plain CAS is byte-identical to before (the device
      * defaults the absent key to 0). */
-    int flags = (create ? 1 : 0) | (force ? 2 : 0);
+    int flags = (create ? 1 : 0) | (force ? 2 : 0) | (consent ? 4 : 0);
     harp_cbor_map(&req, flags ? 4 : 3);
     harp_cbor_uint(&req, 0);
     harp_cbor_text(&req, name);

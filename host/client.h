@@ -148,10 +148,12 @@ int harp_client_fetch_closure(harp_client *c, const harp_hash *root, size_t *fet
 int harp_client_push_closure(harp_client *c, const harp_hash *root, size_t *sent,
                              size_t *already);
 /* CAS: expect NULL = expect-unborn. create adds create-if-unborn; force (§11.3/
- * §11.4 action 1) overrides BOTH an expect mismatch and a dirty live ref. new_gen
- * (may be NULL) receives the post-CAS generation. */
+ * §11.4 action 1) overrides BOTH an expect mismatch and a dirty live ref. consent
+ * (§13.4, flags bit 2 / 0x4) overrides the device's engine-version load gate — the
+ * user's explicit "load this foreign-engine snapshot anyway". new_gen (may be NULL)
+ * receives the post-CAS generation. */
 int harp_client_refset(harp_client *c, const char *name, const harp_hash *expect,
-                       const harp_hash *target, bool create, bool force,
+                       const harp_hash *target, bool create, bool force, bool consent,
                        uint64_t *new_gen);
 
 /* ---- §11.4 reconcile relay (front-panel-mediated) ----
