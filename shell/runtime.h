@@ -711,6 +711,12 @@ private:
      * MINOR diff the host's major-based hold did not catch. Sticky: holds read-only across reconnect
      * (so the host stops retry-pushing) until consent or a new bundle clears it. */
     std::atomic<bool> engineRefused_{false};
+    /* §11.4 action 3 "Open read-only" — the user's EXPLICIT observe-only hold (distinct from the
+     * §12.2/§13.4 readOnlyDefault_ auto-hold). Sticky: set by reconcile choice 2, persists across
+     * reconnect (the auto-push gate skips it so it is never silently cleared), cleared only when the
+     * user picks a WRITE action (Push/Pull/Duplicate/Force-consent). The queue gates honor
+     * readOnlyDefault_ || roExplicit_. */
+    std::atomic<bool> roExplicit_{false};
     /* §8.4 admission: the bandwidth reservation this runtime currently holds in the
      * process-global ledger. admittedBps_==0 means "no live reservation"; the cached
      * path/key let release run against a half-torn-down transport_. Touched only under
