@@ -157,30 +157,28 @@ bool HarpRuntime::helloAndIdentity() {
      * the leading major. HARP_FORCE_ENGINE_MAJOR seeds the baseline so the conformance
      * test can force a single-connect mismatch. A matching reconnect self-clears the flag. */
     {
+        /* §12.2: hold read-only while the loaded PROJECT expects a different engine major than the
+         * device reports. expectMajor is the forced baseline (HARP_FORCE_ENGINE_MAJOR conformance
+         * seam) else the bundle's embedded major (0 = no project staged). It is STABLE across
+         * reconnect, so the hold PERSISTS — a routine §12.3 unplug/replug to the same wrong-engine
+         * device stays read-only — and self-clears only when the device's major actually matches the
+         * project's (a firmware update) or a matching project loads. (Was: engineMajorSeen_
+         * re-baselined to the device's own major every hello, so the hold survived exactly one
+         * connect — re-audit HIGH #3.) The flag also gates live writes (queueParamSet/queueRamp). */
         int curMajor = atoi(engineVer_.c_str());
-        if (!engineMajorSeeded_) {
-            /* §12.2 FRESH-OPEN: baseline to the PROJECT bundle's engine major if it carried one,
-             * so opening a project onto a device with a different engine major defaults to
-             * read-only ("loads but sounds different without consent") — not just on an
-             * across-reconnect change. HARP_FORCE_ENGINE_MAJOR overrides (conformance test); with
-             * no bundle we baseline to the device's own major (no spurious read-only). */
-            const char *force = getenv("HARP_FORCE_ENGINE_MAJOR");
-            int bundleMajor = wantEngineMajor_.load(std::memory_order_relaxed);
-            engineMajorSeen_ = (force && *force) ? atoi(force)
-                               : (bundleMajor > 0 ? bundleMajor : curMajor);
-            engineMajorSeeded_ = true;
-        }
-        if (curMajor != engineMajorSeen_) {
-            readOnlyDefault_ = true;
-            char d[80];
-            snprintf(d, sizeof d, "engine major %d -> %d: project state held read-only",
-                     engineMajorSeen_, curMajor);
+        const char *force = getenv("HARP_FORCE_ENGINE_MAJOR");
+        int expectMajor = (force && *force) ? atoi(force)
+                          : wantEngineMajor_.load(std::memory_order_relaxed);
+        bool mismatch = (expectMajor > 0 && curMajor != expectMajor);
+        if (mismatch && !readOnlyDefault_.load(std::memory_order_relaxed)) {
+            char d[96];
+            snprintf(d, sizeof d, "engine major %d (project) != %d (device): project state held read-only",
+                     expectMajor, curMajor);
             recordTransition(HARP_ST_ATTACHED, HARP_ST_ATTACHED, HARP_TR_ENGINE_MAJOR_MISMATCH, d);
             log_msg("%s", d);
-        } else {
-            readOnlyDefault_ = false;
         }
-        engineMajorSeen_ = curMajor;
+        readOnlyDefault_.store(mismatch, std::memory_order_relaxed);
+        engineMajorSeen_ = expectMajor;
     }
     /* §6.4 latency-profile (key 8): cache for the §14.3 LoopbackMeasurer's expected-
      * RTT. Off the loopback path this is just stored, never read (no render effect). */
@@ -1335,7 +1333,7 @@ bool HarpRuntime::sessionUp() {
             bundlePmhSet = bundleParamMapHashSet_;
             bundlePmh = bundleParamMapHash_;
         }
-        if (haveBundle && readOnlyDefault_) {
+        if (haveBundle && readOnlyDefault_.load(std::memory_order_relaxed)) {
             /* §12.2: the engine major changed across this (re)connect — do NOT auto-apply
              * the staged project state (it may not fit the new engine). Hold it read-only;
              * the user re-applies explicitly once they've confirmed it still fits. */
@@ -1462,6 +1460,11 @@ bool HarpRuntime::sessionUp() {
 /* Tear a session down: reap the reader, orderly audio.stop if the device
  * is still talking to us, release the claim. Safe on a dead transport. */
 void HarpRuntime::sessionDown() {
+    /* §12.2/§11.4: report how many live param/automation writes the read-only hold suppressed
+     * this session (logged here, on the supervisor thread — NOT from the RT queue writers). */
+    if (uint64_t rod = roWrDrops_.exchange(0, std::memory_order_relaxed))
+        log_msg("read-only: suppressed %llu live param/automation write(s) (engine major mismatch)",
+                (unsigned long long)rod);
     bool wasConnected = connected_.exchange(false, std::memory_order_acq_rel);
     /* §12.1: orderly detach. Record the transition off the audio path (this runs
      * on the supervisor thread). A device-gone teardown reaches here too, but the
@@ -1672,6 +1675,13 @@ void HarpRuntime::stop() {
  * so the event is simply dropped (logged once via dormantSrcLogged_). */
 void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t ts) {
     if (!src) return noteDormant();
+    if (readOnlyDefault_.load(std::memory_order_relaxed)) {
+        /* §12.2/§11.4: read-only hold — a live param edit MUST NOT reach a mismatched-engine
+         * device; drop + count (the user exits read-only to make changes). The fresh-open default
+         * held the STORED state read-only; this closes the live-edit leak (re-audit HIGH #1). */
+        roWrDrops_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     if (src->ring.push({0, id, v, ts, 0}))
         evtQueuedSeq_.fetch_add(1, std::memory_order_release);
     else
@@ -1680,6 +1690,12 @@ void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t
 void HarpRuntime::queueRamp(EventSource *src, uint32_t id, float target, uint64_t start,
                             uint64_t end) {
     if (!src) return noteDormant();
+    if (readOnlyDefault_.load(std::memory_order_relaxed)) {
+        /* §12.2/§11.4: read-only hold — drop the automation write so it can't reach the
+         * mismatched engine (re-audit HIGH #1). */
+        roWrDrops_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     if (src->ring.push({1, id, target, start, end}))
         evtQueuedSeq_.fetch_add(1, std::memory_order_release);
     else
