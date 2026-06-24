@@ -457,6 +457,7 @@ static void handle_hello(device *d, const harp_env *e) {
     /* §16 DoS: hello completed — clear the pre-hello half-open SO_RCVTIMEO so a legitimate
      * idle session (the host->device direction is often quiet during playback) is NOT dropped. */
     if (d->ctl_sock != HARP_SOCK_INVALID) harp_sock_recv_timeout_ms(d->ctl_sock, 0);
+    if (d->ctl_io) d->ctl_io->deadline_ns = 0; /* §16: hello done — drop the pre-hello read deadline */
     d->peer_credit = 0;
     d->granted = 0;
     d->sendq_head = d->sendq_tail = d->sendq_count = 0; /* §4.2.1: drop any backlog from a dead session */

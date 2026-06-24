@@ -66,7 +66,8 @@ add_executable(harp-deviced
   device/state.c        # engine <-> content-addressed objects
   device/session.c      # protocol handlers + session loop
   host/rtp.c            # §8.7 RTP packetization (--rtp-out emit)
-  ${HARP_PLAT_SRC}      # §16 DoS: harp_now_ns for the accept rate limit + pre-hello deadline
+  host/sock_io.c        # §8.7 eth control socket io (recv/send + deadline-aware pre-hello read, §16)
+  ${HARP_PLAT_SRC}      # §16 DoS: harp_now_ns for the pre-hello read deadline
 )
 target_include_directories(harp-deviced PRIVATE host)
 target_link_libraries(harp-deviced harpcore ${HARP_MATH_LIB} ${HARP_PLAT_LIBS})
@@ -75,7 +76,7 @@ if(WIN32)
   # target is the plugin/host, not this. panel.c (AF_UNIX) is gated out — POSIX-only;
   # session.c's reconcile symbols come from the tiny panel_stub_win.c. sock_io = the
   # recv/send accept path (harp_io_fd's _read/_write don't work on Winsock SOCKETs).
-  target_sources(harp-deviced PRIVATE device/panel_stub_win.c host/sock_io.c)
+  target_sources(harp-deviced PRIVATE device/panel_stub_win.c)
   target_link_libraries(harp-deviced ws2_32)
 else()
   find_package(Threads REQUIRED)

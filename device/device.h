@@ -356,6 +356,8 @@ typedef struct {
                           can't host-lock and must resample (host/freerun) instead.
                           Models a real converter whose clock the host can't trim. */
 
+    harp_sock_io *ctl_io; /* §16 DoS: the eth control socket's io (the accept-loop harp_sock_io);
+                             handle_hello clears its pre-hello read deadline. NULL off the eth path. */
     harp_sockhandle ctl_sock; /* §16 DoS: the eth control socket for THIS session, or
                                  HARP_SOCK_INVALID off the eth accept path (USB/FFS). The accept
                                  loop arms a 5s pre-hello SO_RCVTIMEO on it; handle_hello clears it

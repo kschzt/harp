@@ -61,6 +61,7 @@ void harp_sock_io_init(harp_sock_io *t, harp_sockhandle s) {
     t->io.write_all = sock_write_all;
     t->io.corrupt_pct = 0; /* §8.7 fault injection is DEVICE-only; init so stack garbage never makes the host corrupt its own frames */
     t->s = s;
+    t->deadline_ns = 0; /* §16: no deadline by default; the device arms it pre-hello (harp-deviced.c) */
 }
 
 harp_sockhandle harp_sock_dial(const char *hostport) {

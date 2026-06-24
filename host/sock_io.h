@@ -39,6 +39,10 @@ typedef int harp_sockhandle;
 typedef struct {
     harp_io         io;
     harp_sockhandle s;
+    uint64_t        deadline_ns; /* §16 DoS: if non-zero, a deadline-aware read_exact (the device's
+                                  * pre-hello path) re-arms SO_RCVTIMEO to the REMAINING budget before
+                                  * each recv, so a slow-trickle half-open cannot hold the read past
+                                  * this wall-clock deadline. 0 = no deadline (the default; host/probe). */
 } harp_sock_io;
 
 /* Bind the read_exact/write_all vtable onto an already-connected socket. */
