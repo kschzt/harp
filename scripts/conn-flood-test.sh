@@ -59,6 +59,38 @@ for i in range(3):
         sys.exit("half-open %d took %.1fs to drop (expected ~5s pre-hello timeout)" % (i, dt))
     print("   half-open %d dropped after %.1fs" % (i, dt))
 
+# (a2) §16 SLOW-TRICKLE: a byte every ~4s (UNDER the 5s inactivity timeout, which alone resets on
+#      every byte) that never completes core.hello. The 10s wall-clock pre-hello deadline MUST drop
+#      it — NOT the (far larger) per-stream reassembly cap, which would hold the single-threaded
+#      accept loop for minutes. The device closes at the deadline; detect via a failed send
+#      (ECONNRESET) or recv()==b'' (EOF) and assert it landed near 10s, not past 13s.
+st = socket.create_connection(("127.0.0.1", port), timeout=3)
+st.settimeout(15)
+t0 = time.time(); dropped_at = None; last_send = -99.0
+while time.time() - t0 < 16 and dropped_at is None:
+    el = time.time() - t0
+    if el - last_send >= 4.0:        # a byte every ~4s, UNDER the 5s per-recv inactivity timeout
+        try:
+            st.sendall(bytes([0]))   # one sub-frame byte, never a complete hello
+            last_send = el
+        except OSError:
+            dropped_at = el; break    # device closed (send failed)
+    st.setblocking(False)            # poll FINELY for the close — granularity << the 4s send gap, so
+    try:                             # the measured time is the DEVICE's drop instant, not a slow CI's
+        if st.recv(8) == b"":        # send cadence (the old 4s poll read ~16s on the Windows runner)
+            dropped_at = time.time() - t0
+    except (BlockingIOError, OSError):
+        pass
+    st.setblocking(True)
+    if dropped_at is None:
+        time.sleep(0.4)
+st.close()
+if dropped_at is None:
+    sys.exit("slow-trickle NOT dropped within 16s — the 10s pre-hello wall-clock deadline is not enforced")
+if dropped_at > 14.0:
+    sys.exit("slow-trickle dropped after %.1fs — far past the ~10s deadline (bounded by the per-stream cap, not the wall clock)" % dropped_at)
+print("   slow-trickle dropped after %.1fs (~10s wall-clock deadline, not the per-stream cap)" % dropped_at)
+
 # (b) a connect storm: ~300 concurrent connect/close — the daemon must survive a flood
 #     (no crash, no spin) and still serve the next client (below).
 def burst():

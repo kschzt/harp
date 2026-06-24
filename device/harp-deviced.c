@@ -45,6 +45,7 @@
 #include "device.h"
 #include "rtp.h"
 #include "sock_io.h" /* harp_sock_io: recv/send accept path (Winsock SOCKETs reject _read/_write) */
+#include "harp/plat.h" /* harp_now_ns: the §16 pre-hello read deadline */
 
 /* THE device. One per daemon; modules share it via device.h. */
 device g_dev;
@@ -143,6 +144,41 @@ static int g_rtp_drop_pct = 0;
 /* §8.7 fault injection: --corrupt-ctl-pct N flips one byte in ~N% of outgoing FRAMED CBOR
  * (ctl + echo + evt, via harp_link_send), set per-io on the device's host link only. */
 static int g_corrupt_ctl_pct = 0;
+
+/* §16 DoS: a deadline-bounded read_exact for the eth control socket's PRE-HELLO phase. Re-arms
+ * SO_RCVTIMEO to the REMAINING budget (harp_sock_io.deadline_ns) before each recv, so a slow-
+ * trickle half-open (a byte just under the per-recv inactivity timeout — which alone resets on
+ * every byte) cannot hold the single-threaded accept loop past the wall-clock deadline: the
+ * timeout shrinks to 0 at the deadline and the next recv fails. deadline_ns == 0 (cleared on
+ * core.hello) reads normally. Overrides harp_sock_io's standard read_exact; the duplicated recv
+ * loop keeps harp_now_ns out of the host-shared sock_io.c. */
+static bool device_prehello_read_exact(harp_io *io, void *buf, size_t n) {
+    harp_sock_io *t = (harp_sock_io *)io;
+    uint8_t *p = (uint8_t *)buf;
+    while (n) {
+        if (t->deadline_ns) {
+            uint64_t now = harp_now_ns();
+            if (now >= t->deadline_ns) return false; /* pre-hello budget exhausted */
+            uint64_t rem_ms = (t->deadline_ns - now) / 1000000ull;
+            if (rem_ms > 5000) rem_ms = 5000; /* §16: 5s inactivity cap WITHIN the 10s total — a
+                                               * stalled half-open drops at 5s, a trickle at the 10s deadline */
+            harp_sock_recv_timeout_ms(t->s, (int)(rem_ms ? rem_ms : 1));
+        }
+        int r = recv(t->s, (char *)p, (int)(n > 0x7fffffff ? 0x7fffffff : n), 0);
+        if (r < 0) {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEINTR) continue;
+#else
+            if (errno == EINTR) continue;
+#endif
+            return false;
+        }
+        if (r == 0) return false; /* peer closed */
+        p += r;
+        n -= (size_t)r;
+    }
+    return true;
+}
 
 void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, uint64_t msc) {
     if (a->rtp_fd < 0) return;
@@ -454,16 +490,16 @@ int main(int argc, char **argv) {
                           peer.sin_family == AF_INET)
                              ? peer.sin_addr.s_addr
                              : 0;
-#ifdef _WIN32
-        /* Winsock SOCKETs reject _read/_write, so the accept path uses recv/send. */
+        /* §16 DoS: ONE recv/send io on both platforms (Winsock rejects _read/_write anyway), with a
+         * deadline-bounded pre-hello read so a slow-trickle half-open can't hold the accept loop. */
         harp_sock_io tio;
         harp_sock_io_init(&tio, cfd);
-#else
-        harp_io_fd tio;
-        harp_io_fd_init(&tio, cfd, cfd);
-#endif
+        tio.io.read_exact = device_prehello_read_exact;   /* §16: deadline-aware pre-hello read */
+        tio.deadline_ns = harp_now_ns() + 10000000000ull; /* §16: 10 s total pre-hello budget */
+        d->ctl_io = &tio;
         tio.io.corrupt_pct = g_corrupt_ctl_pct; /* §8.7 fault injection: device->host frames only */
         harp_deviced_run_session(d, &tio.io);
+        d->ctl_io = NULL;
         d->ctl_sock = HARP_SOCK_INVALID; /* §16: session over — disarm the pre-hello timeout */
         d->rtp_peer_ip = 0; /* session over — forget the peer */
         HARP_CLOSESOCK(cfd);

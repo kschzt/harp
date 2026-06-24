@@ -1068,7 +1068,11 @@ void HarpRuntime::pollEcho() {
             }
             if (ok) echoRing_.push({(uint32_t)id, (float)v, (uint16_t)part});
         } else if (stream == HARP_STREAM_OBJ && storeOk_) {
-            harp_store_put(&store_, msg_.buf, msg_.len, nullptr);
+            /* §11.2: verify-on-receipt — discard a malformed object (harp_obj_kind < 0) rather than
+             * store unparseable bytes under a meaningless content hash (the 3rd obj receiver,
+             * matching device handle_obj + host pump_one). */
+            if (harp_obj_kind(msg_.buf, msg_.len) >= 0)
+                harp_store_put(&store_, msg_.buf, msg_.len, nullptr);
         }
         /* ctl notifications: tolerated and dropped for now */
     }

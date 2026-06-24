@@ -82,13 +82,14 @@ void harp_io_fd_init(harp_io_fd *f, int rfd, int wfd) {
     f->wfd = wfd;
 }
 
-/* §4.2.1 per-stream reassembled-message cap; 0 = OBJ (credit-gated, no fixed cap). */
+/* §4.2.1 per-stream reassembled-message cap. OBJ is credit-gated; the 16 MiB OBJ cap is a hard
+ * safety bound so a peer ignoring its credit window can't grow the accumulator without limit. */
 static size_t harp_stream_msg_cap(uint8_t stream) {
     switch (stream) {
         case HARP_STREAM_CTL: return HARP_CTL_MAX_PAYLOAD;
         case HARP_STREAM_EVT: return HARP_EVT_MAX_PAYLOAD;
         case HARP_STREAM_LOG: return HARP_LOG_MAX_PAYLOAD;
-        default:              return 0; /* OBJ */
+        default:              return HARP_OBJ_MAX_PAYLOAD; /* OBJ: credit-gated + a hard cap */
     }
 }
 
