@@ -10,11 +10,12 @@
  * whole-frame counts. Three checks:
  *   - JITTERED trace (±50 µs): arrival jitter is the SINAD ceiling (the realistic floor),
  *     and a no-starvation run must report ZERO re-anchors.
- *   - ISOLATED converter stopband: a pure libsamplerate resample of a NEAR-NYQUIST tone at
- *     HARP_ASRC_QUALITY (no recovery loop), gating SINAD >=110 dB (the §8.3 >=120 dB floor).
- *     Near Nyquist is where converters diverge — SRC_SINC_FASTEST ~97 dB FAILS, MEDIUM passes;
- *     a 1 kHz tone would NOT discriminate. The runtime AND this test share HARP_ASRC_QUALITY
- *     (freerun.h), so a runtime regression to a sub-floor converter fails here too.
+ *   - ISOLATED converter quality: a pure libsamplerate resample swept across the UPPER band
+ *     (18-23 kHz) at HARP_ASRC_QUALITY (no recovery loop), gating the worst SINAD >=120 dB AND
+ *     passband ripple <=0.01 dB (the §8.3 floor's two MUSTs). Near Nyquist is where converters
+ *     diverge — SRC_SINC_MEDIUM collapses to ~96 dB at 23 kHz and FASTEST to ~97 dB (both FAIL);
+ *     only SRC_SINC_BEST clears it. The runtime AND this test share HARP_ASRC_QUALITY
+ *     (freerun.h), so a runtime regression below BEST fails here too.
  *   - §8.3 stream RE-ANCHOR: three starve/recover cycles must count exactly 3 EPISODES
  *     (host-counters key 7 / clock-stats key 4) — never silent, and not count-once.
  */
@@ -137,17 +138,12 @@ static int test_reanchor(void) {
     return ok;
 }
 
-/* §8.3 converter stopband, ISOLATED: a pure libsamplerate resample of a clean sine at
- * HARP_ASRC_QUALITY (no recovery loop — the freerun trace's SINAD is dominated by the
- * rate-recovery FM, not the converter, so it can't gate this). FASTEST (~97 dB) fails
- * >=110; SRC_SINC_MEDIUM_QUALITY (the >=120 dB floor) passes. Shares HARP_ASRC_QUALITY
- * with the runtime, so a regression to a sub-floor converter fails here. */
-static int test_converter_stopband(void) {
-    const double ratio = 1.000050;          /* ~50 ppm varispeed, like the recovered rate */
-    const double FT = 18000.0;              /* NEAR-NYQUIST: where the converters diverge. At 1 kHz
-                                             * even SRC_SINC_FASTEST clears ~119 dB, so a low tone
-                                             * would NOT gate the FASTEST->MEDIUM fix; near Nyquist
-                                             * FASTEST ~97 dB FAILS >=110 while MEDIUM ~120 passes. */
+/* Resample a clean unit sine at FT (Hz @ HOST) through HARP_ASRC_QUALITY at ~50 ppm varispeed
+ * (no recovery loop — the freerun trace's SINAD is dominated by rate-recovery FM, not the
+ * converter, so it can't gate this). Returns the converter SINAD (dB) and the recovered |gain|
+ * at FT (1.0 = unity) via a sub-ppm LS sine fit. */
+static void resample_measure(double FT, double *sinad_out, double *gain_out) {
+    const double ratio = 1.000050;
     const long NIN = 200000;
     float *in = malloc(sizeof(float) * (size_t)NIN);
     for (long i = 0; i < NIN; i++) in[i] = (float)sin(2 * M_PI * FT * i / HOST);
@@ -158,10 +154,10 @@ static int test_converter_stopband(void) {
     d.data_out = out; d.output_frames = NOUT;
     d.src_ratio = ratio; d.end_of_input = 1;
     int err = src_simple(&d, HARP_ASRC_QUALITY, 1);
-    if (err) { printf("  converter: src_simple err %s\n", src_strerror(err)); free(in); free(out); return 0; }
+    if (err) { printf("  converter: src_simple err %s\n", src_strerror(err)); *sinad_out = -1e9; *gain_out = 0; free(in); free(out); return; }
     long n = d.output_frames_gen, skip = 8192, na = n - 2 * skip; /* drop filter startup AND flush tail */
     double f0 = FT / ratio;                 /* the sine's frequency in output samples (Hz @ HOST) */
-    double sinad = -1e9;
+    double sinad = -1e9, gain = 0;
     for (int kf = -200; kf <= 200; kf++) {  /* search the exact resampled frequency (sub-ppm fit) */
         double f_out = f0 * (1.0 + kf * 1e-6);
         double Sss = 0, Scc = 0, Ssc = 0, Sys = 0, Syc = 0, Syy = 0;
@@ -174,13 +170,41 @@ static int test_converter_stopband(void) {
         double A = (Sys*Scc - Syc*Ssc) / det, B = (Syc*Sss - Sys*Ssc) / det;
         double sg = (A*A*Sss + 2*A*B*Ssc + B*B*Scc) / na;
         double rs = (Syy - (A*Sys + B*Syc)) / na;
-        double s = 10 * log10(sg / rs);
-        if (s > sinad) sinad = s;
+        double sdb = 10 * log10(sg / rs);
+        if (sdb > sinad) { sinad = sdb; gain = sqrt(A*A + B*B); }
     }
     free(in); free(out);
-    int ok = sinad >= 110;
-    printf("  converter(stopband): SINAD %.1f dB at quality=%d -> %s\n",
-           sinad, HARP_ASRC_QUALITY, ok ? "PASS" : "FAIL (<110, below the §8.3 floor)");
+    *sinad_out = sinad; *gain_out = gain;
+}
+
+/* §8.3 converter quality, ISOLATED + ACROSS THE BAND. The §8.3 floor is two MUSTs: stopband
+ * SINAD >=120 dB AND passband ripple <=0.01 dB. Gating a SINGLE near-Nyquist tone at 110 dB
+ * (the old test) was rigged — it passed SRC_SINC_MEDIUM (1), which actually collapses to ~96 dB
+ * at 23 kHz. This sweeps the UPPER band (18-23 kHz, where converters diverge) and gates the
+ * WORST SINAD >=120, plus the passband |gain| flatness (1-10 kHz) <=0.01 dB. SRC_SINC_BEST (0)
+ * clears both; MEDIUM (1, ~96 dB @23 kHz) and FASTEST (2, ~97 dB) FAIL. Shares HARP_ASRC_QUALITY
+ * with the runtime, so a regression below BEST fails here. */
+static int test_converter_stopband(void) {
+    const double stop_f[] = {18000.0, 20000.0, 22000.0, 23000.0};
+    double worst = 1e9;
+    for (size_t i = 0; i < sizeof stop_f / sizeof *stop_f; i++) {
+        double sinad, gain;
+        resample_measure(stop_f[i], &sinad, &gain);
+        printf("  converter(stopband): SINAD %6.1f dB at %5.0f Hz\n", sinad, stop_f[i]);
+        if (sinad < worst) worst = sinad;
+    }
+    const double pass_f[] = {1000.0, 5000.0, 10000.0};   /* passband ripple: |gain| flatness */
+    double gmin = 1e9, gmax = -1e9;
+    for (size_t i = 0; i < sizeof pass_f / sizeof *pass_f; i++) {
+        double sinad, gain;
+        resample_measure(pass_f[i], &sinad, &gain);
+        if (gain < gmin) gmin = gain;
+        if (gain > gmax) gmax = gain;
+    }
+    double ripple = 20.0 * log10(gmax / gmin);
+    int ok = worst >= 120.0 && ripple <= 0.01;
+    printf("  converter: worst stopband SINAD %.1f dB (>=120), passband ripple %.4f dB (<=0.01) at quality=%d -> %s\n",
+           worst, ripple, HARP_ASRC_QUALITY, ok ? "PASS" : "FAIL (below the §8.3 floor)");
     return ok;
 }
 

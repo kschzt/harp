@@ -25,11 +25,12 @@
 
 typedef struct harp_freerun harp_freerun;
 
-/* §8.3 >=120 dB stopband: the ASRC converter quality the RUNTIME uses (runtime.cpp) AND the
- * freerun unit test share this ONE constant, so a regression to a sub-floor converter (e.g.
- * SRC_SINC_FASTEST, ~97 dB) fails the test's clean-SINAD gate. 1 == SRC_SINC_MEDIUM_QUALITY
- * (numeric here to avoid pulling <samplerate.h> into this header). */
-#define HARP_ASRC_QUALITY 1
+/* §8.3 >=120 dB stopband + <=0.01 dB passband ripple: the ASRC converter quality the RUNTIME
+ * uses (runtime.cpp) AND the freerun unit test share this ONE constant, so a regression to a
+ * sub-floor converter fails the test's quality gate. 0 == SRC_SINC_BEST_QUALITY (~145 dB, flat
+ * across the band). SRC_SINC_MEDIUM (1) is only ~117/96 dB at 22/23 kHz and FASTEST (2) ~97 dB
+ * — BOTH below the §8.3 floor near Nyquist (numeric here to avoid pulling <samplerate.h> in). */
+#define HARP_ASRC_QUALITY 0
 
 typedef struct {
     unsigned channels;          /* interleave width (>= 1)                      */

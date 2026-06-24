@@ -2643,9 +2643,9 @@ void HarpRuntime::reader() {
             cfg.dev_rate_hz = (double)rate_; /* nominal seed; recovered from RTP timestamps */
             cfg.target_frames = ethTargetFrames();
             cfg.capacity_frames = ethTargetFrames() * 4;
-            cfg.quality = HARP_ASRC_QUALITY; /* §8.3: >=120 dB stopband (freerun.h; == SRC_SINC_
-                                              * MEDIUM_QUALITY). SRC_SINC_FASTEST (~97 dB) was BELOW
-                                              * the floor — the old "still exceeds" comment was wrong. */
+            cfg.quality = HARP_ASRC_QUALITY; /* §8.3: >=120 dB stopband + <=0.01 dB ripple
+                                              * (freerun.h; == SRC_SINC_BEST_QUALITY). MEDIUM (~96 dB
+                                              * @23 kHz) and FASTEST (~97 dB) are BELOW the floor. */
             harp_freerun *fr = harp_freerun_new(&cfg);
             if (!fr) {
                 log_msg("ASRC: resampler init failed (libsamplerate?) — no audio");
