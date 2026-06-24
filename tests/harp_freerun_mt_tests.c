@@ -59,7 +59,36 @@ static void *observer(void *arg) {
     return NULL;
 }
 
+/* §7.3/§8.3 (round-5): the recovery must track a DRIFTING device clock, not the lifetime average.
+ * Feed a synthetic 0 ppm -> +100 ppm step (pure, no threads); the re-anchored fit must read ~+100
+ * at the end, where the old unbounded cumulative fit reads ~+50 (the mean of the two 10 s phases).
+ * Re-anchoring also bounds the regression sums, fixing the long-soak SSE catastrophic cancellation. */
+static int test_drift_tracking(void) {
+    harp_freerun_cfg cfg = {CH, RATE, RATE, TARGET, CAP, SRC_SINC_FASTEST};
+    harp_freerun *fr = harp_freerun_new(&cfg);
+    if (!fr) { printf("  FAIL drift: new()\n"); return 0; }
+    double dev = 0, hns = 0;
+    const double DT = 5e6;                  /* 5 ms host steps */
+    const double STEP = RATE * (DT / 1e9);  /* device samples per step at nominal */
+    for (int i = 0; i < 2000; i++) {        /* 10 s @ +0 ppm */
+        hns += DT; dev += STEP;
+        harp_freerun_observe(fr, (unsigned long long)dev, (unsigned long long)hns);
+    }
+    harp_freerun_stats a; harp_freerun_get_stats(fr, &a);
+    for (int i = 0; i < 2000; i++) {        /* 10 s @ +100 ppm */
+        hns += DT; dev += STEP * (1.0 + 100e-6);
+        harp_freerun_observe(fr, (unsigned long long)dev, (unsigned long long)hns);
+    }
+    harp_freerun_stats b; harp_freerun_get_stats(fr, &b);
+    int ok = (a.est_ppm > -15 && a.est_ppm < 15) && (b.est_ppm > 80);
+    printf("freerun-drift: phase1 %.1f ppm (want ~0), phase2 %.1f ppm (want ~+100; an avg-fit reads ~+50) -> %s\n",
+           a.est_ppm, b.est_ppm, ok ? "PASS" : "FAIL");
+    harp_freerun_free(fr);
+    return ok;
+}
+
 int main(void) {
+    int drift_ok = test_drift_tracking();
     harp_freerun_cfg cfg = {CH, RATE, RATE, TARGET, CAP, SRC_SINC_FASTEST};
     FR = harp_freerun_new(&cfg);
     if (!FR) { printf("freerun-mt: new() failed\n"); return 1; }
@@ -97,5 +126,5 @@ int main(void) {
            st.est_ppm, rms, worst_fill, CAP, st.underflow_frames, st.overflow_frames,
            harp_freerun_warm(FR), ok ? "PASS" : "FAIL");
     harp_freerun_free(FR);
-    return ok ? 0 : 1;
+    return (ok && drift_ok) ? 0 : 1;
 }

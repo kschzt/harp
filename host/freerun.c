@@ -31,6 +31,9 @@
 
 #define FR_SMOOTH  0.002     /* one-pole LPF on the applied ratio (low FM)       */
 #define FR_MAXADJ  0.05      /* ratio may deviate +/- 5% from nominal            */
+#define FR_WINDOW_S 4.0      /* §7.3/§8.3: re-anchor the fit every ~4s so it tracks the CURRENT
+                              * (drifting) device rate, not the lifetime average, and the regression
+                              * sums stay bounded (the old unbounded fit's Syy -> ~1e22 over a soak) */
 
 struct harp_freerun {
     SRC_STATE *src;
@@ -113,6 +116,16 @@ void harp_freerun_observe(harp_freerun *fr, unsigned long long dev_ts,
                           unsigned long long host_ns) {
     if (!fr->obs_primed) { fr->obs_primed = 1; fr->ts0 = dev_ts; fr->host0 = host_ns; return; }
     double x = (double)(host_ns - fr->host0) / 1e9;       /* host seconds since anchor */
+    /* §7.3/§8.3: bound the fit to a sliding ~FR_WINDOW_S window by re-anchoring the origin. The old
+     * unbounded cumulative fit recovered only the LIFETIME-AVERAGE rate (could not track a drifting
+     * device clock — §8.3 "recover continuously", T14) and grew Syy to ~1e22 (catastrophic SSE
+     * cancellation over the long soaks). On re-anchor the recovered target HOLDS (the sums restart;
+     * denom <= 0 until >2 fresh samples), then the slope re-fits the recent window's current rate. */
+    if (x > FR_WINDOW_S) {
+        fr->ts0 = dev_ts; fr->host0 = host_ns;
+        fr->Sw = fr->Sx = fr->Sy = fr->Sxx = fr->Sxy = fr->Syy = 0;
+        return;
+    }
     double y = (double)(dev_ts - fr->ts0);                /* device samples since anchor */
     fr->Sw += 1; fr->Sx += x; fr->Sy += y; fr->Sxx += x*x; fr->Sxy += x*y; fr->Syy += y*y;
     double denom = fr->Sw * fr->Sxx - fr->Sx * fr->Sx;
