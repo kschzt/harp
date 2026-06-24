@@ -2151,10 +2151,10 @@ int main(int argc, char **argv) {
         bool pending = false;
         int choice = -1;
         int rc = harp_client_reconcile_poll(&p.client, &pending, &choice);
-        static const char *names[] = {"push", "pull", "read-only", "duplicate"};
+        static const char *names[] = {"push", "pull", "read-only", "duplicate", "force-consent"};
         printf("reconcile-poll: %s pending=%s choice=%d (%s)\n", rc == 0 ? "ok" : "FAILED",
                pending ? "true" : "false", choice,
-               (choice >= 0 && choice <= 3) ? names[choice] : "none");
+               (choice >= 0 && choice <= 4) ? names[choice] : "none");
     } else if (strcmp(cmd, "record") == 0 && i + 2 < argc) {
 #ifdef HAVE_LIBUSB
         cmd_record(&p, strtod(argv[i + 1], NULL), argv[i + 2]);

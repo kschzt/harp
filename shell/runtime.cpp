@@ -193,7 +193,17 @@ bool HarpRuntime::helloAndIdentity() {
             recordTransition(HARP_ST_ATTACHED, HARP_ST_ATTACHED, HARP_TR_SERIAL_MISMATCH, d);
             log_msg("%s", d);
         }
-        readOnlyDefault_.store(mismatch || serialDiffers, std::memory_order_relaxed);
+        /* §13.4: HARP_CONSENT_ENGINE_MAJOR conformance seam — the user pre-consents to an
+         * engine-version difference (mirrors the HARP_FORCE_ENGINE_MAJOR seam above). */
+        const char *cenv = getenv("HARP_CONSENT_ENGINE_MAJOR");
+        if (cenv && *cenv && atoi(cenv)) consentEngineMajor_.store(true, std::memory_order_relaxed);
+        bool consented = consentEngineMajor_.load(std::memory_order_relaxed);
+        /* §12.2/§13.4: hold read-only on a different unit (serial), OR an engine-version mismatch /
+         * a device refusal — UNLESS the user consented to the engine difference. Consent does NOT
+         * lift the serial-differs hold (a different physical unit is a separate concern). */
+        readOnlyDefault_.store(serialDiffers || ((mismatch ||
+                                   engineRefused_.load(std::memory_order_relaxed)) && !consented),
+                               std::memory_order_relaxed);
         engineMajorSeen_ = expectMajor;
     }
     /* §6.4 latency-profile (key 8): cache for the §14.3 LoopbackMeasurer's expected-
@@ -2895,6 +2905,13 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
         recordLog(HARP_LOG_INFO, "reconcile", "Read-only (no writes)");
         return true;
     }
+    if (choice == 4) { /* §11.4/§13.4 Force (consent): accept the engine-version difference, then Push */
+        log_msg("recall: reconcile -> Force (engine-version consent)");
+        consentEngineMajor_.store(true, std::memory_order_relaxed);
+        engineRefused_.store(false, std::memory_order_relaxed);
+        readOnlyDefault_.store(false, std::memory_order_relaxed);
+        /* fall through to the Push path — the CAS below now carries consent (flags bit 2). */
+    }
 
     /* Push (0) or Duplicate (3): archive the displaced device state (Duplicate names
      * it visibly as duplicate/<ts>, Push as archive/<ts>), push the target's closure,
@@ -2941,14 +2958,44 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
     }
 
     /* CAS the live ref */
-    bool ok = harp_client_refset(&client_, LIVE_REF, live.unborn ? nullptr : &deviceHead,
-                                 &target, live.unborn, false, false, nullptr) == 0;
-    if (ok) log_msg("recall: live/project restored");
+    bool ok = harp_client_refset(&client_, LIVE_REF, live.unborn ? nullptr : &deviceHead, &target,
+                                 live.unborn, false,
+                                 consentEngineMajor_.load(std::memory_order_relaxed), nullptr) == 0;
+    if (ok) {
+        log_msg("recall: live/project restored");
+    } else if (strcmp(client_.err_code, "incompatible") == 0) {
+        /* §13.4: the device refused the project (engine version differs) — typically a MINOR diff
+         * the host's major-based hold did not catch, so the auto-push above was attempted. Hold
+         * read-only STICKILY (engineRefused_ survives reconnect via helloAndIdentity) so we stop
+         * retry-pushing; the user grants consent (§11.4 Force) to override. */
+        engineRefused_.store(true, std::memory_order_relaxed);
+        readOnlyDefault_.store(true, std::memory_order_relaxed);
+        log_msg("recall: device refused project (incompatible engine version) — held read-only; grant consent to override");
+        recordLog(HARP_LOG_WARN, "recall", "device refused incompatible engine version; held read-only");
+    }
     /* The bundle reference is PERSISTENT, not consumed: the DAW project's notion of
      * state re-asserts on every reconnect ("Live wins") — the archive/duplicate step
      * keeps it loss-free. It only moves when a save pulls a new head (getStateBundle)
      * or a new set loads. */
     return ok;
+}
+
+void HarpRuntime::consentEngineMajorOverride() {
+    /* §13.4: the user accepts the staged project's engine-version difference. Mark consent (so the
+     * push carries flags bit 2), lift the engine read-only hold + the sticky refusal, and re-apply
+     * the staged project (the held path never pushed). The serial-differs hold, if any, re-asserts
+     * on the next hello — consent covers the engine difference only. */
+    consentEngineMajor_.store(true, std::memory_order_relaxed);
+    engineRefused_.store(false, std::memory_order_relaxed);
+    readOnlyDefault_.store(false, std::memory_order_relaxed);
+    bool haveBundle = false;
+    harp_hash target{};
+    { std::lock_guard<std::mutex> blk(bundleMutex_); haveBundle = hasBundle_; target = bundleTarget_; }
+    log_msg("recall: engine-version consent granted — re-applying project");
+    if (haveBundle && connected()) {
+        std::lock_guard<std::mutex> lk(ctlMutex_);
+        pushStateLocked(target);
+    }
 }
 
 /* ---- bundle codec (§15.3) ---- */
@@ -3872,6 +3919,8 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
         if (haveBundlePmh) bundleParamMapHash_ = bundlePmh;
         wantEngineMajor_.store(bundleEngineMajor, std::memory_order_relaxed); /* §12.2 read-only baseline */
         wantSerial_ = bundleSerial; /* §12.2 serial-differs read-only baseline (HIGH #4) */
+        consentEngineMajor_.store(false, std::memory_order_relaxed); /* §13.4 consent is per-project */
+        engineRefused_.store(false, std::memory_order_relaxed);      /* clear any prior refusal hold */
         bundleParams_.clear();
         paramsFromStore(&store_, target, bundleParams_);
     }

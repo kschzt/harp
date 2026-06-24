@@ -56,6 +56,7 @@ run_host() {
   : > "$HOSTLOG"
   echo "── run the host (§8.7 Ethernet) [$label] HARP_FORCE_ENGINE_MAJOR='${force:-<unset>}' $*"
   HARP_ETH_DEVICE="127.0.0.1:$PORT" HARP_DEVICE_SERIAL="$SERIAL" HARP_FORCE_ENGINE_MAJOR="$force" \
+    HARP_CONSENT_ENGINE_MAJOR="${HARP_CONSENT_ENGINE_MAJOR:-}" \
     perl -e 'alarm 30; exec @ARGV' "$HOSTBIN" "$PLUG" --seconds 2 --realtime "$@" >"$HOSTLOG" 2>&1 & HP=$!
   wait "$HP"; local rc=$?; HP=""
   [ "$rc" -eq 142 ] && { cat "$HOSTLOG"; fail "[$label] host HUNG (perl-alarm watchdog fired)"; }
@@ -110,6 +111,21 @@ grep -q "not auto-applied" "$HOSTLOG" && { cat "$HOSTLOG"; fail "control run wro
 grep -q "read-only: suppressed" "$HOSTLOG" && { cat "$HOSTLOG"; fail "control run wrongly SUPPRESSED a live param write on a matching engine (false read-only — write gate over-fired)"; }
 if perl -MCBOR::XS -e 1 >/dev/null 2>&1; then assert_reason4 "$BUNDLE.ctl" 0 "control run wrongly recorded reason 4"; fi
 echo "   ✓ control (matching engine): auto-push fired (re-asserted) + live writes ALLOWED — no read-only, no reason-4"
+
+# ── 2b) CONSENT (§13.4 / med-consent-unreachable): the SAME forced engine-major mismatch as (1),
+#        but the user grants consent (HARP_CONSENT_ENGINE_MAJOR=1 — the conformance seam for the
+#        §11.4 "Force (consent)" action / consentEngineMajorOverride()). The §13.4/§12.2 read-only
+#        hold MUST LIFT: the project re-asserts and live writes are allowed (the push now carries
+#        flags bit 2). Without consent the identical scenario (1) is held — consent is the override
+#        that makes the engine difference reachable.
+# export+unset (NOT a VAR=val prefix: prefixing a shell FUNCTION leaks the assignment into later phases).
+export HARP_CONSENT_ENGINE_MAJOR=1 HARP_RECONCILE_TIMEOUT_MS=0  # consent + headless (no panel to poll)
+run_host 99 consent --load-state "$STATE" --diag-bundle "$BUNDLE.consent" --set-at 1.0:3=0.9
+unset HARP_CONSENT_ENGINE_MAJOR HARP_RECONCILE_TIMEOUT_MS       # must NOT leak into fresh-open / serial-differs
+grep -q "project state re-asserted" "$HOSTLOG" || { cat "$HOSTLOG"; fail "consent: project NOT re-asserted despite consent (the §13.4 engine hold did not lift — med-consent-unreachable)"; }
+grep -q "not auto-applied" "$HOSTLOG" && { cat "$HOSTLOG"; fail "consent: project still HELD read-only despite consent (override ignored)"; }
+grep -q "read-only: suppressed" "$HOSTLOG" && { cat "$HOSTLOG"; fail "consent: live writes still suppressed despite consent (write gate not lifted)"; }
+echo "   ✓ consent (HARP_CONSENT_ENGINE_MAJOR): the §13.4 hold LIFTED — project re-asserted + live writes ALLOWED"
 
 # ── 3) FRESH-OPEN bundle-baseline (§12.2, NO seam): a project saved against a major-1 engine,
 #       opened on this major-2 device, must default read-only WITHOUT HARP_FORCE_ENGINE_MAJOR.
