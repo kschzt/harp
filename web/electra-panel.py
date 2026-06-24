@@ -343,7 +343,10 @@ def main():
     sys.stderr.write("electra-panel: Electra port=%s ctrl=%s\n" % (port_name, ctrl_name))
 
     panel = Panel(PANEL_SOCK)
-    params = json.loads(panel.cmd("params"))["params"]
+    # "—" (U+2014) marks a slot the current engine ignores — skip it so the Electra
+    # only shows the engine's real controls.
+    HIDDEN = "—"
+    params = [p for p in json.loads(panel.cmd("params"))["params"] if p["name"] != HIDDEN]
 
     # CTRL is a quiet command channel: used only at startup to upload the preset +
     # Lua and read their ACKs. We do NOT subscribe to its events or read it after
@@ -371,6 +374,7 @@ def main():
     port = RawMidi(port_name, want_in=True, want_out=True)
     by_cc = {p["id"] for p in params}
     shown = {}  # param id -> last CC value exchanged, so we never echo a value back
+    last_sig = tuple((p["id"], p["name"]) for p in params)  # detect a param-MAP change (engine switch)
 
     # Phase-2 reconcile: when the device parks a §11.4 offer (a shell found
     # live/project != its saved bundle), open the Reconcile page (CC 119 -> the Lua
@@ -441,7 +445,15 @@ def main():
         # Param display CCs only when NOT reconciling (else they'd pull the screen off).
         if not recon["active"]:
             try:
-                cur = json.loads(panel.cmd("params %d" % focus["part"]))["params"]
+                cur = [p for p in json.loads(panel.cmd("params %d" % focus["part"]))["params"]
+                       if p["name"] != HIDDEN]
+                sig = tuple((p["id"], p["name"]) for p in cur)
+                if sig != last_sig:  # the engine swapped its param map -> rebuild the Electra preset
+                    sys.stderr.write("electra-panel: param map changed -> re-uploading preset (%d params)\n" % len(cur))
+                    upload_preset(ctrl, build_preset(cur)); ctrl.read_window(0.5); time.sleep(0.3)
+                    upload_lua(ctrl, RECONCILE_LUA); ctrl.read_window(0.3)
+                    shown.clear(); by_cc.clear(); by_cc.update(p["id"] for p in cur)
+                    last_sig = sig
                 out = bytearray()
                 for p in cur:
                     cc = max(0, min(127, round(p["value"] * 127)))
