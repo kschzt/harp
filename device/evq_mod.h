@@ -64,4 +64,13 @@ static inline harp_mod_target_kind harp_mod_target(uint32_t ev_a, int param_idx,
     return HARP_MODT_IGNORE;
 }
 
+/* §7.1 stale-epoch rule: an event — or an inner tstamp instant (ramp-end §9.4, txn-commit
+ * §9.6) — timestamped in an epoch OLDER than the device's current epoch MUST be discarded and
+ * counted (evt_stale_epoch, §14.2). epoch 0 = "now" (always current); a future epoch shouldn't
+ * arrive but is not stale. Pure predicate so the outer-envelope guard and both inner-instant
+ * guards in handle_evt_msg share one tested rule. */
+static inline bool harp_evt_epoch_stale(uint64_t ev_epoch, uint32_t cur_epoch) {
+    return ev_epoch != 0 && ev_epoch < cur_epoch;
+}
+
 #endif /* HARP_DEVICE_EVQ_MOD_H */

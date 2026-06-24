@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "device.h"
+#include "evq_mod.h" /* harp_evt_epoch_stale (§7.1 shared stale-epoch predicate) */
 #include "harp/plat.h" /* harp_now_ns: §16 DoS pre-hello deadline */
 
 #ifdef __linux__
@@ -1561,7 +1562,7 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
     }
     /* §7.1: an event timestamped in a stale (older) epoch is discarded + counted.
      * epoch 0 = "now" (always current); a future epoch shouldn't arrive but is not stale. */
-    if (ep != 0 && ep < d->audio.epoch) {
+    if (harp_evt_epoch_stale(ep, d->audio.epoch)) {
         CTR_INC(d->evt_stale_epoch);
         return;
     }
@@ -1634,6 +1635,9 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
                 return;
         }
         if (!have_id || !have_t || !have_end) return;
+        /* §7.1: a ramp whose END instant lands in a stale epoch is discarded + counted — the inner
+         * tstamp gets the same rule as the outer envelope (eep was decoded but previously unused). */
+        if (harp_evt_epoch_stale(eep, d->audio.epoch)) { CTR_INC(d->evt_stale_epoch); return; }
         if (target < 0) target = 0;
         if (target > 1) target = 1;
         dev_event ev = {msc, DEV_EV_RAMP, (uint32_t)id, (float)target, ets, 0,
@@ -1719,6 +1723,10 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
                 return;
         }
         if (!have_id) return;
+        /* §7.1: a commit instant in a stale epoch discards the whole atomic batch (txn_abort frees
+         * the slot) + counts — never collapse a buffered batch onto a dead time domain (cep was
+         * decoded but previously unused). */
+        if (have_t && harp_evt_epoch_stale(cep, d->audio.epoch)) { CTR_INC(d->evt_stale_epoch); txn_abort(d, id); return; }
         if (have_t) cmsc = cts; /* commit instant (else "now" = the message msc) */
         if (txn_commit(d, id, cmsc)) live_ref_touch(d, true); /* re-dirty once for a param/ramp batch */
         return;
