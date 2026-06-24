@@ -279,6 +279,11 @@ typedef struct {
      * there would deadlock against the host's accept). 0 / -1 = not host-paced-TCP. */
     int host_paced_port;
     int host_paced_sock;
+    /* §8.3.1: the host's OFFLINE/deterministic intent for this stream (a faster-than-real-time bounce
+     * with no clock to wedge -> the event fence is an UNBOUNDED barrier; a real-time stream bounds it).
+     * The engine keys the fence on THIS, not on the byte carrier — so it is correct for any future
+     * offline transport. Set at audio.start; today only the host-paced TCP bounce sets it. */
+    int offline;
     uint32_t rtp_prebuffer; /* §8.7 bit-exact: frames to emit in a startup BURST
                              * (no pacing) before settling into realtime, so the
                              * host's jitter buffer is full from the first block

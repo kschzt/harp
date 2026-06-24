@@ -887,10 +887,11 @@ static void host_paced_loop(device *d) {
                                                       memory_order_acquire)) > 0) {
                 CTR_INC(g_fence_waits);
                 struct timespec fts = {0, 50000}; /* 50 µs poll */
-                /* §8.3.1: real-time host-paced (USB, host_paced_port == 0) is BOUNDED at ~5 ms
-                 * (≈ one 256-frame block @48k); the deterministic offline bounce (TCP) is the
-                 * unbounded barrier. See harp_fence_keep_waiting (fence_wait.h). */
-                bool offline = (d->audio.host_paced_port > 0);
+                /* §8.3.1: a real-time stream is BOUNDED at ~5 ms (≈ one 256-frame block @48k); the
+                 * deterministic OFFLINE bounce is the unbounded barrier. Keyed on the host's offline
+                 * INTENT (d->audio.offline, set at audio.start) — NOT the byte carrier (TCP/USB) — so a
+                 * future offline bounce over any transport is bounded correctly. See harp_fence_keep_waiting. */
+                bool offline = d->audio.offline;
                 uint64_t deadline = harp_now_ns() + 5000000ull; /* 5 ms (ignored when offline) */
                 while (harp_fence_keep_waiting(
                            (int32_t)(want - atomic_load_explicit(&g_evt_consumed,
