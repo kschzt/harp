@@ -2958,12 +2958,24 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
      * MUST still archive (the §11.4 MUST), while the common re-assert / per-part-audio stress
      * re-pushes the SAME state (deviceHead == target) — a no-op here, so no archive churn. */
     if (!live.unborn && memcmp(deviceHead.b, target.b, HARP_HASH_LEN) != 0) {
-        char archive[96];
+        char tsname[96];
         time_t now = time(nullptr);
         struct tm tm;
         harp_gmtime(now, &tm);
-        snprintf(archive, sizeof archive, "%s/%04d-%02d-%02dT%02d:%02d:%02dZ", prefix,
+        snprintf(tsname, sizeof tsname, "%s/%04d-%02d-%02dT%02d:%02d:%02dZ", prefix,
                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+        /* §11.4: two DISTINCT displacing pushes within the same wall-clock second collide on this
+         * second-granularity name — the second refset (expect=nullptr, create-if-absent) hits the
+         * existing ref, conflicts, and the push aborts (silent loss — the §11.4 MUST). A same-second
+         * repeat gets a per-session sequence suffix so each displaced state archives to a unique ref. */
+        char archive[112];
+        if (strcmp(tsname, lastArchiveName_) == 0) {
+            snprintf(archive, sizeof archive, "%s.%u", tsname, ++archiveDupSeq_);
+        } else {
+            snprintf(archive, sizeof archive, "%s", tsname);
+            snprintf(lastArchiveName_, sizeof lastArchiveName_, "%s", tsname);
+            archiveDupSeq_ = 0;
+        }
         if (harp_client_refset(&client_, archive, nullptr, &deviceHead, true, false, false, nullptr) != 0)
             return false;
     }
@@ -3950,6 +3962,10 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
         wantSerial_ = bundleSerial; /* §12.2 serial-differs read-only baseline (HIGH #4) */
         consentEngineMajor_.store(false, std::memory_order_relaxed); /* §13.4 consent is per-project */
         engineRefused_.store(false, std::memory_order_relaxed);      /* clear any prior refusal hold */
+        roExplicit_.store(false, std::memory_order_relaxed);         /* §11.4: an explicit Open-read-only
+            hold is per-project — a freshly staged bundle is a NEW project and must not inherit the prior
+            session's read-only choice (which would leave it held read-only, "not auto-applied", on connect).
+            Reconnect to the SAME project does not pass through here, so the intended persistence survives. */
         bundleParams_.clear();
         paramsFromStore(&store_, target, bundleParams_);
     }
