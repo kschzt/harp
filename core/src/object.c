@@ -214,6 +214,8 @@ struct snap_out {
     harp_hash root;
     bool have_root;
     int kind;
+    char engine[24];  /* §13.4: snapshot's engine semver (key 5), for the device load gate */
+    bool have_engine;
 };
 
 static bool read_hash(harp_cdec *d, harp_hash *h) {
@@ -233,6 +235,16 @@ static bool snap_cb(uint64_t key, harp_cdec *d, void *ud) {
         o->have_root = true;
         return true;
     }
+    if (key == 5) { /* §13.4: the snapshot author's engine semver */
+        const char *s;
+        size_t sl;
+        if (!harp_cdec_text(d, &s, &sl)) return false;
+        size_t n = sl < sizeof o->engine - 1 ? sl : sizeof o->engine - 1;
+        memcpy(o->engine, s, n);
+        o->engine[n] = 0;
+        o->have_engine = true;
+        return true;
+    }
     return harp_cdec_skip(d);
 }
 
@@ -242,6 +254,19 @@ bool harp_obj_parse_snapshot_root(const uint8_t *enc, size_t len, harp_hash *roo
     if (!obj_fields(enc, len, snap_cb, &o)) return false;
     if (o.kind != HARP_OBJ_SNAPSHOT || !o.have_root) return false;
     *root = o.root;
+    return true;
+}
+
+/* §13.4: extract the snapshot's engine semver (key 5). The device's state.refset load gate
+ * compares its MAJOR to the device's engine major. False if not a snapshot or no engine field. */
+bool harp_obj_parse_snapshot_engine(const uint8_t *enc, size_t len, char *out, size_t outsz) {
+    struct snap_out o = {0};
+    o.kind = -1;
+    if (!obj_fields(enc, len, snap_cb, &o)) return false;
+    if (o.kind != HARP_OBJ_SNAPSHOT || !o.have_engine) return false;
+    size_t n = strlen(o.engine);
+    if (n + 1 > outsz) return false;
+    memcpy(out, o.engine, n + 1);
     return true;
 }
 

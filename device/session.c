@@ -832,7 +832,7 @@ static void handle_state_refset(device *d, const harp_env *e) {
         send_error(d, e->rid, e->method, "malformed", NULL);
         return;
     }
-    bool create = flags & 1, force = flags & 2;
+    bool create = flags & 1, force = flags & 2, consent = flags & 4; /* §13.4 consent: bit 2 */
 
     if (strcmp(refname, LIVE_REF) == 0) live_cache_flush(d);
     harp_ref r;
@@ -880,6 +880,41 @@ static void handle_state_refset(device *d, const harp_env *e) {
 
     /* live refs activate in the engine; others are storage-only */
     if (strcmp(refname, LIVE_REF) == 0) {
+        /* §13.4: refuse a snapshot authored for a different ENGINE MAJOR unless the host
+         * explicitly consented (flags bit 2). "Loads but sounds different" is the user's call —
+         * the device must NOT silently load a foreign-engine snapshot (re-audit HIGH #2). */
+        if (!consent) {
+            harp_cbuf se;
+            harp_cbuf_init(&se);
+            char snap_eng[24] = "";
+            if (harp_store_get(&d->store, &newh, &se) == 0 &&
+                harp_obj_parse_snapshot_engine(se.buf, se.len, snap_eng, sizeof snap_eng)) {
+                int snap_major = atoi(snap_eng);
+                int dev_major = atoi(d->engine_ver ? d->engine_ver : ENGINE_VERSION);
+                if (snap_major != dev_major) {
+                    harp_cbuf_free(&se);
+                    /* details = {0 snapshot-major, 1 device-major}; set flags bit 2 to override. */
+                    harp_cbuf m;
+                    harp_cbuf_init(&m);
+                    harp_env_head(&m, HARP_MSG_ERROR, e->rid, e->method, true);
+                    harp_cbor_map(&m, 3);
+                    harp_cbor_uint(&m, 0);
+                    harp_cbor_text(&m, "incompatible");
+                    harp_cbor_uint(&m, 1);
+                    harp_cbor_text(&m, "snapshot engine major differs; set consent flag 0x4 to override");
+                    harp_cbor_uint(&m, 2);
+                    harp_cbor_map(&m, 2);
+                    harp_cbor_uint(&m, 0);
+                    harp_cbor_uint(&m, (uint64_t)snap_major);
+                    harp_cbor_uint(&m, 1);
+                    harp_cbor_uint(&m, (uint64_t)dev_major);
+                    send_ctl(d, &m);
+                    harp_cbuf_free(&m);
+                    return;
+                }
+            }
+            harp_cbuf_free(&se);
+        }
         if (engine_load_snapshot(d, &newh) != 0) {
             send_error(d, e->rid, e->method, "malformed", "target is not a loadable snapshot");
             return;
