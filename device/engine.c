@@ -1221,6 +1221,9 @@ static void render_part_slots(audio_state *a, float *out, uint32_t n, float rate
  * voices, and render n samples at stream position pos. A downstream daemon supplies its own pair; the refdev's are below, unchanged. */
 void engine_voices_cold(void) { for (size_t i = 0; i < NPARTS; i++) part_voices_cold(&g_parts[i]); }
 
+/* §9.3: the refdev's advertised param map is fixed — it never re-announces. */
+int engine_param_map_dirty_take(void) { return 0; }
+
 /* stream-stop quieting (called by audio_stop after the render thread is joined):
  * free every voice and clear any pending panic so nothing leaks into the next
  * stream. NOT a cold reset (no zero/alloc_clock) — keep byte-identical. */

@@ -2124,6 +2124,15 @@ void harp_deviced_run_session(device *d, harp_io *io) {
              * the host's sequence unreachable and wedge every later fence */
             atomic_fetch_add_explicit(&g_evt_consumed, 1, memory_order_release);
         }
+        /* §9.3 mid-session param-map re-announce: if the engine swapped its
+         * advertised param table (a multi-engine synth changing engines — the
+         * swap may have happened on the audio thread via the evq), recompute the
+         * hash and tell the host to re-read evt.params. Generic: the refdev's
+         * seam always returns 0, so its map stays static + byte-identical. */
+        if (engine_param_map_dirty_take()) {
+            refresh_param_map_hash(d);
+            ntf_core_changed(d, "identity");
+        }
         if (d->closing) break;
     }
     harp_cbuf_free(&msg);

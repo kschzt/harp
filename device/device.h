@@ -425,6 +425,11 @@ void audio_stop(device *d);
 uint16_t render_output(audio_state *a, float *out, uint32_t n, float rate, uint64_t pos);
 void engine_voices_cold(void);   /* audio.start: cold-reset voices */
 void engine_voices_quiet(void);  /* audio_stop: free voices + clear panic */
+/* §9.3 mid-session param-map change: an engine that mutates its advertised param
+ * table at runtime (e.g. a multi-engine synth swapping engines) sets an internal
+ * flag; the session loop polls this seam (take = read-and-clear, any thread) and,
+ * when set, recomputes the hash + sends core.changed. The refdev returns 0. */
+int engine_param_map_dirty_take(void);
 /* §8.7 RTP/UDP emit of one rendered block; no-op unless a->rtp_fd >= 0.
  * Defined in harp-deviced.c so engine.c stays free of socket code. */
 void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, uint64_t msc);
@@ -476,6 +481,9 @@ void encode_param_array(harp_cbuf *b);
  * golden render + per-part recall + identity byte-identical to pre-meter. */
 void encode_param_array_automatable(harp_cbuf *b);
 void compute_param_map_hash(device *d);
+/* §9.3 mid-session: recompute the param-map-hash after g_params changed (no boot
+ * assertion); returns true if the map changed so the caller can send core.changed. */
+bool refresh_param_map_hash(device *d);
 void live_ref_touch(device *d, bool dirty);
 void live_cache_flush(device *d);
 bool front_panel_set(device *d, uint32_t id, double v);          /* the panel's part 0 */
