@@ -26,4 +26,14 @@ static inline bool harp_fence_keep_waiting(int32_t pending, bool running, bool o
     return now_ns < deadline_ns;                /* real-time: bounded — stop at the deadline */
 }
 
+/* §8.3.1 fence-timeout COUNT predicate (PURE, host-unit-tested). After the wait loop above, a
+ * fence_timeout is counted ONLY for a genuine real-time DEADLINE expiry — render fell behind the
+ * bound. The loop also exits when the session is stopping (running went false: a teardown unwind,
+ * NOT a render-late) and the OFFLINE barrier never has a deadline ("the device does not count
+ * fence_timeouts offline"). On the bounded real-time path, events still pending WITH the session
+ * still running can only mean the loop exited via the deadline — so that is the sole count case. */
+static inline bool harp_fence_count_timeout(int32_t pending, bool running, bool offline) {
+    return !offline && running && pending > 0;
+}
+
 #endif /* HARP_FENCE_WAIT_H */

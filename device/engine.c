@@ -898,10 +898,13 @@ static void host_paced_loop(device *d) {
                            atomic_load_explicit(&a->running, memory_order_relaxed),
                            offline, harp_now_ns(), deadline))
                     nanosleep(&fts, NULL);
-                if ((int32_t)(want - atomic_load_explicit(
-                                         &g_evt_consumed,
-                                         memory_order_acquire)) > 0)
-                    CTR_INC(g_fence_timeouts); /* real-time bound expired (render late), or a stop unwound it */
+                /* §8.3.1: count ONLY a genuine real-time DEADLINE expiry — see harp_fence_count_timeout.
+                 * A stop unwinding the loop (running went false) or the unbounded offline barrier must
+                 * NOT count ("the device does not count fence_timeouts offline"). */
+                if (harp_fence_count_timeout(
+                        (int32_t)(want - atomic_load_explicit(&g_evt_consumed, memory_order_acquire)),
+                        atomic_load_explicit(&a->running, memory_order_relaxed), offline))
+                    CTR_INC(g_fence_timeouts);
             }
         }
         /* Input payload: normally discarded (this engine has no input channels), so the
