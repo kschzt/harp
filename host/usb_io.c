@@ -92,13 +92,19 @@ typedef struct {
     int is_audio;
 } in_xfer;
 
-/* one audio OUT slot: small fixed buffer (pacing frames are ~24 B) */
+/* one audio OUT slot. Sized for a FULL H->D frame, not just a pacing header: §8.2 H->D audio
+ * carries nsamples*slots floats, and the §14.3 digital loopback emits an impulse of
+ * HARP_AUDIO_HDR_LEN(20)+HARP_AUDIO_FENCE_LEN(4)+kBlock(256)*4 = 1048 B. The old 256 B slot
+ * rejected it at harp_usb_audio_write's len guard, so the loopback worked over TCP/eth but broke
+ * over USB. USB_READ_CHUNK (16384) is symmetric with the IN xfer buffer + holds it with headroom. */
 typedef struct {
     usb_io *u;
     struct libusb_transfer *xfer;
-    uint8_t buf[256];
+    uint8_t buf[USB_READ_CHUNK];
     int busy; /* under u->mu */
 } aout_slot;
+/* §14.3: the slot MUST hold a full H->D loopback frame (the bug this fixes). hdr(20)+fence(4)+kBlock(256)*4 = 1048 B. */
+_Static_assert(sizeof(((aout_slot *)0)->buf) >= 1048, "USB audio-OUT slot too small for a §14.3 H->D loopback frame");
 
 /* one link OUT write in flight (stack-allocated by the writer) */
 typedef struct {
