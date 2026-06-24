@@ -331,10 +331,22 @@ public:
      * device's analog out-path latency is 0 for the digital refdev; the ASRC group delay
      * (sub-ms) is within the event headroom. (Hot-plug async-connect would need a
      * restartComponent(kLatencyChanged) notification — a documented follow-up.) */
+    /* §6.4: the device's declared ANALOG path latency (input + output converters) at the negotiated
+     * rate, composed into the reported PDC. The buffer above already covers the stream depth (the
+     * latency-profile's key-3 buf_depth) and the ASRC group delay sits within eventHeadroom; this
+     * adds the ADC/DAC terms (profile keys 1/2) that NOTHING else accounts for. 0 for the digital
+     * refdev (in=out=0), so the reported figure is unchanged there — but a converter-bearing device
+     * would otherwise under-report its PDC and mis-align DAW automation against other tracks. */
+    uint32_t devicePathLatency() const {
+        for (size_t i = 0; i < nLat_; i++)
+            if (latProfiles_[i].rate == rate_)
+                return latProfiles_[i].in_lat + latProfiles_[i].out_lat;
+        return 0;
+    }
     uint32_t latencySamples() const {
         uint32_t buf = freeRunning_.load(std::memory_order_relaxed) ? ethTargetFrames()
                                                                     : targetFrames_;
-        return buf + eventHeadroom();
+        return buf + devicePathLatency() + eventHeadroom();
     }
     uint64_t underruns() const { return underruns_.load(std::memory_order_relaxed); }
 
@@ -1069,4 +1081,11 @@ private:
      * ATTACHED instance's part lives in the source it got from registerSource.
      * Notes don't read it — their channel is already baked into the UMP word
      * by the shell; only param sets/ramps need the per-source channel.) */
+
+    /* §11.4 archive-name disambiguation (written under ctlMutex_ in pushStateLocked): the last
+     * archive/duplicate ref name minted + a per-session sequence, so two DISTINCT displacing pushes
+     * within one wall-clock second get unique refs (the second-granularity timestamp alone collides
+     * -> the second create-if-absent refset conflicts -> the push aborts, the §11.4 MUST violated). */
+    char lastArchiveName_[96] = "";
+    unsigned archiveDupSeq_ = 0;
 };
