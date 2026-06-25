@@ -29,7 +29,7 @@ echo "── replug: 20 s realtime render, daemon restart at t=6 s (device $SERI
 # --notes at 0.6 s spacing from t=0, so a list spanning the full 20 s keeps notes
 # (and their audio) flowing past the reconnect, the tail included. ~34 notes -> 20.4 s.
 NOTES=$(python3 -c "print(','.join(['48','55','60','64'][i%4] for i in range(34)))")
-HARP_DEVICE_SERIAL="$SERIAL" "$HOST" "$PLUG" --realtime --notes "$NOTES" --set 8=0.7 --set 3=0.6 \
+HARP_DEVICE_SERIAL="$SERIAL" "$HOST" "$PLUG" --realtime --notes "$NOTES" --set 7=0.7 --set 3=0.6 \
     --seconds 20 --out "$OUT" >"$LOG" 2>&1 &
 HOSTPID=$!
 
