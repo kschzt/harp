@@ -620,6 +620,9 @@ private:
      * side (pullAudio) only. */
     void syncSinkEpoch(AudioSink &sink);
     bool helloAndIdentity();
+    /* §12.2/§13.4: recompute the read-only holds vs the live identity; shared by connect +
+     * the staged-while-connected setStateBundle path. */
+    void recomputeReadOnlyHolds();
     /* Build unionSlots_ = owner outSlots_ then every registered sink's slots
      * (deduped, order preserved) and resolve each sink's `cols` to its slots'
      * column indices within that union. Called under sinksMutex_ from

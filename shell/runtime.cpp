@@ -122,6 +122,50 @@ bool HarpRuntime::request(harp_cbuf *req, harp_cbuf *rsp, harp_env *e) {
     return rc == 0;
 }
 
+/* §12.2/§13.4: (re)compute the read-only holds against the LIVE identity vs the staged project's
+ * expectations — engine-major mismatch, a different bound unit (serial), or a device refusal, minus a
+ * user consent to the engine difference. Called on connect (helloAndIdentity) AND when a project is
+ * staged while connected (setStateBundle), so the staged-while-connected path can't silently auto-push
+ * onto a different/incompatible unit. Logs the hold once (on the clean->read-only transition). */
+void HarpRuntime::recomputeReadOnlyHolds() {
+    int curMajor = atoi(engineVer_.c_str());
+    const char *force = getenv("HARP_FORCE_ENGINE_MAJOR");
+    int expectMajor = (force && *force) ? atoi(force)
+                      : wantEngineMajor_.load(std::memory_order_relaxed);
+    bool mismatch = (expectMajor > 0 && curMajor != expectMajor);
+    bool wasRO = readOnlyDefault_.load(std::memory_order_relaxed);
+    if (mismatch && !wasRO) {
+        char d[96];
+        snprintf(d, sizeof d, "engine major %d (project) != %d (device): project state held read-only",
+                 expectMajor, curMajor);
+        recordTransition(HARP_ST_ATTACHED, HARP_ST_ATTACHED, HARP_TR_ENGINE_MAJOR_MISMATCH, d);
+        log_msg("%s", d);
+    }
+    /* §12.2 (re-audit HIGH #4): hold read-only when a DIFFERENT physical unit was bound than the
+     * project's — selectDevice's same-model fallback can bind another unit; the project must NOT
+     * silently auto-push onto it. Compares the bound serial to the bundle's (§15.3 key 2). */
+    std::string wantSer;
+    { std::lock_guard<std::mutex> blk(bundleMutex_); wantSer = wantSerial_; }
+    bool serialDiffers = !wantSer.empty() && !serial_.empty() && serial_ != wantSer;
+    if (serialDiffers && !wasRO) {
+        char d[160];
+        snprintf(d, sizeof d, "serial %s (project) != %s (device): bound a different unit — project state held read-only",
+                 wantSer.c_str(), serial_.c_str());
+        recordTransition(HARP_ST_ATTACHED, HARP_ST_ATTACHED, HARP_TR_SERIAL_MISMATCH, d);
+        log_msg("%s", d);
+    }
+    /* §13.4: HARP_CONSENT_ENGINE_MAJOR conformance seam — user pre-consents to an engine difference. */
+    const char *cenv = getenv("HARP_CONSENT_ENGINE_MAJOR");
+    if (cenv && *cenv && atoi(cenv)) consentEngineMajor_.store(true, std::memory_order_relaxed);
+    bool consented = consentEngineMajor_.load(std::memory_order_relaxed);
+    /* §12.2/§13.4: hold on a different unit (serial), OR an engine mismatch / device refusal — unless
+     * consented to the engine difference. Consent does NOT lift the serial-differs hold. */
+    readOnlyDefault_.store(serialDiffers || ((mismatch ||
+                               engineRefused_.load(std::memory_order_relaxed)) && !consented),
+                           std::memory_order_relaxed);
+    engineMajorSeen_ = expectMajor;
+}
+
 bool HarpRuntime::helloAndIdentity() {
     harp_client_identity id;
     int rc = harp_client_hello(&client_, "harp-shell 0.1 (VST3)", &id);
@@ -156,56 +200,10 @@ bool HarpRuntime::helloAndIdentity() {
      * (sessionUp then skips the auto-push). engineVer_ is "MAJOR.MINOR.PATCH"; atoi reads
      * the leading major. HARP_FORCE_ENGINE_MAJOR seeds the baseline so the conformance
      * test can force a single-connect mismatch. A matching reconnect self-clears the flag. */
-    {
-        /* §12.2: hold read-only while the loaded PROJECT expects a different engine major than the
-         * device reports. expectMajor is the forced baseline (HARP_FORCE_ENGINE_MAJOR conformance
-         * seam) else the bundle's embedded major (0 = no project staged). It is STABLE across
-         * reconnect, so the hold PERSISTS — a routine §12.3 unplug/replug to the same wrong-engine
-         * device stays read-only — and self-clears only when the device's major actually matches the
-         * project's (a firmware update) or a matching project loads. (Was: engineMajorSeen_
-         * re-baselined to the device's own major every hello, so the hold survived exactly one
-         * connect — re-audit HIGH #3.) The flag also gates live writes (queueParamSet/queueRamp). */
-        int curMajor = atoi(engineVer_.c_str());
-        const char *force = getenv("HARP_FORCE_ENGINE_MAJOR");
-        int expectMajor = (force && *force) ? atoi(force)
-                          : wantEngineMajor_.load(std::memory_order_relaxed);
-        bool mismatch = (expectMajor > 0 && curMajor != expectMajor);
-        bool wasRO = readOnlyDefault_.load(std::memory_order_relaxed);
-        if (mismatch && !wasRO) {
-            char d[96];
-            snprintf(d, sizeof d, "engine major %d (project) != %d (device): project state held read-only",
-                     expectMajor, curMajor);
-            recordTransition(HARP_ST_ATTACHED, HARP_ST_ATTACHED, HARP_TR_ENGINE_MAJOR_MISMATCH, d);
-            log_msg("%s", d);
-        }
-        /* §12.2 (re-audit HIGH #4): ALSO hold read-only when a DIFFERENT physical unit was bound
-         * than the project's — selectDevice's same-model fallback can bind another unit, and the
-         * project must NOT silently auto-push onto it (it has its own state); the user pushes to
-         * bind it here. Compares the bound device serial to the unit the bundle was saved on
-         * (§15.3 identity-expectation key 2). */
-        std::string wantSer;
-        { std::lock_guard<std::mutex> blk(bundleMutex_); wantSer = wantSerial_; }
-        bool serialDiffers = !wantSer.empty() && !serial_.empty() && serial_ != wantSer;
-        if (serialDiffers && !wasRO) {
-            char d[160];
-            snprintf(d, sizeof d, "serial %s (project) != %s (device): bound a different unit — project state held read-only",
-                     wantSer.c_str(), serial_.c_str());
-            recordTransition(HARP_ST_ATTACHED, HARP_ST_ATTACHED, HARP_TR_SERIAL_MISMATCH, d);
-            log_msg("%s", d);
-        }
-        /* §13.4: HARP_CONSENT_ENGINE_MAJOR conformance seam — the user pre-consents to an
-         * engine-version difference (mirrors the HARP_FORCE_ENGINE_MAJOR seam above). */
-        const char *cenv = getenv("HARP_CONSENT_ENGINE_MAJOR");
-        if (cenv && *cenv && atoi(cenv)) consentEngineMajor_.store(true, std::memory_order_relaxed);
-        bool consented = consentEngineMajor_.load(std::memory_order_relaxed);
-        /* §12.2/§13.4: hold read-only on a different unit (serial), OR an engine-version mismatch /
-         * a device refusal — UNLESS the user consented to the engine difference. Consent does NOT
-         * lift the serial-differs hold (a different physical unit is a separate concern). */
-        readOnlyDefault_.store(serialDiffers || ((mismatch ||
-                                   engineRefused_.load(std::memory_order_relaxed)) && !consented),
-                               std::memory_order_relaxed);
-        engineMajorSeen_ = expectMajor;
-    }
+    /* §12.2/§13.4: recompute the read-only holds (engine-major / serial-differs / device-refusal)
+     * against the live identity vs the staged project. Shared with setStateBundle so a project staged
+     * WHILE connected gets the same protection (else it auto-pushes onto a different/incompatible unit). */
+    recomputeReadOnlyHolds();
     /* §6.4 latency-profile (key 8): cache for the §14.3 LoopbackMeasurer's expected-
      * RTT. Off the loopback path this is just stored, never read (no render effect). */
     nLat_ = 0;
@@ -3977,6 +3975,17 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
          * staged offline gets the same check when it applies in the connect handler. */
         if (haveBundlePmh && memcmp(bundlePmh.b, paramMapHash_.b, HARP_HASH_LEN) != 0)
             log_param_map_drift();
+        /* §12.2/§13.4: a project staged WHILE connected must get the SAME read-only holds the connect
+         * handler computes — recompute them against the LIVE identity before any auto-push. Without
+         * this, staging a unit-A project while bound to a same-engine DIFFERENT unit B silently
+         * auto-pushed A's state onto B (the device can't self-protect: the engine matches, so the §13.4
+         * device gate never fires). Held read-only here -> the user pushes explicitly to bind it. */
+        recomputeReadOnlyHolds();
+        if (readOnlyDefault_.load(std::memory_order_relaxed) || roExplicit_.load(std::memory_order_relaxed)) {
+            log_msg("recall bundle staged while connected, but held read-only (different unit / engine) — not auto-applied");
+            recordLog(HARP_LOG_INFO, "recall", "staged-while-connected held read-only — not auto-applied");
+            return true;
+        }
         std::lock_guard<std::mutex> lk(ctlMutex_);
         return pushStateLocked(target);
     }
