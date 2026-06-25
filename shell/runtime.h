@@ -348,10 +348,29 @@ public:
                 return latProfiles_[i].in_lat + latProfiles_[i].out_lat + latProfiles_[i].buf_depth;
         return 0;
     }
+    /* §6.4 keys 1/2 (analog in/out), rate-specific; 0 for the digital refdev. Mode-independent —
+     * both host-paced and free-running carry the converter terms. */
+    uint32_t convertersLatency() const {
+        for (size_t i = 0; i < nLat_; i++)
+            if (latProfiles_[i].rate == rate_)
+                return latProfiles_[i].in_lat + latProfiles_[i].out_lat;
+        return 0;
+    }
     uint32_t latencySamples() const {
-        uint32_t buf = freeRunning_.load(std::memory_order_relaxed) ? ethTargetFrames()
-                                                                    : targetFrames_;
-        return buf + devicePathLatency() + eventHeadroom();
+        if (freeRunning_.load(std::memory_order_relaxed)) {
+            /* §6.4/§8.7 FREE-RUNNING: the device renders + emits in ethNsamples() chunks — NOT the
+             * kBlock host-paced turnaround (buf_depth) the §14.3 loopback measures — and free-running
+             * has no pacing frontier, so the §9.2 event headroom tracks the render block too (not the
+             * kBlock floor). A 64-sample device at DAW block 64 thus reports buffer+128 where the
+             * host-paced chain is buffer+512, and it is CORRECT: that IS the free-running event→audio
+             * path. (Using buf_depth/kBlock here OVER-reported a low-nsamples device, aligning its audio
+             * early.) Events still ride the full reported latency as lead — buffer (~256+) dwarfs the
+             * ~1-2ms host→device delivery, so evt_late stays 0; soak-verified on the wire. */
+            uint32_t ns = ethNsamples();
+            uint32_t hr = maxDawBlock_ > ns ? maxDawBlock_ : ns;
+            return ethTargetFrames() + convertersLatency() + ns + hr;
+        }
+        return targetFrames_ + devicePathLatency() + eventHeadroom();
     }
     uint64_t underruns() const { return underruns_.load(std::memory_order_relaxed); }
 
