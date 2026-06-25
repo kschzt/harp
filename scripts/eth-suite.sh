@@ -21,6 +21,14 @@
 # (used by local validation before pushing — the real multi-OS proof is the PR matrix).
 set -u
 
+# §8.7 counter assertions decode the diag bundle with python3 and print a ✓/§/— status line
+# (rtp-loss, rtp-reorder, ratelimit). Windows' default stdout encoding is cp1252 (charmap),
+# which can't encode those chars -> UnicodeEncodeError -> python exits nonzero -> the test
+# fails for a PRINT, not a real assertion. Force UTF-8 on every sub-script's python stdout so
+# the status prints encode on Windows too (round-6 enabled cbor2 on Windows via eth.yml, which
+# is what first exercised these prints there). Exported once here -> covers every sub-script.
+export PYTHONIOENCODING=utf-8
+
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 

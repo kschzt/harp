@@ -36,7 +36,14 @@ for _ in $(seq 1 25); do grep -q "listening on $PORT" "$DEVLOG" 2>/dev/null && b
 grep -q "listening on $PORT" "$DEVLOG" || { cat "$DEVLOG"; fail "device didn't start on $PORT"; }
 
 rm -f "$BUNDLE"
-HARP_ETH_DEVICE="127.0.0.1:$PORT" HARP_DEVICE_SERIAL="SIM-0001" \
+# 25%-LOSS TORTURE buffer: pin the host jitter buffer to 2048 frames for this test (HARP_ETH_TARGET).
+# Round-6 lowered the UNDECLARED-device default (shell/runtime.h kEthTargetFrames) 2048->1024 for NORMAL
+# operation; under THIS 25%-loss torture 1024 is marginal on a jittery runner (it survived at 2048, and
+# Windows CI dipped to rms~0.026 at 1024). This device declares no rt-floor, so without the override it
+# would inherit the new 1024 default. The buffer the loss-recovery needs is the test's concern, not the
+# shipped default — pinning it here keeps the FIDELITY assertion below honest (and unrelaxed) regardless
+# of the default. (Production declares its floor via --rt-floor/key 14; the env is the host-side equivalent.)
+HARP_ETH_TARGET=2048 HARP_ETH_DEVICE="127.0.0.1:$PORT" HARP_DEVICE_SERIAL="SIM-0001" \
   perl -e 'alarm 20; exec @ARGV' "$HOSTBIN" "$PLUG" --seconds 5 --realtime --diag-bundle "$BUNDLE" >"$HOSTLOG" 2>&1 & HP=$!
 wait "$HP"; rc=$?; HP=""
 kill -9 "$DP" 2>/dev/null; DP=""
