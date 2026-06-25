@@ -1037,8 +1037,12 @@ public:
         if (info.id >= 2 && info.id <= (ParamID)kNumParams && currentEngine_ < kNumEngineTables) {
             const char *t = kEngineTables[currentEngine_][info.id - 1];
             if (t) {
-                if (engSlotHidden(t)) info.flags |= ParameterInfo::kIsHidden;
-                else { UString(info.title, 128).fromAscii(t); info.flags &= ~ParameterInfo::kIsHidden; }
+                /* Always relabel + keep the slot VISIBLE. Dynamically toggling kIsHidden on an
+                 * engine switch makes hosts (Live) leave a "phantom"/removed-param ghost in the
+                 * automation lane (the more->fewer-params case). A fixed-size bank that only ever
+                 * RELABELS avoids that; an unused slot just shows its "—" name instead of vanishing. */
+                UString(info.title, 128).fromAscii(t);
+                info.flags &= ~ParameterInfo::kIsHidden;
             }
         }
         return r;
