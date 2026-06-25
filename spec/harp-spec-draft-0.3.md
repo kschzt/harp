@@ -416,7 +416,7 @@ latency-profile = [* {
   0 => uint,             ; sample rate, Hz
   1 => uint,             ; device input path latency, samples (analog-in → stream)
   2 => uint,             ; device output path latency, samples (stream → analog-out)
-  ? 3 => uint,           ; engine processing latency, samples, if in audio path
+  ? 3 => uint,           ; device render/turnaround block, samples (per-block output buffering; §14.3 measures it as the loopback RTT)
 }]
 ```
 

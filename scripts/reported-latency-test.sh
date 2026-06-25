@@ -37,9 +37,10 @@ DEVDIR=replat-eth-state
 DEVLOG=/tmp/replat-eth-dev.log
 have() { [ -n "${1:-}" ] && [ -x "$1" ]; }
 
-hr=$(( BLOCK > 256 ? BLOCK : 256 ))
-EXPECT_HP=$(( (2*BLOCK > 512 ? 2*BLOCK : 512) + hr ))         # host-paced (offline): USB ring
-EXPECT_FR=$(( (2*BLOCK > RTFLOOR ? 2*BLOCK : RTFLOOR) + hr )) # free-running (RTP): jitter buffer
+hr=$(( BLOCK > 256 ? BLOCK : 256 ))   # §9.2 event headroom: max(DAW block, device pacing block) — host SEND lookahead
+BD=256                                # §6.4 key 3: device render/turnaround block — the §14.3 loopback measures RTT=256
+EXPECT_HP=$(( (2*BLOCK > 512 ? 2*BLOCK : 512) + hr + BD ))         # host-paced: USB ring + headroom + device block
+EXPECT_FR=$(( (2*BLOCK > RTFLOOR ? 2*BLOCK : RTFLOOR) + hr + BD )) # free-running: jitter buffer + headroom + device block
 
 fail() { echo "REPORTED-LATENCY FAIL: $1"; FAIL=1; }
 FAIL=0
@@ -74,4 +75,16 @@ if have "$CHOST" && [ -n "$CPLUG" ]; then check clap "$EXPECT_HP" "" "$CHOST" "$
 if [ "$OSID" = macos ] && have "$AUHOST" && [ -d "$AUCOMP" ]; then check au "$EXPECT_HP" "" "$AUHOST"; \
    else [ "$OSID" = macos ] && echo "   ⏭ SKIP au (au-host/component not installed)"; fi
 
-[ "$FAIL" = 0 ] && echo "REPORTED-LATENCY PASS: free-running=$EXPECT_FR (jitter buffer) + host-paced=$EXPECT_HP cross-format (§6.4/§8.7)" || { echo "REPORTED-LATENCY FAIL"; exit 1; }
+# (3) §6.4 NON-ZERO CONVERTER: a device declaring keys 1/2 (analog-in/out latency) MUST fold them into
+# PDC alongside the render block (key 3) — the path the pure-digital refdev (in=out=0) never exercises.
+CIN=64; COUT=32; CPORT=$((PORT+1)); CDEVDIR="${DEVDIR}-conv"; CDEVLOG=/tmp/replat-conv-dev.log
+rm -rf "$CDEVDIR"; : > "$CDEVLOG"
+"$DEVICED" --port "$CPORT" --rt-floor "$RTFLOOR" --in-lat "$CIN" --out-lat "$COUT" --state-dir "$CDEVDIR" --panel-sock "" >>"$CDEVLOG" 2>&1 & CDP=$!
+trap 'kill -9 "$DP" "$CDP" 2>/dev/null' EXIT
+for _ in $(seq 1 25); do grep -q "listening on $CPORT" "$CDEVLOG" 2>/dev/null && break; sleep 0.2; done
+if grep -q "listening on $CPORT" "$CDEVLOG"; then
+    HARP_ETH_DEVICE="127.0.0.1:$CPORT" check vst3-converter "$(( EXPECT_HP + CIN + COUT ))" "" "$HOSTBIN" "$VPLUG"
+    rm -rf "$CDEVDIR"
+else cat "$CDEVLOG"; fail "converter device (--in-lat/--out-lat) didn't start"; fi
+
+[ "$FAIL" = 0 ] && echo "REPORTED-LATENCY PASS: free-running=$EXPECT_FR (jitter buffer) + host-paced=$EXPECT_HP + converter in+out folded (§6.4/§8.7)" || { echo "REPORTED-LATENCY FAIL"; exit 1; }

@@ -339,6 +339,7 @@ int main(int argc, char **argv) {
     bool no_rate_lock = false;                        /* --no-rate-lock: force host ASRC fallback */
     uint32_t rt_floor = 0;                            /* --rt-floor N: declared safe ethTargetFrames floor (frames), identity key 14 */
     uint32_t rt_nsamples = 0;                         /* --rt-nsamples N: declared RTP packet size (frames), identity key 14 sub-key 1 */
+    uint32_t in_lat = 0, out_lat = 0;                 /* --in-lat / --out-lat N: §6.4 latency-profile keys 1/2 (converter latency, samples) */
     const char *engine_ver = NULL;                    /* --engine-ver X.Y.Z: §12.2 test seam, override reported engine semver */
     bool pmh_flip = false;                            /* --param-map-hash-flip: TEST seam (§9.3/§13.4) —
                                                        * advertise a 1-bit-altered param-map-hash to mimic
@@ -379,12 +380,16 @@ int main(int argc, char **argv) {
             rt_floor = (uint32_t)atoi(argv[++i]); /* §6.4: declare the safe ethTargetFrames floor (identity key 14) */
         else if (strcmp(argv[i], "--rt-nsamples") == 0 && i + 1 < argc)
             rt_nsamples = (uint32_t)atoi(argv[++i]); /* §6.4: declare the RTP packet size (identity key 14 sub-key 1) */
+        else if (strcmp(argv[i], "--in-lat") == 0 && i + 1 < argc)
+            in_lat = (uint32_t)atoi(argv[++i]);  /* §6.4: declare analog-in path latency (latency-profile key 1) */
+        else if (strcmp(argv[i], "--out-lat") == 0 && i + 1 < argc)
+            out_lat = (uint32_t)atoi(argv[++i]); /* §6.4: declare analog-out path latency (latency-profile key 2) */
         else if (strcmp(argv[i], "--engine-ver") == 0 && i + 1 < argc)
             engine_ver = argv[++i]; /* §12.2 test seam: report this engine semver instead of ENGINE_VERSION */
         else {
             fprintf(stderr,
                     "usage: harp-deviced [--state-dir DIR] [--serial S] "
-                    "[--panel-sock PATH] [--tone HZ] [--no-rate-lock] [--rt-floor N] [--rt-nsamples N] [--engine-ver X.Y.Z] "
+                    "[--panel-sock PATH] [--tone HZ] [--no-rate-lock] [--rt-floor N] [--rt-nsamples N] [--in-lat N] [--out-lat N] [--engine-ver X.Y.Z] "
                     "[--port P | --ffs FFS_DIR [--gadget CONFIGFS_PATH]]\n");
             return 2;
         }
@@ -413,6 +418,8 @@ int main(int argc, char **argv) {
      * hardcoded here. Absent => 0 => the host keeps its conservative 2048/256 defaults. */
     d->rt_floor = rt_floor;       /* §6.4 rt-profile: emitted as identity key 14 sub-key 0 when nonzero */
     d->rt_nsamples = rt_nsamples; /* §6.4 rt-profile: emitted as identity key 14 sub-key 1 when nonzero */
+    d->in_lat = in_lat;           /* §6.4 latency-profile key 1 (converter analog-in; 0 = pure-digital refdev) */
+    d->out_lat = out_lat;         /* §6.4 latency-profile key 2 (converter analog-out) */
     d->engine_ver = engine_ver;   /* §12.2 test seam: NULL => ENGINE_VERSION */
     d->ctl_sock = HARP_SOCK_INVALID; /* §16: armed per-connection by the eth accept loop */
     snprintf(d->serial, sizeof d->serial, "%s", serial);
