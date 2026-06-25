@@ -168,7 +168,14 @@ fi
 # 8 s, so the tone's rms survives; no reanchors (ASRC sends no audio.trim).
 echo "──── ASRC: non-rate-lock device, host clock-recovers + resamples"
 start_dev --no-rate-lock --tone 440
-out=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" perl -e 'alarm 20; exec @ARGV' "$HOSTBIN" "$PLUG" --seconds 8 --realtime --json 2>/tmp/eth-asrc.err || true)
+# Pin HARP_ETH_TARGET=2048 for the ASRC torture: round-6 lowered the undeclared-device
+# default buffer to 1024, which is marginal for the *resampled* (varispeed) path on a
+# heavily-loaded shared CI VM — 1024 underran 142x there and collapsed the tone. ASRC is
+# the most buffer-sensitive free-running case (the elastic buffer + the rate mismatch); the
+# default-lowering is for normal ops, not this jitter torture (the 1024 default's runtime is
+# hardware-validated on the real switch soak, not a non-realtime VM). Buffer size is
+# orthogonal to the ASRC path under test (the host still clock-recovers + resamples).
+out=$(HARP_ETH_DEVICE="127.0.0.1:$PORT" HARP_ETH_TARGET=2048 perl -e 'alarm 20; exec @ARGV' "$HOSTBIN" "$PLUG" --seconds 8 --realtime --json 2>/tmp/eth-asrc.err || true)
 rms=$(printf '%s' "$out" | sed -nE 's/.*"rms":([0-9.]+).*/\1/p')
 conn=$(grep -c 'connected:' /tmp/eth-asrc.err 2>/dev/null || true)
 asrc=$(grep -c 'ASRC resample' /tmp/eth-asrc.err 2>/dev/null || true)

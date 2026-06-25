@@ -21,6 +21,14 @@
 # (used by local validation before pushing — the real multi-OS proof is the PR matrix).
 set -u
 
+# §8.7 counter assertions decode the diag bundle with python3 and print a ✓/§/— status line
+# (rtp-loss, rtp-reorder, ratelimit). Windows' default stdout encoding is cp1252 (charmap),
+# which can't encode those chars -> UnicodeEncodeError -> python exits nonzero -> the test
+# fails for a PRINT, not a real assertion. Force UTF-8 on every sub-script's python stdout so
+# the status prints encode on Windows too (round-6 enabled cbor2 on Windows via eth.yml, which
+# is what first exercised these prints there). Exported once here -> covers every sub-script.
+export PYTHONIOENCODING=utf-8
+
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
@@ -89,6 +97,8 @@ run reported-latency   scripts/reported-latency-test.sh      # §6.4 reported PD
 run param-map-recall   scripts/param-map-recall-test.sh      # §13.4 recall warns on param-map drift
 run eth-rtfloor        scripts/eth-rtfloor-test.sh           # §6.4 rt-profile (key 14): declared floor/packet + clamps
 run hello-gate         scripts/hello-gate-test.sh            # §5.4 pre-hello request denied (gate regression guard)
+run evt-storm          scripts/evt-storm-eth-test.sh         # §9.2 evt_late stays 0 on the rt-nsamples=64 free-running path (#76 guard)
+run staged-connected   scripts/staged-connected-eth-test.sh  # §11.4 HIGH #8: --load-state-after-connect onto a mismatched unit held read-only
 
 # §8.2 host-paced late-frame discard: the harp-eth-latefr-test tool is POSIX-only (raw
 # server socket for the device's connect-back), so it isn't built on Windows.
@@ -127,9 +137,11 @@ if have "$PROBE"; then
   run recall           scripts/recall-eth-test.sh            # §11.4 recall round-trip + archive
   run credit           scripts/credit-eth-test.sh            # §4.2.1b obj credit queue/flush under starvation
   run txn              scripts/txn-test.sh                   # §9.6 event transactions: buffer/commit-atomic/abort
+  run epoch            scripts/epoch-test.sh                 # §7.1/§8.6 time.epoch on rate change + stale-epoch discard (cert T4)
   run engine-gate      scripts/engine-gate-eth-test.sh       # §13.4 device refuses foreign-engine snapshot; consent (0x4) overrides
   run core             scripts/core-test.sh                  # §5.5 core methods: ping/identify/changed/bye
   run conn-flood       scripts/conn-flood-test.sh            # §16 DoS: half-open drop + connect-storm survival
+  run ratelimit        scripts/ratelimit-eth-test.sh         # §16(b) shed-on-reflood + no-shed-after-hello (--force-peer-ip)
   run bloat-recall     scripts/bloat-recall-eth-test.sh      # debt #22: live ref resolves on a many-archive store (recall-breaker)
   run gc               scripts/gc-test.sh                    # debt #22a: §10.3 archive retention + mark-sweep GC (wired device path)
   run offline-edit     scripts/offline-edit-eth-test.sh      # §15.5 edit-while-absent reaches device
@@ -138,8 +150,10 @@ else
   skip recall       "harp-probe not built on $OSID"
   skip credit       "harp-probe not built on $OSID"
   skip txn          "harp-probe not built on $OSID"
+  skip epoch        "harp-probe not built on $OSID"
   skip core         "harp-probe not built on $OSID"
   skip conn-flood   "harp-probe not built on $OSID"
+  skip ratelimit    "harp-probe not built on $OSID"
   skip bloat-recall "harp-probe not built on $OSID"
   skip gc           "harp-probe not built on $OSID"
   skip offline-edit "harp-probe not built on $OSID"

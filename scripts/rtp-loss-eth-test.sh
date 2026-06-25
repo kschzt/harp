@@ -36,7 +36,14 @@ for _ in $(seq 1 25); do grep -q "listening on $PORT" "$DEVLOG" 2>/dev/null && b
 grep -q "listening on $PORT" "$DEVLOG" || { cat "$DEVLOG"; fail "device didn't start on $PORT"; }
 
 rm -f "$BUNDLE"
-HARP_ETH_DEVICE="127.0.0.1:$PORT" HARP_DEVICE_SERIAL="SIM-0001" \
+# 25%-LOSS TORTURE buffer: pin the host jitter buffer to 2048 frames for this test (HARP_ETH_TARGET).
+# Round-6 lowered the UNDECLARED-device default (shell/runtime.h kEthTargetFrames) 2048->1024 for NORMAL
+# operation; under THIS 25%-loss torture 1024 is marginal on a jittery runner (it survived at 2048, and
+# Windows CI dipped to rms~0.026 at 1024). This device declares no rt-floor, so without the override it
+# would inherit the new 1024 default. The buffer the loss-recovery needs is the test's concern, not the
+# shipped default — pinning it here keeps the FIDELITY assertion below honest (and unrelaxed) regardless
+# of the default. (Production declares its floor via --rt-floor/key 14; the env is the host-side equivalent.)
+HARP_ETH_TARGET=2048 HARP_ETH_DEVICE="127.0.0.1:$PORT" HARP_DEVICE_SERIAL="SIM-0001" \
   perl -e 'alarm 20; exec @ARGV' "$HOSTBIN" "$PLUG" --seconds 5 --realtime --diag-bundle "$BUNDLE" >"$HOSTLOG" 2>&1 & HP=$!
 wait "$HP"; rc=$?; HP=""
 kill -9 "$DP" 2>/dev/null; DP=""
@@ -61,10 +68,10 @@ FLOOR=0.03
 awk "BEGIN{exit !(${rms:-0} > $FLOOR)}" \
   || fail "440Hz tone did not survive ${DROP}% loss (rms=${rms:-0} <= $FLOOR; healthy rate-locked recovery ~0.05) — §7.3 stream broke / clock unlocked"
 # §8.7: loss MUST be COUNTED, never silently concealed — assert host-counters key 8 (rtp_loss) > 0.
-# Decoded with python3+cbor2 (installed in CI via eth.yml). On POSIX CI the decoder MUST be present,
-# so the skip path is a hard fail — a regression that stopped counting can't slip through green.
-# Windows MSYS2 python is unreliable, so it skip-logs there (the counting code is platform-independent).
-case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) ISWIN=1 ;; *) ISWIN=0 ;; esac
+# Decoded with python3+cbor2 (installed in CI via eth.yml on ALL three OSes, Windows included —
+# HIGH #6). On CI the decoder MUST be present, so its absence is a hard fail on EVERY OS — a
+# regression that stopped counting can't slip through green, and the old Windows skip carve-out
+# (which left the §8.7 MUST untested on one OS) is gone. A bare dev box without cbor2 still skip-logs.
 if [ -s "$BUNDLE" ] && python3 -c "import cbor2" >/dev/null 2>&1; then
   python3 - "$BUNDLE" <<'PY' || fail "RTP loss not counted/surfaced (§8.7 host-counters key 8)"
 import sys, cbor2
@@ -75,9 +82,9 @@ if lost is None: sys.exit("host-counters key 8 (rtp_loss) absent — loss not su
 if not (lost > 0): sys.exit("host-counters key 8 = %r despite injected RTP loss — not counted" % (lost,))
 print("   ✓ host-counters key 8 (rtp_loss) = %d — counted (>0), not concealed" % lost)
 PY
-elif [ -n "${CI:-}" ] && [ "$ISWIN" = 0 ]; then
-  fail "cbor2 unavailable on POSIX CI — the §8.7 loss-count assertion cannot be skipped (install cbor2)"
+elif [ -n "${CI:-}" ]; then
+  fail "cbor2 unavailable on CI — the §8.7 loss-count assertion cannot be skipped on any OS (install cbor2; see eth.yml)"
 else
-  echo "   (cbor2 or bundle absent$( [ "$ISWIN" = 1 ] && echo ', Windows MSYS2' ) — skipped the host-counters key-8 assertion)"
+  echo "   (cbor2 or bundle absent — skipped the host-counters key-8 assertion on this dev box)"
 fi
 echo "RTP-LOSS PASS (recovered the 440Hz tone through ${DROP}% RTP loss: rms=$rms > $FLOOR, $nconn connect(s), clean exit rc=$rc; loss counted)"

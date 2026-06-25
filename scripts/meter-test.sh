@@ -43,7 +43,7 @@ echo "── meter: §9.9 output meters track rendered audio on $SERIAL"
 main_peak() {
     mode="$1"
     for try in 1 2 3; do
-        "$PROBE" -d "$DEV" knob 8 0.9 >/dev/null 2>&1   # master level
+        "$PROBE" -d "$DEV" knob 7 0.9 >/dev/null 2>&1   # master level
         ok=0
         if [ "$mode" = note ]; then
             "$PROBE" -d "$DEV" note 64 1500 100 -p 0 >/dev/null 2>&1 && ok=1

@@ -95,11 +95,11 @@ cmake --build "$BUILD" --target tsan-host -j >/dev/null
 [ -x "$BUILD/tsan-host" ] || { echo "ALIAS-PLAY FAIL: harness build produced no binary"; exit 1; }
 
 # Prime the patch on the device via the front panel (persists past the session,
-# like flood-stress.sh): level up (8), a tone (3), and a FAST envelope (5/6). The
+# like flood-stress.sh): level up (7), a tone (3), and a FAST envelope (5/6). The
 # drone is gone, so all the energy comes from the sustained CHORD note below (held
 # for the whole capture, not struck repeatedly) — each alias's note on its own
 # channel is what makes the group mix separate from the single-channel one.
-for kv in "8 0.6" "3 0.7" "5 0.05" "6 0.1"; do
+for kv in "7 0.6" "3 0.7" "5 0.05" "6 0.1"; do
     "$PROBE" -d "usb:$SERIAL" knob $kv >/dev/null 2>&1 || true
 done
 

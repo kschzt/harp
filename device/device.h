@@ -44,8 +44,17 @@
  * MAJOR bump signals the §13.4 "loads but sounds different" break; the "Drone
  * Mix" param (id 7) is gone, so param-map-hash also moves (the automatable set is
  * 12 params now). Renamed from "refdev-null": the engine has always made sound —
- * "null" was a misnomer. (Prior bump: P2 voice-pool 1.0.0 -> 1.1.0.) */
-#define ENGINE_VERSION "2.0.0"
+ * "null" was a misnomer. (Prior bump: P2 voice-pool 1.0.0 -> 1.1.0.)
+ *
+ * 2.0.0 -> 2.1.0 (§13.4 param-map signal, NOT a render break): drone removal
+ * first left a HOLE at id 7 (ids 1..6, 8..13). That hole made the device param
+ * set non-contiguous, and a DAW shell that still shipped a phantom "FX Send" at
+ * the freed id 7 had it SILENTLY DROPPED (param_index(7) == -1 — a §9.3 drift).
+ * Nobody was bound to id 7, so the ids are now RENUMBERED CONTIGUOUS 1..12 (no
+ * hole): Master Level 8->7, the arp 9..12 -> 8..11, Glide 13->12. This moves the
+ * param-map-hash AGAIN (a fresh §9.3 identity, hence the MINOR bump) but the
+ * audio render is UNCHANGED — every value still maps to the same named param. */
+#define ENGINE_VERSION "2.1.0"
 #define FW_VERSION "0.1.0"
 #define CREDIT_GRANT (16u << 20)
 #define HARP_SENDQ_CAP 1024 /* §4.2.1 bounded obj-send queue (FIFO of hashes); 1024*33B ≈ 33 KiB */
@@ -85,7 +94,9 @@ typedef struct {
 } dev_param;
 
 /* fixed count so sizeof tricks aren't needed across modules. 12 since the drone
- * removal dropped "Drone Mix" (id 7); the arp added ids 9-12 earlier. */
+ * removal dropped "Drone Mix" (the old id 7); the arp added four params earlier.
+ * The ids are CONTIGUOUS 1..12 again (renumbered at 2.1.0 — no hole), so a shell
+ * can map id<->index directly. */
 #define NPARAMS 12
 extern dev_param g_params[NPARAMS];
 
@@ -133,8 +144,8 @@ void engine_part_param_put(int part_idx, uint32_t id, float v);
  * descriptor advertises this and the pump paces itself to it. */
 #define METER_RATE_HZ 30u
 
-/* Stable, collision-free id range for the readonly meter params (§9.9). The 13
- * device params use ids 1..13; meters live at 0x1000+ so they CANNOT collide.
+/* Stable, collision-free id range for the readonly meter params (§9.9). The 12
+ * device params use ids 1..12; meters live at 0x1000+ so they CANNOT collide.
  * id = METER_ID_BASE + slot*2 + {0 peak, 1 rms}; slot 0..15 = parts, 16 = main. */
 #define METER_ID_BASE 0x1000u
 #define METER_ID_PEAK(slot) (METER_ID_BASE + (uint32_t)(slot) * 2u + 0u)
@@ -142,7 +153,7 @@ void engine_part_param_put(int part_idx, uint32_t id, float v);
 #define METER_NPARAMS (METER_NSLOTS * 2) /* one peak + one rms per slot */
 
 /* §9.5 per-voice EXPRESSION mod targets (the MPE pitch/pressure axes). These are
- * mod-event ids — NOT §9.3 params (1..13) and NOT meters (0x1000+) — that a shell
+ * mod-event ids — NOT §9.3 params (1..12) and NOT meters (0x1000+) — that a shell
  * sends via a §9.4 mod event (etype 6) to drive a voice's pitch bend (semitones)
  * and loudness (gain). The device routes them to the voice's bend_semis / z_gain
  * fields (engine.c); a normalized param id still routes to the mod[] layer. The
@@ -475,10 +486,10 @@ bool refdev_parse_params_blob(const uint8_t *payload, size_t len,
 int engine_snapshot_objects(device *d, const harp_hash *parent, const char *msg,
                             harp_hash *out);
 int engine_load_snapshot(device *d, const harp_hash *snap_h);
-/* The FULL descriptor array advertised on evt.params / identity: the 13
+/* The FULL descriptor array advertised on evt.params / identity: the 12
  * automatable device params FOLLOWED BY the readonly meter params (§9.9). */
 void encode_param_array(harp_cbuf *b);
-/* The AUTOMATABLE subset only — the 13 device params, no meters. This is the
+/* The AUTOMATABLE subset only — the 12 device params, no meters. This is the
  * SOLE input to param-map-hash (§9.3): the hash protects stored automation
  * lanes, and readonly outputs (§9.9) can never be automation targets, so they
  * MUST NOT perturb it. Keeping the hash over this subset is what makes the

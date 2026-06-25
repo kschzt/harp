@@ -1,8 +1,8 @@
 #!/bin/bash
 # engine-gate-eth-test — §13.4 device-side engine-version load gate over the §8.7 loopback.
 #
-# Starts harp-deviced with a REPORTED engine (--engine-ver 2.1.0) that differs in MINOR from the
-# compile-time ENGINE_VERSION (2.0.0) its snapshots are stamped with, so the device's own fresh
+# Starts harp-deviced with a REPORTED engine (--engine-ver 2.2.0) that differs in MINOR from the
+# compile-time ENGINE_VERSION (2.1.0) its snapshots are stamped with, so the device's own fresh
 # snapshot is a "foreign-engine" snapshot to itself. harp-probe `engine-gate` then asserts a
 # state.refset of it is REFUSED 'incompatible' WITHOUT the consent flag (bit 0x4) and LOADS WITH it
 # — proving both the device gate (refuses a MINOR diff, not only MAJOR) AND the now-reachable
@@ -21,7 +21,7 @@ fail() { echo "ENGINE-GATE-ETH FAIL: $1"; exit 1; }
 DP=""
 trap '[ -n "$DP" ] && kill -9 "$DP" 2>/dev/null; rm -rf "$DEVDIR"' EXIT INT TERM
 rm -rf "$DEVDIR"; : > "$DEVLOG"
-"$DEVICED" --port "$PORT" --state-dir "$DEVDIR" --engine-ver 2.1.0 >>"$DEVLOG" 2>&1 & DP=$!
+"$DEVICED" --port "$PORT" --state-dir "$DEVDIR" --engine-ver 2.2.0 >>"$DEVLOG" 2>&1 & DP=$!
 for _ in $(seq 1 25); do grep -q "listening on $PORT" "$DEVLOG" 2>/dev/null && break; sleep 0.2; done
 grep -q "listening on $PORT" "$DEVLOG" || { cat "$DEVLOG"; fail "device didn't start on $PORT"; }
 

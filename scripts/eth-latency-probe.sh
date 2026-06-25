@@ -3,13 +3,13 @@
 # live HARP session. The host's REPORTED PDC (latencySamples) is blind to the free-running
 # RTP jitter buffer (ethTargetFrames), so it badly under-counts what you actually feel.
 #
-# METHOD: --set-at flips Master Level (param 8) 0.5 -> 0.0 at a known stream position
+# METHOD: --set-at flips Master Level (param 7) 0.5 -> 0.0 at a known stream position
 # (0.5 s). We render to WAV and detect where the audio actually goes silent; the lateness
 # of that step vs the set-point is the felt latency. Sweeping ETH_TARGET (the RTP buffer)
 # and watching the step MOVE isolates the buffer's contribution with no timing theory.
 #
 # GOTCHAS (each cost a debugging round):
-#   1. Device param state PERSISTS. Every run MUST self-reset (--set-at 0.05:8=0.5 FIRST),
+#   1. Device param state PERSISTS. Every run MUST self-reset (--set-at 0.05:7=0.5 FIRST),
 #      or a prior run's Master Level=0 poisons it and you get silent renders.
 #   2. Run each transport at ITS OWN safe cushion. USB needs ~512 (HARP_CUSHION_FRAMES
 #      default); at 128 it gaps, and the dropouts fake a (negative/bogus) step.
@@ -48,7 +48,7 @@ run() { # $1=ETH_TARGET("" for usb) -> one render+detect
   [ -n "$T" ] && extra="HARP_ETH_TARGET=$T"
   env $extra HARP_CUSHION_FRAMES="${HARP_CUSHION_FRAMES:-128}" \
     perl -e 'alarm 25; exec @ARGV' "$HOSTBIN" "$PLUG" --realtime --seconds 2 --block "${BLOCK:-64}" \
-    --set-at 0.05:8=0.5 --set-at 0.5:8=0.0 --out /tmp/elp.wav >/tmp/elp.log 2>&1
+    --set-at 0.05:7=0.5 --set-at 0.5:7=0.0 --out /tmp/elp.wav >/tmp/elp.log 2>&1
   local un rep; un=$(grep -oE "underruns: [0-9]+" /tmp/elp.log | grep -oE "[0-9]+$"); rep=$(grep -oE "reported-samples=[0-9]+" /tmp/elp.log | head -1 | cut -d= -f2)
   printf "  ETH_TARGET=%-6s reported=%-5s under=%-5s  " "${T:-(usb)}" "${rep:-?}" "${un:-?}"; detect /tmp/elp.wav
 }
@@ -63,4 +63,4 @@ else
   for T in "${@:-2048 384}"; do run "$T"; run "$T"; done
 fi
 # restore Master Level so we don't leave the device silent
-env perl -e 'alarm 15; exec @ARGV' "$HOSTBIN" "$PLUG" --realtime --seconds 0.5 --block "${BLOCK:-64}" --set-at 0.05:8=0.5 --out /tmp/elp_rst.wav >/dev/null 2>&1 && echo "(Master Level restored to 0.5)"
+env perl -e 'alarm 15; exec @ARGV' "$HOSTBIN" "$PLUG" --realtime --seconds 0.5 --block "${BLOCK:-64}" --set-at 0.05:7=0.5 --out /tmp/elp_rst.wav >/dev/null 2>&1 && echo "(Master Level restored to 0.5)"

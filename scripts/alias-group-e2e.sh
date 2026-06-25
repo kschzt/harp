@@ -81,7 +81,7 @@ echo "── alias-group-e2e: $INSTANCES plugin instances on $SERIAL, one part e
 # struck notes are the only sound — without an audible patch the mix would be
 # silent and single==group trivially. Single-instance, so it
 # warms the owner part cleanly before the group run.
-SETTLE="--set 8=0.6 --set 3=0.7 --set 5=0.05 --set 6=0.1"
+SETTLE="--set 7=0.6 --set 3=0.7 --set 5=0.05 --set 6=0.1"
 $V "$PLUG" $SETTLE --seconds 0.5 >/dev/null 2>&1 \
     || { echo "ALIAS-GROUP-E2E FAIL: settle render did not complete (device busy/absent?)"; exit 3; }
 

@@ -48,7 +48,7 @@ fi
 # fully captures each note's attack+decay and the hash is stable run-to-run.
 # (The drone is gone — a part is silent until a note plays.) Done once; every
 # render below inherits it.
-SETTLE="--set 8=0.6 --set 3=0.7 --set 5=0.05 --set 6=0.1"
+SETTLE="--set 7=0.6 --set 3=0.7 --set 5=0.05 --set 6=0.1"
 $V "$PLUG" $SETTLE --seconds 0.5 >/dev/null 2>&1 \
     || { echo "MULTITIMBRAL FAIL: settle render did not complete (device absent?)"; exit 3; }
 

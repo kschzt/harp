@@ -28,7 +28,7 @@ V="${HOSTBIN:-build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3}"
 PROBE="${PROBE:-./build/harp-probe}"
 S="--set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 5=0.1 --set 6=0.2 \
-   --set 8=0.6 --set 9=0 --set 10=0.6 --set 11=0.5 --set 12=0 --set 13=0"
+   --set 7=0.6 --set 8=0 --set 9=0.6 --set 10=0.5 --set 11=0 --set 12=0"
 # 8 notes fill the pool exactly (NVOICES=8, no steal); 12 overrun it (4 steals).
 CHORD8="60,62,64,65,67,69,71,72"
 CHORD12="60,61,62,63,64,65,66,67,68,69,70,71"

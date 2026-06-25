@@ -118,6 +118,25 @@ jobs:
             echo "HOSTBIN=$(find build-vst -name 'harp-vst3-host.exe' | head -1)"
             echo "CHOST=$(find build-vst -name 'clap-host.exe' | head -1)"
           } >> "$GITHUB_ENV"
+      # §8.7 HIGH #6: the rtp-loss/rtp-reorder "loss MUST be counted, never silently concealed"
+      # assertion decodes the diag bundle with python3+cbor2. The suite runs under Git Bash, whose
+      # `python3` is the runner's system Python — install cbor2 INTO it so the counter assertion runs
+      # on Windows too (it used to silently skip for lack of cbor2, leaving the §8.7 MUST untested on
+      # one of the three OSes). The scripts call `python3`; the runner ships it as `python`, so wire a
+      # `python3` shim onto PATH if Git Bash doesn't already resolve one.
+      - name: install cbor2 for the Windows suite (§8.7 counter assertions)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python -m pip install --user cbor2
+          if ! command -v python3 >/dev/null 2>&1; then
+            mkdir -p "$HOME/bin"
+            printf '#!/usr/bin/env bash\nexec python "$@"\n' > "$HOME/bin/python3"
+            chmod +x "$HOME/bin/python3"
+            echo "$HOME/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/bin:$PATH"
+          fi
+          python3 -c "import cbor2; cbor2.loads(cbor2.dumps({1:2})); print('cbor2 ready for the §8.7 counter assertions')"
 
       # ───────── the shared §8.7 conformance suite (one source of truth, every OS) ─────────
       # eth-suite.sh runs the full conformance list; per-test gating is capability-based

@@ -41,8 +41,9 @@ static int g_fail = 0, g_pass = 0;
     } while (0)
 
 /* The codec maps paramId<->grid-column via g_params[].id. We assert against
- * the real table (linked from state_stubs.c, mirroring engine.c's ids 1..13)
- * so the legacy-migration test can hand-pick concrete ids. */
+ * the real table (linked from state_stubs.c, mirroring engine.c's ids 1..12 —
+ * contiguous since the 2.1.0 renumber) so the legacy-migration test can hand-pick
+ * concrete ids. */
 
 static void test_params_blob_codec(void) {
     /* ---- 1. ROUND-TRIP: distinct value per cell, bit-exact recovery ---- */
@@ -95,13 +96,14 @@ static void test_params_blob_codec(void) {
     /* ---- 3. LEGACY MIGRATION: flat { id => value } -> part 0 only ---- */
     /* Hand-build the OLD on-wire form (a flat map whose first value is a FLOAT,
      * which is how the parser discriminates legacy vs per-part). Use real param
-     * ids 3 and 8 (Filter Cutoff, Master Level). */
+     * ids 3 and 7 (Filter Cutoff, Master Level — Master Level is id 7 since the
+     * 2.1.0 contiguous renumber, was id 8). */
     harp_cbuf legacy;
     harp_cbuf_init(&legacy);
     harp_cbor_map(&legacy, 2);
     harp_cbor_uint(&legacy, 3);
     harp_cbor_float(&legacy, 0.25);
-    harp_cbor_uint(&legacy, 8);
+    harp_cbor_uint(&legacy, 7);
     harp_cbor_float(&legacy, 0.75);
 
     float lv[NPARTS][NPARAMS];
@@ -110,10 +112,11 @@ static void test_params_blob_codec(void) {
     memset(lpresent, 0, sizeof lpresent);
     CHECK(refdev_parse_params_blob(legacy.buf, legacy.len, lv, lpresent));
 
-    /* the two ids landed in part 0, with the right values. NB id 8 is column 6
-     * now, not 7: removing id 7 (Drone Mix) shifted Master Level down one slot. */
+    /* the two ids landed in part 0, with the right values. Master Level is at
+     * column 6 (its 7th-row slot is unchanged by the 2.1.0 renumber — only its
+     * id moved 8->7, the drone's old id 7 having been reclaimed). */
     CHECK(lpresent[0][2] && lv[0][2] == 0.25f); /* id 3 -> column index 2 */
-    CHECK(lpresent[0][6] && lv[0][6] == 0.75f); /* id 8 -> column index 6 (was 7 pre-drone-removal) */
+    CHECK(lpresent[0][6] && lv[0][6] == 0.75f); /* id 7 (Master Level) -> column index 6 */
 
     /* nothing else in part 0 is marked present (only the two carried ids) */
     int p0_only_two = 1;

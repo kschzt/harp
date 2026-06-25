@@ -26,12 +26,13 @@ PROBE=${HARP_PROBE:-./build/harp-probe}
 SECS=${HARP_FLOOD_SECONDS:-90}
 
 # Pin a known start state on the device (front-panel sets persist past the
-# session and are not thinned). Params 1-6,8 to mid (id 7 "Drone Mix" was removed
-# with the drone — knob 7 would error and trip set -e); arp off so the flood's
-# determinism doesn't depend on transport-anchored arp timing.
+# session and are not thinned). Params 1-7 to mid (the round-6 renumber closed the
+# old "Drone Mix" hole — Master Level is now id 7, the ids are contiguous 1..7);
+# arp off (Arp Mode is now id 8) so the flood's determinism doesn't depend on
+# transport-anchored arp timing.
 pin_state() {
-    for i in 1 2 3 4 5 6 8; do "$PROBE" -d usb knob "$i" 0.5 >/dev/null 2>&1; done
-    "$PROBE" -d usb knob 9 0.0 >/dev/null 2>&1
+    for i in 1 2 3 4 5 6 7; do "$PROBE" -d usb knob "$i" 0.5 >/dev/null 2>&1; done
+    "$PROBE" -d usb knob 8 0.0 >/dev/null 2>&1
 }
 flood_hash() {
     "$HOST" "$PLUGIN" --flood --seconds "$SECS" --hash 2>/dev/null | sed -n 's/^output-hash: //p'

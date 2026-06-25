@@ -149,6 +149,14 @@ static int g_rtp_reorder_pct = 0;
 /* §8.7 fault injection: --corrupt-ctl-pct N flips one byte in ~N% of outgoing FRAMED CBOR
  * (ctl + echo + evt, via harp_link_send), set per-io on the device's host link only. */
 static int g_corrupt_ctl_pct = 0;
+/* §16(b) rate-limit TEST SEAM ONLY: the per-peer pre-hello shed/penalize path keys on the peer's
+ * IP and EXEMPTS loopback (127.*), but every DoS test connects from 127.0.0.1 — so the penalize/
+ * penalized branch is otherwise unreachable in test. --force-peer-ip A.B.C.D (or env HARP_FORCE_PEER_IP)
+ * makes the accept loop treat the connecting peer as that IP for the RATE-LIMIT DECISION ONLY (the
+ * harp_peer_penalize / harp_peer_penalized key), so a non-loopback value actually executes the shed
+ * path under test. NOT for production use — the real RTP destination still uses the true peer IP.
+ * Network-order (matching getpeername's sin_addr.s_addr); 0 = off / unset = the real behavior. */
+static uint32_t g_force_peer_ip = 0;
 
 /* §16 DoS: a deadline-bounded read_exact for the eth control socket's PRE-HELLO phase. Re-arms
  * SO_RCVTIMEO to the REMAINING budget (harp_sock_io.deadline_ns) before each recv, so a slow-
@@ -347,6 +355,13 @@ int main(int argc, char **argv) {
                                                        * recall-drift WARNING can be exercised in CI */
     bool mdns = false; /* --mdns: §4.4.3 advertise _harp._tcp (off by default; the eth-suite
                         * dials directly and the simulator shouldn't pollute the local segment) */
+    /* §16(b) rate-limit TEST SEAM ONLY: env HARP_FORCE_PEER_IP is the no-argv route (e.g. when the
+     * test can't reach the daemon's command line); an explicit --force-peer-ip below still wins. */
+    {
+        const char *fenv = getenv("HARP_FORCE_PEER_IP");
+        struct in_addr fa;
+        if (fenv && *fenv && inet_pton(AF_INET, fenv, &fa) == 1) g_force_peer_ip = fa.s_addr;
+    }
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc)
             state_dir = argv[++i];
@@ -386,6 +401,12 @@ int main(int argc, char **argv) {
             out_lat = (uint32_t)atoi(argv[++i]); /* §6.4: declare analog-out path latency (latency-profile key 2) */
         else if (strcmp(argv[i], "--engine-ver") == 0 && i + 1 < argc)
             engine_ver = argv[++i]; /* §12.2 test seam: report this engine semver instead of ENGINE_VERSION */
+        else if (strcmp(argv[i], "--force-peer-ip") == 0 && i + 1 < argc) {
+            /* §16(b) rate-limit TEST SEAM ONLY: see g_force_peer_ip — force the rate-limit
+             * decision to treat the peer as this (non-loopback) IP so the shed path runs. */
+            struct in_addr fa;
+            if (inet_pton(AF_INET, argv[++i], &fa) == 1) g_force_peer_ip = fa.s_addr;
+        }
         else {
             fprintf(stderr,
                     "usage: harp-deviced [--state-dir DIR] [--serial S] "
@@ -536,7 +557,11 @@ int main(int argc, char **argv) {
          * local refdev / host+device on one machine / CI) is trusted + never rate-limited, so the
          * shared 127.0.0.1 cannot confound the per-IP key. The first network-order byte is the first
          * octet (127.* = loopback), endian-independent. */
-        uint32_t peer_ip = d->rtp_peer_ip;
+        /* §16(b): the rate-limit decision keys on `peer_ip`. In production this is the real peer IP
+         * (d->rtp_peer_ip). TEST SEAM ONLY: g_force_peer_ip (--force-peer-ip / HARP_FORCE_PEER_IP)
+         * substitutes a forced (non-loopback) IP HERE so a 127.0.0.1 DoS test exercises the shed/
+         * penalize path; the real RTP destination above (d->rtp_peer_ip) is left untouched. */
+        uint32_t peer_ip = g_force_peer_ip ? g_force_peer_ip : d->rtp_peer_ip;
         bool rl_peer = peer_ip && ((const unsigned char *)&peer_ip)[0] != 127u;
         if (rl_peer && harp_peer_penalized(d->prehello_penalty, 16, peer_ip, harp_now_ns())) {
             d->ctl_sock = HARP_SOCK_INVALID;

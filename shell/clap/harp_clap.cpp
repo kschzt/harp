@@ -30,9 +30,11 @@
 
 namespace {
 
-/* Mirrors the refdev's parameter set + the VST3/AU shells (device ids 1..13).
- * The CLAP param id IS the device param id, so a PARAM_VALUE/PARAM_MOD event's
- * param_id routes straight through to queueParamSet / queueMod. */
+/* Mirrors the refdev's parameter set + the VST3/AU shells (device ids 1..12,
+ * CONTIGUOUS since engine 2.1.0 — the drone's old id 7, briefly mis-shipped as a
+ * phantom "FX Send", is gone and the set was renumbered with no hole). The CLAP
+ * param id IS the device param id (we route by id, not slot), so a PARAM_VALUE/
+ * PARAM_MOD event's param_id routes straight through to queueParamSet/queueMod. */
 struct DevParam {
     uint32_t id;
     const char *name;
@@ -41,9 +43,9 @@ struct DevParam {
 static const DevParam kParams[] = {
     {1, "Osc Pitch", 0.5},   {2, "Osc Shape", 0.6},    {3, "Filter Cutoff", 0.7},
     {4, "Filter Reso", 0.5}, {5, "Env Attack", 0.5},   {6, "Env Release", 0.5},
-    {7, "FX Send", 0.5},     {8, "Master Level", 0.5},  {9, "Arp Mode", 0.0},
-    {10, "Arp Division", 0.6}, {11, "Arp Gate", 0.5},   {12, "Arp Octaves", 0.0},
-    {13, "Glide", 0.0},
+    {7, "Master Level", 0.5},  {8, "Arp Mode", 0.0},   /* Master Level was id 8 */
+    {9, "Arp Division", 0.6}, {10, "Arp Gate", 0.5},   {11, "Arp Octaves", 0.0},
+    {12, "Glide", 0.0}, /* was id 13 */
 };
 static constexpr uint32_t kNumParams = sizeof(kParams) / sizeof(kParams[0]);
 static constexpr uint32_t kCutoffId = 3; /* the per-voice-modulatable param (§9.5) */

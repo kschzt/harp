@@ -37,7 +37,7 @@ PROBE="${PROBE:-./build/harp-probe}"
 # the canonical chord-voice settle: drone+level+tone+fast env, cutoff at 0.7 so a
 # +0.5 mod clamps up at 1.0 and a -0.5 mod lands at 0.2 — both clearly audible.
 S="--set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 5=0.1 --set 6=0.2 \
-   --set 8=0.6 --set 9=0 --set 10=0.6 --set 11=0.5 --set 12=0 --set 13=0"
+   --set 7=0.6 --set 8=0 --set 9=0.6 --set 10=0.5 --set 11=0 --set 12=0"
 CHORD="60,64,67"
 DUR="2.0"
 

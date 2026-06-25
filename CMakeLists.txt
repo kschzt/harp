@@ -230,6 +230,7 @@ if(SAMPLERATE_FOUND)
   endif()
   target_link_libraries(harp-freerun-tests ${SAMPLERATE_LIBRARIES} ${HARP_MATH_LIB})
   add_test(NAME freerun COMMAND harp-freerun-tests)
+  set_tests_properties(freerun PROPERTIES LABELS unit) # run under the per-OS `ctest -L unit` gate, not Linux-only
 
   # harp-rtp-tests: the §8.7 RTP codec (host/rtp.c) + end-to-end through the
   # free-running receiver (pack -> unpack -> recover -> resample).
@@ -240,6 +241,7 @@ if(SAMPLERATE_FOUND)
   endif()
   target_link_libraries(harp-rtp-tests ${SAMPLERATE_LIBRARIES} ${HARP_MATH_LIB})
   add_test(NAME rtp COMMAND harp-rtp-tests)
+  set_tests_properties(rtp PROPERTIES LABELS unit) # §8.3 SINAD fixture (shipped BEST converter) — every OS
 
   # harp-rtp-demo: runnable §8.7 RTP-over-UDP path (loopback or KR260 -> Mac).
   if(NOT WIN32)
@@ -285,6 +287,7 @@ if(SAMPLERATE_FOUND)
     endif()
     target_link_libraries(harp-freerun-mt-tests ${SAMPLERATE_LIBRARIES} ${HARP_MATH_LIB} Threads::Threads)
     add_test(NAME freerun_mt COMMAND harp-freerun-mt-tests)
+    set_tests_properties(freerun_mt PROPERTIES LABELS unit) # TSan freerun race test — run under `ctest -L unit`
   endif()
 else()
   message(STATUS "libsamplerate not found -> harp-freerun-tests skipped")
@@ -322,6 +325,21 @@ if(HARP_FUZZ)
   if(NOT APPLE)
     target_compile_options(fuzz-state PRIVATE -fsanitize=fuzzer)
     target_link_options(fuzz-state PRIVATE -fsanitize=fuzzer)
+  endif()
+
+  # fuzz-evt: the §9.2 EVT-stream parser (device/session.c::handle_evt_msg) — the deepest
+  # host->device attack surface (§16/T9, HIGH #5). handle_evt_msg is `static`, so fuzz_evt.c
+  # TU-includes session.c (the real code) and fuzz/evt_stubs.c resolves the engine/store/panel
+  # symbols session.c's OTHER functions reference (no-ops on the reached evq/note-off path,
+  # abort-stubs elsewhere), mirroring fuzz-state. session.c's §16 pre-hello deadline pulls
+  # harp_now_ns, which lives in the platform layer (NOT harpcore), so add ${HARP_PLAT_SRC}.
+  find_package(Threads REQUIRED) # session.c uses pthread (the audio thread / mutexes) — needs -pthread on Linux
+  add_executable(fuzz-evt fuzz/fuzz_evt.c fuzz/evt_stubs.c ${HARP_PLAT_SRC} ${FUZZ_DRIVER})
+  target_link_libraries(fuzz-evt harpcore m ${HARP_PLAT_LIBS} Threads::Threads)
+  target_include_directories(fuzz-evt PRIVATE device host) # host/: device.h -> sock_io.h (§16 ctl_sock)
+  if(NOT APPLE)
+    target_compile_options(fuzz-evt PRIVATE -fsanitize=fuzzer)
+    target_link_options(fuzz-evt PRIVATE -fsanitize=fuzzer)
   endif()
 
   add_executable(gen-corpus fuzz/gen_corpus.c)
