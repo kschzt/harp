@@ -87,4 +87,23 @@ if grep -q "listening on $CPORT" "$CDEVLOG"; then
     rm -rf "$CDEVDIR"
 else cat "$CDEVLOG"; fail "converter device (--in-lat/--out-lat) didn't start"; fi
 
-[ "$FAIL" = 0 ] && echo "REPORTED-LATENCY PASS: free-running=$EXPECT_FR (jitter buffer) + host-paced=$EXPECT_HP + converter in+out folded (§6.4/§8.7)" || { echo "REPORTED-LATENCY FAIL"; exit 1; }
+# (4) §8.7 LOW-LATENCY FREE-RUNNING: a device declaring small nsamples (64) + a tight rt-floor, at a
+# small DAW block, must report the SMALL free-running chain — buffer + nsamples + headroom(max(block,ns))
+# — NOT the host-paced 512 (kBlock turnaround + kBlock headroom). The render block + event headroom both
+# track ethNsamples, so this path lands ~5.3ms where the default would report 1536 (32ms). RME-grounded:
+# 30s switch soak = 0 underruns, 96-note block-64 storm = 0 late events (host detector + §14.2 evt_late).
+LLPORT=$((PORT+2)); LLDEVDIR="${DEVDIR}-ll"; LLDEVLOG=/tmp/replat-ll-dev.log
+rm -rf "$LLDEVDIR"; : > "$LLDEVLOG"
+"$DEVICED" --port "$LLPORT" --rt-nsamples 64 --rt-floor 128 --state-dir "$LLDEVDIR" --panel-sock "" >>"$LLDEVLOG" 2>&1 & LLDP=$!
+trap 'kill -9 "$DP" "$CDP" "$LLDP" 2>/dev/null' EXIT
+for _ in $(seq 1 25); do grep -q "listening on $LLPORT" "$LLDEVLOG" 2>/dev/null && break; sleep 0.2; done
+if grep -q "listening on $LLPORT" "$LLDEVLOG"; then
+  lllog=/tmp/replat-ll.log
+  env HARP_ETH_DEVICE="127.0.0.1:$LLPORT" perl -e 'alarm 30; exec @ARGV' "$HOSTBIN" "$VPLUG" --realtime --block 64 --seconds 0.2 >"$lllog" 2>&1
+  llgot=$(grep -E 'reported-samples=[0-9]+' "$lllog" | tail -1 | sed -nE 's/.*reported-samples=([0-9]+).*/\1/p')
+  if [ "$llgot" = 256 ]; then echo "   ✓ vst3-lowlat-freerun: reported-samples=256 (nsamples=64 @ block 64 = 5.3ms, vs 1536 default)"
+  else fail "low-latency free-running reported=$llgot, want 256 (buffer 128 + nsamples 64 + headroom 64)"; fi
+  rm -rf "$LLDEVDIR"
+else cat "$LLDEVLOG"; fail "low-latency device (--rt-nsamples 64) didn't start"; fi
+
+[ "$FAIL" = 0 ] && echo "REPORTED-LATENCY PASS: free-running=$EXPECT_FR + host-paced=$EXPECT_HP + converter folded + low-latency free-running=256 (§6.4/§8.7)" || { echo "REPORTED-LATENCY FAIL"; exit 1; }
