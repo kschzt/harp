@@ -359,9 +359,9 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, 0);
     harp_cbor_uint(m, 48000);
     harp_cbor_uint(m, 1);
-    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, d->in_lat);  /* §6.4 key 1: analog-in path latency (--in-lat; 0 = pure-digital) */
     harp_cbor_uint(m, 2);
-    harp_cbor_uint(m, 0);
+    harp_cbor_uint(m, d->out_lat); /* §6.4 key 2: analog-out path latency (--out-lat) */
     harp_cbor_uint(m, 3);
     harp_cbor_uint(m, 256);
     harp_cbor_uint(m, 9); /* build id */

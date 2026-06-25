@@ -357,6 +357,10 @@ typedef struct {
                              adopts it as the audio.start packet size instead of the 256 default.
                              Smaller = lower latency + smoother delivery on a clean link; the host
                              clamps it to [32, kBlock]. */
+    uint32_t in_lat, out_lat; /* harp-deviced --in-lat / --out-lat N: §6.4 latency-profile keys 1/2
+                                 (analog-in→stream, stream→analog-out), samples. 0 = pure-digital (the
+                                 refdev default). A converter-bearing device declares them so the host
+                                 folds them into PDC alongside the render block (key 3). */
     bool no_rate_lock; /* §8.7 ASRC fallback test hook (harp-deviced --no-rate-lock):
                           drop the audio.rate-lock capability from hello so the host
                           can't host-lock and must resample (host/freerun) instead.

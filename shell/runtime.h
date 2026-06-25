@@ -334,13 +334,18 @@ public:
     /* §6.4: the device's declared ANALOG path latency (input + output converters) at the negotiated
      * rate, composed into the reported PDC. The buffer above already covers the stream depth (the
      * latency-profile's key-3 buf_depth) and the ASRC group delay sits within eventHeadroom; this
-     * adds the ADC/DAC terms (profile keys 1/2) that NOTHING else accounts for. 0 for the digital
-     * refdev (in=out=0), so the reported figure is unchanged there — but a converter-bearing device
-     * would otherwise under-report its PDC and mis-align DAW automation against other tracks. */
+     * adds the ADC/DAC terms (keys 1/2) AND the device render/turnaround block (key 3, buf_depth) —
+     * the per-block output buffering the §14.3 loopback MEASURES as the RTT (256 on the refdev, proven
+     * on hardware). All three are real event->audio latency that NOTHING else in latencySamples()
+     * accounts for: eventHeadroom is the host's SEND lookahead (§9.2) and buf is the host RX buffer —
+     * both host-side. §6.4 says a measured loopback "takes precedence for PDC"; folding key 3 here makes
+     * the DECLARED PDC equal the MEASURED one, so running the §14.3 probe no longer jumps the reported
+     * figure by 256. (Was: in+out only — the refdev's render block silently dropped, under-reporting
+     * the host-paced PDC as 768 where the true chain ring(512)+headroom(256)+block(256) = 1024.) */
     uint32_t devicePathLatency() const {
         for (size_t i = 0; i < nLat_; i++)
             if (latProfiles_[i].rate == rate_)
-                return latProfiles_[i].in_lat + latProfiles_[i].out_lat;
+                return latProfiles_[i].in_lat + latProfiles_[i].out_lat + latProfiles_[i].buf_depth;
         return 0;
     }
     uint32_t latencySamples() const {
