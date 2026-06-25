@@ -1279,6 +1279,10 @@ static void handle_audio_start(device *d, const harp_env *e) {
      * 0 for USB/RTP, so audio_thread takes the unchanged path there. */
     d->audio.host_paced_port = (int)hp_port;
     d->audio.host_paced_sock = -1;
+    /* §8.3.1: offline intent — today only the deterministic host-paced TCP bounce (key 7) runs
+     * faster-than-real-time with no stream to wedge. The engine fence reads d->audio.offline, NOT the
+     * transport, so a future offline bounce over any carrier is bounded correctly. */
+    d->audio.offline = (hp_port > 0);
     if (rtp_fd >= 0) {          /* fresh RTP stream identity */
         d->audio.rtp_ssrc = 0x48415250u; /* "HARP" */
         d->audio.rtp_seq = 0;
