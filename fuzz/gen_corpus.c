@@ -187,6 +187,75 @@ int main(int argc, char **argv) {
     harp_audio_hdr_encode(&h, hdr);
     dump(dir, "audio-hdr", hdr, sizeof hdr);
 
+    /* EVT-stream parser (§9.2) seeds for fuzz-evt: handle_evt_msg consumes the bare event
+     * message body [ [epoch,msc], etype, body... ] (no envelope/frame wrapper — fuzz_evt feeds
+     * raw bytes straight to the parser). These start coverage inside each etype arm so the
+     * fuzzer mutates outward from valid wire instead of rediscovering the grammar. epoch 0 ==
+     * "now" (always current). Mirrors the shapes the host's evt encoders emit. */
+#define EVT_HEAD(et)                     \
+    harp_cbuf_reset(&m);                  \
+    harp_cbor_array(&m, 3);               \
+    harp_cbor_array(&m, 2);               \
+    harp_cbor_uint(&m, 0);    /* epoch */ \
+    harp_cbor_uint(&m, 1000); /* msc */   \
+    harp_cbor_uint(&m, (et))
+
+    /* etype 0: §9.10 UMP carriage — one MIDI-1.0-in-UMP note-on (mt=2, status 0x9). */
+    EVT_HEAD(0);
+    {
+        uint8_t ump[4] = {0x29, 0x90, 60, 100}; /* mt=2, chan=9 -> part 9; note 60 vel 100 */
+        harp_cbor_bytes(&m, ump, sizeof ump);
+    }
+    dump(dir, "evt-ump-noteon", m.buf, m.len);
+
+    /* etype 5: §9.4 ramp { 0 param-id, 1 target, 2 end [epoch,msc] }. */
+    EVT_HEAD(5);
+    harp_cbor_map(&m, 3);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, 3); /* Filter Cutoff */
+    harp_cbor_uint(&m, 1);
+    harp_cbor_float(&m, 0.75);
+    harp_cbor_uint(&m, 2);
+    harp_cbor_array(&m, 2);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, 2000);
+    dump(dir, "evt-ramp", m.buf, m.len);
+
+    /* etype 6: §9.4 non-destructive mod { 0 param-id, 1 signed offset }. */
+    EVT_HEAD(6);
+    harp_cbor_map(&m, 2);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, 3);
+    harp_cbor_uint(&m, 1);
+    harp_cbor_float(&m, -0.2);
+    dump(dir, "evt-mod", m.buf, m.len);
+
+    /* etype 7: §9.7 transport anchor { 0 flags, 1 tempo, 4 ppq }. */
+    EVT_HEAD(7);
+    harp_cbor_map(&m, 3);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, 1);
+    harp_cbor_uint(&m, 1);
+    harp_cbor_float(&m, 120.0);
+    harp_cbor_uint(&m, 4);
+    harp_cbor_float(&m, 4.0);
+    dump(dir, "evt-transport", m.buf, m.len);
+
+    /* etype 2/3: §9.6 txn begin { 0 txn-id } then a commit { 0 id } — opens then atomically
+     * applies, so the fuzzer reaches both the buffer and the all-or-nothing apply arms. */
+    EVT_HEAD(2);
+    harp_cbor_map(&m, 1);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, 7); /* txn-id 7 */
+    dump(dir, "evt-txn-begin", m.buf, m.len);
+
+    EVT_HEAD(3);
+    harp_cbor_map(&m, 1);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_uint(&m, 7);
+    dump(dir, "evt-txn-commit", m.buf, m.len);
+#undef EVT_HEAD
+
     harp_cbuf_free(&m);
     printf("corpus written to %s\n", dir);
     return 0;

@@ -37,10 +37,13 @@ if pgrep -x "Live" >/dev/null 2>&1; then
     exit 3
 fi
 
+# Device param ids are CONTIGUOUS 1..12 (engine 2.1.0 renumber): Master Level
+# 8->7, the arp 9..12 -> 8..11, Glide 13->12. The same VALUE lands on the same
+# named param, so the renumber leaves these renders byte-identical (pins unchanged).
 SETTLE="--set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 5=0.1 --set 6=0.2 \
-        --set 8=0.6 --set 9=0 --set 10=0.6 --set 11=0.5 --set 12=0 --set 13=0"
-ARP="--set 9=0.25 --set 10=0.6 --set 11=0.5 --set 12=0.0 --set 8=0.7 \
-     --set 5=0.05 --set 6=0.1 --set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 13=0"
+        --set 7=0.6 --set 8=0 --set 9=0.6 --set 10=0.5 --set 11=0 --set 12=0"
+ARP="--set 8=0.25 --set 9=0.6 --set 10=0.5 --set 11=0.0 --set 7=0.7 \
+     --set 5=0.05 --set 6=0.1 --set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 12=0"
 
 check() { # check NAME EXPECTED CMD...
     name=$1; want=$2; shift 2
@@ -57,7 +60,7 @@ $V "$PLUG" $SETTLE --seconds 0.5 >/dev/null 2>&1
 check "vst3 golden" "$GOLDEN_HASH" $V "$PLUG" $SETTLE --notes 62,69,74,65 --seconds 2.6 --hash
 $V "$PLUG" $ARP --seconds 0.5 >/dev/null 2>&1
 check "vst3 groove" "$GROOVE_HASH" $V "$PLUG" $ARP --bpm 120 --chord 60,64,67 --seconds 4 --hash
-# arp off (SETTLE has param 9=0), so --chord holds 60,64,67 simultaneously: polyphony
+# arp off (SETTLE has Arp Mode id 8=0), so --chord holds 60,64,67 simultaneously: polyphony
 $V "$PLUG" $SETTLE --seconds 0.5 >/dev/null 2>&1
 check "vst3 chord " "$CHORD_HASH" $V "$PLUG" $SETTLE --chord 60,64,67 --seconds 2.0 --hash
 

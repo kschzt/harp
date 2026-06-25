@@ -46,7 +46,10 @@ static_assert(HARP_MPE_MOD_TIMBRE == 3u, "MPE timbre must be Filter Cutoff (para
 #define HARP_AU_MANU 'HARP'
 #define HARP_AU_VERSION 0x00010000
 
-/* mirrors the device's parameter set (ids 1..13, normalized 0..1) */
+/* mirrors the device's parameter set (ids 1..12, CONTIGUOUS since engine 2.1.0,
+ * normalized 0..1). The drone's old id 7 — briefly mis-shipped here as a phantom
+ * "FX Send" — is gone and the set was renumbered with no hole, so the id<->index
+ * map (id == element index, param `elem`/`param` is 1-based) holds exactly. */
 struct AuParam {
     AudioUnitParameterID id;
     const char *name;
@@ -54,16 +57,16 @@ struct AuParam {
 static const AuParam kAuParams[] = {
     {1, "Osc Pitch"},   {2, "Osc Shape"},    {3, "Filter Cutoff"},
     {4, "Filter Reso"}, {5, "Env Attack"},   {6, "Env Release"},
-    {7, "FX Send"},     {8, "Master Level"}, {9, "Arp Mode"},
-    {10, "Arp Division"}, {11, "Arp Gate"},  {12, "Arp Octaves"},
-    {13, "Glide"},
+    {7, "Master Level"}, {8, "Arp Mode"},   /* Master Level was id 8 */
+    {9, "Arp Division"}, {10, "Arp Gate"},  {11, "Arp Octaves"},
+    {12, "Glide"}, /* was id 13 */
 };
 static constexpr UInt32 kNumAuParams = sizeof(kAuParams) / sizeof(kAuParams[0]);
 
 /* §9.9 OUTPUT METERS. The device's readonly per-part + main-mix peak/RMS meters
  * (id range 0x1000+, shared scheme in shell_constants.h, mirroring
  * device/device.h) are surfaced as READONLY AudioUnitParameters: reported in the
- * ParameterList AFTER the 13 device params and the Part router, with ParameterInfo
+ * ParameterList AFTER the 12 device params and the Part router, with ParameterInfo
  * flags that are READABLE but NOT WRITABLE (the AU read-only equivalent of VST3's
  * kIsReadOnly), so a host shows live meters but cannot write/automate them (§9.9).
  * The shell never sets them — their values arrive through the SAME device echo
@@ -93,7 +96,7 @@ static void au_meter_name(AudioUnitParameterID id, char *buf, size_t n) {
  * cross-format-recall-test.sh). HOST-SIDE routing only: au_SetParameter special-
  * cases id 98 out of the device param-set path (exactly as the VST3 process()
  * does), so it never affects the wire or param-map-hash. The Part is reported
- * AFTER the 13 device params in the parameter list; default 0 => part 0, the
+ * AFTER the 12 device params in the parameter list; default 0 => part 0, the
  * single-instance/golden default. kPartParamId is used where an
  * AudioUnitParameterID is expected (== uint32_t). */
 
@@ -189,10 +192,10 @@ struct HarpAU {
     HarpAU() {
         for (UInt32 i = 0; i < kNumAuParams; i++) paramShadow[i] = 0.5f;
         for (UInt32 i = 0; i < kNumMeterParams; i++) meterShadow[i] = 0.0f; /* silent floor */
-        paramShadow[8] = 0.0f;  /* Arp Mode off */
-        paramShadow[9] = 0.6f;  /* Division 1/16 */
-        paramShadow[11] = 0.0f; /* Octaves 1 */
-        paramShadow[12] = 0.0f; /* Glide off */
+        paramShadow[7] = 0.0f;  /* Arp Mode off (id 8 -> idx 7, post-2.1.0 renumber) */
+        paramShadow[8] = 0.6f;  /* Division 1/16 (id 9 -> idx 8) */
+        paramShadow[10] = 0.0f; /* Octaves 1 (id 11 -> idx 10) */
+        paramShadow[11] = 0.0f; /* Glide off (id 12 -> idx 11; was [12] — an OOB write past paramShadow[12]) */
         part = envChannelDefault();
         outFormat.mSampleRate = 48000;
         outFormat.mFormatID = kAudioFormatLinearPCM;
@@ -517,7 +520,7 @@ static OSStatus au_GetPropertyInfo(void *self, AudioUnitPropertyID prop,
             size = sizeof(AUChannelInfo);
             break;
         case kAudioUnitProperty_ParameterList:
-            /* 13 device params + the host-side "Part" router (id 98) + the §9.9
+            /* 12 device params + the host-side "Part" router (id 98) + the §9.9
              * readonly meter params (ids 0x1000+) */
             size = scope == kAudioUnitScope_Global
                        ? (kNumAuParams + 1 + kNumMeterParams) * sizeof(AudioUnitParameterID)
@@ -611,7 +614,7 @@ static OSStatus au_GetProperty(void *self, AudioUnitPropertyID prop,
                 *ioSize = 0;
                 return noErr;
             }
-            /* 13 device params, then the host-side "Part" router (id 98), then the
+            /* 12 device params, then the host-side "Part" router (id 98), then the
              * §9.9 readonly meter params (ids 0x1000+, peak/rms per slot) last */
             const UInt32 total = kNumAuParams + 1 + kNumMeterParams;
             UInt32 n = *ioSize / sizeof(AudioUnitParameterID);
@@ -827,7 +830,7 @@ static OSStatus au_GetParameter(void *self, AudioUnitParameterID param,
     if (param < 1 || (param > kNumAuParams && !isMeterId((uint32_t)param)))
         return kAudioUnitErr_InvalidParameter;
     /* drain device echoes into the shadows so hosts see panel moves AND live
-     * meters. ONE drain feeds both: device-param echoes (ids 1..13) -> paramShadow,
+     * meters. ONE drain feeds both: device-param echoes (ids 1..12) -> paramShadow,
      * §9.9 readonly meter echoes (ids 0x1000+, the SAME evt 'param' path) ->
      * meterShadow, indexed by (id - kMeterIdBase). The echo ring is single-consumer
      * (OWNER-only, like the VST3 shell's process()); an attached/unacquired instance

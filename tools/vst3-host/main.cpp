@@ -401,6 +401,7 @@ int main(int argc, char **argv) {
                 "       [--channel N] [--loop STARTPPQ:ENDPPQ]\n"
                 "       [--part N] [--realtime] [--out FILE.wav] [--hash] [--json]\n"
                 "       [--expect-hash HEX] [--save-state FILE] [--load-state FILE]\n"
+                "       [--load-state-after-connect FILE]\n"
                 "       [--diag-bundle FILE | --diag-bundle-anon FILE]\n"
                 "       [--loopback IN,OUT]\n"
                 "       [--instances N | --aliases ch0,ch1,..] [--serial SERIAL]\n"
@@ -436,6 +437,13 @@ int main(int argc, char **argv) {
     uint32_t rate = 48000, block = 256;
     double seconds = 2.0;
     std::string input_kind = "silence", out_path, save_state_path, load_state_path;
+    /* §11.4 staged-while-connected (HIGH #8): --load-state-after-connect FILE restores
+     * the SAME bundle as --load-state, but DEFERS the setState until AFTER setActive(true)
+     * (the connect). A pre-activate restore lands while the runtime is still disconnected;
+     * deferring it drives HarpRuntime::setStateBundle's connected() branch — the #73
+     * production trigger (a DAW staging a recall onto an already-live device). Empty =
+     * off; mutually exclusive with --load-state (the pre-activate path). */
+    std::string load_state_after_path;
     double sine_hz = 440.0;
     std::vector<std::pair<uint32_t, double>> sets;
     /* §15.5 offline-edit hook: --set-at SEC:ID=V applies a param mid-render (vs --set at
@@ -527,6 +535,7 @@ int main(int argc, char **argv) {
         else if (a == "--out") out_path = next();
         else if (a == "--save-state") save_state_path = next();
         else if (a == "--load-state") load_state_path = next();
+        else if (a == "--load-state-after-connect") load_state_after_path = next(); /* §11.4 HIGH #8 */
         else if (a == "--diag-bundle") diag_bundle_path = next(); /* §14.4 host-context-A */
         else if (a == "--diag-bundle-anon") { /* + §16 anon pass */
             diag_bundle_path = next();
@@ -850,10 +859,15 @@ int main(int argc, char **argv) {
     FUnknownPtr<IAudioProcessor> processor(component);
     if (!processor) die("component is not an IAudioProcessor");
 
-    /* ---- restore state (as a DAW project-open would) ---- */
-    if (!load_state_path.empty()) {
+    /* ---- restore state (as a DAW project-open would) ----
+     * The restore plumbing is shared by both staging paths: --load-state runs it HERE
+     * (pre-activate, the disconnected branch) and --load-state-after-connect (§11.4 HIGH
+     * #8) defers the same call to AFTER setActive(true) so it hits setStateBundle's
+     * connected() branch. The only difference is WHEN setState fires, so the body lives
+     * in one lambda. */
+    auto restore_state = [&](const std::string &path) {
         std::vector<char> comp, ctrl;
-        if (!load_state_file(load_state_path, comp, ctrl)) die("cannot read state file");
+        if (!load_state_file(path, comp, ctrl)) die("cannot read state file");
         MemoryStream cs(comp.data(), (TSize)comp.size());
         if (component->setState(&cs) != kResultOk) die("component setState failed");
         if (controller) {
@@ -864,9 +878,10 @@ int main(int argc, char **argv) {
                 controller->setState(&ts);
             }
         }
-        printf("state: restored from %s (%zu+%zu bytes)\n", load_state_path.c_str(),
+        printf("state: restored from %s (%zu+%zu bytes)\n", path.c_str(),
                comp.size(), ctrl.size());
-    }
+    };
+    if (!load_state_path.empty()) restore_state(load_state_path);
 
     /* ---- list ---- */
     if (do_list && controller) {
@@ -911,6 +926,11 @@ int main(int argc, char **argv) {
 
     if (component->setActive(true) != kResultOk) die("setActive failed");
     processor->setProcessing(true);
+
+    /* §11.4 staged-while-connected (HIGH #8): restore the bundle AFTER the connect.
+     * Unlike the pre-activate --load-state above, the runtime is now live/connected, so
+     * setStateBundle takes its connected() branch (#73). Same restore plumbing, deferred. */
+    if (!load_state_after_path.empty()) restore_state(load_state_after_path);
 
     /* §6.4 reported PDC latency the DAW sees via setLatencySamples — queried AFTER
      * setActive(true) so it reflects the live owner runtime (audit gap #4 item 3).

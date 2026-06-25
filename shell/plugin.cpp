@@ -1,6 +1,6 @@
 /* HARP RefDev — VST3 shell (§15): presents a HARP device to a DAW.
  *
- * One stereo output, host-paced audio via the embedded runtime, the 13
+ * One stereo output, host-paced audio via the embedded runtime, the 12
  * device params as automatable parameters (automation becomes §9.4
  * ramps, notes travel as §9.10 UMP, ProcessContext becomes §9.7
  * transport), getState/setState = Recall Bundle. The AU shell
@@ -54,15 +54,19 @@ struct DevParam {
     int32 stepCount;   /* 0 = continuous (VST3: stepCount = steps - 1) */
     double defaultVal; /* must mirror the device defaults (recall sanity) */
 };
+/* Device ids are CONTIGUOUS 1..12 (engine 2.1.0): the drone's old id 7 ("Drone
+ * Mix", briefly mis-shipped here as a phantom "FX Send") is gone and the set was
+ * renumbered with no hole, so the id<->index map below (id == array index + 1)
+ * holds exactly — see process()'s inputParameterChanges path. */
 static const DevParam kParams[] = {
     {1, "Osc Pitch", 0, 0.5},    {2, "Osc Shape", 0, 0.5},
     {3, "Filter Cutoff", 0, 0.5}, {4, "Filter Reso", 0, 0.5},
     {5, "Env Attack", 0, 0.5},   {6, "Env Release", 0, 0.5},
-    {7, "FX Send", 0, 0.5},      {8, "Master Level", 0, 0.5},
-    /* the arp (device params 9-12; param-map-hash changed with these) */
-    {9, "Arp Mode", 4, 0.0},     {10, "Arp Division", 5, 0.6},
-    {11, "Arp Gate", 0, 0.5},    {12, "Arp Octaves", 3, 0.0},
-    {13, "Glide", 0, 0.0}, /* 0 = off; portamento is opt-in now */
+    {7, "Master Level", 0, 0.5}, /* was id 8 (the phantom FX Send at id 7 is gone) */
+    /* the arp (device params 8-11, renumbered from 9-12; param-map-hash moved) */
+    {8, "Arp Mode", 4, 0.0},     {9, "Arp Division", 5, 0.6},
+    {10, "Arp Gate", 0, 0.5},    {11, "Arp Octaves", 3, 0.0},
+    {12, "Glide", 0, 0.0}, /* was id 13; 0 = off, portamento is opt-in now */
 };
 static constexpr int kNumParams = sizeof(kParams) / sizeof(kParams[0]);
 /* HOST-SIDE routing parameter (NOT a device param): which multitimbral PART

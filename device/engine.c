@@ -39,26 +39,32 @@ static const double ARP_DIV_PPQ[] = {1.0, 0.5, 1.0 / 3, 0.25, 1.0 / 6, 0.125};
 
 /* P3: g_params is the GLOBAL param DEFINITIONS table (id/name/steps/labels/
  * default). The per-part VALUE lives in part::pval (below); the last field of
- * each row is the factory default that every part's pval[] starts from. The
- * each row is the factory default that every part's pval[] starts from. The
- * Drone Mix param (id 7) was REMOVED with the drone at engine 2.0.0, leaving a
- * gap in the id space (1..6, 8..13) — param_index() resolves by id, not slot, so
- * the arp's 9..12 and Master Level's 8 are unchanged; only id 7 is gone (and the
- * param-map-hash moves, since the automatable set is now 12 params). */
+ * each row is the factory default that every part's pval[] starts from.
+ *
+ * The Drone Mix param (id 7) was REMOVED with the drone at engine 2.0.0. It
+ * first left a GAP in the id space (1..6, 8..13); at 2.1.0 the ids were
+ * RENUMBERED CONTIGUOUS (1..12) — no hole — so the shells can keep their simple
+ * id<->index map (a contiguous tag space). param_index() resolves by id, not
+ * slot, so the engine reads are unaffected by the renumber as long as the
+ * render-path id constants below move with the table. The RENUMBER changes the
+ * param-map-hash (a new §9.3 identity — what bumped the engine MINOR to 2.1.0)
+ * but NOT the audio: each value still lands on the SAME named param, only its id
+ * shifted (Master Level 8->7, the arp 9..12 -> 8..11, Glide 13->12). */
 dev_param g_params[NPARAMS] = {
     {1, "Osc Pitch", 0, NULL, 0.5f},    {2, "Osc Shape", 0, NULL, 0.5f},
     {3, "Filter Cutoff", 0, NULL, 0.5f}, {4, "Filter Reso", 0, NULL, 0.5f},
     {5, "Env Attack", 0, NULL, 0.5f},   {6, "Env Release", 0, NULL, 0.5f},
-    {8, "Master Level", 0, NULL, 0.5f},
-    /* the arp (params 9-12). Mode defaults OFF so pre-arp behavior is preserved. */
-    {9, "Arp Mode", 5, ARP_MODES, 0.0f},
-    {10, "Arp Division", 6, ARP_DIVS, 0.6f}, /* index 3 = 1/16 */
-    {11, "Arp Gate", 0, NULL, 0.5f},
-    {12, "Arp Octaves", 4, ARP_OCTS, 0.0f},
+    {7, "Master Level", 0, NULL, 0.5f}, /* was id 8 (the drone's old id 7 is gone) */
+    /* the arp (params 8-11, renumbered from 9-12). Mode defaults OFF so pre-arp
+     * behavior is preserved. */
+    {8, "Arp Mode", 5, ARP_MODES, 0.0f},
+    {9, "Arp Division", 6, ARP_DIVS, 0.6f}, /* index 3 = 1/16 */
+    {10, "Arp Gate", 0, NULL, 0.5f},
+    {11, "Arp Octaves", 4, ARP_OCTS, 0.0f},
     /* 0 = no portamento (legato snaps too — what an arp wants); else
      * glide tau 1..512 ms, exp-mapped. The old behavior was a fixed
-     * 12 ms tau that audibly never arrived at fast arp rates. */
-    {13, "Glide", 0, NULL, 0.0f},
+     * 12 ms tau that audibly never arrived at fast arp rates. (was id 13) */
+    {12, "Glide", 0, NULL, 0.0f},
 };
 
 /* Compile-time mirror of g_params[].def, in id order — used to initialise
@@ -558,7 +564,7 @@ static void engine_render(part *p, synth_voice *v, float *interleaved, uint32_t 
         v->s_shape = VP(p, v, 2);
         v->s_cutoff = VP(p, v, 3);
         v->s_reso = VP(p, v, 4);
-        v->s_master = VP(p, v, 8);
+        v->s_master = VP(p, v, 7); /* Master Level: renumbered 8->7 at 2.1.0 */
         v->n_freq = 220.0f;
         v->s_init = true;
     }
@@ -576,7 +582,7 @@ static void engine_render(part *p, synth_voice *v, float *interleaved, uint32_t 
         v->s_shape += alpha * (VP(p, v, 2) - v->s_shape);
         v->s_cutoff += alpha * (VP(p, v, 3) - v->s_cutoff);
         v->s_reso += alpha * (VP(p, v, 4) - v->s_reso);
-        v->s_master += alpha * (VP(p, v, 8) - v->s_master);
+        v->s_master += alpha * (VP(p, v, 7) - v->s_master); /* Master Level: 8->7 */
 
         /* note voice control: gate + envelope. Pitch SNAPS on a fresh
          * attack and glides only when legato (env still high): a fixed-tau
@@ -603,7 +609,7 @@ static void engine_render(part *p, synth_voice *v, float *interleaved, uint32_t 
             float target = v->bend_semis != 0.0f
                 ? 440.0f * exp2f(((float)note + v->bend_semis - 69.0f) / 12.0f)
                 : 440.0f * exp2f(((float)note - 69.0f) / 12.0f);
-            float glide = VP(p, v, 13);
+            float glide = VP(p, v, 12); /* Glide: renumbered 13->12 at 2.1.0 */
             if (glide <= 0.001f || (retrig && v->env < 0.2f)) {
                 v->n_freq = target; /* no portamento / fresh attack: arrive
                                        on time (off notes are worse than
@@ -1114,9 +1120,10 @@ void *audio_thread(void *arg) {
  * polyphonic allocator, keeping "one note at a time" byte-identical. The arp
  * type + ARP_LATCH_MAX are defined up top so 'part' can contain the state by
  * value; the step/latch/anchor/gate MATH is unchanged. P3: arp_active() reads
- * THIS PART's Arp Mode param (the arp params 9..12 are per part now). */
+ * THIS PART's Arp Mode param (the arp params 8..11 are per part now; renumbered
+ * contiguous from 9..12 at 2.1.0 with the drone's old id 7 reclaimed). */
 
-static bool arp_active(const part *p) { return param_step_index(p, 9) != 0; }
+static bool arp_active(const part *p) { return param_step_index(p, 8) != 0; } /* Arp Mode: 9->8 */
 
 static void arp_reset(part *p);
 static void arp_voice_off(part *p);
@@ -1202,7 +1209,7 @@ static uint64_t arp_ssi_at(part *p, double ppq, double rate) {
  * pos-1?", so fire and deadline agree by construction — no epsilon games
  * across the ppq<->ssi rounding. */
 static uint64_t arp_next_step_ssi(part *p, uint64_t after, double rate) {
-    double div = ARP_DIV_PPQ[param_step_index(p, 10)];
+    double div = ARP_DIV_PPQ[param_step_index(p, 9)]; /* Arp Division: 10->9 */
     double k = floor(arp_ppq_at(p, after, rate) / div + 1e-9) + 1.0;
     uint64_t bssi = arp_ssi_at(p, k * div, rate);
     while (bssi <= after) bssi = arp_ssi_at(p, (k += 1.0) * div, rate);
@@ -1236,17 +1243,17 @@ static void arp_fire_due(part *p, uint64_t pos, double rate) {
      * is the pure harp_arp_select (device/arp_select.h) so all four modes are
      * unit-testable off-hardware; `order` is its sort scratch. */
     int order[ARP_LATCH_MAX];
-    harp_arp_pick pick = harp_arp_select(param_step_index(p, 9), p->arp.step,
+    harp_arp_pick pick = harp_arp_select(param_step_index(p, 8), p->arp.step, /* Arp Mode: 9->8 */
                                          p->arp.latch, p->arp.nlatch,
-                                         param_step_index(p, 12), order);
+                                         param_step_index(p, 11), order); /* Arp Octaves: 12->11 */
     int note = pick.note;
 
     arp_voice_on(p, note, p->arp.vel[pick.sel]); /* mono retrigger on voice 0 */
     p->arp.sounding = note;
     /* gate: release after gate-fraction of the step length */
-    double div = ARP_DIV_PPQ[param_step_index(p, 10)];
+    double div = ARP_DIV_PPQ[param_step_index(p, 9)]; /* Arp Division: 10->9 */
     double step_samples = div * 60.0 * rate / p->arp.tempo;
-    double gate = param_value(p, 11);
+    double gate = param_value(p, 10); /* Arp Gate: 11->10 */
     gate = gate < 0.05 ? 0.05 : gate > 0.98 ? 0.98 : gate;
     p->arp.gate_off = pos + (uint64_t)(step_samples * gate + 0.5);
     if (p->arp.gate_off <= pos) p->arp.gate_off = pos + 1;

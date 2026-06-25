@@ -2711,6 +2711,7 @@ void HarpRuntime::reader() {
                 return;
             }
             uint64_t prevTs = 0;
+            bool tsPrimed = false; /* gate the clock observe on the FIRST forward packet */
             float resamp[kRtpBufFloats];
             const unsigned target = ethTargetFrames(); /* keep audioRing_ near here */
             /* §14.4 host-context-C: this reader IS the ASRC clock-recovery, so it is
@@ -2728,8 +2729,23 @@ void HarpRuntime::reader() {
                 if (floats >= width) {
                     unsigned ns = floats / width;
                     uint64_t dev = harp_rtp_unwrap_ts((uint32_t)ts32, prevTs);
-                    prevTs = dev;
-                    harp_freerun_observe(fr, dev, harp_now_ns());
+                    /* §8.7 reorder-residual (re-audit HIGH #10): a REORDERED or DUPLICATE
+                     * packet (the same non-advancing seq harp_rtp_loss_gap flags advance=false
+                     * for) carries a dev timestamp that does NOT advance past the high-water
+                     * (dev <= prevTs). Feeding its (dev_ts, host_ns) into the regression
+                     * perturbs the drift fit — a backward dev with a forward host_ns drags the
+                     * slope. The loss-COUNT fix (round 5, eth_transport recvAudio) already keeps
+                     * lastSeq_ from rewinding; this is the CLOCK-fit analogue: only an ADVANCING
+                     * packet (dev > prevTs, the in-order/forward case) updates the fit AND the
+                     * high-water. A reordered/dup packet is still PUSHED below (its audio is real
+                     * data, late but valid for the elastic buffer) — only its timestamp is
+                     * withheld from the clock recovery. The first packet always primes. */
+                    bool advance = (!tsPrimed) || (dev > prevTs);
+                    if (advance) {
+                        prevTs = dev;
+                        tsPrimed = true;
+                        harp_freerun_observe(fr, dev, harp_now_ns());
+                    }
                     harp_freerun_push(fr, buf, ns); /* raw union (channels = width) */
                     /* drain the resampler into audioRing_/sinks until EVERY consumer
                      * ring nears target or the resampler runs dry; the consumers'
@@ -3259,8 +3275,24 @@ void HarpRuntime::emitClockStats(harp_cbuf *out) {
     int64_t driftPpb = haveAsrc
         ? (int64_t)llround(asrcEstPpm_.load(std::memory_order_relaxed) * 1000.0)
         : 0;
+    /* §7.2 correlation-uncertainty MUST (re-audit HIGH #9): the spec requires the
+     * recovered correlation (the drift, key 0) to be exposed WITH its CURRENT
+     * uncertainty (key 2, "offset uncertainty (1-sigma band), µs"). The ASRC reader
+     * recovers the rate by regressing dev_ts against host arrival time; the RMS of
+     * that regression's residual, expressed as arrival-time error (freerun
+     * jitter_us), IS the 1-sigma uncertainty of the recovered correlation — the
+     * floor the recovery averages down. It was a DEAD STORE before this (published
+     * to asrcJitterBits_ each drain, never read); reading it here satisfies the MUST
+     * with a real host-measured value, not a constant. Only meaningful on the ASRC
+     * path (it owns the regression); rate-lock/host-paced have no host-side fit, so
+     * key 2 is absent there (the CDDL marks it optional). */
+    double driftUncertaintyUs = 0.0;
+    if (haveAsrc) {
+        uint64_t jb = asrcJitterBits_.load(std::memory_order_relaxed);
+        memcpy(&driftUncertaintyUs, &jb, sizeof driftUncertaintyUs);
+    }
     uint64_t nkeys = 2; /* key 0 (drift) + key 3 (recovery) always */
-    if (haveAsrc) nkeys += 2;              /* key 4 (reanchors) + key 5 (asrc-stats) */
+    if (haveAsrc) nkeys += 3;              /* key 2 (uncertainty) + key 4 (reanchors) + key 5 (asrc-stats) */
     else if (haveRatelock) nkeys++;        /* key 6 (ratelock-stats) */
     /* NB: rtp_loss is NOT a clock-stats key — clock-stats key 7 is reserved for ptp-stats
      * (a map). RTP loss lives at host-counters key 8; reanchors mirror at clock-stats key 4. */
@@ -3268,6 +3300,10 @@ void HarpRuntime::emitClockStats(harp_cbuf *out) {
     harp_cbor_map(out, nkeys);
     harp_cbor_uint(out, 0);
     harp_cbor_int(out, driftPpb);            /* clock_drift_ppb (host-measured gauge) */
+    if (haveAsrc) { /* §7.2 key 2: 1-sigma uncertainty of the recovered correlation, µs */
+        harp_cbor_uint(out, 2);
+        harp_cbor_float(out, driftUncertaintyUs);
+    }
     harp_cbor_uint(out, 3);
     harp_cbor_uint(out, (uint64_t)recovery); /* clock-recovery enum */
     if (haveAsrc) {

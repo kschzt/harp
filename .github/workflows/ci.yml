@@ -265,7 +265,7 @@ jobs:
       - name: fuzz smoke (coverage-guided, seeded; §16/T9)
         run: |
           mkdir -p corpus && ./build-fuzz/gen-corpus corpus
-          for t in cbor envelope object link audio state; do
+          for t in cbor envelope object link audio state evt; do
             echo "=== fuzz-$t"
             ./build-fuzz/fuzz-$t -runs=30000 -max_len=4096 -seed=1 corpus
           done

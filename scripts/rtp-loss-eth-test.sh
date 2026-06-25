@@ -61,10 +61,10 @@ FLOOR=0.03
 awk "BEGIN{exit !(${rms:-0} > $FLOOR)}" \
   || fail "440Hz tone did not survive ${DROP}% loss (rms=${rms:-0} <= $FLOOR; healthy rate-locked recovery ~0.05) — §7.3 stream broke / clock unlocked"
 # §8.7: loss MUST be COUNTED, never silently concealed — assert host-counters key 8 (rtp_loss) > 0.
-# Decoded with python3+cbor2 (installed in CI via eth.yml). On POSIX CI the decoder MUST be present,
-# so the skip path is a hard fail — a regression that stopped counting can't slip through green.
-# Windows MSYS2 python is unreliable, so it skip-logs there (the counting code is platform-independent).
-case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) ISWIN=1 ;; *) ISWIN=0 ;; esac
+# Decoded with python3+cbor2 (installed in CI via eth.yml on ALL three OSes, Windows included —
+# HIGH #6). On CI the decoder MUST be present, so its absence is a hard fail on EVERY OS — a
+# regression that stopped counting can't slip through green, and the old Windows skip carve-out
+# (which left the §8.7 MUST untested on one OS) is gone. A bare dev box without cbor2 still skip-logs.
 if [ -s "$BUNDLE" ] && python3 -c "import cbor2" >/dev/null 2>&1; then
   python3 - "$BUNDLE" <<'PY' || fail "RTP loss not counted/surfaced (§8.7 host-counters key 8)"
 import sys, cbor2
@@ -75,9 +75,9 @@ if lost is None: sys.exit("host-counters key 8 (rtp_loss) absent — loss not su
 if not (lost > 0): sys.exit("host-counters key 8 = %r despite injected RTP loss — not counted" % (lost,))
 print("   ✓ host-counters key 8 (rtp_loss) = %d — counted (>0), not concealed" % lost)
 PY
-elif [ -n "${CI:-}" ] && [ "$ISWIN" = 0 ]; then
-  fail "cbor2 unavailable on POSIX CI — the §8.7 loss-count assertion cannot be skipped (install cbor2)"
+elif [ -n "${CI:-}" ]; then
+  fail "cbor2 unavailable on CI — the §8.7 loss-count assertion cannot be skipped on any OS (install cbor2; see eth.yml)"
 else
-  echo "   (cbor2 or bundle absent$( [ "$ISWIN" = 1 ] && echo ', Windows MSYS2' ) — skipped the host-counters key-8 assertion)"
+  echo "   (cbor2 or bundle absent — skipped the host-counters key-8 assertion on this dev box)"
 fi
 echo "RTP-LOSS PASS (recovered the 440Hz tone through ${DROP}% RTP loss: rms=$rms > $FLOOR, $nconn connect(s), clean exit rc=$rc; loss counted)"

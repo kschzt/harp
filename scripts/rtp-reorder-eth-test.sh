@@ -52,7 +52,9 @@ awk "BEGIN{exit !(${rms:-0} > 0.2)}" \
 # transient gap per reorder (the higher seq arrives before the held one), but the FIX keeps it bounded
 # at ~1/reorder; the rewind BUG multiplies it to ~4/reorder (the 3-deep hold). Assert rtp_loss is
 # bounded (< 200; the fix reads ~83 here, the bug would read ~330) and counted (>0, never concealed).
-case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) ISWIN=1 ;; *) ISWIN=0 ;; esac
+# cbor2 is installed on ALL three OSes (eth.yml, Windows included — HIGH #6), so its absence is a hard
+# CI fail on EVERY OS; the old Windows skip carve-out (§8.7 MUST untested on one OS) is gone. A bare
+# dev box without cbor2 still skip-logs.
 if [ -s "$BUNDLE" ] && python3 -c "import cbor2" >/dev/null 2>&1; then
   python3 - "$BUNDLE" <<'PY' || fail "RTP reorder mis-counted as loss (§8.7 host-counters key 8 — rewind over-count?)"
 import sys, cbor2
@@ -63,9 +65,9 @@ if lost <= 0:    sys.exit("host-counters key 8 = %r — reorder should still sur
 if lost >= 200:  sys.exit("host-counters key 8 = %d — reorder OVER-counted (>=200); the high-water seq rewound" % lost)
 print("   ✓ host-counters key 8 (rtp_loss) = %d — bounded (~1/reorder, no rewind amplification)" % lost)
 PY
-elif [ -n "${CI:-}" ] && [ "$ISWIN" = 0 ]; then
-  fail "cbor2 unavailable on POSIX CI — the §8.7 reorder loss-count assertion cannot be skipped"
+elif [ -n "${CI:-}" ]; then
+  fail "cbor2 unavailable on CI — the §8.7 reorder loss-count assertion cannot be skipped on any OS (install cbor2; see eth.yml)"
 else
-  echo "   (cbor2 or bundle absent$( [ "$ISWIN" = 1 ] && echo ', Windows MSYS2' ) — skipped the host-counters key-8 assertion)"
+  echo "   (cbor2 or bundle absent — skipped the host-counters key-8 assertion on this dev box)"
 fi
 echo "RTP-REORDER PASS (440Hz tone intact through ${REORDER}% reorder: rms=$rms; loss bounded, not rewound; $nconn connect(s), rc=$rc)"

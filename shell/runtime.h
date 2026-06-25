@@ -499,11 +499,22 @@ private:
      * HARP_CUSHION_BLOCKS overrides for measurement. */
     static constexpr uint32_t kTargetDepthFrames = 2;
 
-    /* §8.7 bit-exact: the Ethernet jitter-buffer setpoint (frames). The feeder's
-     * audio.trim loop holds audioRing_ here, AND audio.start sends it as key 2 so
-     * the device PREFILLS this many frames in a startup burst — otherwise the
-     * ppm-limited trim takes seconds to fill from empty (startup silence). */
-    static constexpr uint32_t kEthTargetFrames = 2048;
+    /* §8.7 bit-exact: the Ethernet jitter-buffer setpoint (frames) for a device that
+     * declares NO rt-floor (identity key 14). The feeder's audio.trim loop holds
+     * audioRing_ here, AND audio.start sends it as key 2 so the device PREFILLS this
+     * many frames in a startup burst — otherwise the ppm-limited trim takes seconds
+     * to fill from empty (startup silence).
+     *
+     * UNDECLARED DEFAULT lowered 2048 -> 1024 (user request): a 15-min hardware soak
+     * measured the real safe floor at ~320 frames on BOTH a switch and the worst-case
+     * direct cable, so the old 2048 was ~6x conservative. A device that declares its
+     * rt-floor (key 14) overrides this entirely (deviceEthFloor_ in ethTargetFrames),
+     * so this value ONLY affects an unknown device that declares nothing — 1024 keeps
+     * a healthy >3x safety margin over the measured ~320 for an unknown/worse link,
+     * while the per-device declared floor remains the real tuning. The trim loop is
+     * target-invariant (alpha self-normalizes by target — see feeder()), so the lower
+     * default needs no retune; the structural 2*maxDawBlock floor below still applies. */
+    static constexpr uint32_t kEthTargetFrames = 1024;
     /* §6.4 rt-profile (identity key 14): the device-declared safe RTP jitter-buffer floor
      * (frames); 0 = undeclared. Set in helloAndIdentity(); when present it replaces the
      * kEthTargetFrames default in ethTargetFrames() (still clamped by the structural floor). */
@@ -514,8 +525,9 @@ private:
     uint32_t deviceEthNsamples_ = 0;
 
     /* §8.7 latency knobs (measurement / clean-direct-link low-latency mode). The
-     * default 2048-frame setpoint + 256-frame packet is the consumer-LAN-safe pair
-     * (proven 127 dB). On a clean cable HARP_ETH_TARGET dials the buffer down toward
+     * UNDECLARED default 1024-frame setpoint + 256-frame packet is the consumer-LAN-safe
+     * pair (proven 127 dB; lowered from 2048 per the soak — see kEthTargetFrames). On a
+     * clean cable HARP_ETH_TARGET dials the buffer down toward
      * the DAW-block floor and HARP_ETH_NSAMPLES shrinks the device RTP packet. The
      * SAME ethTargetFrames() value flows to BOTH the trim setpoint (runtime.cpp) and
      * the audio.start key-2 prefill, so the device prefills to exactly the setpoint
@@ -781,7 +793,12 @@ private:
      * snapshot crosses. asrcLive_ is the presence gate (an ASRC session is up). */
     std::atomic<bool>     asrcLive_{false};   /* an ASRC (free-running, non-rate-lock) reader is running */
     std::atomic<uint64_t> asrcRatioBits_{0};  /* harp_freerun_stats.ratio (double, bit-punned) */
-    std::atomic<uint64_t> asrcJitterBits_{0}; /* harp_freerun_stats.jitter_us (double, bit-punned) */
+    std::atomic<uint64_t> asrcJitterBits_{0}; /* §7.2 recovered-correlation 1-sigma uncertainty:
+                                               * harp_freerun_stats.jitter_us (RMS of the rate-recovery
+                                               * regression residual, µs; double bit-punned). READ by
+                                               * emitClockStats -> clock-stats key 2 (offset uncertainty)
+                                               * to satisfy the §7.2 MUST that the recovered correlation
+                                               * be exposed WITH its current uncertainty (no longer a dead store). */
     std::atomic<double>   asrcEstPpm_{0.0};   /* harp_freerun_stats.est_ppm (recovered drift) */
     std::atomic<uint32_t> asrcFill_{0};       /* harp_freerun_stats.fill_frames */
     std::atomic<uint32_t> asrcReanchors_{0};  /* §8.3 harp_freerun_stats.reanchors (clock-stats key 4) */

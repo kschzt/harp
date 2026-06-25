@@ -24,8 +24,8 @@ sync, and DAW compatibility from scratch.
 
 HARP is a complete, working implementation of that integration — with an open
 spec underneath, if you want to build a device on it. The reference device is
-a Raspberry Pi running a 16-part multitimbral, 8-voice-polyphonic synth (13
-params per part); anything that speaks the protocol gets the same treatment from
+a Raspberry Pi running a 16-part multitimbral, 8-voice-polyphonic synth (12
+automatable params per part); anything that speaks the protocol gets the same treatment from
 any conforming host:
 
 - **Total recall, Git-style** — device state is content-addressed and
@@ -101,8 +101,10 @@ an **editor's draft** (0.5.5): breaking changes are expected and negotiated at
 `hello`. The four-actions recall UI (§11.4 reconcile — Push / Pull / Read-only / Duplicate)
 ships in the reference Electra front-panel sidecar, and the spec-conformance periphery (the
 `_harp._tcp` mDNS advertisement, credit flow-control, event transactions, admission control,
-the version/update prompt) has been filled in over the §8.7 Ethernet/IP binding; shell-side
-mDNS *browse* is still on the roadmap (§6.1). The [Status](#status) section is the full breakdown.
+the version/update prompt) has been filled in over the §8.7 Ethernet/IP binding, and shell-side
+mDNS *browse* now ships as the default dial path — with no USB device and no pinned address,
+`selectDevice` browses `_harp._tcp` and dials the first synth it finds (§6.1). The
+[Status](#status) section is the full breakdown.
 
 ## Repository map
 
@@ -112,7 +114,7 @@ core/             portable C11 protocol library, no dependencies:
                   framing, deterministic CBOR, SHA-256, content-addressed
                   objects, crash-atomic ref store, audio frame codec
 device/           harp-deviced — the reference device daemon: a 16-part
-                  multitimbral synth engine (13 params/part) behind the
+                  multitimbral synth engine (12 automatable params/part) behind the
                   protocol. Transports: TCP (simulation, any OS) and
                   FunctionFS USB gadget (Linux)
 host/             harp-probe — host-side CLI: recall flows, audio capture,
@@ -344,7 +346,7 @@ or after the DAW — the shell's supervisor reconnects either way.
 - **Musical time (§9.7)** — the device follows `evt.transport`: a note-latch
   arpeggiator whose step clock derives from the (timestamp, PPQ, tempo) anchor
   lands on division boundaries sample-exactly, survives loop wraps, and renders
-  a byte-identical *groove hash*. (The param map is now 13 ids, applied per
+  a byte-identical *groove hash*. (The automatable param map is 12 ids, applied per
   part; old projects map onto matching ids with a warning, §9.3.)
 - **Multitimbral (§9.4, §15.1–§15.2)** — one device is one session, and several
   shell instances that name the same unit *share* it, each owning a part
@@ -399,14 +401,14 @@ or after the DAW — the shell's supervisor reconnects either way.
   (silent hash-verified reopen), T9 (malformed input), T10 (power-loss safety),
   T15/T17 (byte-identical renders), T16 (event timing).
 
-**Not yet:** the four-safe-actions UI (v0 auto-resolves by Push-with-archive),
-runtime/shell process split (§15.1), firmware management (§13), class-audio
-coexistence (§8.5), free-running ASRC for an analog device, the `core.changed` /
-`core.bye` senders (§5.5), and PTP-grade Ethernet clock sync wired into the
-runtime (the §8.7 binding ships with a rate-trim loop + ASRC; PTP stays a
-hardware prototype). Spec conformance is otherwise complete across core and
-normative periphery; **§13 firmware management and certification is the remaining
-bar.**
+**Not yet:** runtime/shell process split (§15.1), firmware management (§13),
+class-audio coexistence (§8.5), free-running ASRC for an analog device, and
+PTP-grade Ethernet clock sync wired into the runtime (the §8.7 binding ships
+with a rate-trim loop + ASRC; PTP stays a hardware prototype). The §11.4
+four-safe-actions reconcile UI (Push / Pull / Read-only / Duplicate) and the
+§5.5 `core.changed` / `core.bye` senders now ship. Spec conformance is otherwise
+complete across core and normative periphery; **§13 firmware management and
+certification is the remaining bar.**
 
 The spec is an **editor's draft**: breaking changes expected, version
 negotiated at `core.hello`. Changes flow through HARP Enhancement Proposals

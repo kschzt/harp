@@ -22,17 +22,17 @@
 #include "device.h"
 
 /* REAL: the parser matches blob ids against g_params[].id. Kept in lockstep
- * with device/engine.c (ids 1..6, 8..13 — id 7 "Drone Mix" was removed with the
- * drone, leaving a gap). Only the id field matters to the codec, but the whole
- * rows are mirrored so a drift is obvious. */
+ * with device/engine.c (ids 1..12, CONTIGUOUS — the 2.1.0 renumber reclaimed the
+ * drone's old id 7 and closed the gap). Only the id field matters to the codec,
+ * but the whole rows are mirrored so a drift is obvious. */
 dev_param g_params[NPARAMS] = {
     {1, "Osc Pitch", 0, NULL, 0.5f},     {2, "Osc Shape", 0, NULL, 0.5f},
     {3, "Filter Cutoff", 0, NULL, 0.5f}, {4, "Filter Reso", 0, NULL, 0.5f},
     {5, "Env Attack", 0, NULL, 0.5f},    {6, "Env Release", 0, NULL, 0.5f},
-    {8, "Master Level", 0, NULL, 0.5f},
-    {9, "Arp Mode", 5, NULL, 0.0f},      {10, "Arp Division", 6, NULL, 0.6f},
-    {11, "Arp Gate", 0, NULL, 0.5f},     {12, "Arp Octaves", 4, NULL, 0.0f},
-    {13, "Glide", 0, NULL, 0.0f},
+    {7, "Master Level", 0, NULL, 0.5f},
+    {8, "Arp Mode", 5, NULL, 0.0f},      {9, "Arp Division", 6, NULL, 0.6f},
+    {10, "Arp Gate", 0, NULL, 0.5f},     {11, "Arp Octaves", 4, NULL, 0.0f},
+    {12, "Glide", 0, NULL, 0.0f},
 };
 /* Drift tripwire: this mirror is hand-kept in lockstep with engine.c. A param
  * COUNT change there bumps NPARAMS and trips this assert, forcing the rows
