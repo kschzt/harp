@@ -83,8 +83,12 @@ typedef struct {
 } dev_param;
 
 /* fixed count so sizeof tricks aren't needed across modules. 12 since the drone
- * removal dropped "Drone Mix" (id 7); the arp added ids 9-12 earlier. */
+ * removal dropped "Drone Mix" (id 7); the arp added ids 9-12 earlier. Overridable
+ * (-DNPARAMS=N) so a downstream device (the Jetson GPU synth) can grow its bank
+ * without touching the refdev — which stays at 12. */
+#ifndef NPARAMS
 #define NPARAMS 12
+#endif
 extern dev_param g_params[NPARAMS];
 
 /* Per-part param value access (P3). The atomic value lives in part::pval
