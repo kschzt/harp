@@ -188,7 +188,7 @@ static void control_thread(HarpRuntime *rt, EventSource *src, bool isOwner,
             rt->queueParamSet(src, 3, 0.7f, base);  /* tone */
             rt->queueParamSet(src, 5, 0.05f, base); /* fast attack */
             rt->queueParamSet(src, 6, 0.1f, base);  /* fast decay */
-            rt->queueParamSet(src, 8, iso, base);   /* level — the variable under test */
+            rt->queueParamSet(src, 7, iso, base);   /* level (Master Level = id 7 post-2.1.0 renumber) — the variable under test */
         } else {
             /* params, ramps, notes — the whole queue* surface, on OUR source */
             rt->queueParamSet(src, 1 + (n % 8), (float)(n % 100) / 100.f, base + (n % 256));

@@ -1,10 +1,10 @@
 #!/bin/bash
 # eth-rtfloor-test — §6.4 rt-profile (identity key 14). A device declares its safe Ethernet RT
 # setpoints: sub-key 0 = ethTargetFrames jitter-buffer floor, sub-key 1 = RTP packet size
-# (nsamples). The host adopts each in place of its 2048/256 defaults, clamped (floor by the
+# (nsamples). The host adopts each in place of its 1024/256 defaults, clamped (floor by the
 # 2*maxDawBlock structural floor; packet to [32, kBlock]). Either sub-key may be omitted.
 # Reference-fleet defaults: a KR260-* device declares 320/64, a PI4B-* device 448/128, applied
-# when no flag is given (harp-deviced). Undeclared (no cap/key) => host keeps 2048/256.
+# when no flag is given (harp-deviced). Undeclared (no cap/key) => host keeps 1024/256.
 #
 # Asserts via the host log "eth audio.start: packet=<ns> prefill/target=<frames> ...".
 #
@@ -48,10 +48,10 @@ check() {
 echo "── rt-profile declaration (block 64 -> structural floor 2*64=128; packet clamp [32, kBlock=256])"
 check declared    SIM-decl   "--rt-floor 384 --rt-nsamples 64" 384  64    # both declared -> both adopted
 check floor-only  SIM-fonly  "--rt-floor 384"                  384  256   # only floor; packet keeps 256 default
-check pkt-only    SIM-ponly  "--rt-nsamples 96"                2048 96    # only packet; floor keeps 2048 default
-check undeclared  SIM-none   ""                                2048 256   # nothing declared -> defaults
+check pkt-only    SIM-ponly  "--rt-nsamples 96"                1024 96    # only packet; floor keeps 1024 default
+check undeclared  SIM-none   ""                                1024 256   # nothing declared -> defaults
 check clamp-floor SIM-cf     "--rt-floor 32"                   128  256   # floor below 2*block -> clamp up to 128
-check clamp-pktlo SIM-cplo   "--rt-nsamples 16"                2048 32    # packet below 32 -> clamp up to 32
-check clamp-pkthi SIM-cphi   "--rt-nsamples 9999"              2048 256   # packet above kBlock -> clamp to 256
+check clamp-pktlo SIM-cplo   "--rt-nsamples 16"                1024 32    # packet below 32 -> clamp up to 32
+check clamp-pkthi SIM-cphi   "--rt-nsamples 9999"              1024 256   # packet above kBlock -> clamp to 256
 check clamp-flhi  SIM-cfh    "--rt-floor 99999"                12288 256  # floor above the 12288 ceiling -> clamp down
 echo "RTFLOOR-ETH PASS (floor+packet declared/adopted, partial maps, both clamps)"

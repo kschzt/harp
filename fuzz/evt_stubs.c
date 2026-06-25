@@ -49,6 +49,17 @@ _Atomic uint64_t g_fence_timeouts;
 _Atomic int g_touch_pending;
 _Atomic float g_meter_peak[METER_NSLOTS];
 _Atomic float g_meter_rms[METER_NSLOTS];
+/* §14.2: FunctionFS transport-error counter (device/ffs_link.c). emit_counters reads it via
+ * CTR_GET; real datum so it has somewhere to land, left 0 on the fuzz path. */
+_Atomic uint64_t g_usb_errors;
+
+/* §8.2 audio.start opens the FunctionFS audio endpoints under __linux__ (device/ffs.c). The
+ * fuzzer never starts a real stream, so these return -1 (no endpoint) — matching the same
+ * #ifdef guard the references in session.c carry. */
+#ifdef __linux__
+int harp_ffs_audio_in_fd(void) { return -1; }
+int harp_ffs_audio_out_fd(void) { return -1; }
+#endif
 
 /* ── REACHED on the fuzz path: no-op so the parser runs without a real engine/queue ── */
 void evq_push(dev_event ev) { (void)ev; }

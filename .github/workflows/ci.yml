@@ -21,15 +21,21 @@ jobs:
           cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host ring-tests registry-tests mpe-zone-tests -j3
       - name: shell unit tests (rings + registry + mpe-zone via ctest -L unit)
         run: ctest --test-dir build-vst -L unit --output-on-failure
-      - name: root tree — core + engine-logic + device-codec tests (gap #3/#4; Apple-clang/arm64)
+      - name: root tree — core + engine-logic + device-codec + freerun/rtp tests (gap #3/#4; Apple-clang/arm64)
         # macOS previously configured ONLY the shell tree (build-vst), so the pure
         # integer policies (voice-alloc/arp/mod-routing) and the harpcore codecs never
         # ran on Apple-clang/arm64 — yet the AU shell funnels MPE straight into them.
         # The root configure is cheap (no SDK clone) and picks up the brew libusb/
         # libsamplerate already installed above.
+        #
+        # freerun/rtp/freerun_mt carry LABELS unit so the §8.3 SINAD-on-the-shipped-
+        # converter fixture runs on EVERY OS — but `ctest -L unit` only RUNS a test
+        # whose binary exists. brew libsamplerate above makes SAMPLERATE_FOUND true
+        # (and macOS is NOT WIN32), so all three targets are defined; build them here
+        # or `-L unit` reports them "Not Run". freerun_mt is the TSan SPSC race test.
         run: |
           cmake -B build
-          cmake --build build --target harp-engine-logic-tests harp-tests harp-device-tests harp-ffs-link-tests -j3
+          cmake --build build --target harp-engine-logic-tests harp-tests harp-device-tests harp-ffs-link-tests harp-freerun-tests harp-rtp-tests harp-freerun-mt-tests -j3
           ctest --test-dir build -L unit --output-on-failure
       - name: AU shell + auval (Apple's own validation gate)
         run: |

@@ -141,7 +141,7 @@ run_host "" save-v1 --save-state "$STATE.v1"
 [ -s "$STATE.v1" ] || { cat "$HOSTLOG"; fail "save-state (engine 1.0.0) produced no fixture"; }
 kill -9 "$DP" 2>/dev/null; DP=""
 rm -rf "$DEVDIR.v2"; : > "$DEVLOG"
-echo "── open it on the default-engine (2.0.0) device with NO HARP_FORCE_ENGINE_MAJOR"
+echo "── open it on the default-engine (2.1.0) device with NO HARP_FORCE_ENGINE_MAJOR"
 "$DEVICED" --serial "$SERIAL" --port "$PORT" --state-dir "$DEVDIR.v2" >>"$DEVLOG" 2>&1 & DP=$!
 wait_listen || { cat "$DEVLOG"; fail "v2 (default engine) device didn't start on $PORT"; }
 run_host "" fresh-open --load-state "$STATE.v1" --diag-bundle "$BUNDLE.fresh"

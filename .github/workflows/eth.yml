@@ -136,7 +136,7 @@ jobs:
             echo "$HOME/bin" >> "$GITHUB_PATH"
             export PATH="$HOME/bin:$PATH"
           fi
-          python3 -c "import cbor2; print('cbor2', cbor2.__version__, 'ready for the §8.7 counter assertions')"
+          python3 -c "import cbor2; cbor2.loads(cbor2.dumps({1:2})); print('cbor2 ready for the §8.7 counter assertions')"
 
       # ───────── the shared §8.7 conformance suite (one source of truth, every OS) ─────────
       # eth-suite.sh runs the full conformance list; per-test gating is capability-based
