@@ -48,6 +48,9 @@ using namespace Steinberg::Vst;
  * local copies of the shell's host param ids, like kPartParamId, rather than
  * pulling the shell header). The "MPE" toggle (97) arms raw-MIDI MPE; each
  * (channel, axis) maps to a hidden param the shell decodes back into a §9.5 mod. */
+/* MULTI-OUT: how many output buses (bus 0 = main mix, then per-part buses 1..16) the host
+ * activates. Default 1 = main-mix only (the golden-identical path). --out-buses N activates N. */
+static int g_outBuses = 1;
 static const uint32_t kMpeEnableParamId = 97;
 static const uint32_t kMpeMidiBase = 0x3000u;
 static const uint32_t kMpeMidiAxes = 4u;
@@ -183,7 +186,8 @@ static int run_multi_instance(VST3::Hosting::Module::Ptr &module, const VST3::Ho
         in->nin = in->component->getBusCount(kAudio, kInput);
         in->nout = in->component->getBusCount(kAudio, kOutput);
         for (int32 i = 0; i < in->nin; i++) in->component->activateBus(kAudio, kInput, i, true);
-        for (int32 i = 0; i < in->nout; i++) in->component->activateBus(kAudio, kOutput, i, true);
+        int32 actOut = in->nout < g_outBuses ? in->nout : g_outBuses; /* MULTI-OUT: main + parts */
+        for (int32 i = 0; i < actOut; i++) in->component->activateBus(kAudio, kOutput, i, true);
         if (in->nout == 0) die("multi-instance: alias has no audio output bus");
         BusInfo outBus{};
         in->component->getBusInfo(kAudio, kOutput, 0, outBus);
@@ -531,6 +535,7 @@ int main(int argc, char **argv) {
         else if (a == "--realtime") realtime = true;
         else if (a == "--rate") rate = (uint32_t)atoi(next().c_str());
         else if (a == "--block") block = (uint32_t)atoi(next().c_str());
+        else if (a == "--out-buses") g_outBuses = atoi(next().c_str()); /* MULTI-OUT: activate N output buses (main + parts) */
         else if (a == "--seconds") seconds = atof(next().c_str());
         else if (a == "--out") out_path = next();
         else if (a == "--save-state") save_state_path = next();
@@ -900,7 +905,12 @@ int main(int argc, char **argv) {
     int32 nin = component->getBusCount(kAudio, kInput);
     int32 nout = component->getBusCount(kAudio, kOutput);
     for (int32 i = 0; i < nin; i++) component->activateBus(kAudio, kInput, i, true);
-    for (int32 i = 0; i < nout; i++) component->activateBus(kAudio, kOutput, i, true);
+    /* MULTI-OUT: activate the main mix (bus 0) plus the first g_outBuses-1 per-part buses
+     * (default 1 = main-mix only, the golden-identical path). Activating ALL declared output
+     * buses would make a multi-out shell stream the full 34-channel union even for a
+     * main-mix-only render. The multi-out test raises g_outBuses via --out-buses N. */
+    int32 actOut = nout < g_outBuses ? nout : g_outBuses;
+    for (int32 i = 0; i < actOut; i++) component->activateBus(kAudio, kOutput, i, true);
     if (nout == 0) die("plugin has no audio output bus");
     BusInfo outBus{};
     component->getBusInfo(kAudio, kOutput, 0, outBus);
