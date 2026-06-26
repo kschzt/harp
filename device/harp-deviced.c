@@ -215,6 +215,33 @@ static void rtp_send_one(audio_state *a, const harp_rtp_hdr *h, const float *sam
 
 void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, uint64_t msc) {
     if (a->rtp_fd < 0) return;
+    /* WIDE UNION (>8 slots): one ns×S×4 datagram would exceed the OS max UDP datagram
+     * (macOS net.inet.udp.maxdgram = 9216), so the send silently fails and the host gets
+     * NOTHING. Split the frame into <=8-slot pt=97 groups, each a 4-byte sub-header
+     * [off, cnt, total, flags] + ns×cnt gathered floats, all sharing the RTP timestamp; the
+     * host reassembles by timestamp (see rtp.h). <=8 slots stays the byte-identical pt=96
+     * path below. The render thread is the SOLE caller, so the gather buffer is static. */
+    unsigned S = a->n_out_slots ? a->n_out_slots : 2;
+    if (S > HARP_RTP_MAX_GROUP_SLOTS) {
+        unsigned ns = (unsigned)(payload_bytes / ((size_t)S * sizeof(float)));
+        static uint8_t grp[HARP_RTP_GROUP_HDR_BYTES +
+                           AUDIO_MAX_NSAMPLES * HARP_RTP_MAX_GROUP_SLOTS * sizeof(float)];
+        for (unsigned off = 0; off < S; off += HARP_RTP_MAX_GROUP_SLOTS) {
+            unsigned cnt = (S - off > HARP_RTP_MAX_GROUP_SLOTS) ? HARP_RTP_MAX_GROUP_SLOTS : (S - off);
+            uint16_t gseq = a->rtp_seq++;
+            /* §8.7 test loss injection still applies per packet; ADVANCE seq first (drop = gap). */
+            if (g_rtp_drop_pct > 0 && (gseq * 2654435761u) % 100u < (uint32_t)g_rtp_drop_pct) continue;
+            grp[0] = (uint8_t)off; grp[1] = (uint8_t)cnt; grp[2] = (uint8_t)S; grp[3] = 0;
+            float *gf = (float *)(grp + HARP_RTP_GROUP_HDR_BYTES);
+            for (unsigned s = 0; s < ns; s++)
+                for (unsigned c = 0; c < cnt; c++)
+                    gf[(size_t)s * cnt + c] = samples[(size_t)s * S + off + c];
+            harp_rtp_hdr gh = {HARP_RTP_PT_GROUP, 0, gseq, (uint32_t)msc, a->rtp_ssrc};
+            rtp_send_one(a, &gh, (const float *)grp,
+                         HARP_RTP_GROUP_HDR_BYTES + (size_t)ns * cnt * sizeof(float));
+        }
+        return;
+    }
     uint16_t seq = a->rtp_seq++;
     /* drop ~N% of datagrams, but ADVANCE the seq first so the host sees a genuine gap
      * (real loss), not a stall. Knuth multiplicative hash = reproducible (no rand) yet

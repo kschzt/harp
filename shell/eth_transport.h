@@ -188,12 +188,11 @@ struct EthTransport final : ShellTransport {
         const uint8_t *pl;
         size_t pln;
         if (harp_rtp_unpack(rxpkt_, (size_t)n, &h, &pl, &pln) != 0) return 0;
-        if (dev_ts) *dev_ts = h.timestamp;
         /* §8.7: count lost RTP packets from sequence gaps (loss MUST be counted, never silently
          * concealed) through the SHARED pure helper (host/rtp.h) so the live shell streaming path
          * and the CLI agree. A forward gap (< 0x8000) = that many lost packets AND advances the
          * high-water seq; a reordered/duplicate packet (gap >= 0x8000) reports 0 loss and must NOT
-         * rewind lastSeq_ — rewinding makes the NEXT in-order packet over-count a huge spurious gap. */
+         * rewind lastSeq_. Per PACKET — both single- and multi-packet frames (each group has a seq). */
         if (!seqValid_) {
             lastSeq_ = h.seq;
             seqValid_ = true;
@@ -203,12 +202,62 @@ struct EthTransport final : ShellTransport {
             if (lost) rtpLost_.fetch_add(lost, std::memory_order_relaxed);
             if (advance) lastSeq_ = h.seq;
         }
+        lastArr_.store(harp_now_ns(), std::memory_order_relaxed); /* every packet, incl. assembling groups */
+
+        /* §8.7 wide union: a pt=97 group is reassembled by timestamp — recvAudio returns a
+         * complete frame only when the NEXT frame's first group arrives (one frame of jitter
+         * the elastic buffer already absorbs), 0 while still assembling. */
+        if (h.pt == HARP_RTP_PT_GROUP)
+            return reassembleGroup(h, pl, pln, out, maxFloats, dev_ts);
+
+        /* single-packet frame (pt=96): payload is raw slot-interleaved floats — byte-identical
+         * to the pre-multipacket wire (every <=8-slot test path is untouched). */
+        if (dev_ts) *dev_ts = h.timestamp;
         if (pln % sizeof(float)) return 0; /* whole float samples only */
         unsigned f = (unsigned)(pln / sizeof(float)); /* slot-interleaved floats */
         if (f > maxFloats) f = maxFloats; /* one packet always fits a sane out */
         memcpy(out, pl, (size_t)f * sizeof(float));
-        lastArr_.store(harp_now_ns(), std::memory_order_relaxed);
         return f;
+    }
+
+    /* Reassemble a pt=97 multi-packet frame. Groups sharing reasmTs_ are scattered into reasm_
+     * (zeroed at frame start, so a missing group is silence). A group with a NEW timestamp
+     * flushes the assembled frame to `out` (its timestamp into *dev_ts) and starts a fresh one.
+     * Returns the flushed frame's float count, or 0 while still assembling. */
+    unsigned reassembleGroup(const harp_rtp_hdr &h, const uint8_t *pl, size_t pln,
+                             float *out, unsigned maxFloats, unsigned *dev_ts) {
+        if (pln < HARP_RTP_GROUP_HDR_BYTES) return 0;
+        unsigned off = pl[0], cnt = pl[1], total = pl[2];
+        size_t sbytes = pln - HARP_RTP_GROUP_HDR_BYTES;
+        if (cnt == 0 || total == 0 || total > kReasmSlots || off + cnt > total ||
+            sbytes % sizeof(float))
+            return 0;
+        unsigned ns = (unsigned)((sbytes / sizeof(float)) / cnt);
+        if (ns == 0 || ns > kReasmNs) return 0;
+        const float *sf = (const float *)(pl + HARP_RTP_GROUP_HDR_BYTES);
+
+        unsigned flushed = 0;
+        if (reasmValid_ && h.timestamp != reasmTs_) {
+            unsigned fr = reasmNs_ * reasmTotal_;
+            if (fr > maxFloats) fr = maxFloats;
+            memcpy(out, reasm_, (size_t)fr * sizeof(float));
+            if (dev_ts) *dev_ts = reasmTs_;
+            flushed = fr;
+            reasmValid_ = false;
+        }
+        if (!reasmValid_) {
+            std::memset(reasm_, 0, sizeof reasm_); /* conceal any missing group as silence */
+            reasmTs_ = h.timestamp;
+            reasmTotal_ = total;
+            reasmNs_ = ns;
+            reasmValid_ = true;
+        }
+        /* scatter this group's contiguous columns [off, off+cnt) into the union frame */
+        if (total == reasmTotal_ && ns == reasmNs_)
+            for (unsigned s = 0; s < ns; s++)
+                for (unsigned c = 0; c < cnt; c++)
+                    reasm_[(size_t)s * total + off + c] = sf[(size_t)s * cnt + c];
+        return flushed;
     }
     unsigned silentMs() const override {
         unsigned long long last = lastArr_.load(std::memory_order_relaxed);
@@ -287,6 +336,15 @@ private:
     uint16_t lastSeq_ = 0;
     bool seqValid_ = false;
     std::atomic<uint64_t> rtpLost_{0};
+    /* §8.7 wide-union RTP reassembly (pt=97 multi-packet frames): assemble the <=8-slot
+     * groups sharing one RTP timestamp into the full union frame, then hand the reader a
+     * complete frame exactly as a single-packet one — so the demux/clock/ASRC are unchanged.
+     * A group that never arrives stays silence (the frame is zeroed at start). */
+    static constexpr unsigned kReasmSlots = 34, kReasmNs = 256;
+    float reasm_[kReasmNs * kReasmSlots] = {0};
+    uint32_t reasmTs_ = 0;
+    bool reasmValid_ = false;
+    unsigned reasmTotal_ = 0, reasmNs_ = 0;
     /* §8.3-over-§8.7 host-paced: live ONLY when hostPaced_. audioListen_ is the
      * ephemeral TCP listener (key 7) the device dials back; audioSock_ is the one
      * accepted connection carrying H->D pacing + D->H rendered frames. */
