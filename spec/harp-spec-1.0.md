@@ -2,7 +2,7 @@
 
 **An open standard for integrating hardware instruments with audio software hosts.**
 
-Specification, Draft 0.5.5 — 23 June 2026
+Specification, Version 1.0 — 26 June 2026
 
 | | |
 |---|---|
@@ -1231,4 +1231,4 @@ Suggested proving milestone, matching the protocol's own priorities: a VST3 shel
 
 ---
 
-*End of Draft 0.5.5. Earlier drafts of the ideas herein circulated as a product brief titled "Hardware Plugin Runtime"; this document is the open-standard formulation of that work.*
+*End of Version 1.0. Earlier drafts of the ideas herein circulated as a product brief titled "Hardware Plugin Runtime"; this document is the open-standard formulation of that work.*

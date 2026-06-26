@@ -109,7 +109,7 @@ mDNS *browse* now ships as the default dial path — with no USB device and no p
 ## Repository map
 
 ```
-spec/             the specification (draft 0.5.5) + machine-readable CDDL
+spec/             the specification (v1.0) + machine-readable CDDL
 core/             portable C11 protocol library, no dependencies:
                   framing, deterministic CBOR, SHA-256, content-addressed
                   objects, crash-atomic ref store, audio frame codec
@@ -279,7 +279,7 @@ or after the DAW — the shell's supervisor reconnects either way.
 
 ## Documentation
 
-- **The specification**: [`spec/harp-spec-draft-0.3.md`](spec/harp-spec-draft-0.3.md).
+- **The specification**: [`spec/harp-spec-1.0.md`](spec/harp-spec-1.0.md).
   First read: §1 (motivation and design principles), §10–§11 (the state
   model — "Git, not SysEx"), §8 (the audio plane and clock domains).
   The changelog at the top records what implementation taught us.
