@@ -108,6 +108,7 @@ extern dev_param g_params[NPARAMS];
  * (knobs); read everywhere; last-write-wins, relaxed — ordering for
  * timestamped changes comes from the event queue. */
 int param_index(uint32_t id); /* slot in g_params, or -1 (engine.c) */
+int engine_is_fx(void);       /* §8.8 role: 1 = effect (processes a->fx_in), 0 = synth */
 
 /* Cross-module per-part value access (engine.c). state.c (snapshot encode/
  * load), session.c (x.harp-refdev.params), and panel.c reach a part's pval[]
@@ -340,6 +341,16 @@ typedef struct {
     _Atomic bool loopback_on;
     uint8_t loopback_in_slot;
     uint8_t loopback_out_slot;
+
+    /* §8.8 audio.fx — host→device EFFECT input. When the active engine is an effect
+     * (engine_is_fx()) and the host declares input slots, host_paced_loop demuxes the H→D
+     * payload into fx_in as n_in_slots planar float columns (fx_in + c*AUDIO_MAX_NSAMPLES),
+     * for render_output to process into WET output (§8.8: device emits wet only, host holds
+     * the dry). Distinct from the §14.3 loopback scratch. fx_in_n = samples this block; 0
+     * when no input was sent (engine renders silence/tail). A synth engine ignores fx_in, so
+     * the golden render path is byte-identical. Allocated lazily on first FX audio.start. */
+    float *fx_in;              /* n_in_slots planar columns, AUDIO_MAX_NSAMPLES each */
+    uint16_t fx_in_n;          /* valid samples per column this block */
 
     /* §9.9 meter echo pump: a control-thread emitter that streams readonly
      * meter params via evt_echo_param at METER_RATE_HZ, ONLY while streaming.

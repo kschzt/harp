@@ -290,6 +290,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_text(m, "audio.host-paced");
     harp_cbor_text(m, "audio.deterministic");
     harp_cbor_text(m, "audio.offline-rate");
+    if (engine_is_fx()) harp_cbor_text(m, "audio.fx"); /* §8.8: this device processes host audio (effect) */
     if (!d->no_rate_lock)
         harp_cbor_text(m, "audio.rate-lock"); /* §8.7 bit-exact: device honors audio.trim to
                                              slave its free-running emit rate to the host's
