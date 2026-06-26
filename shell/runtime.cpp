@@ -2089,8 +2089,17 @@ void HarpRuntime::syncSinkEpoch(AudioSink &sink) {
     uint32_t ep = sink.epoch.load(std::memory_order_acquire);
     if (ep != sink.epochSeen) {
         sink.epochSeen = ep;
-        sink.padDebt = 0;
-        sink.ring.clear();
+        /* Only drop the ring when there is BOGUS padding to clear. The epoch bump
+         * (computeUnionSlotsLocked, every sink) signals "this sink's slots joined the
+         * union". For a LATE-attached sink that padded silence first, padDebt > 0 and the
+         * ring holds stale silence — drop both (the B3 fix). But a MULTI-OUT sink registered
+         * BEFORE audio.start has padDebt == 0 and a ring of VALID prefill from the initial
+         * union; clearing it would discard real audio and (with 2+ sinks) cascade into a
+         * perpetual underrun — the offline/USB multi-out hang. So clear only when padDebt>0. */
+        if (sink.padDebt > 0) {
+            sink.padDebt = 0;
+            sink.ring.clear();
+        }
     }
 }
 
@@ -2355,7 +2364,14 @@ void HarpRuntime::feeder() {
          * pending, so the device's response writes land instantly and its pacing
          * turnaround is just render time. */
         if (!freeRunning_) {
-        size_t ringFrames = audioRing_.readAvailable() / 2;
+        /* MULTI-OUT: pace to keep the SLOWEST consumer fed — the main-mix ring OR any
+         * per-part sink. A wide-union multi-out main demuxes every paced frame into both
+         * audioRing_ and the 16 sinks; gating on audioRing_ ALONE let the feeder stop once
+         * the main mix hit target while a per-part sink was still below it, so that bus's
+         * blocking pull stalled (offline/USB multi-out hung). minRingFillFrames() is the min
+         * across main + all sinks — exactly what the free-running reader's drain gate uses.
+         * With no sinks it == audioRing_ fill, so the single-out path is byte-identical. */
+        size_t ringFrames = minRingFillFrames();
         uint64_t inFlight = framesSent_ - framesRecv_;
         /* The frontier cap is event-timing law, not flow control: event
          * timestamps carry target + one-pacing-block of headroom, so the
