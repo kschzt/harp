@@ -190,8 +190,15 @@ static void control_thread(HarpRuntime *rt, EventSource *src, bool isOwner,
             rt->queueParamSet(src, 6, 0.1f, base);  /* fast decay */
             rt->queueParamSet(src, 7, iso, base);   /* level (Master Level = id 7 post-2.1.0 renumber) — the variable under test */
         } else {
-            /* params, ramps, notes — the whole queue* surface, on OUR source */
-            rt->queueParamSet(src, 1 + (n % 8), (float)(n % 100) / 100.f, base + (n % 256));
+            /* params, ramps, notes — the whole queue* surface, on OUR source.
+             * Flood the 7 CONTINUOUS synth params (ids 1..7: Osc/Filter/Env/Master) ONLY.
+             * Pre-2.1.0 this was `n % 8` (ids 1..8) — safe then because id 8 WAS Master
+             * Level (the last continuous param; the drone's old id 7 was an empty hole).
+             * The renumber made id 8 the STEPPED Arp Mode, so `n % 8` began randomly
+             * switching the arpeggiator ON, retriggering notes into a wildly louder,
+             * non-deterministic mix that collapsed alias-play's per-part separation
+             * (single-RMS ~1k -> ~3-12k). Keep the flood off the arp/control band (8..12). */
+            rt->queueParamSet(src, 1 + (n % 7), (float)(n % 100) / 100.f, base + (n % 256));
             rt->queueRamp(src, 3, (float)(n % 50) / 50.f, base, base + 256);
         }
         /* Bake THIS source's channel (part) into the note's UMP word, exactly as

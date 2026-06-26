@@ -40,7 +40,7 @@ if [ -z "$CLAP" ]; then
     [ -z "$CLAP" ] && CLAP="build-vst/harp-clap.clap"
 fi
 PROBE="${PROBE:-./build/harp-probe}"
-CHORD_HASH="eaed2355f68db8ed"   # re-baselined: drone removed (== golden-test.sh / clap-test.sh)
+CHORD_HASH="979fbd7d2b2aafe6"   # re-baselined: §6.4 PDC fold #75 (== golden-test.sh / clap-test.sh)
 S="--set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 5=0.1 --set 6=0.2 \
    --set 7=0.6 --set 8=0 --set 9=0.6 --set 10=0.5 --set 11=0 --set 12=0"
 fail() { echo "MPE FAIL: $1"; exit 1; }

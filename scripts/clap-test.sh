@@ -35,8 +35,8 @@ if [ -z "$CLAP" ]; then # locate the built module (its subdir differs across gen
 fi
 PROBE="${PROBE:-./build/harp-probe}"
 
-GOLDEN_HASH="787947297e858ec3"  # re-baselined: drone removed (== golden-test.sh)
-CHORD_HASH="eaed2355f68db8ed"   # re-baselined: chord 60,64,67 (== golden-test.sh)
+GOLDEN_HASH="eb6a3b838d1d8ec3"  # re-baselined: §6.4 PDC fold #75 (== golden-test.sh)
+CHORD_HASH="979fbd7d2b2aafe6"   # re-baselined: §6.4 PDC fold #75 (== golden-test.sh)
 VST3_MOD_HASH="bee1987d778baaaa" # re-baselined: drone removed
 
 S="--set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 5=0.1 --set 6=0.2 \
