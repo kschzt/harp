@@ -219,8 +219,11 @@ public:
      * and mixes (§8.8: dry/wet is the host's). DEFAULT empty => NOT an effect:
      * the feeder sends the byte-identical slots=0 pacing frame and writeFxInput
      * is a no-op, so the instrument shell's render is untouched (the golden gate).
-     * Host-paced only (the verified harp-fx mode); on a free-running RTP binding
-     * fxArmed() is ignored (bidirectional real-time effect is a §8.8 follow-up). */
+     * Arming this also FORCES host-paced (wantHostPacedMode()): an effect is driven
+     * THROUGH (H→D in, D→H wet), which free-running RTP cannot express, so an FX
+     * negotiates host-paced for BOTH live and offline — the device renders each H→D
+     * block to wet identically whether the stream is bounded (offline) or continuous
+     * (live), so live playback returns the wet instead of silence. */
     void setFxInputSlots(const std::vector<uint32_t> &slots) {
         fxInSlots_ = slots;
         if (fxInSlots_.size() > kMaxFxInCols) fxInSlots_.resize(kMaxFxInCols);
@@ -757,6 +760,21 @@ private:
     bool snapshotLocked(harp_hash *out);
     bool fetchClosureLocked(const harp_hash &root);
     bool pushStateLocked(const harp_hash &target);
+
+    /* §8.8 audio.fx mode law: an EFFECT device is INHERENTLY host-paced — the host
+     * must drive audio THROUGH it (H→D track in, D→H wet). A free-running RTP
+     * binding has NO H→D input path (the device emits its own audio), so an armed
+     * effect would receive no input and return silence. So whenever the §8.8
+     * in-slots are armed (fxArmed()), force host-paced REGARDLESS of the DAW's
+     * offline/live state — the proven host-paced feeder + reader then carry the
+     * track audio and fill the wet in LIVE playback exactly as in an offline bounce.
+     * The INSTRUMENT shell never arms fxInSlots_, so this is exactly wantHostPaced_
+     * for it (free-running live, host-paced offline) — the golden path is untouched.
+     * Read off the RT path (selectDevice/setOffline); fxInSlots_ is set once before
+     * start() and never mutated, so reading it cross-thread is race-free. */
+    bool wantHostPacedMode() const {
+        return wantHostPaced_.load(std::memory_order_relaxed) || fxArmed();
+    }
 
     ShellTransport *transport_ = nullptr; /* the active binding (USB now; Ethernet next) */
     std::atomic<bool> freeRunning_{false}; /* cached transport_->isFreeRunning() (set at

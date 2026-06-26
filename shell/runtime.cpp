@@ -1169,6 +1169,13 @@ static std::string discoverEthDevice() {
  * stale free-running ring). Pre-start / no-session / USB are early no-ops. */
 void HarpRuntime::setOffline(bool o) {
     bool prev = wantHostPaced_.exchange(o, std::memory_order_release);
+    /* §8.8: an effect device is INHERENTLY host-paced (the host drives audio
+     * THROUGH it; free-running RTP has no H→D input path). So an armed FX session
+     * is ALWAYS host-paced and the DAW's live<->offline toggle must NEVER re-dial
+     * it to free-running — wantHostPacedMode() stays true either way, so there is no
+     * mode to flip. Gate the whole toggle on fxArmed(); the instrument (never armed)
+     * keeps its exact free-running/host-paced live/offline flip behaviour below. */
+    if (fxArmed()) return;
     if (prev == o) return;                                          /* idempotent: no change */
     if (!running_.load(std::memory_order_acquire)) return;          /* pre-start: first dial reads it */
     if (!connected_.load(std::memory_order_acquire)) return;        /* no live session: next sessionUp reads it */
@@ -1210,7 +1217,8 @@ ShellTransport *HarpRuntime::selectDevice() {
                 if (target.empty()) return nullptr; /* none resolved this cycle — supervisor retries */
                 log_msg("mDNS: discovered network device %s — dialing", target.c_str());
             }
-            return EthTransport::dial(target.c_str(), wantHostPaced_.load(std::memory_order_relaxed));
+            /* §8.8: an armed effect (fxArmed) always dials host-paced — see wantHostPacedMode(). */
+            return EthTransport::dial(target.c_str(), wantHostPacedMode());
         }
 
     /* reconnect: pinned to the exact unit this instance already owns — the
@@ -1221,7 +1229,7 @@ ShellTransport *HarpRuntime::selectDevice() {
             /* §4.4.3/§12.3: this instance is pinned to a NETWORK synth — re-dial the same
              * address (a transient drop keeps it), and if the synth renumbered, re-browse for
              * one. Never fall into the USB-only lookup below, which could never resume it. */
-            bool hp = wantHostPaced_.load(std::memory_order_relaxed);
+            bool hp = wantHostPacedMode(); /* §8.8: an armed FX always re-dials host-paced */
             if (ShellTransport *t = EthTransport::dial(boundEthHostport_.c_str(), hp)) return t;
             std::string disc = allowDiscovery_.load(std::memory_order_relaxed) ? discoverEthDevice() : std::string();
             if (!disc.empty()) {
@@ -1286,7 +1294,8 @@ ShellTransport *HarpRuntime::selectDevice() {
     std::string disc = allowDiscovery_.load(std::memory_order_relaxed) ? discoverEthDevice() : std::string();
     if (!disc.empty()) {
         log_msg("mDNS: discovered network device %s — dialing", disc.c_str());
-        return EthTransport::dial(disc.c_str(), wantHostPaced_.load(std::memory_order_relaxed));
+        /* §8.8: an armed effect (fxArmed) always dials host-paced — see wantHostPacedMode(). */
+        return EthTransport::dial(disc.c_str(), wantHostPacedMode());
     }
     return nullptr;
 }
