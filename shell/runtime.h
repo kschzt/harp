@@ -836,6 +836,10 @@ private:
     std::thread eventPumpThread_; /* per session, like the reader */
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
+    /* false only during the synchronous start() dial (the DAW load thread): suppresses the
+     * mDNS browse there so a stale/unreachable advertiser can't stall load. selectDevice's
+     * USB + pinned-eth paths stay enabled; the supervisor runs with it true (browses async). */
+    std::atomic<bool> allowDiscovery_{true};
     std::atomic<uint64_t> underruns_{0};
     std::atomic<uint64_t> padSamples_{0}; /* total silence padded — severity, not count */
     std::atomic<uint64_t> evDrops_{0};    /* events lost to ring overflow — never silent */

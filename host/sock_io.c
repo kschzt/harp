@@ -10,10 +10,13 @@
 
 #ifndef _WIN32
 #  include <arpa/inet.h>
+#  include <fcntl.h>
 #  include <netdb.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
+#  include <sys/select.h>
 #  include <sys/socket.h>
+#  include <sys/time.h>
 #  include <unistd.h>
 #endif
 
@@ -64,6 +67,54 @@ void harp_sock_io_init(harp_sock_io *t, harp_sockhandle s) {
     t->deadline_ns = 0; /* §16: no deadline by default; the device arms it pre-hello (harp-deviced.c) */
 }
 
+/* Bounded TCP connect. A stale/unreachable HOST:PORT (e.g. a device that still
+ * advertises over mDNS but is powered down) must never hang the caller: a plain
+ * blocking connect() to an unreachable host waits the ~75 s OS default, which —
+ * on the shell's connect path — would stall a DAW. Do a non-blocking connect and
+ * select() for writability within timeout_ms; restore blocking for the framed
+ * link's recv/send. Returns 0 on a completed connect, -1 on failure/timeout. */
+static int connect_bounded(harp_sockhandle fd, const struct sockaddr *addr,
+                           socklen_t addrlen, int timeout_ms) {
+#ifdef _WIN32
+    u_long nb = 1;
+    ioctlsocket(fd, FIONBIO, &nb);
+#else
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+#endif
+    int done = 0;
+    if (connect(fd, addr, (int)addrlen) == 0) {
+        done = 1; /* immediate (e.g. loopback) */
+    } else {
+#ifdef _WIN32
+        int inprog = (WSAGetLastError() == WSAEWOULDBLOCK);
+#else
+        int inprog = (errno == EINPROGRESS);
+#endif
+        if (inprog) {
+            fd_set wf;
+            FD_ZERO(&wf);
+            FD_SET(fd, &wf);
+            struct timeval tv;
+            tv.tv_sec = timeout_ms / 1000;
+            tv.tv_usec = (timeout_ms % 1000) * 1000;
+            if (select((int)fd + 1, NULL, &wf, NULL, &tv) > 0 && FD_ISSET(fd, &wf)) {
+                int err = 0;
+                socklen_t el = (socklen_t)sizeof err;
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&err, &el) == 0 && err == 0)
+                    done = 1; /* connection completed cleanly */
+            }
+        }
+    }
+#ifdef _WIN32
+    nb = 0;
+    ioctlsocket(fd, FIONBIO, &nb);
+#else
+    if (fl >= 0) fcntl(fd, F_SETFL, fl);
+#endif
+    return done ? 0 : -1;
+}
+
 harp_sockhandle harp_sock_dial(const char *hostport) {
     char host[256];
     const char *colon = strrchr(hostport, ':');
@@ -90,7 +141,7 @@ harp_sockhandle harp_sock_dial(const char *hostport) {
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd == HARP_SOCK_INVALID) continue;
-        if (connect(fd, ai->ai_addr, (int)ai->ai_addrlen) == 0) break;
+        if (connect_bounded(fd, ai->ai_addr, (socklen_t)ai->ai_addrlen, 2000) == 0) break;
         harp_sock_close(fd);
         fd = HARP_SOCK_INVALID;
     }

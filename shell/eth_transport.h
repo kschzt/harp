@@ -39,6 +39,7 @@ extern "C" {
 #  include <netinet/tcp.h> /* TCP_NODELAY for the host-paced audio socket */
 #  include <poll.h>
 #  include <sys/socket.h>
+#  include <sys/time.h> /* struct timeval for SO_RCVTIMEO/SO_SNDTIMEO */
 #  include <unistd.h>
 #endif
 
@@ -108,6 +109,22 @@ struct EthTransport final : ShellTransport {
     harp_io *ctlIo() override { return &ctl_.io; }
     bool linkPoll(unsigned ms) override { return readable(ctl_.s, (int)ms); }
     size_t linkPending() override { return readable(ctl_.s, 0) ? 1 : 0; }
+    /* Bound the ctl recv/send for the hello/identity window so a device that accepts the TCP
+     * connect but never replies (a listening-but-wedged daemon) can't hang the dial. ms=0
+     * restores blocking, so the live framed link (which reads only after linkPoll) is untouched. */
+    void setCtlTimeout(unsigned ms) override {
+#ifdef _WIN32
+        DWORD tv = (DWORD)ms; /* Winsock SO_RCVTIMEO/SO_SNDTIMEO take a DWORD of milliseconds */
+        setsockopt(ctl_.s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, (int)sizeof tv);
+        setsockopt(ctl_.s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, (int)sizeof tv);
+#else
+        struct timeval tv;
+        tv.tv_sec = (time_t)(ms / 1000);
+        tv.tv_usec = (suseconds_t)((ms % 1000) * 1000);
+        setsockopt(ctl_.s, SOL_SOCKET, SO_RCVTIMEO, &tv, (socklen_t)sizeof tv);
+        setsockopt(ctl_.s, SOL_SOCKET, SO_SNDTIMEO, &tv, (socklen_t)sizeof tv);
+#endif
+    }
 
     /* ---- audio ----
      * free-running: RTP (recvAudio); audioRead/audioWrite stay no-op stubs exactly
