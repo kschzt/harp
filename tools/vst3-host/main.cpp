@@ -51,6 +51,10 @@ using namespace Steinberg::Vst;
 /* MULTI-OUT: how many output buses (bus 0 = main mix, then per-part buses 1..16) the host
  * activates. Default 1 = main-mix only (the golden-identical path). --out-buses N activates N. */
 static int g_outBuses = 1;
+/* MULTI-OUT: which output bus to CAPTURE to the WAV/hash/rms (0 = main mix, 1..16 = parts).
+ * Used by the per-part isolation test: drive notes on a channel, capture that part's bus and
+ * a silent neighbour. --capture-bus N implies activating at least N+1 buses. */
+static int g_captureBus = 0;
 static const uint32_t kMpeEnableParamId = 97;
 static const uint32_t kMpeMidiBase = 0x3000u;
 static const uint32_t kMpeMidiAxes = 4u;
@@ -536,6 +540,8 @@ int main(int argc, char **argv) {
         else if (a == "--rate") rate = (uint32_t)atoi(next().c_str());
         else if (a == "--block") block = (uint32_t)atoi(next().c_str());
         else if (a == "--out-buses") g_outBuses = atoi(next().c_str()); /* MULTI-OUT: activate N output buses (main + parts) */
+        else if (a == "--capture-bus") { g_captureBus = atoi(next().c_str()); /* MULTI-OUT: capture bus N */
+            if (g_outBuses < g_captureBus + 1) g_outBuses = g_captureBus + 1; }
         else if (a == "--seconds") seconds = atof(next().c_str());
         else if (a == "--out") out_path = next();
         else if (a == "--save-state") save_state_path = next();
@@ -1219,9 +1225,15 @@ int main(int argc, char **argv) {
                        done / block);
         }
 
+        /* MULTI-OUT: capture the selected output bus (default 0 = main mix). The shell writes
+         * explicit silence to a routed-but-idle part bus, so capturing one proves isolation. */
+        int32 cb = (g_captureBus < pd.numOutputs && pd.outputs[g_captureBus].channelBuffers32 &&
+                    pd.outputs[g_captureBus].channelBuffers32[0])
+                       ? g_captureBus
+                       : 0;
         for (size_t s = 0; s < n; s++)
             for (int32 c = 0; c < out_ch; c++)
-                capture.push_back(pd.outputs[0].channelBuffers32[c][s]);
+                capture.push_back(pd.outputs[cb].channelBuffers32[c][s]);
         if (bpm > 0) ctx.projectTimeMusic += (double)n * bpm / (60.0 * rate);
         done += n;
         ctx.projectTimeSamples += (TSamples)n;
