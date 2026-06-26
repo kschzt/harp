@@ -131,6 +131,9 @@ struct usb_io {
     int dead;          /* transport failed (unplug); all ops fail fast */
     int closing;       /* orderly teardown; cancelled completions are normal */
     int inflight;      /* transfers not yet reaped (close waits for zero) */
+    unsigned ctl_timeout_ms; /* >0 only during the hello window: bounds the link read/write so a
+                                wedged daemon (enumerated, not draining the endpoint) can't hang
+                                the dial; 0 = block (the live framed link). Set via harp_usb_set_ctl_timeout. */
 
     int debug;        /* HARP_USB_DEBUG: per-completion tracing */
     int sync_audio;    /* HARP_USB_SYNC_AUDIO: diagnostic fallback — audio
@@ -250,6 +253,11 @@ static bool usb_read_exact(harp_io *io, void *buf, size_t n) {
     usb_io *u = (usb_io *)io;
     uint8_t *p = buf;
     harp_mutex_lock(&u->mu);
+    /* During the hello window (ctl_timeout_ms>0) bound the total wait so a wedged daemon that
+     * never feeds the link FIFO can't hang the dial; 0 = block forever (the live framed link,
+     * read only after linkPoll). The deadline is absolute so a partial-then-stalled hello is
+     * bounded too. */
+    uint64_t dl = u->ctl_timeout_ms ? harp_deadline_ms(u->ctl_timeout_ms) : 0;
     while (n) {
         size_t got = fifo_pop(&u->link_fifo, p, n);
         p += got;
@@ -259,7 +267,15 @@ static bool usb_read_exact(harp_io *io, void *buf, size_t n) {
             harp_mutex_unlock(&u->mu);
             return false;
         }
-        harp_cond_wait(&u->cv, &u->mu);
+        if (dl) {
+            bool timedout = harp_cond_timedwait(&u->cv, &u->mu, dl);
+            if (timedout && fifo_used(&u->link_fifo) == 0) {
+                harp_mutex_unlock(&u->mu);
+                return false; /* hello-window timeout: device not responding */
+            }
+        } else {
+            harp_cond_wait(&u->cv, &u->mu);
+        }
     }
     harp_mutex_unlock(&u->mu);
     return true;
@@ -294,7 +310,9 @@ static bool usb_write_all(harp_io *io, const void *buf, size_t n) {
         return false;
     }
     u->inflight++;
-    uint64_t dl = harp_deadline_ms(USB_LINK_WRITE_GIVE_UP_MS);
+    /* During the hello window use the short ctl bound (a daemon that isn't draining the link
+     * endpoint stalls the OUT transfer); otherwise the normal 30s give-up for a live link. */
+    uint64_t dl = harp_deadline_ms(u->ctl_timeout_ms ? u->ctl_timeout_ms : USB_LINK_WRITE_GIVE_UP_MS);
     while (!c.done) {
         if (harp_cond_timedwait(&u->cv, &u->mu, dl) && !c.done) {
             /* still in flight after the give-up window: the device is
@@ -378,6 +396,19 @@ bool harp_usb_audio_write(harp_io *io, const void *buf, int len, unsigned timeou
     u->inflight++;
     harp_mutex_unlock(&u->mu);
     return true;
+}
+
+/* ---------------- ctl hello-window timeout ---------------- */
+
+/* Bound the link read/write during the hello window so a wedged daemon (enumerated but not
+ * draining the endpoint) can't hang the dial. ms=0 restores blocking for the live framed link.
+ * The shell sets 2000 around hello/identity, 0 after — the USB twin of EthTransport's SO_RCVTIMEO. */
+void harp_usb_set_ctl_timeout(harp_io *io, unsigned ms) {
+    if (!io) return;
+    usb_io *u = (usb_io *)io;
+    harp_mutex_lock(&u->mu);
+    u->ctl_timeout_ms = ms;
+    harp_mutex_unlock(&u->mu);
 }
 
 /* ---------------- link polling (event echoes) ---------------- */

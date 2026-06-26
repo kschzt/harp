@@ -87,4 +87,8 @@ bool harp_usb_audio_write(harp_io *io, const void *buf, int len, unsigned timeou
 bool harp_usb_link_poll(harp_io *io, unsigned timeout_ms);
 size_t harp_usb_link_pending(harp_io *io);
 
+/* Bound the link read/write during the hello window (ms>0) so a wedged daemon can't hang the
+ * dial; ms=0 restores blocking for the live framed link. The shell brackets hello with 2000/0. */
+void harp_usb_set_ctl_timeout(harp_io *io, unsigned ms);
+
 #endif

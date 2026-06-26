@@ -23,6 +23,7 @@ struct UsbTransport final : ShellTransport {
     harp_io *ctlIo() override { return io_; }
     bool   linkPoll(unsigned ms) override { return harp_usb_link_poll(io_, ms); }
     size_t linkPending() override { return harp_usb_link_pending(io_); }
+    void   setCtlTimeout(unsigned ms) override { harp_usb_set_ctl_timeout(io_, ms); }
     bool hasAudio() override { return harp_usb_has_audio(io_); }
     int  audioRead(void *buf, int len, unsigned ms) override {
         return harp_usb_audio_read(io_, buf, len, ms);
