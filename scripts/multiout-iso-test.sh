@@ -54,4 +54,21 @@ for C in 3 7; do
     kill "$DP" 2>/dev/null; wait "$DP" 2>/dev/null; rm -rf multiout-iso-state; DP=
 done
 
-echo "MULTIOUT-ISO PASS (per-part routing + zero bus bleed + main-mix sum over the 34-slot RTP union)"
+# ── OFFLINE (host-paced TCP) wide-union determinism. This is the SAME host-paced render path
+# USB uses, so it guards the multi-out hang fix (the per-part sinks must fill from the initial
+# union — register-before-start + no bogus epoch clear). Render part 3's bus twice offline and
+# require a byte-identical hash (offline is deterministic; a hang or a dropped sink would differ).
+rm -rf multiout-iso-state; : > /tmp/multiout-iso-dev.log
+"$DEVICED" --port "$PORT" --serial SIM-MO-ISO --state-dir multiout-iso-state >/tmp/multiout-iso-dev.log 2>&1 & DP=$!
+trap 'kill "$DP" 2>/dev/null; rm -rf multiout-iso-state' EXIT INT TERM
+for _ in $(seq 1 25); do grep -q "listening on $PORT" /tmp/multiout-iso-dev.log 2>/dev/null && break; sleep 0.2; done
+ohash() { HARP_ETH_DEVICE="127.0.0.1:$PORT" perl -e 'alarm 30; exec @ARGV' \
+    "$HOSTBIN" "$PLUG" --out-buses 17 --channel 3 --capture-bus 4 --notes 62,69,74,65 \
+    --seconds 1.5 --hash 2>/dev/null | grep -oE "output-hash: [0-9a-f]+" | tail -1 | cut -d' ' -f2; }
+oh1=$(ohash); oh2=$(ohash)
+echo "  offline part-3 bus hash #1=${oh1:-HUNG} #2=${oh2:-HUNG}"
+[ -n "$oh1" ] || fail "OFFLINE wide-union multi-out HUNG (no audio / host-paced pacing stall)"
+[ "$oh1" = "$oh2" ] || fail "OFFLINE wide-union multi-out non-deterministic (#1=$oh1 #2=$oh2)"
+kill "$DP" 2>/dev/null; wait "$DP" 2>/dev/null; rm -rf multiout-iso-state; DP=
+
+echo "MULTIOUT-ISO PASS (free-running zero-bleed isolation + offline host-paced determinism over the 34-slot union)"
