@@ -1193,7 +1193,8 @@ ShellTransport *HarpRuntime::selectDevice() {
              * host:port. host-paced (deterministic) when the DAW renders offline, else free-run RTP. */
             std::string target = eth;
             if (target == "mdns" || target == "discover") {
-                target = discoverEthDevice();
+                /* skip the browse on the synchronous load-thread attempt; the supervisor browses async */
+                target = allowDiscovery_.load(std::memory_order_relaxed) ? discoverEthDevice() : std::string();
                 if (target.empty()) return nullptr; /* none resolved this cycle — supervisor retries */
                 log_msg("mDNS: discovered network device %s — dialing", target.c_str());
             }
@@ -1210,7 +1211,7 @@ ShellTransport *HarpRuntime::selectDevice() {
              * one. Never fall into the USB-only lookup below, which could never resume it. */
             bool hp = wantHostPaced_.load(std::memory_order_relaxed);
             if (ShellTransport *t = EthTransport::dial(boundEthHostport_.c_str(), hp)) return t;
-            std::string disc = discoverEthDevice();
+            std::string disc = allowDiscovery_.load(std::memory_order_relaxed) ? discoverEthDevice() : std::string();
             if (!disc.empty()) {
                 log_msg("mDNS: re-discovered network device %s — dialing", disc.c_str());
                 return EthTransport::dial(disc.c_str(), hp);
@@ -1268,8 +1269,9 @@ ShellTransport *HarpRuntime::selectDevice() {
         return wrapUsb(io);
     /* §6.1/§4.4.3: nothing on USB and no explicit HARP_ETH_DEVICE — browse the segment for a
      * network synth advertising `_harp._tcp` and dial the first one found. Keeps the shell's
-     * device list "USB + network" without the DAW having to know an address. */
-    std::string disc = discoverEthDevice();
+     * device list "USB + network" without the DAW having to know an address. The synchronous
+     * load-thread attempt skips it (allowDiscovery_=false); the supervisor browses async. */
+    std::string disc = allowDiscovery_.load(std::memory_order_relaxed) ? discoverEthDevice() : std::string();
     if (!disc.empty()) {
         log_msg("mDNS: discovered network device %s — dialing", disc.c_str());
         return EthTransport::dial(disc.c_str(), wantHostPaced_.load(std::memory_order_relaxed));
@@ -1319,6 +1321,11 @@ bool HarpRuntime::sessionUp() {
         harp_client_free(&client_);
         harp_client_init(&client_, transport_->ctlIo(), &link_, storeOk_ ? &store_ : nullptr,
                          nullptr, nullptr);
+        /* Bound the hello/identity round-trip: a device that ACCEPTS the TCP connect but never
+         * replies (a listening-but-wedged daemon) must not hang the dial — critical on a PINNED
+         * device, whose dial runs on the synchronous load thread (setActive). Per-recv bound;
+         * cleared to blocking on success so the live framed link is unaffected. */
+        transport_->setCtlTimeout(2000);
         if (!helloAndIdentity()) {
             log_msg("hello failed");
             harp_client_free(&client_);
@@ -1326,6 +1333,7 @@ bool HarpRuntime::sessionUp() {
             transport_ = nullptr;
             return false;
         }
+        transport_->setCtlTimeout(0); /* hello ok — restore blocking recv for the live session */
         log_msg("connected: %s %s (serial %s, engine %s %s)", vendorName_.c_str(),
                 productName_.c_str(), serial_.c_str(), engineId_.c_str(),
                 engineVer_.c_str());
@@ -1664,7 +1672,13 @@ bool HarpRuntime::start(uint32_t sampleRate) {
      * libusb_init/exit. Created before the first sessionUp() and the
      * supervisor spawn so both use it. */
     if (!usbCtx_) usbCtx_ = harp_usb_ctx_create();
-    bool now = sessionUp(); /* fast path: report a present device immediately */
+    /* The synchronous first attempt runs on the DAW's load thread (setActive), so it must
+     * NOT browse mDNS — a stale/unreachable advertiser would stall the dial and freeze the
+     * DAW. Try only the fast USB / pinned-eth paths here; the supervisor (background) does
+     * discovery, so a network synth still hot-plugs in a beat later. */
+    allowDiscovery_.store(false, std::memory_order_relaxed);
+    bool now = sessionUp(); /* fast path: report a present USB/pinned device immediately */
+    allowDiscovery_.store(true, std::memory_order_relaxed);
     if (!now) log_msg("no HARP device on the bus; supervising for hot-plug");
     supervisorThread_ = std::thread([this] { supervisor(); });
     return now;

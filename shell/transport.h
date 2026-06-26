@@ -33,6 +33,10 @@ struct ShellTransport {
      * pending?". 1:1 with the §4.2.1 always-pending inbound read. */
     virtual bool   linkPoll(unsigned timeout_ms) = 0;
     virtual size_t linkPending() = 0;
+    /* Bound the control recv/send during the hello window so a listening-but-wedged device
+     * can't hang the dial (eth: SO_RCVTIMEO/SO_SNDTIMEO). No-op for USB — libusb transfers
+     * carry their own timeout. ms=0 restores blocking for the live session. */
+    virtual void setCtlTimeout(unsigned ms) { (void)ms; }
 
     /* ---- audio endpoints (§8.2/§8.3). Host-paced bindings read render frames
      * and write pacing frames; a free-running binding's audioWrite is a no-op
