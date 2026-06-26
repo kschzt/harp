@@ -48,6 +48,13 @@ using namespace Steinberg::Vst;
  * local copies of the shell's host param ids, like kPartParamId, rather than
  * pulling the shell header). The "MPE" toggle (97) arms raw-MIDI MPE; each
  * (channel, axis) maps to a hidden param the shell decodes back into a §9.5 mod. */
+/* MULTI-OUT: how many output buses (bus 0 = main mix, then per-part buses 1..16) the host
+ * activates. Default 1 = main-mix only (the golden-identical path). --out-buses N activates N. */
+static int g_outBuses = 1;
+/* MULTI-OUT: which output bus to CAPTURE to the WAV/hash/rms (0 = main mix, 1..16 = parts).
+ * Used by the per-part isolation test: drive notes on a channel, capture that part's bus and
+ * a silent neighbour. --capture-bus N implies activating at least N+1 buses. */
+static int g_captureBus = 0;
 static const uint32_t kMpeEnableParamId = 97;
 static const uint32_t kMpeMidiBase = 0x3000u;
 static const uint32_t kMpeMidiAxes = 4u;
@@ -183,7 +190,8 @@ static int run_multi_instance(VST3::Hosting::Module::Ptr &module, const VST3::Ho
         in->nin = in->component->getBusCount(kAudio, kInput);
         in->nout = in->component->getBusCount(kAudio, kOutput);
         for (int32 i = 0; i < in->nin; i++) in->component->activateBus(kAudio, kInput, i, true);
-        for (int32 i = 0; i < in->nout; i++) in->component->activateBus(kAudio, kOutput, i, true);
+        int32 actOut = in->nout < g_outBuses ? in->nout : g_outBuses; /* MULTI-OUT: main + parts */
+        for (int32 i = 0; i < actOut; i++) in->component->activateBus(kAudio, kOutput, i, true);
         if (in->nout == 0) die("multi-instance: alias has no audio output bus");
         BusInfo outBus{};
         in->component->getBusInfo(kAudio, kOutput, 0, outBus);
@@ -531,6 +539,9 @@ int main(int argc, char **argv) {
         else if (a == "--realtime") realtime = true;
         else if (a == "--rate") rate = (uint32_t)atoi(next().c_str());
         else if (a == "--block") block = (uint32_t)atoi(next().c_str());
+        else if (a == "--out-buses") g_outBuses = atoi(next().c_str()); /* MULTI-OUT: activate N output buses (main + parts) */
+        else if (a == "--capture-bus") { g_captureBus = atoi(next().c_str()); /* MULTI-OUT: capture bus N */
+            if (g_outBuses < g_captureBus + 1) g_outBuses = g_captureBus + 1; }
         else if (a == "--seconds") seconds = atof(next().c_str());
         else if (a == "--out") out_path = next();
         else if (a == "--save-state") save_state_path = next();
@@ -900,7 +911,12 @@ int main(int argc, char **argv) {
     int32 nin = component->getBusCount(kAudio, kInput);
     int32 nout = component->getBusCount(kAudio, kOutput);
     for (int32 i = 0; i < nin; i++) component->activateBus(kAudio, kInput, i, true);
-    for (int32 i = 0; i < nout; i++) component->activateBus(kAudio, kOutput, i, true);
+    /* MULTI-OUT: activate the main mix (bus 0) plus the first g_outBuses-1 per-part buses
+     * (default 1 = main-mix only, the golden-identical path). Activating ALL declared output
+     * buses would make a multi-out shell stream the full 34-channel union even for a
+     * main-mix-only render. The multi-out test raises g_outBuses via --out-buses N. */
+    int32 actOut = nout < g_outBuses ? nout : g_outBuses;
+    for (int32 i = 0; i < actOut; i++) component->activateBus(kAudio, kOutput, i, true);
     if (nout == 0) die("plugin has no audio output bus");
     BusInfo outBus{};
     component->getBusInfo(kAudio, kOutput, 0, outBus);
@@ -1209,9 +1225,15 @@ int main(int argc, char **argv) {
                        done / block);
         }
 
+        /* MULTI-OUT: capture the selected output bus (default 0 = main mix). The shell writes
+         * explicit silence to a routed-but-idle part bus, so capturing one proves isolation. */
+        int32 cb = (g_captureBus < pd.numOutputs && pd.outputs[g_captureBus].channelBuffers32 &&
+                    pd.outputs[g_captureBus].channelBuffers32[0])
+                       ? g_captureBus
+                       : 0;
         for (size_t s = 0; s < n; s++)
             for (int32 c = 0; c < out_ch; c++)
-                capture.push_back(pd.outputs[0].channelBuffers32[c][s]);
+                capture.push_back(pd.outputs[cb].channelBuffers32[c][s]);
         if (bpm > 0) ctx.projectTimeMusic += (double)n * bpm / (60.0 * rate);
         done += n;
         ctx.projectTimeSamples += (TSamples)n;

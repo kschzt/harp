@@ -118,6 +118,13 @@ else skip offline-fence "harp-eth-fence-test not built (POSIX-only host-paced to
 if [ "$OSID" = windows ]; then skip part-filter "MinGW device panel is a stub (§9.4 multi-instance demux pending Windows panel transport)"
 else run part-filter    scripts/part-filter-eth-test.sh; fi
 
+# MULTI-OUT (M1): the Kontakt/Overbridge-style multi-out main — one VST3 instance, 17 output
+# buses. Per-part zero-bleed isolation over free-running RTP (the wide-union >8-slot
+# multi-packet path) + offline host-paced determinism (the same path USB drives). POSIX-only
+# (the perl-alarm capture harness); the protocol is OS-independent so macOS+Linux cover it.
+if [ "$OSID" = windows ]; then skip multiout-iso "multiout-iso uses the POSIX perl-alarm harness (Windows multi-out coverage pending)"
+else run multiout-iso   scripts/multiout-iso-test.sh; fi
+
 # §11.4 action 3 "Open read-only": dirty the live (harp-probe) + pick choice 2 via the device
 # --panel-sock, then assert the explicit read-only pick SUPPRESSES live writes (med-open-ro-noop).
 # POSIX-only (MinGW device panel is a stub) + probe-gated; auto-enables when both land on a platform.
