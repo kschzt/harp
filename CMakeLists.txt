@@ -190,6 +190,18 @@ if(NOT WIN32)
   target_include_directories(harp-eth-latefr-test PRIVATE host)
   target_link_libraries(harp-eth-latefr-test harpcore
     ${HARP_MATH_LIB} ${HARP_PLAT_LIBS} Threads::Threads)
+
+  # harp-eth-fence-test: §8.3.1 event-fence INTEGRATION — audio.start(key 7) host-paced
+  # OFFLINE bounce; sends a FENCED pacing frame then a NOTE on the EVT stream so the
+  # render blocks on + clears the fence; asserts g_fence_waits moves and g_fence_timeouts
+  # stays 0 (the offline barrier never times out), and prints a determinism hash the
+  # driving script compares run-to-run. POSIX-only (raw connect-back socket), same as
+  # latefr above; needs NO libsamplerate.
+  add_executable(harp-eth-fence-test tools/eth-fence-test.c
+    host/client.c host/sock_io.c ${HARP_PLAT_SRC})
+  target_include_directories(harp-eth-fence-test PRIVATE host)
+  target_link_libraries(harp-eth-fence-test harpcore
+    ${HARP_MATH_LIB} ${HARP_PLAT_LIBS} Threads::Threads)
 endif()
 
 # harp-device-tests: unit tests for the params-blob codec (§10 / P3 closer
@@ -217,6 +229,25 @@ if(NOT MSVC)
   target_link_libraries(harp-device-tests harpcore ${HARP_MATH_LIB} Threads::Threads)
   add_test(NAME device_codec COMMAND harp-device-tests)
   set_tests_properties(device_codec PROPERTIES LABELS unit)
+endif()
+
+# harp-param-map-hash-tests: §9.3 param-map-hash change-detection. Links the
+# REAL automatable encoder (device/state.c: encode_param_array_from, the shape
+# fed to compute_param_map_hash) + fuzz/state_stubs.c for the other device
+# symbols, then feeds hand-built VARIANT param tables to prove the frozen golden
+# hash changes iff stored automation is invalidated (id meaning / steps /
+# removal) and is deterministic. Same NOT-MSVC guard rationale as
+# harp-device-tests: state.c isn't MSVC-built in this tree.
+if(NOT MSVC)
+  add_executable(harp-param-map-hash-tests
+    tests/harp_param_map_hash_tests.c
+    device/state.c
+    fuzz/state_stubs.c
+  )
+  target_include_directories(harp-param-map-hash-tests PRIVATE device host)
+  target_link_libraries(harp-param-map-hash-tests harpcore ${HARP_MATH_LIB} Threads::Threads)
+  add_test(NAME param_map_hash COMMAND harp-param-map-hash-tests)
+  set_tests_properties(param_map_hash PROPERTIES LABELS unit)
 endif()
 
 # harp-freerun-tests: the §7.3/§8.7 free-running receiver — clock recovery +

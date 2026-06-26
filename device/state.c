@@ -322,12 +322,21 @@ static void encode_one_param(harp_cbuf *b, const dev_param *p, bool include_caps
  * before metering existed — byte-for-byte. This is the SOLE input to
  * param-map-hash (see compute_param_map_hash): the readonly meter params are
  * deliberately excluded so the hash is unchanged from pre-meter firmware. */
+/* The automatable-subset encoder, parameterised over the param TABLE. The
+ * production path (encode_param_array_automatable) passes g_params/NPARAMS; the
+ * §9.3 hash unit test passes hand-built variant tables to prove the hash
+ * changes iff the param set changes in an automation-invalidating way. This is
+ * a pure extraction — same bytes for the same table — so the production hash is
+ * byte-unchanged. include_caps=false here so the masked-out P2 capability bits
+ * keep the stream identical to pre-P2 firmware (a cap add must never invalidate
+ * stored automation, §9.3). */
+void encode_param_array_from(harp_cbuf *b, const dev_param *table, size_t n) {
+    harp_cbor_array(b, n);
+    for (size_t i = 0; i < n; i++) encode_one_param(b, &table[i], false);
+}
+
 void encode_param_array_automatable(harp_cbuf *b) {
-    harp_cbor_array(b, NPARAMS);
-    /* include_caps=false: the P2 modulatable bits are MASKED OUT so this byte
-     * stream — the SOLE param-map-hash input — is identical to pre-P2 firmware.
-     * A capability-add must never invalidate stored automation (§9.3). */
-    for (size_t i = 0; i < NPARAMS; i++) encode_one_param(b, &g_params[i], false);
+    encode_param_array_from(b, g_params, NPARAMS);
 }
 
 /* The FULL advertised array (§9.3 + §9.9): the 12 automatable params (NPARAMS) FOLLOWED

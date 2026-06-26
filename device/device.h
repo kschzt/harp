@@ -495,6 +495,11 @@ void encode_param_array(harp_cbuf *b);
  * MUST NOT perturb it. Keeping the hash over this subset is what makes the
  * golden render + per-part recall + identity byte-identical to pre-meter. */
 void encode_param_array_automatable(harp_cbuf *b);
+/* The automatable-subset encoder, parameterised over the param TABLE (the §9.3
+ * hash input shape). encode_param_array_automatable is the production wrapper
+ * (table = g_params, n = NPARAMS); the param-map-hash unit test passes variant
+ * tables to assert the hash changes iff stored automation is invalidated. */
+void encode_param_array_from(harp_cbuf *b, const dev_param *table, size_t n);
 void compute_param_map_hash(device *d);
 void live_ref_touch(device *d, bool dirty);
 void live_cache_flush(device *d);

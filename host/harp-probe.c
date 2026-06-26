@@ -1305,12 +1305,74 @@ static void cmd_cas_test(probe *p) {
     } else
         printf("   (d) unknown hash-algorithm byte -> malformed: OK\n");
 
+    /* (e) DIRTY-REF (§11.3): a CAS whose `expect` MATCHES the head is STILL rejected
+     * 'conflict' if the live ref is DIRTY — a host must not overwrite unsaved front-panel
+     * edits without an explicit snapshot/force. The device's error map (§11.3) distinguishes
+     * the two conflict causes in key 1: "ref is dirty" (vs. "expect mismatch"), which the
+     * client surfaces in err_msg. We prove the DIRTY guard specifically by using a *matching*
+     * expect, so only dirtiness can trip it.
+     *
+     * The dirty flag is TRANSIENT — any snapshot/refset clears it — so we must NOT snapshot
+     * between dirtying and the attempt, and H1 must be the head captured BEFORE the knob edit.
+     * Re-read the live head fresh (cases a–d above leave it clean at `head`), then a single
+     * front-panel knob write dirties live without moving its hash (a dirty edit changes no
+     * stored hash until a snapshot), so expect=H1 still matches and the dirty guard is the
+     * ONLY thing that can reject. Target = `head` (a valid, already-pushed closure) so the
+     * conflict can't be a not-found. */
+    harp_ref live_now;
+    {
+        harp_ref r2[MAX_REFS];
+        size_t n2 = get_refs(p, r2);
+        if (!find_ref(r2, n2, LIVE_REF, &live_now) || live_now.unborn) {
+            fprintf(stderr, "   FAIL (e): no clean live ref to dirty\n");
+            fails++;
+        } else if (live_now.dirty) {
+            fprintf(stderr, "   FAIL (e): live ref unexpectedly DIRTY before the edit\n");
+            fails++;
+        } else {
+            harp_hash h1 = live_now.hash; /* H1: the PRE-dirty head (matches expect) */
+            /* dirty live via the front-panel knob path (live_ref_touch(d,true)); reuse the
+             * x.harp-refdev.knob wire-send from cmd_knob — value differs to force an edit. */
+            harp_cbuf kreq, krsp;
+            harp_cbuf_init(&kreq);
+            harp_cbuf_init(&krsp);
+            req_head(p, &kreq, "x.harp-refdev.knob", true);
+            harp_cbor_map(&kreq, 2);
+            harp_cbor_uint(&kreq, 0);
+            harp_cbor_uint(&kreq, 3); /* param id 3 */
+            harp_cbor_uint(&kreq, 1);
+            harp_cbor_float(&kreq, 0.123456); /* an arbitrary new value -> dirties live */
+            request(p, &kreq, &krsp);
+            harp_cbuf_free(&kreq);
+            harp_cbuf_free(&krsp);
+
+            /* expect = H1 (MATCHES the still-current head), force = false -> the only possible
+             * reject is the dirty guard. */
+            rc = harp_client_refset(&p->client, LIVE_REF, &h1, &head, false, false, false, &gen);
+            if (rc == 0) {
+                fprintf(stderr, "   FAIL (e): dirty-ref CAS ACCEPTED (overwrote unsaved edits!)\n");
+                fails++;
+            } else if (strcmp(p->client.err_code, "conflict") != 0) {
+                fprintf(stderr, "   FAIL (e): expected 'conflict', got code='%s'\n",
+                        p->client.err_code);
+                fails++;
+            } else if (strcmp(p->client.err_msg, "ref is dirty") != 0) {
+                fprintf(stderr,
+                        "   FAIL (e): matching-expect dirty CAS gave conflict but msg='%s' "
+                        "(want 'ref is dirty' — the device did not distinguish the dirty cause)\n",
+                        p->client.err_msg);
+                fails++;
+            } else
+                printf("   (e) matching expect but dirty live -> conflict: OK (dirty-ref -> conflict: OK)\n");
+        }
+    }
+
     if (fails) {
-        fprintf(stderr, "CAS-TEST FAIL (%d of 4)\n", fails);
+        fprintf(stderr, "CAS-TEST FAIL (%d of 5)\n", fails);
         exit(1);
     }
     printf("CAS-TEST PASS: conflict rejected, force overrides, unpushed -> not-found, "
-           "bad-alg -> malformed\n");
+           "bad-alg -> malformed, dirty-ref -> conflict\n");
 }
 
 /* engine-gate (§13.4): against a device whose REPORTED engine (--engine-ver) differs from the
