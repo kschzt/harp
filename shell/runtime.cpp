@@ -270,7 +270,13 @@ bool HarpRuntime::audioStart(uint32_t rate) {
      * (0 free-running RTP, 1 loopback, else 2 host-paced), float32. */
     {
         uint32_t outCh = (uint32_t)unionSlots_.size();
-        uint32_t inCh = freeRunning_.load(std::memory_order_relaxed) ? 0u : (loopbackArmed() ? 1u : 2u);
+        /* IN columns declared on the wire: 0 free-running RTP (no H→D audio); else
+         * §8.8 FX in-slots when armed, the single loopback column when probing, or the
+         * historical 2 host-paced pacing columns (slots=0 frames, but [0,1] declared). */
+        uint32_t inCh = freeRunning_.load(std::memory_order_relaxed)
+                            ? 0u
+                            : (fxArmed() ? (uint32_t)fxInSlots_.size()
+                                         : (loopbackArmed() ? 1u : 2u));
         uint64_t needBps = (uint64_t)(outCh + inCh) * 4ull * rate;
         std::string pathKey;
         if (transport_ && transport_->kind() == ShellTransport::Kind::Usb) {
@@ -358,7 +364,13 @@ bool HarpRuntime::audioStart(uint32_t rate) {
          * input column (d->audio.in_slots = {in}); the probe then injects on that one
          * column. This only matters once diag.loopback.start arms the device — off
          * the probe the device ignores in_slots and the render is unchanged. */
-        if (loopbackArmed()) {
+        if (fxArmed()) {
+            /* §8.8 audio.fx: declare the device's input columns; the feeder fills
+             * them with the track audio process() pushes (writeFxInput). The device
+             * (engine_is_fx()) demuxes these columns into a->fx_in and returns WET. */
+            harp_cbor_array(&req, fxInSlots_.size());
+            for (uint32_t s : fxInSlots_) harp_cbor_uint(&req, s);
+        } else if (loopbackArmed()) {
             harp_cbor_array(&req, 1);
             harp_cbor_uint(&req, (uint64_t)loopbackIn_);
         } else {
@@ -2225,6 +2237,18 @@ size_t HarpRuntime::pullAudioBlocking(AudioSink *sink, float *dst, size_t nFrame
     return 0;
 }
 
+/* §8.8 audio.fx: the FX shell's process() pushes the track's input here each
+ * block; the feeder pops kBlock-frame chunks and frames them H→D (see feeder()).
+ * Interleaved by fxInSlots_.size() columns (mono in => 1). Lock-free SPSC — the
+ * feeder is the sole consumer. No-op (returns 0) when not armed, so the
+ * instrument shell never touches this. Drops the tail on overflow (the feeder
+ * fell behind: the output underruns in lockstep, which the pull side counts). */
+size_t HarpRuntime::writeFxInput(const float *interleaved, size_t nFrames) {
+    if (fxInSlots_.empty() || !interleaved || nFrames == 0) return 0;
+    size_t cols = fxInSlots_.size();
+    return fxInRing_.write(interleaved, nFrames * cols) / cols;
+}
+
 /* ---------------- feeder thread ---------------- */
 
 void HarpRuntime::feeder() {
@@ -2370,8 +2394,18 @@ void HarpRuntime::feeder() {
         /* the cap bounds the frame END: a frame starting under the cap but
          * extending past it would cover timestamps the current block can
          * still mint (measured: mid-frame note-ons applied a frame late) */
+        /* §8.8 audio.fx: when the shell armed an effect input, each pacing frame
+         * CARRIES the track audio (process() pushed it via writeFxInput) on
+         * `fxCols` interleaved columns; the device demuxes them into a->fx_in and
+         * returns WET. Not armed (the instrument) => fxCols==0 => the byte-identical
+         * slots=0 pacing frame, no payload, no input gate. */
+        const size_t fxCols = fxArmed() ? fxInSlots_.size() : 0;
         while (ringFrames < (size_t)targetFrames_ && inFlight < ahead_ &&
                ssi_ + kBlock <= frontierCap) {
+            /* §8.8: only pace once the track input for this range is in the SPSC
+             * ring — this couples the H→D input 1:1 to the D→H wet the reader fills,
+             * so dry and wet stay sample-aligned (the lockstep host-paced effect). */
+            if (fxCols && fxInRing_.readAvailable() < kBlock * fxCols) break;
             /* every pacing frame carries the event fence (§8.3.1): the
              * count of events queued so far this session. Any event queued
              * before this instant is guaranteed consumed device-side
@@ -2381,12 +2415,13 @@ void HarpRuntime::feeder() {
              * until the fence closed the order by construction). */
             harp_audio_hdr pace = {HARP_AUDIO_FVER,
                                    HARP_AUDIO_DIR_H2D | HARP_AUDIO_FENCE,
-                                   0,
+                                   (uint16_t)fxCols, /* slots: 0 instrument, N §8.8 FX in-cols */
                                    0,
                                    ssi_,
                                    (uint16_t)kBlock,
                                    HARP_AUDIO_FMT_F32};
-            uint8_t ph[HARP_AUDIO_HDR_LEN + HARP_AUDIO_FENCE_LEN];
+            /* header + 4 fence bytes (+ §8.8 FX input payload: kBlock × fxCols f32) */
+            uint8_t ph[HARP_AUDIO_HDR_LEN + HARP_AUDIO_FENCE_LEN + kBlock * kMaxFxInCols * 4];
             harp_audio_hdr_encode(&pace, ph);
             /* §8.3.1 fence = events queued SINCE this stream's audio.start =
              * monotonic high-water MINUS the current epoch baseline. At the initial
@@ -2405,7 +2440,16 @@ void HarpRuntime::feeder() {
             ph[HARP_AUDIO_HDR_LEN + 1] = (uint8_t)(seq >> 8);
             ph[HARP_AUDIO_HDR_LEN + 2] = (uint8_t)(seq >> 16);
             ph[HARP_AUDIO_HDR_LEN + 3] = (uint8_t)(seq >> 24);
-            if (!transport_->audioWrite(ph, sizeof ph, 8)) break;
+            size_t frameLen = HARP_AUDIO_HDR_LEN + HARP_AUDIO_FENCE_LEN;
+            if (fxCols) {
+                /* the device demuxes payload column c (in_slots order) into
+                 * a->fx_in[c]; writeFxInput already interleaved process()'s input
+                 * by fxCols, so a straight ring read fills the payload in column
+                 * order. The availability gate above guarantees a full block. */
+                fxInRing_.read((float *)(ph + frameLen), (size_t)kBlock * fxCols);
+                frameLen += (size_t)kBlock * fxCols * 4;
+            }
+            if (!transport_->audioWrite(ph, (int)frameLen, 8)) break;
             ssi_ += kBlock;
             framesSent_++;
             inFlight++;
