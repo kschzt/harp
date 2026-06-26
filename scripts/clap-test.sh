@@ -37,7 +37,7 @@ PROBE="${PROBE:-./build/harp-probe}"
 
 GOLDEN_HASH="eb6a3b838d1d8ec3"  # re-baselined: §6.4 PDC fold #75 (== golden-test.sh)
 CHORD_HASH="979fbd7d2b2aafe6"   # re-baselined: §6.4 PDC fold #75 (== golden-test.sh)
-VST3_MOD_HASH="bee1987d778baaaa" # re-baselined: drone removed
+VST3_MOD_HASH="db4ca4c755d09a16" # re-baselined: §6.4 PDC fold #75 (live VST3 NE render == CLAP mod, verified PI4B-0003)
 
 S="--set 1=0.5 --set 2=0.6 --set 3=0.7 --set 4=0.5 --set 5=0.1 --set 6=0.2 \
    --set 7=0.6 --set 8=0 --set 9=0.6 --set 10=0.5 --set 11=0 --set 12=0"
