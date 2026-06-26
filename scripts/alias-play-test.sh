@@ -56,6 +56,13 @@ cd "$(dirname "$0")/.."
 
 SERIAL="${HARP_DEVICE_SERIAL:-PI4B-0001}"
 export HARP_DEVICE_SERIAL="$SERIAL"
+# Headless: no front panel to answer a §11.4 recall pick. Each fresh session's
+# priming dirties the live state, so EVERY capture's connect posts a reconcile
+# offer — without this it blocks the full HARP_RECONCILE_TIMEOUT_MS (default 30s)
+# per sample, padding the capture to silence and reading as "device busy" flake.
+# 0 = take the immediate Push fallback. (The conformance suite sets this globally
+# via hw-tests-linux.sh; set it HERE too so a standalone run is just as solid.)
+export HARP_RECONCILE_TIMEOUT_MS="${HARP_RECONCILE_TIMEOUT_MS:-0}"
 PROBE="${PROBE:-./build/harp-probe}"
 BUILD="${BUILD:-build-mt-host}"      # the multi-instance harness, built WITHOUT TSan
 INSTANCES="${INSTANCES:-4}"          # owner ch0 + 3 siblings ch1..3 — a real group

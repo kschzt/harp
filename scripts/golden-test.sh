@@ -23,9 +23,9 @@
 set -e
 cd "$(dirname "$0")/.."
 
-GOLDEN_HASH="787947297e858ec3"  # re-baselined: drone removed (engine 2.0.0)
-GROOVE_HASH="3b5a16e234168457"  # re-baselined: drone removed (engine 2.0.0)
-CHORD_HASH="eaed2355f68db8ed"   # re-baselined: drone removed
+GOLDEN_HASH="eb6a3b838d1d8ec3"  # re-baselined: §6.4 PDC fold (#75) shifted host-placed events +256 (verified PI4B-0003)
+GROOVE_HASH="d100f5a156ef8d45"  # re-baselined: §6.4 PDC fold (#75)
+CHORD_HASH="979fbd7d2b2aafe6"   # re-baselined: §6.4 PDC fold (#75)
 
 V=build-vst/harp-vst3-host
 A=build-vst/au-host
