@@ -238,6 +238,60 @@ int main(int argc, char **argv) {
         rt.stop();
         return 0;
     }
+    /* release mode: play ONE note on a chosen engine, hold it `holdSec`, send note-OFF, then
+     * keep capturing the tail. Measures RMS in a SUSTAINED window (while held) vs POST-RELEASE
+     * windows, so an ADSR release is provable in one run (released tail must decay faster than
+     * the still-held level). Usage: harp-runtime-probe release <engIdx> <numEng> <pitch> <holdSec> <tag> */
+    if (argc > 1 && strcmp(argv[1], "release") == 0) {
+        int engIdx   = argc > 2 ? atoi(argv[2]) : 10;
+        int numEng   = argc > 3 ? atoi(argv[3]) : 18;
+        int pitch    = argc > 4 ? atoi(argv[4]) : 60;
+        double hold  = argc > 5 ? atof(argv[5]) : 1.0;
+        const char *tag = argc > 6 ? argv[6] : "release";
+        uint32_t rsr = 44100;
+        HarpRuntime rt; rt.configure(rsr, 256); rt.start(rsr);
+        for (int i = 0; i < 100 && !rt.connected(); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        fprintf(stderr, "runtime-probe(release): connected=%d engine=%d/%d pitch=%d hold=%.2fs tag=%s\n",
+                rt.connected(), engIdx, numEng, pitch, hold, tag);
+        if (!rt.connected()) { rt.stop(); return 1; }
+        uint64_t ts0 = rt.streamPos() + rt.latencySamples();
+        rt.queueParamSet(rt.ownerSource(), 1, (engIdx + 0.5f) / numEng, ts0);  /* select engine */
+        for (int a = 7; a + 1 < argc; a += 2)                                  /* optional [id val] overrides, post-select */
+            rt.queueParamSet(rt.ownerSource(), (uint32_t)atoi(argv[a]), (float)atof(argv[a + 1]), ts0);
+        std::vector<float> capL; float buf[256 * 2];
+        auto t0 = std::chrono::steady_clock::now();
+        int settle = (int)(rsr / 256.0 * 0.5);                                 /* let switch + field reset settle */
+        for (int b = 0; b < settle; b++) { rt.pullAudio(buf, 256);
+            std::this_thread::sleep_until(t0 + std::chrono::microseconds((long long)(b + 1) * 256 * 1000000LL / rsr)); }
+        const double total = hold + 2.5;                                       /* capture 2.5s of tail after the hold */
+        bool onF = false, offF = false;
+        auto p0 = std::chrono::steady_clock::now();
+        int pblocks = (int)((double)rsr / 256.0 * total);
+        for (int b = 0; b < pblocks; b++) {
+            double elapsed = b * 256.0 / rsr;
+            if (!onF) { rt.queueNote(rt.ownerSource(), 0x20900000u | ((uint32_t)(pitch & 0x7f) << 8) | 96u, rt.streamPos() + rt.latencySamples()); onF = true; }
+            if (!offF && elapsed >= hold) { rt.queueNote(rt.ownerSource(), 0x20800000u | ((uint32_t)(pitch & 0x7f) << 8) | 0u, rt.streamPos() + rt.latencySamples()); offF = true; }
+            rt.pullAudio(buf, 256);
+            for (int i = 0; i < 256; i++) capL.push_back(buf[i * 2]);
+            std::this_thread::sleep_until(p0 + std::chrono::microseconds((long long)(b + 1) * 256 * 1000000LL / rsr));
+        }
+        char path[160]; snprintf(path, sizeof(path), "/tmp/release-%s.wav", tag);
+        writeWav(path, capL, rsr);
+        auto winRMS = [&](double a, double b)->double { long i0 = (long)(a * rsr), i1 = (long)(b * rsr);
+            if (i1 > (long)capL.size()) i1 = (long)capL.size(); double s = 0; long nn = 0;
+            for (long i = i0; i < i1; i++) { s += (double)capL[i] * capL[i]; nn++; } return nn ? std::sqrt(s / nn) : 0.0; };
+        double eSus  = winRMS(0.40, hold - 0.05);            /* steady held level */
+        double eRel1 = winRMS(hold + 0.30, hold + 0.45);     /* ~0.3-0.45s after note-off */
+        double eRel2 = winRMS(hold + 1.00, hold + 1.30);     /* ~1.0-1.3s after note-off */
+        fprintf(stderr, "runtime-probe(release): wrote %s (%.1fs)\n", path, capL.size() / (double)rsr);
+        fprintf(stderr, "  RMS sustained[0.40,%.2f]=%.5f  postRel[+0.3,+0.45]=%.5f (%.1f%%)  postRel[+1.0,+1.3]=%.5f (%.1f%%)\n",
+                hold - 0.05, eSus, eRel1, eSus > 1e-9 ? 100.0 * eRel1 / eSus : 0.0,
+                eRel2, eSus > 1e-9 ? 100.0 * eRel2 / eSus : 0.0);
+        rt.stop();
+        return 0;
+    }
+
     int pitch = argc > 1 ? atoi(argv[1]) : 60; /* C4 */
     uint32_t sr = argc > 2 ? (uint32_t)atoi(argv[2]) : 48000; /* Live is usually 44100 */
     int nonblock = argc > 3 ? atoi(argv[3]) : 0; /* 1 = pullAudio (non-blocking) like Live */
