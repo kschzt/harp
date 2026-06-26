@@ -277,7 +277,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, PROTO_MAJOR);
     harp_cbor_uint(m, PROTO_MINOR);
     harp_cbor_uint(m, 6); /* capabilities */
-    harp_cbor_array(m, (d->no_rate_lock ? 18 : 19) + ((d->rt_floor || d->rt_nsamples) ? 1 : 0)); /* §6.4: +audio.rt-floor when rt-profile declared. §9.6: +evt.txn; P3: +evt.multitimbral; §9.9: +evt.param.meter;
+    harp_cbor_array(m, (d->no_rate_lock ? 18 : 19) + ((d->rt_floor || d->rt_nsamples) ? 1 : 0) + (engine_is_fx() ? 1 : 0)); /* §8.8: +audio.fx when the engine is an effect (must match the string emitted below, or the CBOR array length is short → identity corrupt → core.hello fails). §6.4: +audio.rt-floor when rt-profile declared. §9.6: +evt.txn; P3: +evt.multitimbral; §9.9: +evt.param.meter;
                                +evt.param.mod; §8.7: +audio.rate-lock (dropped under
                                --no-rate-lock to force the host ASRC fallback);
                                §14.4: +diag.bundle; §14.3: +diag.loopback.digital */
