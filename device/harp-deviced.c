@@ -81,7 +81,7 @@ static void on_term(int sig) {
  * platform mDNS responder (avahi on Linux, dns-sd on macOS); a missing responder simply
  * means no advertisement. The child is killed on shutdown (on_term) so the responder emits
  * the mDNS goodbye record (§12.3 detach signal). */
-static void mdns_advertise(int port) {
+static void mdns_advertise(int port, const char *name) {
     char ports[16], txtproto[24], txtport[24];
     snprintf(ports, sizeof ports, "%d", port);
     snprintf(txtproto, sizeof txtproto, "proto=%d.%d", PROTO_MAJOR, PROTO_MINOR);
@@ -93,10 +93,10 @@ static void mdns_advertise(int port) {
         int n = open("/dev/null", O_RDWR);
         if (n >= 0) { dup2(n, 1); dup2(n, 2); }
 #ifdef __APPLE__
-        execlp("dns-sd", "dns-sd", "-R", "HARP refdev", "_harp._tcp", "local", ports,
+        execlp("dns-sd", "dns-sd", "-R", name, "_harp._tcp", "local", ports,
                txtproto, txtport, (char *)NULL);
 #else
-        execlp("avahi-publish-service", "avahi-publish-service", "HARP refdev", "_harp._tcp",
+        execlp("avahi-publish-service", "avahi-publish-service", name, "_harp._tcp",
                ports, txtproto, txtport, (char *)NULL);
 #endif
         _exit(127); /* responder tool absent */
@@ -355,6 +355,10 @@ int main(int argc, char **argv) {
                                                        * recall-drift WARNING can be exercised in CI */
     bool mdns = false; /* --mdns: §4.4.3 advertise _harp._tcp (off by default; the eth-suite
                         * dials directly and the simulator shouldn't pollute the local segment) */
+    const char *mdns_name = "HARP refdev"; /* --mdns-name: §4.4.3 service instance name. Default keeps
+                        * every existing invocation byte-identical; distinct names let >1 harp device
+                        * (e.g. a synth + an audio.fx effect) coexist on one segment without an avahi
+                        * name collision (which silently renames the 2nd to "...#2"). */
     /* §16(b) rate-limit TEST SEAM ONLY: env HARP_FORCE_PEER_IP is the no-argv route (e.g. when the
      * test can't reach the daemon's command line); an explicit --force-peer-ip below still wins. */
     {
@@ -391,6 +395,8 @@ int main(int argc, char **argv) {
             pmh_flip = true; /* §13.4 test seam: advertise a drifted param-map-hash */
         else if (strcmp(argv[i], "--mdns") == 0)
             mdns = true; /* §4.4.3: advertise _harp._tcp (--port mode; avahi on Linux, dns-sd on macOS) */
+        else if (strcmp(argv[i], "--mdns-name") == 0 && i + 1 < argc)
+            mdns_name = argv[++i]; /* §4.4.3: distinct service instance name (avoid avahi collisions) */
         else if (strcmp(argv[i], "--rt-floor") == 0 && i + 1 < argc)
             rt_floor = (uint32_t)atoi(argv[++i]); /* §6.4: declare the safe ethTargetFrames floor (identity key 14) */
         else if (strcmp(argv[i], "--rt-nsamples") == 0 && i + 1 < argc)
@@ -516,7 +522,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "harp-deviced: serial %s, state %s, listening on %d (boot %llu)\n",
             d->serial, state_dir, port, (unsigned long long)d->boot_count);
 #ifndef _WIN32
-    if (mdns) mdns_advertise(port); /* §4.4.3: advertise _harp._tcp now the port is bound */
+    if (mdns) mdns_advertise(port, mdns_name); /* §4.4.3: advertise _harp._tcp now the port is bound */
 #else
     (void)mdns; /* mDNS advertise is POSIX-only (Windows is host-side, not a refdev target) */
 #endif
