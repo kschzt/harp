@@ -6,13 +6,15 @@ Specification, Version 1.0 — 26 June 2026
 
 | | |
 |---|---|
-| **Status** | Editor's Draft — not yet stable, breaking changes expected |
+| **Status** | **Version 1.0 — stable.** Breaking changes are negotiated at `core.hello` (§5.4) and flow through HARP Enhancement Proposals (§18) |
 | **Working name** | "HARP" is provisional pending trademark search; the protocol identifier `harp` is used normatively throughout |
 | **Editors** | *(to be formed — initial working group)* |
 | **Spec license** | CC BY 4.0 |
 | **Schema & reference code license** | Apache-2.0 |
 | **Patent policy** | Royalty-free; contributors sign a non-assertion covenant (§19) |
 | **Feedback** | via HARP Enhancement Proposals (HEPs), see §18 |
+
+> **Version 1.0** — **First stable release; no wire change from 0.5.5.** The protocol is frozen for 1.0: the four planes (control / state / events / audio), both transport bindings (USB §4.3, Ethernet/IP §4.4), and the normative periphery are complete, and a spec→code audit of the reference implementation cleared 1.0 with zero blockers. The 0.5.x editor's drafts are superseded; from here, breaking changes are negotiated at `core.hello` (§5.4) and flow through HARP Enhancement Proposals (§18). The remaining bar before a *certification* claim (distinct from this functional 1.0) is §13 firmware management and a unified T1–T17 conformance harness.
 
 > **Changes in 0.5.5** — **Editorial reconciliation, no wire change.** Aligns the specification document with the consolidated `harp.cddl` and the reference implementation. (a) The in-document `identity` CDDL (§6.2 and Appendix A) gains **`? 14 => rt-profile`** — device-declared §8.7 RT setpoints (jitter-buffer floor + RTP packet size, capability `audio.rt-floor`); it was already in the consolidated `harp.cddl` and shipped on the reference device, so the in-document blocks were stale at key 13. (b) **§8.3.1 fence bound** is scoped to *real-time* host-paced rendering — a faster-than-real-time **offline** bounce has no wall clock to wedge and MUST render the exact fenced event set deterministically, so a deterministic device MAY block until the fenced events arrive (the bound and `fence_timeouts` do not apply offline). (c) **§14.4**'s normative diag-bundle schema lives in `docs/diag-bundle-design.md`, not Appendix A. (d) Document version, footer, README, and `harp.cddl` header now all read 0.5.5.
 
