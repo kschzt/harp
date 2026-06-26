@@ -49,11 +49,11 @@ jobs:
           fi
           # CBOR decoder for the diag-bundle conformance assertions (rtp-loss host-counters key 8, etc.)
           python3 -m pip install cbor2 || python3 -m pip install --break-system-packages cbor2
-      - name: build device (harp-deviced + harp-probe)
+      - name: build device + POSIX eth test tools (harp-deviced + harp-probe + latefr/fence)
         if: runner.os != 'Windows'
         run: |
           cmake -B build -S .
-          cmake --build build --target harp-deviced harp-probe -j
+          cmake --build build --target harp-deviced harp-probe harp-eth-latefr-test harp-eth-fence-test -j
       - name: build shell + host (+ AU host on macOS)
         if: runner.os != 'Windows'
         run: |

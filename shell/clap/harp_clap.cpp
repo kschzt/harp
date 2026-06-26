@@ -41,7 +41,7 @@ struct DevParam {
     double def; /* mirrors the device defaults (recall sanity) */
 };
 static const DevParam kParams[] = {
-    {1, "Osc Pitch", 0.5},   {2, "Osc Shape", 0.6},    {3, "Filter Cutoff", 0.7},
+    {1, "Osc Pitch", 0.5},   {2, "Osc Shape", 0.5},    {3, "Filter Cutoff", 0.5},
     {4, "Filter Reso", 0.5}, {5, "Env Attack", 0.5},   {6, "Env Release", 0.5},
     {7, "Master Level", 0.5},  {8, "Arp Mode", 0.0},   /* Master Level was id 8 */
     {9, "Arp Division", 0.6}, {10, "Arp Gate", 0.5},   {11, "Arp Octaves", 0.0},

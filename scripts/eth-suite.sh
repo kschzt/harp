@@ -105,6 +105,13 @@ run staged-connected   scripts/staged-connected-eth-test.sh  # §11.4 HIGH #8: -
 if [ -x ./build/harp-eth-latefr-test ]; then run latefr scripts/latefr-eth-test.sh
 else skip latefr "harp-eth-latefr-test not built (POSIX-only host-paced tool)"; fi
 
+# §8.3.1 event-fence integration: harp-eth-fence-test drives the OFFLINE host-paced bounce
+# with a FENCED pacing frame + a deferred NOTE event so the device's fence branch is reached;
+# asserts fence_waits moves, fence_timeouts stays 0 (unbounded offline barrier), and the
+# bounce is run-to-run deterministic. POSIX-only (raw connect-back socket), same as latefr.
+if [ -x ./build/harp-eth-fence-test ]; then run offline-fence scripts/offline-fence-eth.sh
+else skip offline-fence "harp-eth-fence-test not built (POSIX-only host-paced tool)"; fi
+
 # §9.4 per-part echo demux drives the device front panel over a unix socket; the MinGW
 # device replaces panel.c with a no-op stub, so the multi-instance path is POSIX-only
 # until the Windows panel transport lands.
@@ -135,10 +142,12 @@ else skip shell-mdns "mDNS needs a live responder (macOS CI only; bench-proven o
 # built on every platform yet (Windows: pending); the gate auto-enables them when it is.
 if have "$PROBE"; then
   run recall           scripts/recall-eth-test.sh            # §11.4 recall round-trip + archive
+  run archive-before-push scripts/archive-before-push-test.sh # §11.4 archive-BEFORE-push ordering: displaced state preserved before live overwrite
   run credit           scripts/credit-eth-test.sh            # §4.2.1b obj credit queue/flush under starvation
   run txn              scripts/txn-test.sh                   # §9.6 event transactions: buffer/commit-atomic/abort
   run epoch            scripts/epoch-test.sh                 # §7.1/§8.6 time.epoch on rate change + stale-epoch discard (cert T4)
   run engine-gate      scripts/engine-gate-eth-test.sh       # §13.4 device refuses foreign-engine snapshot; consent (0x4) overrides
+  run cas-conflict     scripts/cas-conflict-eth-test.sh      # §11.3 CAS conflict: stale-expect AND dirty-ref both -> conflict ("ref is dirty")
   run core             scripts/core-test.sh                  # §5.5 core methods: ping/identify/changed/bye
   run conn-flood       scripts/conn-flood-test.sh            # §16 DoS: half-open drop + connect-storm survival
   run ratelimit        scripts/ratelimit-eth-test.sh         # §16(b) shed-on-reflood + no-shed-after-hello (--force-peer-ip)
@@ -151,6 +160,7 @@ else
   skip credit       "harp-probe not built on $OSID"
   skip txn          "harp-probe not built on $OSID"
   skip epoch        "harp-probe not built on $OSID"
+  skip cas-conflict "harp-probe not built on $OSID"
   skip core         "harp-probe not built on $OSID"
   skip conn-flood   "harp-probe not built on $OSID"
   skip ratelimit    "harp-probe not built on $OSID"
