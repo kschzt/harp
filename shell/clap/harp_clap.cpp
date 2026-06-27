@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 #include <clap/clap.h>
@@ -65,7 +66,7 @@ struct HarpClap {
     clap_plugin_t plugin;       /* MUST be first: host holds a clap_plugin_t* */
     const clap_host_t *host = nullptr;
 
-    RuntimeHandle handle{};
+    std::unique_ptr<HarpRuntime> rt_{};
     EventSource *source = nullptr;
     double rate = 48000.0;
     uint32_t maxFrames = 4096;
@@ -86,15 +87,15 @@ struct HarpClap {
     static constexpr int kNumParts = 16;
     AudioSink *partSinks_[kNumParts] = {nullptr};
 
-    HarpRuntime *rt() const { return handle.rt; }
-    bool owner() const { return handle.owner; }
+    HarpRuntime *rt() const { return rt_.get(); }
 
     void releaseSource() {
         for (int k = 0; k < kNumParts; k++) {
             if (partSinks_[k] && rt()) rt()->unregisterAudioSink(partSinks_[k]);
             partSinks_[k] = nullptr;
         }
-        if (source && rt()) rt()->unregisterSource(source);
+        /* `source` is the runtime's own owner source — freed with the runtime; just
+         * forget it here (run before rt_.reset()). */
         source = nullptr;
     }
 };
@@ -247,7 +248,7 @@ static bool st_load(const clap_plugin_t *p, const clap_istream_t *is) {
             memcpy(h->paramVals, raw.data() + sizeof kParamCacheTag, sizeof h->paramVals);
         return true;
     }
-    if (h->rt() && h->owner())
+    if (h->rt())
         h->rt()->setStateBundle(raw.data(), raw.size()); /* live reload */
     else
         h->pendingState = raw; /* stage; activate() applies before start() */
@@ -409,8 +410,7 @@ static bool pl_init(const clap_plugin_t *p) {
 static void pl_destroy(const clap_plugin_t *p) {
     HarpClap *h = self(p);
     h->releaseSource();
-    runtime_release(h->handle);
-    h->handle = RuntimeHandle{};
+    h->rt_.reset();
     delete h;
 }
 
@@ -421,47 +421,41 @@ static bool pl_activate(const clap_plugin_t *p, double sample_rate, uint32_t /*m
     h->maxFrames = max_frames;
     h->interleaved.assign((size_t)max_frames * 2, 0.0f);
 
-    /* acquire a runtime for the pinned serial — the SAME sequence the VST3/AU
-     * shells run at setActive: HARP_DEVICE_SERIAL env, else the serial named in
-     * a staged Recall Bundle, else "" (a fresh owner runtime). */
-    std::string wantSerial;
-    if (const char *e = getenv("HARP_DEVICE_SERIAL"); e && e[0])
-        wantSerial = e;
-    else if (!h->pendingState.empty())
-        wantSerial =
-            HarpRuntime::bundleWantedSerial(h->pendingState.data(), h->pendingState.size());
-    h->handle = runtime_acquire(wantSerial);
+    /* Construct THIS instance's private runtime (no sharing — every instance owns
+     * its own). Device SELECTION is the runtime's own job (selectDevice():
+     * HARP_DEVICE_SERIAL env, else the staged bundle's serial via setStateBundle
+     * below, else auto-select). Drive it like the VST3/AU single-instance path:
+     * configure -> stage project bundle -> start. */
+    /* Idempotent against a double activate without an intervening deactivate (a
+     * spec-violating host): tear down any runtime we already hold, dropping its
+     * sinks FIRST, so we never leak one — mirrors the VST3/FX shells. */
+    if (h->rt_) {
+        h->releaseSource();
+        h->rt_.reset();
+    }
+    h->rt_ = runtime_acquire();
     if (!h->rt()) return false;
 
-    if (h->owner()) {
-        /* owner drives the session: configure -> stage project bundle -> start.
-         * Byte-identical ordering to the VST3/AU single-instance path. */
-        h->rt()->configure((uint32_t)h->rate, h->maxFrames);
-        h->rt()->setOffline(h->offline); /* §8.3-over-§8.7: host-paced eth if offline (before start) */
-        if (!h->pendingState.empty())
-            h->rt()->setStateBundle(h->pendingState.data(), h->pendingState.size());
-        /* MULTI-OUT (M4): register all 16 per-part sinks BEFORE start() so they enter the FIXED
-         * audio.start union (no mid-session re-neg). The reader demuxes each part's pair into its
-         * ring; pl_process writes the host-provided output ports and drains the rest. */
-        for (int k = 0; k < HarpClap::kNumParts; k++) {
-            std::vector<uint32_t> slots = {2u + 2u * (uint32_t)k, 3u + 2u * (uint32_t)k};
-            h->partSinks_[k] = h->rt()->registerAudioSink(slots);
-        }
-        h->rt()->start((uint32_t)h->rate);
-        h->source = h->rt()->ownerSource();
-    } else {
-        /* attached: the shared session is already configured/started; register
-         * our per-part source so our notes/params merge onto it (P5). */
-        h->source = h->rt()->registerSource(h->part);
+    h->rt()->configure((uint32_t)h->rate, h->maxFrames);
+    h->rt()->setOffline(h->offline); /* §8.3-over-§8.7: host-paced eth if offline (before start) */
+    if (!h->pendingState.empty())
+        h->rt()->setStateBundle(h->pendingState.data(), h->pendingState.size());
+    /* MULTI-OUT (M4): register all 16 per-part sinks BEFORE start() so they enter the FIXED
+     * audio.start union (no mid-session re-neg). The reader demuxes each part's pair into its
+     * ring; pl_process writes the host-provided output ports and drains the rest. */
+    for (int k = 0; k < HarpClap::kNumParts; k++) {
+        std::vector<uint32_t> slots = {2u + 2u * (uint32_t)k, 3u + 2u * (uint32_t)k};
+        h->partSinks_[k] = h->rt()->registerAudioSink(slots);
     }
+    h->rt()->start((uint32_t)h->rate);
+    h->source = h->rt()->ownerSource();
     return true;
 }
 
 static void pl_deactivate(const clap_plugin_t *p) {
     HarpClap *h = self(p);
     h->releaseSource();
-    runtime_release(h->handle);
-    h->handle = RuntimeHandle{};
+    h->rt_.reset();
 }
 
 static bool pl_start_processing(const clap_plugin_t *) { return true; }
@@ -494,7 +488,7 @@ static clap_process_status pl_process(const clap_plugin_t *p, const clap_process
             applyEvent(h, hdr, base);
         }
     }
-    if (h->owner() && pc->transport) applyTransport(h, pc->transport, pc->frames_count, base);
+    if (pc->transport) applyTransport(h, pc->transport, pc->frames_count, base);
 
     /* MULTI-OUT (M4): pull the device's host-paced audio into each output port — port 0 = main
      * mix (the no-sink pull, byte-identical), ports 1..16 = the per-part demux sinks. renderPort

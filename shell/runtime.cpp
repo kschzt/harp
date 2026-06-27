@@ -1505,17 +1505,13 @@ bool HarpRuntime::sessionUp() {
     uint8_t junk[16384];
     while (transport_->audioRead(junk, sizeof junk, 30) > 0) {}
 
-    /* new session = new stream = new SSI time domain (§7.1). Events still
-     * queued from the previous session carry STALE timestamps — drain EVERY
-     * source (no pump is running yet, so consuming here is safe; the lock
-     * guards against an attached instance registering/removing concurrently),
-     * and the fence sequence space restarts from zero on both sides. */
+    /* new session = new stream = new SSI time domain (§7.1). Events still queued
+     * from the previous session carry STALE timestamps — drain the owner source
+     * (no pump is running yet, so consuming here is safe), and the fence sequence
+     * space restarts from zero on both sides. */
     {
-        std::lock_guard<std::mutex> lk(sourcesMutex_);
-        for (size_t i = 0; i < nSources_; i++) {
-            TimedEv stale;
-            while (sources_[i]->ring.pop(stale)) {}
-        }
+        TimedEv stale;
+        while (ownerSource_.ring.pop(stale)) {}
     }
     evtQueuedSeq_.store(0, std::memory_order_release);
     evtEpochBase_.store(0, std::memory_order_release); /* fresh fence epoch == 0 */
@@ -1747,20 +1743,10 @@ bool HarpRuntime::start(uint32_t sampleRate) {
 void HarpRuntime::stop() {
     /* Flush in-flight events before teardown: the DAW's final note-offs
      * arrive in the last process() blocks, and killing the feeder with
-     * them still queued is how notes get stuck. Bounded wait — across ALL
-     * sources, so a sibling part's tail note-offs flush too (P5). */
+     * them still queued is how notes get stuck. Bounded wait. */
     if (running_.load(std::memory_order_acquire) && connected()) {
         for (int i = 0; i < 100; i++) {
-            bool allEmpty = true;
-            {
-                std::lock_guard<std::mutex> lk(sourcesMutex_);
-                for (size_t s = 0; s < nSources_; s++)
-                    if (!sources_[s]->ring.empty()) {
-                        allEmpty = false;
-                        break;
-                    }
-            }
-            if (allEmpty) break;
+            if (ownerSource_.ring.empty()) break;
             harp_sleep_ns(1000000ull); /* 1 ms */
         }
     }
@@ -1778,20 +1764,13 @@ void HarpRuntime::stop() {
 
 /* ---------------- audio thread side ---------------- */
 
-/* Each queue* pushes to the CALLER'S source ring (its SPSC producer side) and
- * bumps the SHARED per-session fence (evtQueuedSeq_): the device must consume
- * the TOTAL across all sources before rendering a fenced range, so the fence
- * counts every source's events, not just one's.
- *
- * A null source means the instance is EVENT-DORMANT: registerSource() returned
- * nullptr because the device's 16 parts are all taken (a 17th alias). We MUST
- * NOT fall back to the owner source — that would make this instance a SECOND
- * producer on the owner's ring, breaking the SPSC invariant the whole merge
- * rests on. A 17th part legitimately contributes nothing to a 16-part device,
- * so the event is simply dropped (logged once via dormantSrcLogged_). */
+/* Each queue* pushes to the owner source ring (its SPSC producer side) and bumps
+ * the per-session fence (evtQueuedSeq_): the device must consume that many events
+ * before rendering a fenced range. A null source (unacquired instance) is a
+ * defensive no-op — the shells only queue once they hold the owner source. */
 void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t ts,
                                 uint8_t channel) {
-    if (!src) return noteDormant();
+    if (!src) return;
     if (readOnlyDefault_.load(std::memory_order_relaxed) || roExplicit_.load(std::memory_order_relaxed)) {
         /* §12.2/§11.4: read-only hold — a live param edit MUST NOT reach a mismatched-engine
          * device; drop + count (the user exits read-only to make changes). The fresh-open default
@@ -1811,7 +1790,7 @@ void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t
 }
 void HarpRuntime::queueRamp(EventSource *src, uint32_t id, float target, uint64_t start,
                             uint64_t end, uint8_t channel) {
-    if (!src) return noteDormant();
+    if (!src) return;
     if (readOnlyDefault_.load(std::memory_order_relaxed) || roExplicit_.load(std::memory_order_relaxed)) {
         /* §12.2/§11.4: read-only hold — drop the automation write so it can't reach the
          * mismatched engine (re-audit HIGH #1). */
@@ -1827,7 +1806,7 @@ void HarpRuntime::queueRamp(EventSource *src, uint32_t id, float target, uint64_
         evDrops_.fetch_add(1, std::memory_order_relaxed);
 }
 void HarpRuntime::queueNote(EventSource *src, uint32_t word, uint64_t ts) {
-    if (!src) return noteDormant();
+    if (!src) return;
     if (src->ring.push({2, word, 0.0f, ts, 0})) {
         evtQueuedSeq_.fetch_add(1, std::memory_order_release);
     } else {
@@ -1843,7 +1822,7 @@ void HarpRuntime::queueNote(EventSource *src, uint32_t word, uint64_t ts) {
 
 void HarpRuntime::queueMod(EventSource *src, uint32_t id, float offset,
                            uint32_t voice, uint64_t ts) {
-    if (!src) return noteDormant();
+    if (!src) return;
     /* kind 4 = mod; the §9.5 voice key rides in `end` (it is a packed uint, not
      * a timestamp). A dropped mod is benign — it leaves the base value as-is, no
      * stuck state — so unlike a note we do not escalate to panic on overflow.
@@ -1872,70 +1851,8 @@ void HarpRuntime::queueTransport(EventSource *src, uint32_t flags, double tempo,
         evDrops_.fetch_add(1, std::memory_order_relaxed);
 }
 
-/* ---- source registry (P5; off the audio path) ---- */
-
-/* Register an attached instance's source. Allocates an EventSource for `channel`
- * and adds it to the array under the lock; the eventPump's next pass drains it.
- * The owner source is slot 0 and never registered here. Returns nullptr if the
- * table is full (kMaxSources == the device's 16 parts): the caller (queue* via
- * a null source) then DROPS that instance's events — it is event-dormant. We do
- * NOT fall back to the owner source: a 17th instance pushing to the owner's ring
- * would make it multi-producer and break the SPSC invariant, and a 17th part
- * legitimately contributes nothing to a 16-part device anyway. */
-EventSource *HarpRuntime::registerSource(uint8_t channel) {
-    EventSource *src = new EventSource(channel);
-    std::lock_guard<std::mutex> lk(sourcesMutex_);
-    if (nSources_ >= kMaxSources) {
-        delete src;
-        return nullptr;
-    }
-    sources_[nSources_++] = src;
-    return src;
-}
-
-/* Remove an attached source and free it, keeping the event fence CONSISTENT.
- *
- * SAFE-FREE: a source's ring is only ever READ (popped) by the eventPump, and
- * only while it holds sourcesMutex_ (the pump drains every ring into its batch
- * UNDER the lock, then writes the wire AFTER unlocking — see eventPump). We
- * take that SAME lock and remove the source from the array FIRST: from that
- * point the pump's next pass can no longer see it, so unregisterSource is its
- * SOLE accessor (the producer is quiescent — the host stops process() before
- * setActive(false)/release). It can then drain and free it safely.
- *
- * FENCE CONSISTENCY: evtQueuedSeq_ is the per-session high-water mark of events
- * QUEUED (every queue* fetch_add's it; the device must consume that many evt
- * messages before rendering a fenced range). Any events left UNWRITTEN in this
- * source's ring at release were counted into the fence but will never reach the
- * wire — so without correction the device would consume total-K < fence and
- * EVERY later fenced frame would hit the §8.3.1 bounded timeout (evt_late /
- * fence_timeouts climbing for ALL surviving parts). We drop those K in-flight
- * events ON PURPOSE — the part is gone — but fetch_sub(K) so the fence drops to
- * exactly what was written == what the device will consume, leaving SURVIVING
- * parts' timing tight.
- *
- * The owner source and nullptr are no-ops (the owner persists for the session,
- * and its ring is drained normally by the pump). */
-void HarpRuntime::unregisterSource(EventSource *src) {
-    if (!src || src == &ownerSource_) return;
-    std::lock_guard<std::mutex> lk(sourcesMutex_);
-    for (size_t i = 0; i < nSources_; i++) {
-        if (sources_[i] == src) {
-            sources_[i] = sources_[nSources_ - 1]; /* compact: last fills the hole */
-            sources_[--nSources_] = nullptr;
-            /* removed from the registry FIRST -> the pump can't touch it now;
-             * we are its sole owner. Drain the leftover (queued-but-unwritten)
-             * events, dropping them but decrementing the fence by exactly that
-             * count so the device's consume target matches what was written. */
-            uint32_t leftover = 0;
-            TimedEv te;
-            while (src->ring.pop(te)) leftover++;
-            if (leftover) evtQueuedSeq_.fetch_sub(leftover, std::memory_order_release);
-            delete src;
-            return;
-        }
-    }
-}
+/* (The attached-source registry — registerSource/unregisterSource — is retired:
+ * one private runtime per instance, so the only event source is ownerSource_.) */
 
 /* ---- audio sink registry (P5b; off the audio path) ---- */
 
@@ -1978,10 +1895,10 @@ AudioSink *HarpRuntime::registerAudioSink(const std::vector<uint32_t> &slots) {
     return sink;
 }
 
-/* Remove + free a sink on release, keeping reader() safe. SAFE-FREE mirrors
- * unregisterSource: a sink's ring is only WRITTEN by reader(), and only while it
- * holds sinksMutex_ (it demuxes every frame into every registered sink under the
- * lock — see reader). We take that SAME lock and remove the sink from the array
+/* Remove + free a sink on release, keeping reader() safe. SAFE-FREE: a sink's
+ * ring is only WRITTEN by reader(), and only while it holds sinksMutex_ (it
+ * demuxes every frame into every registered sink under the lock — see reader).
+ * We take that SAME lock and remove the sink from the array
  * FIRST: reader()'s next pass can no longer see it, so we are its sole accessor
  * (the consumer is quiescent — the host stops process() before release) and can
  * free it. Idempotent on nullptr. */
@@ -2525,11 +2442,11 @@ void HarpRuntime::feeder() {
              * start base == 0, so this is byte-identical to the pre-P5b fence; after
              * a re-neg the device reset g_evt_consumed to 0 and base caught up to the
              * counter, so the count restarts at 0 here too — no over-count, no wedge.
-             * SATURATE at 0: unregisterSource fetch_sub's a removed source's leftover
-             * (queued-but-unwritten) events, which can pull the monotonic counter
-             * BELOW a baseline that had counted them — a raw subtraction would wrap
-             * to a huge OVER-count and wedge every later frame. An under-count is
-             * always safe (the fence is a minimum -> at worst evt_late), so clamp. */
+             * SATURATE at 0 (now purely defensive): the counter is monotonic — the
+             * only decrementer, a released source's leftover-event fetch_sub, is
+             * retired with the source registry, so hw >= base always holds. The
+             * clamp stays as a cheap guard; an under-count is always safe anyway
+             * (the fence is a minimum -> at worst evt_late). */
             uint32_t hw = evtQueuedSeq_.load(std::memory_order_acquire);
             uint32_t base = evtEpochBase_.load(std::memory_order_acquire);
             uint32_t seq = hw > base ? hw - base : 0;
@@ -2582,13 +2499,13 @@ void HarpRuntime::feeder() {
  * their own thread; the link endpoint is distinct from the audio
  * endpoint, so the two never contend on the wire — only on ctlMutex_,
  * whose link writes are short. */
-/* Drain up to `budget` events from one source's ring, appending each as a
- * framed EVT message to `batch`. Returns the count drained. The eventPump is
- * the SOLE consumer of every source ring (SPSC), and calls this only while
- * holding sourcesMutex_ (the safe-free invariant — see unregisterSource).
+/* Drain up to `budget` events from the owner source's ring, appending each as a
+ * framed EVT message to `batch`. Returns the count drained. The eventPump is the
+ * SOLE consumer of the source ring (SPSC) — there is one fixed session-long
+ * source, so no lock and no safe-free dance.
  *
- * Param sets and ramps carry the SOURCE's channel (key 5) so each instance's
- * knob edits land on ITS part — this is what makes the merge multitimbral.
+ * Param sets and ramps carry the SOURCE's channel (key 5) so a multi-out main's
+ * per-channel knob edits land on the right part (channel N -> part N).
  * Notes already carry their channel in the UMP word (the shell baked it in).
  * Transport (kind 3) is global and only ever lives on the owner source. */
 int HarpRuntime::drainSource(EventSource &src, harp_cbuf &batch, harp_cbuf &msgbuf,
@@ -2659,24 +2576,11 @@ void HarpRuntime::eventPump() {
          * pipe); the cap only bounds the write size — the loop comes
          * straight back for the rest.
          *
-         * P5 MERGE: drain EVERY registered source, stamping each event with
-         * ITS source's channel (param/ramp), so a multitimbral group's parts
-         * all land on the one wire. The owner source is drained FIRST and is
-         * slot 0 — so with a SINGLE instance this is exactly the pre-P5 path:
-         * one source, one channel, the same 64-event batch, BYTE-IDENTICAL.
-         * We drain into `batch` UNDER sourcesMutex_ (pure memory work, no I/O)
-         * and write the wire AFTER unlocking: that lock is the safe-free
-         * invariant (unregisterSource deletes under it, so the pump never
-         * reads a freed ring) and it never wraps the wire write. The audio
-         * thread (queue*) never takes this lock — its source pointer is its
-         * own SPSC producer side. */
+         * Drain the owner source (the one and only source — the per-instance
+         * attached-source merge is retired). The audio thread (queue*) is its sole
+         * SPSC producer; the pump is the sole consumer, so no lock is needed. */
         harp_cbuf_reset(&batch);
-        int sent = 0;
-        {
-            std::lock_guard<std::mutex> slk(sourcesMutex_);
-            for (size_t i = 0; i < nSources_; i++)
-                sent += drainSource(*sources_[i], batch, msgbuf, 64 - sent);
-        }
+        int sent = drainSource(ownerSource_, batch, msgbuf, 64);
         if (sent) {
             std::lock_guard<std::mutex> lk(ctlMutex_);
             /* A P5b re-negotiation may run (under ctlMutex_, serialized against this
@@ -2695,14 +2599,6 @@ void HarpRuntime::eventPump() {
             }
             didWork = true;
         }
-
-        /* a 17th alias hit the full source table and is event-dormant; the
-         * audio thread raised the flag, we log it once (off the RT path) */
-        if (dormantSrcSeen_.load(std::memory_order_relaxed) &&
-            !dormantSrcLogged_.exchange(true, std::memory_order_relaxed))
-            log_msg("WARNING: source table full (%zu parts) — a further instance "
-                    "is event-dormant; its events are dropped",
-                    kMaxSources);
 
         if (!didWork) {
             harp_sleep_ns(500000ull); /* 0.5 ms — well inside the one-block budget */

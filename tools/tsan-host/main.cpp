@@ -272,14 +272,12 @@ int main(int argc, char **argv) {
             p = c + 1;
         }
     }
-    /* The registry key, exactly as the plugin computes it: HARP_DEVICE_SERIAL
-     * pins a unit. Set it (with --instances >1) to exercise SHARING — N
-     * instances on one serial, one owner runtime, one claim. Unset -> each
-     * instance auto-selects its own fresh runtime (the multi-device path). */
+    /* HARP_DEVICE_SERIAL pins a unit — the runtime's selectDevice() reads it
+     * directly; unset -> auto-select. The registry's share-by-serial role is gone
+     * (M3): every runtime is private now (see runtime_acquire). */
     const char *envSerial = getenv("HARP_DEVICE_SERIAL");
-    std::string wantSerial = (envSerial && envSerial[0]) ? envSerial : std::string();
-    fprintf(stderr, "tsan-host: %d instance(s), %d s, block %u, serial=\"%s\"\n", instances,
-            seconds, block, wantSerial.c_str());
+    fprintf(stderr, "tsan-host: %d part(s), %d s, block %u, serial=\"%s\"\n", instances,
+            seconds, block, envSerial ? envSerial : "");
 
     /* MULTI-OUT: ONE owner instance owns the whole device and every part — the
      * registry's share-by-serial / owner+attached model is gone (M3). `instances`
@@ -288,7 +286,8 @@ int main(int argc, char **argv) {
      * multi-out shell registers its active part buses. The flag name is kept so the
      * scripts pass --instances unchanged. */
     int nParts = instances < 1 ? 1 : instances;
-    RuntimeHandle owner = runtime_acquire(wantSerial); /* empty serial -> a fresh PRIVATE owner */
+    std::unique_ptr<HarpRuntime> owner = runtime_acquire(); /* a fresh PRIVATE owner runtime */
+    HarpRuntime *ort = owner.get();
     std::vector<AudioSink *> sinks(nParts, nullptr);   /* sinks[p] = part p's demux sink (p>=1) */
     int capturePart = nParts > 1 ? 1 : 0;              /* the part whose sink the play-proof captures */
     std::vector<std::thread> audio, control;
@@ -301,11 +300,11 @@ int main(int argc, char **argv) {
     if (partAudio && !lateSink)
         for (int p = 1; p < nParts; p++) {
             std::vector<uint32_t> slots = {2u + 2u * (uint32_t)p, 3u + 2u * (uint32_t)p};
-            sinks[p] = owner.rt->registerAudioSink(slots);
+            sinks[p] = ort->registerAudioSink(slots);
         }
-    owner.rt->configure(48000, block);
-    owner.rt->start(48000); /* device-less is fine — supervisor retries, threads still run */
-    EventSource *src = owner.rt->ownerSource();
+    ort->configure(48000, block);
+    ort->start(48000); /* device-less is fine — supervisor retries, threads still run */
+    EventSource *src = ort->ownerSource();
 
     /* let the supervisor connect/claim before flooding */
     struct timespec s = {1, 0};
@@ -315,10 +314,10 @@ int main(int argc, char **argv) {
      * designated part's sink thread (captures g_sink_capture, the non-silent demux
      * proof); and ONE control thread driving all N parts' channels on the owner
      * source — single producer, exactly as the shell's process() is. */
-    audio.emplace_back(audio_thread, owner.rt, block, !outPath.empty());
+    audio.emplace_back(audio_thread, ort, block, !outPath.empty());
     if (partAudio && !lateSink && capturePart >= 1 && sinks[capturePart])
-        audio.emplace_back(part_audio_thread, owner.rt, sinks[capturePart], block, true);
-    control.emplace_back(control_thread, owner.rt, src, nParts, seconds);
+        audio.emplace_back(part_audio_thread, ort, sinks[capturePart], block, true);
+    control.emplace_back(control_thread, ort, src, nParts, seconds);
     if (!lateSink) {
         for (int t = 0; t < seconds; t++) nanosleep(&s, nullptr);
     } else {
@@ -341,7 +340,7 @@ int main(int argc, char **argv) {
          * the registry — but on a healthy rig this lands a true mid-session
          * re-negotiation. A short settle lets the initial {0,1} union stream a
          * bit first so the re-neg is visibly a CHANGE. */
-        HarpRuntime *ownerRt = owner.rt;
+        HarpRuntime *ownerRt = ort;
         for (int t = 0; t < 50 && ownerRt && !ownerRt->connected(); t++) {
             struct timespec ms100 = {0, 100000000L};
             nanosleep(&ms100, nullptr);
@@ -405,8 +404,8 @@ int main(int argc, char **argv) {
      * unregisterAudioSink on nullptr is a no-op; the owner source is the runtime's
      * built-in one, so there is nothing to unregister for it. */
     for (int p = 1; p < nParts; p++)
-        if (sinks[p]) owner.rt->unregisterAudioSink(sinks[p]);
-    runtime_release(owner);
+        if (sinks[p]) ort->unregisterAudioSink(sinks[p]);
+    owner.reset(); /* unique_ptr dtor (~HarpRuntime) stops + joins the threads */
     /* --out: emit the owner main-mix content hash (and a listening-aid WAV) on
      * the SAME oracle vst3-host uses. The play-proof script compares this across
      * a ch0-only run and an N-channel alias-group run: a different hash means the
