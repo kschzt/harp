@@ -2072,8 +2072,22 @@ void HarpRuntime::encodeRampEvent(harp_cbuf *m, uint32_t id, float target,
  * request, and the late-arriving samples for those positions are dropped
  * (padDebtFloats_) when they show up. The wrong policy — playing late
  * arrivals anyway — grows latency by every pad and audibly "echoes" the
- * missing moment while the DAW grid drifts. */
+ * missing moment while the DAW grid drifts.
+ *
+ * §8.8 audio.fx EXCEPTION: an armed effect (fxArmed) is a FIXED-LATENCY DELAY
+ * LINE, not a 1:1 free-running synth stream. Its wet is inherently PDC-late
+ * (round-trip ≈ the reported latencySamples()): the first ~PDC pulls
+ * legitimately underrun while the H→D→wet pipeline primes, then the wet flows
+ * continuously (the device runs faster than real-time, so once primed the ring
+ * stays full). For the FX, a late wet IS the signal — just delayed by the PDC
+ * the plugin already reports (the DAW compensates) — NOT a dropout to skip.
+ * Dropping it (the spent-position policy) re-empties the ring every block and
+ * yields 100% silence. So skip the settle for the FX: the PDC-late wet
+ * accumulates in audioRing_ and plays. fxArmed()/fxInSlots_ is fixed before
+ * start() (never mutated mid-session), so reading it here is race-free, and the
+ * INSTRUMENT shell never arms it — its synth/free-running path is unchanged. */
 void HarpRuntime::settlePadDebt() {
+    if (fxArmed()) return;
     while (padDebtFloats_) {
         float scratch[1024];
         size_t take = padDebtFloats_ < 1024 ? padDebtFloats_ : 1024;
@@ -2126,7 +2140,13 @@ size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
     ssiRead_.fetch_add(nFrames, std::memory_order_relaxed);
     if (got < want) {
         memset(dst + got, 0, (want - got) * sizeof(float));
-        padDebtFloats_ += want - got;
+        /* §8.8: only the 1:1 synth path owes droppable pad debt. For an armed FX
+         * (fxArmed) this short read is PRIMING silence while the fixed-latency wet
+         * pipeline fills — the wet is PDC-late, not spent — so DON'T schedule a drop
+         * (settlePadDebt early-returns for the FX too). We still COUNT the underrun:
+         * for the FX these are the expected handful of priming blocks, after which the
+         * ring stays full and there are none. fxInSlots_ is fixed before start(). */
+        if (!fxArmed()) padDebtFloats_ += want - got;
         if (connected_.load(std::memory_order_acquire)) {
             underruns_.fetch_add(1, std::memory_order_relaxed);
             padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
