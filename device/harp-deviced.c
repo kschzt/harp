@@ -83,6 +83,7 @@ static void on_term(int sig) {
  * the mDNS goodbye record (§12.3 detach signal). */
 static void mdns_advertise(int port, const char *name) {
     char ports[16], txtproto[24], txtport[24];
+    if (!name || !name[0]) name = "HARP refdev"; /* default instance name (the refdev's) */
     snprintf(ports, sizeof ports, "%d", port);
     snprintf(txtproto, sizeof txtproto, "proto=%d.%d", PROTO_MAJOR, PROTO_MINOR);
     snprintf(txtport, sizeof txtport, "port=%d", port);
@@ -215,6 +216,33 @@ static void rtp_send_one(audio_state *a, const harp_rtp_hdr *h, const float *sam
 
 void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, uint64_t msc) {
     if (a->rtp_fd < 0) return;
+    /* WIDE UNION (>8 slots): one ns×S×4 datagram would exceed the OS max UDP datagram
+     * (macOS net.inet.udp.maxdgram = 9216), so the send silently fails and the host gets
+     * NOTHING. Split the frame into <=8-slot pt=97 groups, each a 4-byte sub-header
+     * [off, cnt, total, flags] + ns×cnt gathered floats, all sharing the RTP timestamp; the
+     * host reassembles by timestamp (see rtp.h). <=8 slots stays the byte-identical pt=96
+     * path below. The render thread is the SOLE caller, so the gather buffer is static. */
+    unsigned S = a->n_out_slots ? a->n_out_slots : 2;
+    if (S > HARP_RTP_MAX_GROUP_SLOTS) {
+        unsigned ns = (unsigned)(payload_bytes / ((size_t)S * sizeof(float)));
+        static uint8_t grp[HARP_RTP_GROUP_HDR_BYTES +
+                           AUDIO_MAX_NSAMPLES * HARP_RTP_MAX_GROUP_SLOTS * sizeof(float)];
+        for (unsigned off = 0; off < S; off += HARP_RTP_MAX_GROUP_SLOTS) {
+            unsigned cnt = (S - off > HARP_RTP_MAX_GROUP_SLOTS) ? HARP_RTP_MAX_GROUP_SLOTS : (S - off);
+            uint16_t gseq = a->rtp_seq++;
+            /* §8.7 test loss injection still applies per packet; ADVANCE seq first (drop = gap). */
+            if (g_rtp_drop_pct > 0 && (gseq * 2654435761u) % 100u < (uint32_t)g_rtp_drop_pct) continue;
+            grp[0] = (uint8_t)off; grp[1] = (uint8_t)cnt; grp[2] = (uint8_t)S; grp[3] = 0;
+            float *gf = (float *)(grp + HARP_RTP_GROUP_HDR_BYTES);
+            for (unsigned s = 0; s < ns; s++)
+                for (unsigned c = 0; c < cnt; c++)
+                    gf[(size_t)s * cnt + c] = samples[(size_t)s * S + off + c];
+            harp_rtp_hdr gh = {HARP_RTP_PT_GROUP, 0, gseq, (uint32_t)msc, a->rtp_ssrc};
+            rtp_send_one(a, &gh, (const float *)grp,
+                         HARP_RTP_GROUP_HDR_BYTES + (size_t)ns * cnt * sizeof(float));
+        }
+        return;
+    }
     uint16_t seq = a->rtp_seq++;
     /* drop ~N% of datagrams, but ADVANCE the seq first so the host sees a genuine gap
      * (real loss), not a stall. Knuth multiplicative hash = reproducible (no rand) yet
@@ -349,16 +377,14 @@ int main(int argc, char **argv) {
     uint32_t rt_nsamples = 0;                         /* --rt-nsamples N: declared RTP packet size (frames), identity key 14 sub-key 1 */
     uint32_t in_lat = 0, out_lat = 0;                 /* --in-lat / --out-lat N: §6.4 latency-profile keys 1/2 (converter latency, samples) */
     const char *engine_ver = NULL;                    /* --engine-ver X.Y.Z: §12.2 test seam, override reported engine semver */
+    const char *product = NULL;                       /* --product STRING: identity product/model + panel + mDNS instance name (NULL => harp-refdev) */
+    const char *engine_name = NULL;                   /* --engine-name STRING: identity engine name (NULL => ENGINE_ID; media-type unaffected) */
     bool pmh_flip = false;                            /* --param-map-hash-flip: TEST seam (§9.3/§13.4) —
                                                        * advertise a 1-bit-altered param-map-hash to mimic
                                                        * an engine-update param-map change, so the shell's
                                                        * recall-drift WARNING can be exercised in CI */
     bool mdns = false; /* --mdns: §4.4.3 advertise _harp._tcp (off by default; the eth-suite
                         * dials directly and the simulator shouldn't pollute the local segment) */
-    const char *mdns_name = "HARP refdev"; /* --mdns-name: §4.4.3 service instance name. Default keeps
-                        * every existing invocation byte-identical; distinct names let >1 harp device
-                        * (e.g. a synth + an audio.fx effect) coexist on one segment without an avahi
-                        * name collision (which silently renames the 2nd to "...#2"). */
     /* §16(b) rate-limit TEST SEAM ONLY: env HARP_FORCE_PEER_IP is the no-argv route (e.g. when the
      * test can't reach the daemon's command line); an explicit --force-peer-ip below still wins. */
     {
@@ -395,8 +421,6 @@ int main(int argc, char **argv) {
             pmh_flip = true; /* §13.4 test seam: advertise a drifted param-map-hash */
         else if (strcmp(argv[i], "--mdns") == 0)
             mdns = true; /* §4.4.3: advertise _harp._tcp (--port mode; avahi on Linux, dns-sd on macOS) */
-        else if (strcmp(argv[i], "--mdns-name") == 0 && i + 1 < argc)
-            mdns_name = argv[++i]; /* §4.4.3: distinct service instance name (avoid avahi collisions) */
         else if (strcmp(argv[i], "--rt-floor") == 0 && i + 1 < argc)
             rt_floor = (uint32_t)atoi(argv[++i]); /* §6.4: declare the safe ethTargetFrames floor (identity key 14) */
         else if (strcmp(argv[i], "--rt-nsamples") == 0 && i + 1 < argc)
@@ -413,9 +437,13 @@ int main(int argc, char **argv) {
             struct in_addr fa;
             if (inet_pton(AF_INET, argv[++i], &fa) == 1) g_force_peer_ip = fa.s_addr;
         }
+        else if (strcmp(argv[i], "--product") == 0 && i + 1 < argc)
+            product = argv[++i]; /* identity product/model + panel product + mDNS instance name */
+        else if (strcmp(argv[i], "--engine-name") == 0 && i + 1 < argc)
+            engine_name = argv[++i]; /* identity engine name (PARAMS_MEDIA / recall format unaffected) */
         else {
             fprintf(stderr,
-                    "usage: harp-deviced [--state-dir DIR] [--serial S] "
+                    "usage: harp-deviced [--state-dir DIR] [--serial S] [--product NAME] [--engine-name NAME] "
                     "[--panel-sock PATH] [--tone HZ] [--no-rate-lock] [--rt-floor N] [--rt-nsamples N] [--in-lat N] [--out-lat N] [--engine-ver X.Y.Z] "
                     "[--port P | --ffs FFS_DIR [--gadget CONFIGFS_PATH]]\n");
             return 2;
@@ -449,6 +477,8 @@ int main(int argc, char **argv) {
     d->out_lat = out_lat;         /* §6.4 latency-profile key 2 (converter analog-out) */
     d->engine_ver = engine_ver;   /* §12.2 test seam: NULL => ENGINE_VERSION */
     d->ctl_sock = HARP_SOCK_INVALID; /* §16: armed per-connection by the eth accept loop */
+    d->product = product;         /* identity product/model + panel + mDNS name; NULL => "harp-refdev" */
+    d->engine_name = engine_name; /* identity engine name; NULL => ENGINE_ID (media-type unaffected) */
     snprintf(d->serial, sizeof d->serial, "%s", serial);
     if (harp_store_open(&d->store, state_dir) != 0) {
         fprintf(stderr, "harp-deviced: cannot open state dir %s\n", state_dir);
@@ -522,7 +552,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "harp-deviced: serial %s, state %s, listening on %d (boot %llu)\n",
             d->serial, state_dir, port, (unsigned long long)d->boot_count);
 #ifndef _WIN32
-    if (mdns) mdns_advertise(port, mdns_name); /* §4.4.3: advertise _harp._tcp now the port is bound */
+    if (mdns) mdns_advertise(port, d->product); /* §4.4.3: advertise _harp._tcp (instance name = --product, default "HARP refdev") */
 #else
     (void)mdns; /* mDNS advertise is POSIX-only (Windows is host-side, not a refdev target) */
 #endif

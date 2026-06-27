@@ -259,7 +259,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, 0);
     harp_cbor_uint(m, 0x0001);
     harp_cbor_uint(m, 1);
-    harp_cbor_text(m, "harp-refdev");
+    harp_cbor_text(m, d->product ? d->product : "harp-refdev"); /* --product override; default refdev */
     harp_cbor_uint(m, 2); /* serial */
     harp_cbor_text(m, d->serial);
     harp_cbor_uint(m, 3); /* firmware */
@@ -267,7 +267,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, 4); /* engine */
     harp_cbor_map(m, 3);
     harp_cbor_uint(m, 0);
-    harp_cbor_text(m, ENGINE_ID);
+    harp_cbor_text(m, d->engine_name ? d->engine_name : ENGINE_ID); /* --engine-name override; PARAMS_MEDIA unaffected */
     harp_cbor_uint(m, 1);
     harp_cbor_text(m, d->engine_ver ? d->engine_ver : ENGINE_VERSION);
     harp_cbor_uint(m, 2);
@@ -2205,6 +2205,27 @@ void harp_deviced_run_session(device *d, harp_io *io) {
              * handle_evt_msg rejected, or a malformed message would leave
              * the host's sequence unreachable and wedge every later fence */
             atomic_fetch_add_explicit(&g_evt_consumed, 1, memory_order_release);
+        }
+        /* §9.3 mid-session param-map re-announce: if the engine swapped its
+         * advertised param table (a multi-engine synth changing engines — the
+         * swap may have happened on the audio thread via the evq), recompute the
+         * hash and tell the host to re-read evt.params. Generic: the refdev's
+         * seam always returns 0, so its map stays static + byte-identical. */
+        if (engine_param_map_dirty_take()) {
+            refresh_param_map_hash(d);
+            ntf_core_changed(d, "identity");
+            /* A multi-engine synth that swaps engines also LOADS the new engine's
+             * default param values (per-engine value memory). core.changed only
+             * tells the host to re-read the descriptor SET (labels/hash); it does
+             * NOT carry values, and the new defaults are device-side state the
+             * host's automation lane doesn't know about. So echo every automatable
+             * param's CURRENT value (the new engine's defaults/remembered tweaks)
+             * via the same evt.param.echo path a front-panel edit uses — a connected
+             * VST then updates its knobs to the new engine's bank. Generic: the
+             * refdev's seam returns 0, so this never fires there (map stays static).
+             * g_params holds ONLY automatable params (meters are separate ids). */
+            for (size_t i = 0; i < NPARAMS; i++)
+                evt_echo_param(d, g_params[i].id, engine_part_param_get(0, g_params[i].id), 0);
         }
         if (d->closing) break;
     }

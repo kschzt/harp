@@ -281,9 +281,15 @@ public:
     /* Each takes the calling instance's EventSource (its SPSC producer side).
      * Single-instance passes ownerSource(); the merge is the only difference
      * from the pre-P5 single-ring path. */
-    void queueParamSet(EventSource *src, uint32_t id, float v, uint64_t ts);
+    /* MULTI-OUT M2: `channel` is the device part this param/ramp targets (§9.4 key 5). The
+     * default kChanFromSource (0xff) resolves to the source's own channel at queue time — so
+     * every existing caller is byte-identical. A multi-out main passes an explicit channel (a
+     * satellite's MIDI channel N -> part N) to drive any part from ONE instance, per event. */
+    static constexpr uint8_t kChanFromSource = 0xff;
+    void queueParamSet(EventSource *src, uint32_t id, float v, uint64_t ts,
+                       uint8_t channel = kChanFromSource);
     void queueRamp(EventSource *src, uint32_t id, float target, uint64_t start,
-                   uint64_t end);
+                   uint64_t end, uint8_t channel = kChanFromSource);
     void queueNote(EventSource *src, uint32_t umpWord, uint64_t ts);
     /* §9.4 non-destructive modulation (etype 6): an additive signed offset on
      * one param's base value. `voice` is the §9.5 packed key of the target note

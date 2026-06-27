@@ -1,5 +1,6 @@
 #include "runtime.h"
 #include "runtime_registry.h" /* §8.4 admission ledger (ledger_reserve/release/reserved) */
+#include "shell_config.h" /* HARP_SHELL_ENGINE_FILTER / HARP_SHELL_ETHERNET_ONLY (default = refdev) */
 #include "ump.h"
 #include "usb_transport.h" /* the concrete USB binding selectDevice() wraps */
 #include "eth_transport.h" /* the §8.7 Ethernet binding (bit-exact host-locked) */
@@ -1150,9 +1151,44 @@ static ShellTransport *wrapUsb(harp_io *io) { return io ? new UsbTransport(io) :
  * "host:port" (empty if none, or where dns_sd is unavailable — then the shell just keeps
  * supervising for a USB device). A short, bounded browse; the supervisor retries ~1 s, so it
  * re-browses each cycle (this is how a network synth hot-plugs in). Opt out with HARP_NO_MDNS=1. */
+#ifdef HARP_SHELL_ENGINE_FILTER
+/* A product built with HARP_SHELL_ENGINE_FILTER binds ONLY a network device whose
+ * §12 engine id matches — so it skips the other HARP devices on the bus without the
+ * user picking. mDNS resolves host:port but not the engine, so briefly hello each
+ * candidate and read its engine id: cheap (a few LAN devices), stateless (store=NULL). */
+static bool ethEngineIs(const char *hostport, const char *want) {
+    harp_sockhandle s = harp_sock_dial(hostport);
+    if (s == HARP_SOCK_INVALID) return false;
+    harp_sock_io t;
+    harp_sock_io_init(&t, s);
+    harp_link link;
+    harp_link_init(&link);
+    harp_client c;
+    harp_client_init(&c, &t.io, &link, nullptr, nullptr, nullptr);
+    harp_client_identity id;
+    bool ok = harp_client_hello(&c, "harp-shell (engine probe)", &id) == 0 &&
+              strcmp(id.engine_id, want) == 0;
+    harp_client_free(&c);
+    harp_link_free(&link);
+    harp_sock_close(s);
+    return ok;
+}
+#endif
+
 static std::string discoverEthDevice() {
     if (const char *no = getenv("HARP_NO_MDNS"))
         if (no[0] && no[0] != '0') return std::string();
+#ifdef HARP_SHELL_ENGINE_FILTER
+    /* browse ALL `_harp._tcp`, keep the first that reports the wanted engine */
+    harp_mdns_instance inst[16];
+    int n = harp_mdns_discover(1200, inst, sizeof inst / sizeof inst[0]);
+    for (int i = 0; i < n; i++) {
+        char hp[300];
+        snprintf(hp, sizeof hp, "%s:%u", inst[i].host, (unsigned)inst[i].port);
+        if (ethEngineIs(hp, HARP_SHELL_ENGINE_FILTER)) return std::string(hp);
+    }
+    return std::string();
+#else
     harp_mdns_instance inst;
     if (harp_mdns_discover(1200, &inst, 1) >= 1) {
         char hp[300];
@@ -1160,6 +1196,7 @@ static std::string discoverEthDevice() {
         return std::string(hp);
     }
     return std::string();
+#endif
 }
 
 /* §8.3-over-§8.7 mid-stream live<->offline toggle. The shell calls this from its
@@ -1241,6 +1278,7 @@ ShellTransport *HarpRuntime::selectDevice() {
         return wrapUsb(harp_usb_open_match_ctx(usbCtx_, boundSerial_.c_str(), false, 0, 0));
     }
 
+#ifndef HARP_SHELL_ETHERNET_ONLY /* a network-only product never claims a USB unit */
     /* first bind: what does the loaded project want? */
     std::string wantSerial;
     bool wantModel = false;
@@ -1287,6 +1325,7 @@ ShellTransport *HarpRuntime::selectDevice() {
      * records it on first save. */
     if (harp_io *io = harp_usb_open_match_ctx(usbCtx_, nullptr, false, 0, 0))
         return wrapUsb(io);
+#endif /* !HARP_SHELL_ETHERNET_ONLY */
     /* §6.1/§4.4.3: nothing on USB and no explicit HARP_ETH_DEVICE — browse the segment for a
      * network synth advertising `_harp._tcp` and dial the first one found. Keeps the shell's
      * device list "USB + network" without the DAW having to know an address. The synchronous
@@ -1750,7 +1789,8 @@ void HarpRuntime::stop() {
  * producer on the owner's ring, breaking the SPSC invariant the whole merge
  * rests on. A 17th part legitimately contributes nothing to a 16-part device,
  * so the event is simply dropped (logged once via dormantSrcLogged_). */
-void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t ts) {
+void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t ts,
+                                uint8_t channel) {
     if (!src) return noteDormant();
     if (readOnlyDefault_.load(std::memory_order_relaxed) || roExplicit_.load(std::memory_order_relaxed)) {
         /* §12.2/§11.4: read-only hold — a live param edit MUST NOT reach a mismatched-engine
@@ -1759,13 +1799,18 @@ void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t
         roWrDrops_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    if (src->ring.push({0, id, v, ts, 0}))
+    /* M2 per-event part: an explicit channel (a satellite's MIDI channel N) targets part N;
+     * the default resolves to the source's own channel (byte-identical for every prior caller). */
+    uint8_t ch = (channel == kChanFromSource)
+                     ? (uint8_t)(src->chan.load(std::memory_order_relaxed) & 0xf)
+                     : (uint8_t)(channel & 0xf);
+    if (src->ring.push({0, id, v, ts, 0, ch}))
         evtQueuedSeq_.fetch_add(1, std::memory_order_release);
     else
         evDrops_.fetch_add(1, std::memory_order_relaxed);
 }
 void HarpRuntime::queueRamp(EventSource *src, uint32_t id, float target, uint64_t start,
-                            uint64_t end) {
+                            uint64_t end, uint8_t channel) {
     if (!src) return noteDormant();
     if (readOnlyDefault_.load(std::memory_order_relaxed) || roExplicit_.load(std::memory_order_relaxed)) {
         /* §12.2/§11.4: read-only hold — drop the automation write so it can't reach the
@@ -1773,7 +1818,10 @@ void HarpRuntime::queueRamp(EventSource *src, uint32_t id, float target, uint64_
         roWrDrops_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    if (src->ring.push({1, id, target, start, end}))
+    uint8_t ch = (channel == kChanFromSource)
+                     ? (uint8_t)(src->chan.load(std::memory_order_relaxed) & 0xf)
+                     : (uint8_t)(channel & 0xf);
+    if (src->ring.push({1, id, target, start, end, ch}))
         evtQueuedSeq_.fetch_add(1, std::memory_order_release);
     else
         evDrops_.fetch_add(1, std::memory_order_relaxed);
@@ -1798,8 +1846,12 @@ void HarpRuntime::queueMod(EventSource *src, uint32_t id, float offset,
     if (!src) return noteDormant();
     /* kind 4 = mod; the §9.5 voice key rides in `end` (it is a packed uint, not
      * a timestamp). A dropped mod is benign — it leaves the base value as-is, no
-     * stuck state — so unlike a note we do not escalate to panic on overflow. */
-    if (src->ring.push({4, id, offset, ts, voice}))
+     * stuck state — so unlike a note we do not escalate to panic on overflow.
+     * M2: carry the source's channel as the part FALLBACK — a per-voice mod still
+     * derives its part from the voice key (encodeModEvent), a part-wide mod (voice 0)
+     * uses this channel, byte-identical to the prior src.chan path. */
+    uint8_t ch = (uint8_t)(src->chan.load(std::memory_order_relaxed) & 0xf);
+    if (src->ring.push({4, id, offset, ts, voice, ch}))
         evtQueuedSeq_.fetch_add(1, std::memory_order_release);
     else
         evDrops_.fetch_add(1, std::memory_order_relaxed);
@@ -2124,8 +2176,17 @@ void HarpRuntime::syncSinkEpoch(AudioSink &sink) {
     uint32_t ep = sink.epoch.load(std::memory_order_acquire);
     if (ep != sink.epochSeen) {
         sink.epochSeen = ep;
-        sink.padDebt = 0;
-        sink.ring.clear();
+        /* Only drop the ring when there is BOGUS padding to clear. The epoch bump
+         * (computeUnionSlotsLocked, every sink) signals "this sink's slots joined the
+         * union". For a LATE-attached sink that padded silence first, padDebt > 0 and the
+         * ring holds stale silence — drop both (the B3 fix). But a MULTI-OUT sink registered
+         * BEFORE audio.start has padDebt == 0 and a ring of VALID prefill from the initial
+         * union; clearing it would discard real audio and (with 2+ sinks) cascade into a
+         * perpetual underrun — the offline/USB multi-out hang. So clear only when padDebt>0. */
+        if (sink.padDebt > 0) {
+            sink.padDebt = 0;
+            sink.ring.clear();
+        }
     }
 }
 
@@ -2408,7 +2469,14 @@ void HarpRuntime::feeder() {
          * pending, so the device's response writes land instantly and its pacing
          * turnaround is just render time. */
         if (!freeRunning_) {
-        size_t ringFrames = audioRing_.readAvailable() / 2;
+        /* MULTI-OUT: pace to keep the SLOWEST consumer fed — the main-mix ring OR any
+         * per-part sink. A wide-union multi-out main demuxes every paced frame into both
+         * audioRing_ and the 16 sinks; gating on audioRing_ ALONE let the feeder stop once
+         * the main mix hit target while a per-part sink was still below it, so that bus's
+         * blocking pull stalled (offline/USB multi-out hung). minRingFillFrames() is the min
+         * across main + all sinks — exactly what the free-running reader's drain gate uses.
+         * With no sinks it == audioRing_ fill, so the single-out path is byte-identical. */
+        size_t ringFrames = minRingFillFrames();
         uint64_t inFlight = framesSent_ - framesRecv_;
         /* The frontier cap is event-timing law, not flow control: event
          * timestamps carry target + one-pacing-block of headroom, so the
@@ -2525,24 +2593,26 @@ void HarpRuntime::feeder() {
  * Transport (kind 3) is global and only ever lives on the owner source. */
 int HarpRuntime::drainSource(EventSource &src, harp_cbuf &batch, harp_cbuf &msgbuf,
                              int budget) {
-    uint8_t chan = src.chan.load(std::memory_order_relaxed);
+    /* M2: the target part (§9.4 key 5) is PER EVENT — te.channel, resolved at queue time
+     * from the caller's explicit channel (a satellite's MIDI channel N) or this source's own
+     * channel. So one main instance drives every part; an attached single-channel source is
+     * byte-identical (its events all carry src.chan). Notes carry their channel in the UMP word. */
+    (void)src; /* channel now travels in each TimedEv, not read from the source here */
     TimedEv te;
     int sent = 0;
     for (; sent < budget && src.ring.pop(te); sent++) {
-        harp_cbuf_reset(&msgbuf);
-        if (te.kind == 0)
-            encodeParamEvent(&msgbuf, te.a, te.v, te.ts, chan);
+        harp_cbuf_reset(&msgbuf);        if (te.kind == 0)
+            encodeParamEvent(&msgbuf, te.a, te.v, te.ts, te.channel);
         else if (te.kind == 1)
-            encodeRampEvent(&msgbuf, te.a, te.v, te.ts, te.end, chan);
+            encodeRampEvent(&msgbuf, te.a, te.v, te.ts, te.end, te.channel);
         else if (te.kind == 3) {
             double ppq;
             memcpy(&ppq, &te.end, sizeof ppq);
             encodeTransportEvent(&msgbuf, te.a, te.v, ppq, te.ts);
         } else if (te.kind == 4)
             /* mod (§9.4): the voice key rides in `end`; a per-voice mod takes its
-             * part from the voice key, a part-wide mod (voice 0) from this source's
-             * channel — so a zone-wide MPE master bend reaches this part, not 0. */
-            encodeModEvent(&msgbuf, te.a, te.v, te.ts, (uint32_t)te.end, chan);
+             * part from the voice key, a part-wide mod (voice 0) from te.channel. */
+            encodeModEvent(&msgbuf, te.a, te.v, te.ts, (uint32_t)te.end, te.channel);
         else
             encodeUmpEvent(&msgbuf, te.a, te.ts);
         harp_frame_hdr h = {HARP_FRAME_FVER, HARP_STREAM_EVT, HARP_FLAG_FIN,

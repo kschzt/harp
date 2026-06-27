@@ -30,6 +30,7 @@
 #include "note_voice_map.h"
 #include "runtime.h"
 #include "runtime_registry.h"
+#include "shell_config.h" /* per-product identity/params/device-filter (default = refdev) */
 #include "shell_constants.h"
 #include "ump.h"
 
@@ -42,33 +43,38 @@ static_assert(HARP_MPE_MOD_TIMBRE == 3u, "MPE timbre must be Filter Cutoff (para
 using namespace Steinberg;
 using namespace Steinberg::Vst;
 
-/* Frozen identity — see docs/vst3-shell-plan.md. NEVER change. */
-static const FUID kHarpProcessorUID(0xB520EC1F, 0x856F4A80, 0xA09D6455, 0x12430ACB);
-static const FUID kHarpControllerUID(0x3AF7D698, 0x0DB04F6E, 0x8F107EEF, 0x7480467A);
+/* Frozen identity — see docs/vst3-shell-plan.md. NEVER change. Values come from
+ * shell_config.h (default = these refdev UIDs; a downstream product overrides). */
+static const FUID kHarpProcessorUID(HARP_SHELL_PROC_FUID);
+static const FUID kHarpControllerUID(HARP_SHELL_CTRL_FUID);
 
-/* Mirrors the refdev's parameter set; replaced by evt.params descriptors
- * once the event plane lands. */
+/* The device parameter set (shell_config.h HARP_SHELL_PARAMS; default = refdev).
+ * `labels` is nullptr for a plain param, or a "A|B|C" pipe-delimited enum for a
+ * named picker (registered as a StringListParameter when HARP_SHELL_LABELED_PARAMS
+ * is defined). Replaced by evt.params descriptors once the event plane lands. */
 struct DevParam {
     uint32_t id;
     const char *name;
     int32 stepCount;   /* 0 = continuous (VST3: stepCount = steps - 1) */
     double defaultVal; /* must mirror the device defaults (recall sanity) */
+    const char *labels; /* nullptr, or "A|B|C" enum labels (stepCount+1 of them) */
 };
-/* Device ids are CONTIGUOUS 1..12 (engine 2.1.0): the drone's old id 7 ("Drone
- * Mix", briefly mis-shipped here as a phantom "FX Send") is gone and the set was
- * renumbered with no hole, so the id<->index map below (id == array index + 1)
- * holds exactly — see process()'s inputParameterChanges path. */
-static const DevParam kParams[] = {
-    {1, "Osc Pitch", 0, 0.5},    {2, "Osc Shape", 0, 0.5},
-    {3, "Filter Cutoff", 0, 0.5}, {4, "Filter Reso", 0, 0.5},
-    {5, "Env Attack", 0, 0.5},   {6, "Env Release", 0, 0.5},
-    {7, "Master Level", 0, 0.5}, /* was id 8 (the phantom FX Send at id 7 is gone) */
-    /* the arp (device params 8-11, renumbered from 9-12; param-map-hash moved) */
-    {8, "Arp Mode", 4, 0.0},     {9, "Arp Division", 5, 0.6},
-    {10, "Arp Gate", 0, 0.5},    {11, "Arp Octaves", 3, 0.0},
-    {12, "Glide", 0, 0.0}, /* was id 13; 0 = off, portamento is opt-in now */
-};
+/* The refdev default set lives in shell_config.h's HARP_SHELL_PARAMS (a downstream
+ * product overrides it). It MUST mirror the device's contiguous 1..12 ids (engine
+ * 2.1.0: the drone's old id 7 / phantom "FX Send" is gone, the set renumbered with
+ * no hole) so id == array index + 1 holds — see process()'s inputParameterChanges. */
+static const DevParam kParams[] = { HARP_SHELL_PARAMS };
 static constexpr int kNumParams = sizeof(kParams) / sizeof(kParams[0]);
+#ifdef HARP_SHELL_ENGINE_TABLES
+/* Per-engine slot labels (a product that defines HARP_SHELL_ENGINE_TABLES): row e =
+ * engine e's titles, column k = the title for param id (k+1); "—" hides the slot. The
+ * controller re-titles ids 2..kNumParams from this when the Engine param changes, so
+ * the UI shows the selected engine's REAL controls. Mirrors the device's per-engine
+ * param map; harp ships none — the refdev keeps its single static name set. */
+static const char *const kEngineTables[][kNumParams] = { HARP_SHELL_ENGINE_TABLES };
+static constexpr int kNumEngineTables = (int)(sizeof(kEngineTables) / sizeof(kEngineTables[0]));
+static inline bool engSlotHidden(const char *s) { return s && strcmp(s, "—") == 0; }
+#endif
 /* HOST-SIDE routing parameter (NOT a device param): which multitimbral PART
  * (§9.4 channel 0..15) this plugin instance owns. Stepped+automatable so a DAW
  * can show/persist it per-instance and several aliases each pick a distinct
@@ -134,12 +140,34 @@ public:
     tresult PLUGIN_API initialize(FUnknown *context) override {
         tresult r = AudioEffect::initialize(context);
         if (r != kResultOk) return r;
-        addAudioOutput(STR16("Stereo Out"), SpeakerArr::kStereo);
+        /* MULTI-OUT (M1): a Kontakt/Overbridge-style multi-out instrument. Bus 0 is the
+         * summed MAIN MIX (kMain, default-active — the byte-identical single-output path);
+         * buses 1..16 are the per-part stereo pairs (kAux, NOT default-active, so a host
+         * lights up only the parts it routes). process() writes bus 0 from the main-mix
+         * ring and each active part bus from its demux sink. */
+        addAudioOutput(STR16("Main Mix"), SpeakerArr::kStereo);
+        for (int k = 0; k < kNumParts; k++) {
+            char ascii[16];
+            snprintf(ascii, sizeof ascii, "Part %d", k + 1);
+            String128 nm;
+            UString(nm, 128).fromAscii(ascii);
+            addAudioOutput(nm, SpeakerArr::kStereo, kAux, 0); /* aux, activatable on demand */
+        }
         /* Live refuses Instrument-category plugins without an event input
          * ("no valid event input bus"). Notes are ignored until §9.10 UMP
          * carriage lands — but the bus must exist. */
         addEventInput(STR16("MIDI In"), 16);
         return kResultOk;
+    }
+
+    tresult PLUGIN_API activateBus(MediaType type, BusDirection dir, int32 index,
+                                   TBool state) override {
+        /* MULTI-OUT (M1): track which per-part output bus the host routes (buses 1..16);
+         * registerActivePartSinks (at setActive, before start) registers a demux sink for
+         * each active one, so only routed parts stream. Bus 0 (main mix) is always present. */
+        if (type == kAudio && dir == kOutput && index >= 1 && index <= kNumParts)
+            partBusActive_[index - 1] = (state != 0);
+        return AudioEffect::activateBus(type, dir, index, state);
     }
 
     tresult PLUGIN_API setupProcessing(ProcessSetup &setup) override {
@@ -203,6 +231,14 @@ public:
                 runtime()->setOffline(offline_);
                 if (!pendingState_.empty())
                     runtime()->setStateBundle(pendingState_.data(), pendingState_.size());
+                /* MULTI-OUT (M1): per-part sinks are registered per ACTIVATED output bus
+                 * (registerActivePartSinks, driven by the host's activateBus) BEFORE start()
+                 * — so a host that routes only the main mix keeps the 2-slot union (golden
+                 * byte-identical) and a host routing N parts streams 2+2N slots. Registering
+                 * all 16 unconditionally is wrong: it forces a 34-channel union even for the
+                 * main-mix-only case, and a 34-ch free-running RTP frame (256·34·4 = 34 KB)
+                 * exceeds the datagram size. Activatable = only routed parts stream. */
+                registerActivePartSinks();
                 runtime()->start(rate_);
                 source_ = runtime()->ownerSource();
                 /* P6: pin the owner source to THIS instance's part. start() seeds
@@ -555,6 +591,15 @@ public:
                         }
                         continue;
                     }
+                    if (isPerChanParamId(id)) {
+                        /* M2 PER-CHANNEL PARAM: a satellite track's MIDI CC on channel N, host-
+                         * mapped via IMidiMapping (getMidiControllerAssignment) to this synthetic
+                         * id. Decode (channel, device param) and queue a param-set with §9.4 key 5
+                         * = channel, so ONE main instance drives every part's params. Immediate
+                         * set (CC is stepped at block boundaries; no per-(channel,param) ramp). */                        rt.queueParamSet(source_, perChanParamDevId(id), (float)v, ts,
+                                         perChanParamChannel(id));
+                        continue;
+                    }
                     if (idx == SIZE_MAX) {
                         rt.queueParamSet(source_, id, (float)v, ts);
                         continue;
@@ -594,47 +639,65 @@ public:
          *     no SPSC invariant is touched. It still must NOT drain the echo ring
          *     (owner-only). */
         if (!isOwner && !sink_) return processSilence(data);
+        if (data.numSamples <= 0) return kResultOk;
 
-        if (data.numOutputs < 1 || data.numSamples <= 0 ||
-            data.outputs[0].numChannels < 1 || !data.outputs[0].channelBuffers32)
-            return kResultOk;
-        int32 nch = data.outputs[0].numChannels;
-        float *L = data.outputs[0].channelBuffers32[0];
-        float *R = nch > 1 ? data.outputs[0].channelBuffers32[1] : nullptr;
-        if (!L) return kResultOk;
-
-        /* pull interleaved from the relevant ring; deinterleave into bus channels
-         * (mono hosts get L+R summed). The OWNER pulls the main-mix ring (the
-         * no-sink pullAudio — byte-identical); an opted-in attached instance
-         * pulls its demuxed per-part sink. */
+        /* MULTI-OUT (M1) audio write. renderBus pulls `data.numSamples` frames for ONE
+         * source — the main-mix ring (mainMix=true, the byte-identical no-sink path) or a
+         * per-part demux sink — and deinterleaves into output bus `busIdx` if the host gave
+         * it a valid buffer; a mono bus gets L+R summed. It ALWAYS consumes the ring (the
+         * reader is the sole producer of every registered sink, so an inactive bus must still
+         * be drained or its ring overflows). RT-safe: stack `tmp`, no allocation, no lock. */
         float tmp[4096 * 2];
-        int32 remaining = data.numSamples;
-        int32 written = 0;
-        while (remaining > 0) {
-            int32 chunk = remaining > 4096 ? 4096 : remaining;
-            if (isOwner) {
-                if (offline_) /* offline bounce: waiting for the wire is correct */
-                    rt.pullAudioBlocking(tmp, (size_t)chunk, 1000);
-                else
-                    rt.pullAudio(tmp, (size_t)chunk); /* RT: silence on underrun */
-            } else {
-                if (offline_)
-                    rt.pullAudioBlocking(sink_, tmp, (size_t)chunk, 1000);
-                else
-                    rt.pullAudio(sink_, tmp, (size_t)chunk);
+        auto renderBus = [&](int32 busIdx, AudioSink *sk, bool mainMix) {
+            float *L = nullptr, *R = nullptr;
+            bool haveBus = busIdx < (int32)data.numOutputs &&
+                           data.outputs[busIdx].numChannels >= 1 &&
+                           data.outputs[busIdx].channelBuffers32 &&
+                           data.outputs[busIdx].channelBuffers32[0];
+            if (haveBus) {
+                L = data.outputs[busIdx].channelBuffers32[0];
+                R = data.outputs[busIdx].numChannels > 1
+                        ? data.outputs[busIdx].channelBuffers32[1]
+                        : nullptr;
             }
-            for (int32 s = 0; s < chunk; s++) {
-                if (R) {
-                    L[written + s] = tmp[2 * s];
-                    R[written + s] = tmp[2 * s + 1];
+            int32 remaining = data.numSamples, written = 0;
+            while (remaining > 0) {
+                int32 chunk = remaining > 4096 ? 4096 : remaining;
+                if (mainMix) {
+                    if (offline_) /* offline bounce: waiting for the wire is correct */
+                        rt.pullAudioBlocking(tmp, (size_t)chunk, 1000);
+                    else
+                        rt.pullAudio(tmp, (size_t)chunk); /* RT: silence on underrun */
                 } else {
-                    L[written + s] = 0.5f * (tmp[2 * s] + tmp[2 * s + 1]);
+                    if (offline_)
+                        rt.pullAudioBlocking(sk, tmp, (size_t)chunk, 1000);
+                    else
+                        rt.pullAudio(sk, tmp, (size_t)chunk);
                 }
+                if (L)
+                    for (int32 s = 0; s < chunk; s++) {
+                        if (R) {
+                            L[written + s] = tmp[2 * s];
+                            R[written + s] = tmp[2 * s + 1];
+                        } else {
+                            L[written + s] = 0.5f * (tmp[2 * s] + tmp[2 * s + 1]);
+                        }
+                    }
+                written += chunk;
+                remaining -= chunk;
             }
-            written += chunk;
-            remaining -= chunk;
-        }
-        data.outputs[0].silenceFlags = 0;
+            if (haveBus) data.outputs[busIdx].silenceFlags = 0;
+        };
+
+        /* Bus 0: the OWNER's summed main mix (no-sink ring, byte-identical to the shipped
+         * single-output path); an attached instance still renders ITS part into bus 0. */
+        renderBus(0, isOwner ? nullptr : sink_, isOwner);
+        /* Buses 1..16: the owner's per-part demux. Drain EVERY registered sink each block
+         * (the reader produces into all 16 rings whether or not their bus is routed), write
+         * the active part buses, discard the rest — no overflow, no bleed between parts. */
+        if (isOwner)
+            for (int k = 0; k < kNumParts; k++)
+                if (partSinks_[k]) renderBus(k + 1, partSinks_[k], false);
 
         /* device front-panel echoes (§9.4) -> output parameter changes: OWNER
          * ONLY (the echo ring is single-consumer). An attached per-part instance
@@ -764,6 +827,29 @@ private:
      * when the sink table is full — process() then pulls main mix (owner) or
      * silence (attached), exactly as P5. */
     AudioSink *sink_ = nullptr;
+    /* MULTI-OUT (M1): the OWNER/main instance is a Kontakt/Overbridge-style multi-out
+     * synth — it exposes 17 stereo buses (bus 0 = main mix, buses 1..16 = the per-part
+     * pairs) and owns the whole device. partSinks_[k] is the demux sink for part k's
+     * stereo pair (device slots {2+2k, 3+2k}); registered BEFORE start() so all 16 enter
+     * the fixed audio.start union (no mid-session re-neg, no late-attach silence race).
+     * Every block we DRAIN all 16 (the reader is the sole producer) and write the active
+     * output buses; an inactive bus is drained-and-discarded so its ring can't overflow. */
+    static constexpr int kNumParts = 16;
+    AudioSink *partSinks_[kNumParts] = {nullptr};
+    /* Which per-part output bus the host has routed (activateBus). A bus is registered
+     * as a demux sink only when active, so a main-mix-only host keeps the 2-slot union
+     * (golden byte-identical) — the activatable Kontakt/Overbridge model. */
+    bool partBusActive_[kNumParts] = {false};
+    /* Register a demux sink for each ACTIVE per-part bus that doesn't have one yet (owner
+     * only). Called before start() so the slots enter the fixed audio.start union. */
+    void registerActivePartSinks() {
+        if (!owner() || !runtime()) return;
+        for (int k = 0; k < kNumParts; k++)
+            if (partBusActive_[k] && !partSinks_[k]) {
+                std::vector<uint32_t> slots = {2u + 2u * (uint32_t)k, 3u + 2u * (uint32_t)k};
+                partSinks_[k] = runtime()->registerAudioSink(slots);
+            }
+    }
     /* Drop our event source. For an ATTACHED instance this removes + frees the
      * source we registered (after which the owner's eventPump never touches it);
      * for an owner / unacquired instance it is a no-op (the owner source belongs
@@ -774,6 +860,12 @@ private:
          * never demuxes into it / touches a freed ring), before the source and
          * before runtime_release. No-op when we never registered one (the
          * default audio-silent attached path / owner). */
+        /* MULTI-OUT (M1): drop the owner's 16 per-part sinks too (after which the reader
+         * never demuxes into a freed ring), before the source and runtime_release. */
+        for (int k = 0; k < kNumParts; k++) {
+            if (partSinks_[k] && runtime()) runtime()->unregisterAudioSink(partSinks_[k]);
+            partSinks_[k] = nullptr;
+        }
         if (sink_ && runtime()) runtime()->unregisterAudioSink(sink_);
         sink_ = nullptr;
         if (source_ && runtime()) runtime()->unregisterSource(source_);
@@ -865,6 +957,25 @@ public:
         tresult r = EditController::initialize(context);
         if (r != kResultOk) return r;
         for (auto &p : kParams) {
+#ifdef HARP_SHELL_LABELED_PARAMS
+            if (p.labels) { /* a NAMED picker: register the enum labels so the DAW shows them */
+                auto *sl = new Steinberg::Vst::StringListParameter(UString256(p.name), p.id);
+                const char *s = p.labels;
+                while (*s) {
+                    const char *e = strchr(s, '|');
+                    size_t len = e ? (size_t)(e - s) : strlen(s);
+                    char buf[64];
+                    if (len >= sizeof buf) len = sizeof buf - 1;
+                    memcpy(buf, s, len);
+                    buf[len] = 0;
+                    sl->appendString(UString256(buf));
+                    if (!e) break;
+                    s = e + 1;
+                }
+                parameters.addParameter(sl);
+                continue;
+            }
+#endif
             UString256 title(p.name);
             parameters.addParameter(title, nullptr, p.stepCount, p.defaultVal,
                                     ParameterInfo::kCanAutomate, p.id);
@@ -937,6 +1048,13 @@ public:
         if (cc == kPitchBend) { id = mpeMidiId((uint32_t)channel, kMpeAxisBend); return kResultTrue; }
         if (cc == kAfterTouch) { id = mpeMidiId((uint32_t)channel, kMpeAxisPressure); return kResultTrue; }
         if (cc == 74) { id = mpeMidiId((uint32_t)channel, kMpeAxisTimbre); return kResultTrue; }
+        /* M2 PER-CHANNEL DEVICE PARAMS: GP CC kPerChanCcBase+i on channel N -> part N's device
+         * param (i+1). A satellite MIDI track routes its CC to the main on its channel; the
+         * processor decodes the synthetic id and queues a param-set with §9.4 key 5 = N. */
+        if (cc >= (CtrlNumber)kPerChanCcBase && cc < (CtrlNumber)(kPerChanCcBase + kNumParams)) {
+            id = perChanParamId((uint32_t)channel, (uint32_t)(cc - (CtrlNumber)kPerChanCcBase) + 1u);
+            return kResultTrue;
+        }
         return kResultFalse;
     }
 
@@ -987,11 +1105,51 @@ public:
                 setParamNormalized(kv.first, kv.second);
         return kResultOk;
     }
+#ifdef HARP_SHELL_ENGINE_TABLES
+    /* PER-ENGINE PARAM RELABEL. The device's param NAMES change with the selected
+     * engine (slot IDs stay fixed, so automation/recall survive). The controller tracks
+     * the Engine param and re-titles ids 2..kNumParams from kEngineTables[engine]; on a
+     * change it asks the host to re-read titles. The engine index uses the device's
+     * (int)(v*N) select so the shown labels match the rendered engine. */
+    int currentEngine_ = 0;
+    static int engineIndexFor(double norm) {
+        int e = (int)(norm * kNumEngineTables);
+        return e < 0 ? 0 : (e >= kNumEngineTables ? kNumEngineTables - 1 : e);
+    }
+    tresult PLUGIN_API setParamNormalized(ParamID id, ParamValue value) override {
+        tresult r = EditController::setParamNormalized(id, value);
+        if (id == (ParamID)(HARP_SHELL_ENGINE_PARAM_ID)) {
+            int e = engineIndexFor(value);
+            if (e != currentEngine_) {
+                currentEngine_ = e;
+                if (componentHandler)
+                    componentHandler->restartComponent(Steinberg::Vst::kParamTitlesChanged);
+            }
+        }
+        return r;
+    }
+    tresult PLUGIN_API getParameterInfo(int32 paramIndex, ParameterInfo &info) override {
+        tresult r = EditController::getParameterInfo(paramIndex, info);
+        if (r != kResultOk) return r;
+        if (info.id >= 2 && info.id <= (ParamID)kNumParams && currentEngine_ < kNumEngineTables) {
+            const char *t = kEngineTables[currentEngine_][info.id - 1];
+            if (t) {
+                /* Always relabel + keep the slot VISIBLE. Dynamically toggling kIsHidden on an
+                 * engine switch makes hosts (Live) leave a "phantom"/removed-param ghost in the
+                 * automation lane (the more->fewer-params case). A fixed-size bank that only ever
+                 * RELABELS avoids that; an unused slot just shows its "—" name instead of vanishing. */
+                UString(info.title, 128).fromAscii(t);
+                info.flags &= ~ParameterInfo::kIsHidden;
+            }
+        }
+        return r;
+    }
+#endif
 };
 
 /* ---------------- factory ---------------- */
 
-#define stringPluginName "HARP RefDev"
+#define stringPluginName HARP_SHELL_PLUGIN_NAME
 
 BEGIN_FACTORY_DEF("HARP Project", "https://github.com/kschzt/harp",
                   "mailto:harp@example.invalid")

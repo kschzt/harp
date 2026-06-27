@@ -17,6 +17,20 @@
 
 #define HARP_RTP_HDR_BYTES 12
 
+/* §8.7 wide-union multi-packet audio. A free-running RTP frame carrying more than
+ * HARP_RTP_MAX_GROUP_SLOTS output slots would exceed the OS max UDP datagram (macOS
+ * net.inet.udp.maxdgram = 9216 ≈ 8 slots × 256 samples × 4 B), so the device can't send
+ * it. Such a frame is SPLIT into <=HARP_RTP_MAX_GROUP_SLOTS-slot groups, each sent as a
+ * pt=HARP_RTP_PT_GROUP packet whose payload is a 4-byte sub-header
+ * [slot_off:u8, n_slots:u8, total_slots:u8, flags:u8] then ns×n_slots interleaved floats.
+ * All groups of one frame share the RTP timestamp; the host reassembles by timestamp. A
+ * <=8-slot union stays ONE pt=HARP_RTP_PT_AUDIO packet (no sub-header) — byte-identical to
+ * the pre-multipacket wire, so every existing 2-/4-slot test path is untouched. */
+#define HARP_RTP_PT_AUDIO 96        /* single-packet frame (payload = raw slot-interleaved floats) */
+#define HARP_RTP_PT_GROUP 97        /* multi-packet group (payload = 4-B sub-header + floats) */
+#define HARP_RTP_MAX_GROUP_SLOTS 8  /* 8 slots × 256 samples × 4 B = 8192 < 9216 maxdgram */
+#define HARP_RTP_GROUP_HDR_BYTES 4  /* [slot_off, n_slots, total_slots, flags] */
+
 typedef struct {
     uint8_t  pt;          /* payload type (7 bits)        */
     uint8_t  marker;      /* marker bit                   */
