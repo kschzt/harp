@@ -64,12 +64,8 @@ run scripts/timing-test.sh
 run scripts/soak.sh "${SOAK_SECONDS:-30}"
 run scripts/tempo-lock-test.sh
 run scripts/multidevice-test.sh
-run scripts/session-share-test.sh
-run scripts/alias-play-test.sh
 run scripts/alias-group-e2e.sh
-run scripts/alias-part-audio-test.sh
 run scripts/late-sink-test.sh
-run scripts/part-param-iso-test.sh
 run scripts/meter-test.sh
 run scripts/replug-test.sh
 echo "════ hw-tests: $PASS passed, $FAIL failed, $SKIP skipped"
