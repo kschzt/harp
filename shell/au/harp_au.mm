@@ -25,19 +25,10 @@
 #include <new>
 #include <vector>
 
-#include "mpe_zone.h"
 #include "runtime.h"
 #include "runtime_registry.h"
 #include "shell_constants.h"
 #include "ump.h"
-
-/* mpe_zone.h carries its own copies of the §9.5 expression mod-target ids (so it
- * stays self-contained); pin them to the shared shell constants here, exactly as
- * the meter ids are pinned against device.h. A drift is a compile error, not a
- * silently mis-routed MPE axis. (Timbre = Filter Cutoff, device param id 3.) */
-static_assert(HARP_MPE_MOD_PITCH_BEND == kHarpModPitchBend, "MPE pitch-bend id drift");
-static_assert(HARP_MPE_MOD_PRESSURE == kHarpModPressure, "MPE pressure id drift");
-static_assert(HARP_MPE_MOD_TIMBRE == 3u, "MPE timbre must be Filter Cutoff (param 3)");
 
 #include <string>
 
@@ -182,17 +173,6 @@ struct HarpAU {
      * (au_SetParameter). */
     uint8_t part = 0;
 
-    /* Classic-MPE zone collapse (shell/mpe_zone.h). Logic and Ableton Live send
-     * MPE to an AU as RAW 16-channel MIDI — one note per member channel plus
-     * that note's per-note pitch bend / channel pressure / CC74 timbre. The
-     * device takes the UMP channel as the multitimbral PART, so a member channel
-     * must NEVER become the part: this collapses the whole zone onto `part` and
-     * carries each per-note dimension as a §9.5 per-voice mod (the same wire the
-     * VST3 Note-Expression path uses). Engages on an MPE Configuration Message
-     * (auto-detect) — what both DAWs send when MPE is armed; INACTIVE until then,
-     * so a non-MPE session is byte-identical (notes keep their own channel). */
-    MpeZone mpe;
-
     /* Raw recall bundle staged by au_apply_classinfo (setState) BEFORE a runtime
      * exists — ClassInfo is restored on project-open, before AudioUnitInitialize.
      * The OWNER applies it via setStateBundle() right before start(), reproducing
@@ -258,7 +238,6 @@ struct HarpAU {
      * source (unacquired) = no-op. */
     void applyPart() {
         if (source) source->chan.store(part & 0xf, std::memory_order_relaxed);
-        mpe.setPart(part); /* the zone collapses every MPE note + mod onto this part */
     }
 
     /* Drop our audio sinks before the runtime is torn down (after which the reader
@@ -950,42 +929,24 @@ static OSStatus au_MIDIEvent(void *self, UInt32 status, UInt32 data1, UInt32 dat
     /* queue on THIS instance's source (P5): the owner's built-in source for an
      * owner, this instance's registered source for an attached one. */
     EventSource *src = au->source;
-    MpeZone &mpe = au->mpe;
-    /* The zone is the single funnel for raw MIDI. With NO active zone every note
-     * keeps its own channel (mpe.noteOn returns {chan,true}) and the expression
-     * paths return valid=false — byte-identical to the pre-MPE handler. When a
-     * zone is live (an MCM was seen) notes collapse onto the instance part and
-     * the per-note bend/pressure/CC74 ride as §9.5 per-voice mods on that note's
-     * voice key, exactly the wire the VST3/CLAP note-expression path emits. */
+    /* MIDI channel C -> device part C (§9.4 multitimbral): raw MIDI routes each
+     * note to its own channel's part directly. (The raw-16ch MPE zone-collapse is
+     * retired with the multi-out model; AU per-note expression went with it.
+     * Routing-by-channel is byte-identical to the old MPE-zone-inactive path.) */
     if (kind == 0x90 && data2 > 0) {
-        MpeNote r = mpe.noteOn(chan, (uint8_t)data1);
-        if (r.accepted) rt->queueNote(src, ump_note_on(data1, data2, r.part), ts);
+        rt->queueNote(src, ump_note_on(data1, data2, chan), ts);
     } else if (kind == 0x80 || (kind == 0x90 && data2 == 0)) {
-        MpeNote r = mpe.noteOff(chan, (uint8_t)data1);
-        if (r.accepted) rt->queueNote(src, ump_note_off(data1, r.part), ts);
-    } else if (kind == 0xE0) { /* pitch bend (X): data1 = 14-bit LSB, data2 = MSB */
-        uint16_t v14 = (uint16_t)((data1 & 0x7f) | ((data2 & 0x7f) << 7));
-        MpeMod m = mpe.pitchBend(chan, v14);
-        if (m.valid) rt->queueMod(src, HARP_MPE_MOD_PITCH_BEND, m.value, m.voiceKey, ts);
-    } else if (kind == 0xD0) { /* channel pressure (Z) -> per-voice loudness gain */
-        MpeMod m = mpe.channelPressure(chan, (uint8_t)data1);
-        if (m.valid) rt->queueMod(src, HARP_MPE_MOD_PRESSURE, m.value, m.voiceKey, ts);
+        rt->queueNote(src, ump_note_off(data1, chan), ts);
     } else if (kind == 0xB0) { /* control change */
         if (data1 >= kPerChanCcBase && data1 < kPerChanCcBase + kNumAuParams) {
             /* MULTI-OUT (M2/M4): a GP CC kPerChanCcBase+i on channel N edits part N's
              * device param (i+1) with §9.4 key 5 = N — so ONE main instance drives every
              * part's params (a satellite's MIDI CC on its channel). Raw MIDI carries the
-             * channel directly (no IMidiMapping roundtrip, like CLAP). Intercepted BEFORE
-             * the MPE timbre path so the per-part param range is never swallowed as CC. */
+             * channel directly (no IMidiMapping roundtrip, like CLAP). */
             rt->queueParamSet(src, (uint32_t)(data1 - kPerChanCcBase) + 1u,
                               (float)data2 / 127.0f, ts, chan);
         } else if (data1 == 120 || data1 == 123) {
             rt->queueNote(src, ump_all_notes_off(), 0); /* panic, now */
-            mpe.reset(); /* drop stale channel->voice bindings + RPN parse state */
-        } else { /* CC74 timbre (Y) -> Filter Cutoff; CC 101/100/6/38 -> RPN/MCM
-                  * (parsed even when inactive so an incoming MCM auto-engages). */
-            MpeMod m = mpe.cc(chan, (uint8_t)data1, (uint8_t)data2);
-            if (m.valid) rt->queueMod(src, HARP_MPE_MOD_TIMBRE, m.value, m.voiceKey, ts);
         }
     }
     return noErr;
