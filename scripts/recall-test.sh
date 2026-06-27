@@ -36,8 +36,14 @@ arch_names > /tmp/harp-arch0.txt
 curl -s "http://$HOST:8080/api/knob?id=3&value=0.10" > /dev/null
 curl -s "http://$HOST:8080/api/knob?id=6&value=0.95" > /dev/null
 
-# 3. DAW reopen
-"$HOSTBIN" "$VST" --load-state /tmp/harp-recall.state --seconds 0.6 > /tmp/harp-recall.log 2>&1 \
+# 3. DAW reopen. The render MUST outlast the reconcile window: with HARP_RECONCILE_TIMEOUT_MS
+# above (1000 ms) the device holds divergent state, so pushStateLocked posts a panel offer and
+# POLLS up to that timeout before the no-pick Push fallback fires (runtime.cpp:2977-3001). The
+# reconcile runs async on the supervisor thread while this host renders; a 0.6 s render could
+# begin shutdown mid-poll, before the Push applied params 3/6 — a real race (lost ~2/3 on a
+# loaded rig, won otherwise). 2.0 s comfortably exceeds the 1.0 s poll + the archive-then-CAS
+# push + the device reflecting it, so the restore has always completed before step 4 reads it.
+"$HOSTBIN" "$VST" --load-state /tmp/harp-recall.state --seconds 2.0 > /tmp/harp-recall.log 2>&1 \
     || fail "load render"
 grep -q "restored\|SYNCED" /tmp/harp-recall.log || fail "no recall action logged"
 
