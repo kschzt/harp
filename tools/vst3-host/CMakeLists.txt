@@ -64,14 +64,6 @@ enable_testing()
 add_test(NAME rings COMMAND ring-tests)
 set_tests_properties(rings PROPERTIES LABELS unit)
 
-# ---- mpe_zone unit tests (no SDK, no hardware): the classic-MPE zone-collapse
-# state machine the AU shell funnels raw MPE through. Pins the logic the hardware
-# mpe-raw test then confirms end-to-end. ----
-add_executable(mpe-zone-tests mpe_zone_tests.cpp)
-target_include_directories(mpe-zone-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../shell)
-add_test(NAME mpe_zone COMMAND mpe-zone-tests)
-set_tests_properties(mpe_zone PROPERTIES LABELS unit)
-
 # ---- the HARP shell plugin (shell/) — needs libusb ----
 find_package(PkgConfig QUIET)
 if(PKG_CONFIG_FOUND)

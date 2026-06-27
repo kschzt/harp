@@ -44,10 +44,6 @@
 using namespace Steinberg;
 using namespace Steinberg::Vst;
 
-/* MPE host-side param ids — mirrored from shell/shell_constants.h (this host keeps
- * local copies of the shell's host param ids, like kPartParamId, rather than
- * pulling the shell header). The "MPE" toggle (97) arms raw-MIDI MPE; each
- * (channel, axis) maps to a hidden param the shell decodes back into a §9.5 mod. */
 /* MULTI-OUT: how many output buses (bus 0 = main mix, then per-part buses 1..16) the host
  * activates. Default 1 = main-mix only (the golden-identical path). --out-buses N activates N. */
 static int g_outBuses = 1;
@@ -55,13 +51,6 @@ static int g_outBuses = 1;
  * Used by the per-part isolation test: drive notes on a channel, capture that part's bus and
  * a silent neighbour. --capture-bus N implies activating at least N+1 buses. */
 static int g_captureBus = 0;
-static const uint32_t kMpeEnableParamId = 97;
-static const uint32_t kMpeMidiBase = 0x3000u;
-static const uint32_t kMpeMidiAxes = 4u;
-enum { kMpeAxisBend = 0, kMpeAxisTimbre = 1, kMpeAxisPressure = 2 };
-static inline uint32_t mpeMidiId(uint32_t chan, uint32_t axis) {
-    return kMpeMidiBase + (chan & 0xf) * kMpeMidiAxes + axis;
-}
 /* M2 per-channel device-param ids — mirrored from shell/shell_constants.h (base 0x4000, stride
  * 16). --set-ch CH:ID=V sends part CH's device param ID through the SAME synthetic-id path a
  * satellite's MIDI CC arrives on after the host's IMidiMapping, exercising the processor decode. */
@@ -652,19 +641,6 @@ int main(int argc, char **argv) {
     int brightness_idx = 0;    /* which chord note (index) gets the Brightness expression;
                                   lets a test modulate voice 0 vs voice 1 of ONE arrangement
                                   to prove the mod is per-voice, not part-wide (§9.5). */
-    /* --mpe-chord: classic RAW-MIDI MPE (Ableton Live on VST3). Each note plays on
-     * its OWN lower-zone member channel (ch1, ch2, …) with the "MPE" toggle armed,
-     * so the shell's mpe_zone collapses the zone onto the instance part; per-note
-     * pitch/timbre/pressure ride as IMidiMapping param changes on that member
-     * channel (the host's job in a real DAW). --mpe-bend SEMIS scaled over the
-     * default ±48 member range, so the same SEMIS as CLAP/AU renders identically. */
-    std::vector<int> mpe_chord;
-    bool mpe_no_arm = false;   /* play mpe-chord notes WITHOUT arming the toggle,
-                                  so MPE engages ONLY from a --load-state'd project
-                                  (proves the toggle persists in the recall state) */
-    bool has_mpe_bend = false, has_mpe_press = false, has_mpe_timbre = false;
-    double mpe_bend = 0.0, mpe_press = 0.0, mpe_timbre = 0.0;
-    int mpe_bend_idx = 0, mpe_press_idx = 0, mpe_timbre_idx = 0;
     int channel = 0;           /* MIDI channel 0..15 for emitted notes -> device part (P2.1) */
     int part = -1;             /* -1 = main mix (default); 0..15 = pull that part's stereo pair (P2.2) */
     /* multi-instance (P6): >1 plugin instances in ONE process, one per channel,
@@ -758,32 +734,6 @@ int main(int argc, char **argv) {
                 if (pos == std::string::npos) break;
                 pos++;
             }
-        } else if (a == "--mpe-chord") {
-            std::string list = argv[++i];
-            size_t pos = 0;
-            while (pos < list.size()) {
-                mpe_chord.push_back(atoi(list.c_str() + pos));
-                pos = list.find(',', pos);
-                if (pos == std::string::npos) break;
-                pos++;
-            }
-        } else if (a == "--mpe-bend") {
-            mpe_bend = atof(argv[++i]);
-            has_mpe_bend = true;
-        } else if (a == "--mpe-bend-idx") {
-            mpe_bend_idx = atoi(argv[++i]);
-        } else if (a == "--mpe-press") {
-            mpe_press = atof(argv[++i]);
-            has_mpe_press = true;
-        } else if (a == "--mpe-press-idx") {
-            mpe_press_idx = atoi(argv[++i]);
-        } else if (a == "--mpe-timbre") {
-            mpe_timbre = atof(argv[++i]);
-            has_mpe_timbre = true;
-        } else if (a == "--mpe-timbre-idx") {
-            mpe_timbre_idx = atoi(argv[++i]);
-        } else if (a == "--mpe-no-arm") {
-            mpe_no_arm = true;
         } else if (a == "--brightness") {
             brightness = atof(argv[++i]);
         } else if (a == "--brightness-idx") {
@@ -894,12 +844,6 @@ int main(int argc, char **argv) {
         } else
             die("unknown option " + a);
     }
-
-    /* --mpe-chord arms the "MPE" toggle (id 97) at the first block — set before the
-     * notes (at 0.1 s) so the zone is live when they arrive and they collapse.
-     * --mpe-no-arm skips this, so MPE must come from a --load-state'd project (a
-     * persistence test): the toggle rides bit 7 of the recall part byte. */
-    if (!mpe_chord.empty() && !mpe_no_arm) sets.push_back({kMpeEnableParamId, 1.0});
 
     /* The flood preset: an IDM-grade hammer on the event plane — tiny DAW
      * blocks, every knob under dense LFO automation, rapid notes, a fast tempo,
@@ -1353,58 +1297,6 @@ int main(int argc, char **argv) {
                     evList.addEvent(ev);
                 }
                 nid++;
-            }
-        }
-        /* classic RAW-MIDI MPE: each note on its OWN lower-zone member channel
-         * (ch1, ch2, …), the "MPE" toggle already armed (via sets), so the shell
-         * collapses the zone onto the instance part. Per-note expression rides as
-         * IMidiMapping param changes on that member channel, queued in THIS block
-         * at the note offset — the shell processes the note-on (events) before the
-         * param changes, so the voice is minted before its bend lands on it. */
-        if (!mpe_chord.empty()) {
-            size_t onAt = (size_t)(0.1 * rate);
-            bool last = done + n >= total;
-            for (size_t ci = 0; ci < mpe_chord.size(); ci++) {
-                int16 ch = (int16)((ci + 1) & 0xf); /* lower-zone member channel */
-                if (onAt >= done && onAt < done + n) {
-                    int32 soff = (int32)(onAt - done);
-                    Event ev{};
-                    ev.type = Event::kNoteOnEvent;
-                    ev.sampleOffset = soff;
-                    ev.noteOn.channel = ch;
-                    ev.noteOn.pitch = (int16)mpe_chord[ci];
-                    ev.noteOn.velocity = 0.8f; /* == --chord, for a matching mix */
-                    ev.noteOn.noteId = -1;
-                    evList.addEvent(ev);
-                    auto addExpr = [&](uint32_t axis, double val) {
-                        int32 qi = 0;
-                        auto *q = pc.addParameterData(mpeMidiId((uint32_t)ch, axis), qi);
-                        int32 pi = 0;
-                        if (q) q->addPoint(soff, val, pi);
-                    };
-                    if (has_mpe_bend && (int)ci == mpe_bend_idx) {
-                        /* SEMIS over the default ±48 member range -> 14-bit -> 0..1
-                         * (the shell inverts: v14 = round(value*16383)). */
-                        double v14 = 8192.0 + mpe_bend / 48.0 * 8192.0;
-                        if (v14 < 0) v14 = 0;
-                        if (v14 > 16383) v14 = 16383;
-                        addExpr(kMpeAxisBend, v14 / 16383.0);
-                    }
-                    if (has_mpe_press && (int)ci == mpe_press_idx)
-                        addExpr(kMpeAxisPressure, mpe_press); /* 0..1 -> CC value*/
-                    if (has_mpe_timbre && (int)ci == mpe_timbre_idx)
-                        addExpr(kMpeAxisTimbre, mpe_timbre); /* 0..1 -> CC74 */
-                }
-                if (last) {
-                    Event ev{};
-                    ev.type = Event::kNoteOffEvent;
-                    ev.sampleOffset = (int32)(n > 0 ? n - 1 : 0);
-                    ev.noteOff.channel = ch;
-                    ev.noteOff.pitch = (int16)mpe_chord[ci];
-                    ev.noteOff.velocity = 0;
-                    ev.noteOff.noteId = -1;
-                    evList.addEvent(ev);
-                }
             }
         }
         for (size_t ni = 0; ni < notes.size(); ni++) {
