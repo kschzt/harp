@@ -426,6 +426,13 @@ static bool pl_activate(const clap_plugin_t *p, double sample_rate, uint32_t /*m
      * HARP_DEVICE_SERIAL env, else the staged bundle's serial via setStateBundle
      * below, else auto-select). Drive it like the VST3/AU single-instance path:
      * configure -> stage project bundle -> start. */
+    /* Idempotent against a double activate without an intervening deactivate (a
+     * spec-violating host): tear down any runtime we already hold, dropping its
+     * sinks FIRST, so we never leak one — mirrors the VST3/FX shells. */
+    if (h->rt_) {
+        h->releaseSource();
+        h->rt_.reset();
+    }
     h->rt_ = runtime_acquire();
     if (!h->rt()) return false;
 
