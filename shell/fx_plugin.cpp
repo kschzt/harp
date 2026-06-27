@@ -120,28 +120,41 @@ public:
                 runtime_release(handle_);
                 handle_ = RuntimeHandle{};
             }
-            std::string wantSerial;
-            if (const char *e = getenv("HARP_DEVICE_SERIAL"); e && e[0])
-                wantSerial = e;
-            else if (!pendingState_.empty())
-                wantSerial = HarpRuntime::bundleWantedSerial(pendingState_.data(),
-                                                             pendingState_.size());
-            handle_ = runtime_acquire(wantSerial);
-            if (owner()) {
+            /* §8.8 OWNERSHIP — an FX insert is PER-TRACK: each instance must drive
+             * its OWN host-paced session THROUGH the device (H->D track audio in,
+             * D->H wet). It must NEVER attach as a registry NON-OWNER. A non-owner
+             * runs NONE of the session setup below — no setFxInputSlots, no start(),
+             * no source_ — so process() falls into its !source_ path and the track
+             * goes SILENT. That is exactly the Ableton failure: a transient scan
+             * instance grabs ownership of the shared-by-serial runtime first, the
+             * LIVE insert attaches owner=false, and its output is pure silence
+             * (the device reverberated nothing because no input ever reached it).
+             *
+             * So DECOUPLE the registry key from device targeting: ALWAYS acquire a
+             * FRESH, unshared, always-owner runtime (the empty-serial golden path in
+             * runtime_acquire). Nothing is lost — the device is single-claim, so a
+             * host-paced INPUT session was never shareable across inserts anyway.
+             *   - Device binding is UNAFFECTED: selectDevice() dials HARP_ETH_DEVICE
+             *     (or the USB serial), NOT the registry key.
+             *   - The §12.2 device-identity gate is PRESERVED: setStateBundle() below
+             *     records the bundle's wanted serial (wantSerial_) for the serial-
+             *     differs read-only hold, independent of the registry key. */
+            handle_ = runtime_acquire("");
+            if (owner()) { /* always true now — the guard is a defensive invariant */
                 runtime()->configure(rate_, maxBlock_);
                 runtime()->setOffline(offline_);
                 /* §8.8: arm the host->device EFFECT input BEFORE start(), so
                  * audio.start declares the in-slots (key 3) and the feeder carries
                  * the track audio in the H->D payload. The instrument shell never
-                 * calls this, so its wire stays byte-identical (the golden gate). */
+                 * calls this, so its wire stays byte-identical (the golden gate).
+                 * Arming also FORCES host-paced (wantHostPacedMode()), so an armed FX
+                 * is never free-running — it returns the wet in live playback too. */
                 runtime()->setFxInputSlots(kFxInSlots);
                 if (!pendingState_.empty())
                     runtime()->setStateBundle(pendingState_.data(), pendingState_.size());
                 runtime()->start(rate_);
                 source_ = runtime()->ownerSource();
             }
-            /* (A second FX instance with no pinned serial gets its OWN runtime and
-             * is its own owner; for v1 we expect a single insert per device.) */
         } else {
             releaseSource();
             runtime_release(handle_);
@@ -177,8 +190,37 @@ public:
         return kResultOk;
     }
 
+    /* DEFENSIVE (§8.8): no event source means this instance never armed a session —
+     * which an FX must never do now that it always owns a fresh runtime (see
+     * setActive). If it ever did happen, pass the DRY track signal straight through
+     * (or silence if there is none) rather than killing the track: a stray insert
+     * then degrades to clean dry audio, never the silent-track bug. (A connected-but-
+     * disconnected device is NOT this case — source_ is set there, so a dead port
+     * still correctly yields silence via the normal wet=0 path below.) */
+    tresult passthroughDry(ProcessData &data) {
+        if (data.numOutputs < 1 || data.numSamples <= 0 ||
+            data.outputs[0].numChannels < 1 || !data.outputs[0].channelBuffers32)
+            return kResultOk;
+        int32 n = data.numSamples, nch = data.outputs[0].numChannels;
+        const float *inL = nullptr, *inR = nullptr;
+        if (data.numInputs >= 1 && data.inputs[0].channelBuffers32 &&
+            data.inputs[0].numChannels >= 1) {
+            inL = data.inputs[0].channelBuffers32[0];
+            inR = data.inputs[0].numChannels > 1 ? data.inputs[0].channelBuffers32[1] : inL;
+        }
+        if (!inL) return silenceOut(data);
+        float *outL = data.outputs[0].channelBuffers32[0];
+        float *outR = nch > 1 ? data.outputs[0].channelBuffers32[1] : nullptr;
+        for (int32 s = 0; s < n; s++) {
+            if (outR) { outL[s] = inL[s]; outR[s] = inR[s]; }
+            else outL[s] = 0.5f * (inL[s] + inR[s]);
+        }
+        data.outputs[0].silenceFlags = 0;
+        return kResultOk;
+    }
+
     tresult PLUGIN_API process(ProcessData &data) override {
-        if (!runtime() || !source_) return silenceOut(data);
+        if (!runtime() || !source_) return passthroughDry(data);
         HarpRuntime &rt = *runtime();
         uint64_t base = rt.streamPos() + rt.latencySamples();
 
