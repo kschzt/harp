@@ -76,6 +76,9 @@ void engine_note_off_if(uint32_t note) { (void)note; }
  * dirty-take always returns 0 — the session loop's re-announce branch (refresh +
  * core.changed) is never taken on the fuzz parse path. */
 int engine_param_map_dirty_take(void) { return 0; }
+/* §8.8 audio.fx role seam: the refdev is a SYNTH (no audio input), so 0 — session.c's
+ * identity encoder reads this to decide whether to advertise the `audio.fx` capability. */
+int engine_is_fx(void) { return 0; }
 void live_ref_touch(device *d, bool dirty) {
     (void)d;
     (void)dirty;
