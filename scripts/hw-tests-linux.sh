@@ -105,10 +105,13 @@ run scripts/tempo-lock-test.sh
 run scripts/multidevice-test.sh
 run scripts/alias-group-e2e.sh
 run scripts/late-sink-test.sh
-# alias-part-audio + part-param-iso (the old attached-alias model) were REMOVED in the
-# multi-out migration (M3): per-part demux isolation is now covered by multiout-iso and
-# per-channel param routing by multiout-perchan (both on the eth.yml §8.7 loopback), with
-# per-part routing/timbre proven on real hardware by multitimbral-test + recall-perpart here.
+# alias-part-audio + part-param-iso run on eth.yml (the §8.7 loopback / eth-tests.sh, both
+# rate-lock AND varispeed-ASRC), NOT here: both drive a SUSTAINED multi-instance claim that
+# this VM-passthrough USB rig can't hold. The per-part demux/isolation is transport-agnostic,
+# so the loopback covers it reliably (and adds real §8.7 multichannel-ASRC coverage); the USB
+# rig keeps the single-claim tests it can actually hold. (M3 migrates these to one multi-out
+# instance — TODO; the eth-tests.sh dependency is why they are not deletable yet.)
+echo "──── alias-part-audio + part-param-iso: run on eth.yml (loopback — sustained multi-instance wedges this passthrough USB rig); SKIP here"; SKIP=$((SKIP+2))
 run scripts/meter-test.sh
 run scripts/replug-test.sh
 echo "════ hw-tests (linux): $PASS passed, $FAIL failed, $SKIP skipped"
