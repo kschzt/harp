@@ -1,27 +1,25 @@
 #!/bin/sh
-# part-param-iso-test — the combined P5+P6 e2e: in ONE shared multitimbral session,
-# a per-part PARAM routes to its OWN part's audio and ONLY that part. P6 proved the
-# Part parameter routes a single instance's params (and recall-perpart that they
-# persist per part); P5 proved several instances MERGE onto one session. This ties
-# them together on the audio plane: instance A owns part 0, instance B owns part 1,
-# both inject param-sets on their own event source (§9.4 key 5 = their channel),
-# and we watch part 1's demuxed audio (the P5b sink) respond to part 1's level
-# while staying deaf to part 0's.
+# part-param-iso-test — the P5b+P6 e2e: in ONE multitimbral session, a per-part
+# PARAM routes to its OWN part's audio and ONLY that part. The Part routing places
+# each channel's params on its own part (§9.4 key 5 = the channel) and recall-perpart
+# proves they persist per part; this ties that to the audio plane: the one runtime
+# drives part 0 and part 1, sets each part's level on its own channel, and we watch
+# part 1's demuxed audio (the P5b sink) respond to part 1's level while staying deaf
+# to part 0's.
 #
-# THE SIGNAL — sink-rms, the attached instance's demuxed PART-1 audio (slots {2,3}),
-# as the harness prints it. param 8 is the per-part LEVEL (the front panel's "8"),
-# so part 1's energy tracks part 1's param-8 monotonically. Three shared-session
-# runs (HARP_ISO_LEVELS = "<part0>,<part1>", each instance drives ONLY a controlled
-# tone+env+level on its part — no random flood, so the sink's energy is part 1's
-# level alone):
+# THE SIGNAL — sink-rms, part 1's demuxed PART-1 audio (slots {2,3}), as the harness
+# prints it. param 8 is the per-part LEVEL (the front panel's "8"), so part 1's
+# energy tracks part 1's param-8 monotonically. Three runs (HARP_ISO_LEVELS =
+# "<part0>,<part1>", each part driven with ONLY a controlled tone+env+level — no
+# random flood, so the sink's energy is part 1's level alone):
 #   HIGH  = 0.2,0.9  part 1 loud   -> sink-rms high
 #   LOW   = 0.2,0.2  part 1 quiet  -> sink-rms low
-#   XTALK = 0.9,0.2  part 1 quiet, OWNER part 0 loud -> sink-rms must stay ~LOW
+#   XTALK = 0.9,0.2  part 1 quiet, part 0 loud -> sink-rms must stay ~LOW
 # Two assertions, jitter-robust (RMS energy, the realtime pull jitters byte-wise):
 #   1. HIGH > 1.5x LOW   — part 1's OWN level param reached part 1's audio (routing).
-#   2. XTALK < 1.5x LOW  — driving the OWNER's level (part 0) to 0.9 did NOT raise
-#      part 1; the sink stayed near LOW. So params do not cross parts — the §9.4
-#      channel key isolates them inside the one merged session.
+#   2. XTALK < 1.5x LOW  — driving part 0's level to 0.9 did NOT raise part 1; the
+#      sink stayed near LOW. So params do not cross parts — the §9.4 channel key
+#      isolates them within the one session.
 #
 # Same harness/conventions as alias-part-audio-test.sh (tsan-host, no TSan, one
 # pinned board, Live closed). Exit 0 pass / 2 N/A (board absent) / 3 device busy.
@@ -56,7 +54,7 @@ if [ -z "${HARP_ETH_DEVICE:-}" ]; then
         echo "PART-PARAM-ISO SKIP: $PROBE not built"; exit 2
     fi
 fi
-echo "── part-param-iso: per-part level routing + isolation on ${HARP_ETH_DEVICE:-$SERIAL} (owner part 0 + attached part 1)"
+echo "── part-param-iso: per-part level routing + isolation on ${HARP_ETH_DEVICE:-$SERIAL} (part 0 + part 1)"
 
 echo "── building multi-instance harness (-DHARP_TSAN=ON -DHARP_TSAN_SANITIZE=OFF)"
 cmake -B "$BUILD" -S tools/vst3-host -DHARP_TSAN=ON -DHARP_TSAN_SANITIZE=OFF >/dev/null
@@ -69,7 +67,7 @@ median() {
 }
 
 # sink_rms LEVELS — run a 2-instance shared session with HARP_ISO_LEVELS=LEVELS and
-# --part-audio, echo the attached part-1 sink RMS (median of $SAMPLES, retries the
+# --part-audio, echo the part-1 sink RMS (median of $SAMPLES, retries the
 # transient post-teardown claim race exactly as alias-part-audio-test).
 # ONE device claim per config, $SAMPLES internal windows (tsan-host --rms-windows):
 # the rig wedges on repeated multi-instance --part-audio RE-claims, so each config's
@@ -124,7 +122,7 @@ if [ "$ROUTES" = 1 ] && [ "$ISOLATED" = 1 ]; then
     exit 0
 elif [ "$ROUTES" != 1 ]; then
     echo "PART-PARAM-ISO FAIL: part 1 level did not route (HIGH $HI not > 2×LOW $LO) —"
-    echo "   the attached instance's param-8 did not reach part 1's audio"
+    echo "   part 1's param-8 did not reach part 1's audio"
     exit 1
 else
     echo "PART-PARAM-ISO FAIL: cross-talk (XTALK $XT >= 0.5×HIGH $HI) — driving the owner's"

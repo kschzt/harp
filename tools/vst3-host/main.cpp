@@ -152,40 +152,31 @@ static tresult negotiate_buses(IComponent *component, IAudioProcessor *processor
     return r;
 }
 
-/* ---- multi-instance (P6): a multitimbral alias GROUP through the REAL plugin ----
+/* ---- multi-channel render (P6): the multitimbral MAIN INSTANCE through the plugin ----
  *
- * The single-instance host above loads ONE plugin/component/controller and
- * renders it. This drives N plugin instances created from the SAME module
- * factory, in ONE process, the way several plugin tracks in one DAW would —
- * and the way the runtime-direct tsan-host already does at the runtime layer,
- * but here through the FULL VST3 plugin chain (component/controller/processor,
- * setActive, process()).
+ * The single-instance host above loads ONE plugin and renders it with notes on
+ * one channel. This renders the SAME ONE plugin instance but drives N MIDI
+ * channels into it at once — the multi-out main-instance model: a note on channel
+ * C routes to device part C (§9.4 key 5; plugin.cpp routes ev.noteOn.channel ->
+ * device part), and the instance's bus 0 (the main mix) SUMS every engaged part.
+ * This is exactly what a DAW does when N MIDI tracks (or Renoise aliases) feed one
+ * HARP main track on channels 0..N-1; the per-channel routing is the DAW's job,
+ * reproduced here by injecting each channel's notes into the one input stream.
  *
- * SHARING: HARP_DEVICE_SERIAL is pinned for the whole process before any
- * setActive(true). Every instance's plugin reads it, hands it to the P4
- * registry (runtime_acquire), and so all N instances RIDE ONE shared runtime /
- * ONE USB claim. The FIRST instance to activate is the registry owner (it
- * configures/starts the session and pulls the main mix); the rest ATTACH —
- * each registers its own event source on its own part and injects notes there,
- * which the owner's eventPump merges onto the one session (P5). So the group
- * plays multitimbrally and the owner's main mix SUMS every engaged part.
+ * NO registry, NO sharing, NO per-instance Part parameter: there is exactly ONE
+ * claimer (this instance) and routing is by the note's MIDI channel alone. (This
+ * replaced the old N-plugin-instances-share-one-serial model when the device
+ * became a single multi-out main; the registry that merged N event sources is
+ * gone.) `channels` lists the active parts; each is struck with the base note
+ * transposed by its channel so the parts are distinct pitches — a real
+ * multitimbral spread, not a unison.
  *
- * PART ROUTING: each instance gets its channel as its device part two ways,
- * matching the plugin's design — (a) its NOTE events carry that channel in the
- * UMP word (plugin.cpp routes ev.noteOn.channel -> device part directly), and
- * (b) its Part param (id 98, 0..15) is set via setParamNormalized(98, ch/15),
- * the recall-safe per-instance channel the plugin task adds (replacing the
- * process-global HARP_CHANNEL env that would otherwise collapse every alias
- * onto one part). We set BOTH so this works whether routing is by event
- * channel or by the persisted Part param.
+ * CAPTURE: bus 0 = the device main mix. An N-channel render's main mix DIFFERS
+ * from a 1-channel (part-0-only) render because more parts are summed — the
+ * play-proof alias-group-e2e.sh measures (single hash != group hash), now produced
+ * through the real plugin's one multi-out instance.
  *
- * CAPTURE: only the OWNER's process() output is captured — that is the device
- * main mix (attached instances are audio-silent per P5). The captured mix of
- * an N-alias group differs from a 1-alias (owner-only) run because more parts
- * are summed: the same play-proof signal alias-play-test.sh measures, but
- * produced through the real plugin chain rather than the runtime directly.
- *
- * Returns the process exit code. Single-instance invocations never reach here. */
+ * Returns the process exit code. Single-channel invocations never reach here. */
 static int run_multi_instance(VST3::Hosting::Module::Ptr &module, const VST3::Hosting::ClassInfo &ci,
                               const std::vector<int> &channels, const std::string &serial,
                               uint32_t rate, uint32_t block, double seconds, double bpm,
@@ -194,95 +185,50 @@ static int run_multi_instance(VST3::Hosting::Module::Ptr &module, const VST3::Ho
                               const std::string &out_path, bool do_hash, bool do_json,
                               const std::string &expect_hash) {
     const int N = (int)channels.size();
-    /* Part param the plugin task adds (id 98, 0..15): we set it per instance to
-     * route that instance to its device part, recall-safe. */
-    static const uint32_t kPartParamId = 98;
 
-    /* Pin the serial for the whole process: every instance's plugin reads
-     * HARP_DEVICE_SERIAL at setActive(true) and hands it to the registry, so all
-     * N share ONE runtime / ONE claim. MUST be set before any setActive below. */
+    /* Device selection only (NOT sharing — there is ONE instance): honor an
+     * explicit --serial / HARP_DEVICE_SERIAL so the lone claimer pins a board,
+     * exactly as the single-instance path does. Set before setActive below. */
+    if (!serial.empty()) {
 #ifdef _WIN32
-    _putenv_s("HARP_DEVICE_SERIAL", serial.c_str());
+        _putenv_s("HARP_DEVICE_SERIAL", serial.c_str());
 #else
-    setenv("HARP_DEVICE_SERIAL", serial.c_str(), 1);
+        setenv("HARP_DEVICE_SERIAL", serial.c_str(), 1);
 #endif
-    printf("multi-instance: %d aliases, serial=%s, channels=", N, serial.c_str());
+    }
+    printf("multi-channel: %d active parts, serial=%s, channels=", N, serial.c_str());
     for (int k = 0; k < N; k++) printf("%s%d", k ? "," : "", channels[k]);
     printf("\n");
 
     auto factory = module->getFactory();
 
-    /* One full plugin instance per alias: PlugProvider news a fresh component +
-     * controller pair from the same factory (so N components/processors/
-     * controllers exist at once), exactly as N plugin tracks would. */
-    struct Inst {
-        IPtr<PlugProvider> provider;
-        OPtr<IComponent> component;
-        OPtr<IEditController> controller;
-        FUnknownPtr<IAudioProcessor> processor{nullptr};
-        HostProcessData pd;
-        int32 out_ch = 0, nin = 0, in_ch = 0, nout = 0;
-        int channel = 0;
-    };
-    std::vector<std::unique_ptr<Inst>> insts;
-    insts.reserve(N);
+    /* ONE full plugin instance: the multi-out main. */
+    IPtr<PlugProvider> provider = owned(new PlugProvider(factory, ci, true));
+    if (!provider || !provider->initialize()) die("multi-channel: provider init failed");
+    OPtr<IComponent> component = provider->getComponent();
+    if (!component) die("multi-channel: no component");
+    FUnknownPtr<IAudioProcessor> processor(component);
+    if (!processor) die("multi-channel: component is not an IAudioProcessor");
 
-    for (int k = 0; k < N; k++) {
-        auto in = std::make_unique<Inst>();
-        in->channel = channels[k];
-        in->provider = owned(new PlugProvider(factory, ci, true));
-        if (!in->provider || !in->provider->initialize())
-            die("multi-instance: provider init failed for alias " + std::to_string(k));
-        in->component = in->provider->getComponent();
-        in->controller = in->provider->getController();
-        if (!in->component) die("multi-instance: no component for alias " + std::to_string(k));
-        in->processor = FUnknownPtr<IAudioProcessor>(in->component);
-        if (!in->processor) die("multi-instance: component is not an IAudioProcessor");
+    int32 nin = component->getBusCount(kAudio, kInput);
+    int32 nout = component->getBusCount(kAudio, kOutput);
+    for (int32 i = 0; i < nin; i++) component->activateBus(kAudio, kInput, i, true);
+    int32 actOut = nout < g_outBuses ? nout : g_outBuses; /* MULTI-OUT: main + parts */
+    for (int32 i = 0; i < actOut; i++) component->activateBus(kAudio, kOutput, i, true);
+    if (nout == 0) die("multi-channel: no audio output bus");
+    BusInfo outBus{};
+    component->getBusInfo(kAudio, kOutput, 0, outBus);
+    int32 out_ch = outBus.channelCount;
 
-        in->nin = in->component->getBusCount(kAudio, kInput);
-        in->nout = in->component->getBusCount(kAudio, kOutput);
-        for (int32 i = 0; i < in->nin; i++) in->component->activateBus(kAudio, kInput, i, true);
-        int32 actOut = in->nout < g_outBuses ? in->nout : g_outBuses; /* MULTI-OUT: main + parts */
-        for (int32 i = 0; i < actOut; i++) in->component->activateBus(kAudio, kOutput, i, true);
-        if (in->nout == 0) die("multi-instance: alias has no audio output bus");
-        BusInfo outBus{};
-        in->component->getBusInfo(kAudio, kOutput, 0, outBus);
-        in->out_ch = outBus.channelCount;
-        if (in->nin > 0) {
-            BusInfo inBus{};
-            in->component->getBusInfo(kAudio, kInput, 0, inBus);
-            in->in_ch = inBus.channelCount;
-        }
+    ProcessSetup setup{realtime ? kRealtime : kOffline, kSample32, (int32)block, (SampleRate)rate};
+    if (processor->setupProcessing(setup) != kResultOk) die("multi-channel: setupProcessing failed");
+    HostProcessData pd;
+    if (!pd.prepare(*component, (int32)block, kSample32)) die("multi-channel: process data prepare failed");
 
-        ProcessSetup setup{realtime ? kRealtime : kOffline, kSample32, (int32)block,
-                           (SampleRate)rate};
-        if (in->processor->setupProcessing(setup) != kResultOk)
-            die("multi-instance: setupProcessing failed for alias " + std::to_string(k));
-        if (!in->pd.prepare(*in->component, (int32)block, kSample32))
-            die("multi-instance: process data prepare failed");
+    if (component->setActive(true) != kResultOk) die("multi-channel: setActive failed");
+    processor->setProcessing(true);
+    printf("multi-channel: instance active, %d parts engaged on bus 0 main mix\n", N);
 
-        /* Route this instance to its part via the Part param BEFORE setActive,
-         * so the runtime sees the channel as it starts its session; we also feed
-         * it as a block-0 automation point below. setParamNormalized on a plugin
-         * that lacks id 98 yet is a harmless no-op (kResultFalse), so the host
-         * still builds/runs against the param before the sibling task lands. */
-        if (in->controller)
-            in->controller->setParamNormalized(kPartParamId, in->channel / 15.0);
-        insts.push_back(std::move(in));
-    }
-
-    /* Activate in order: the FIRST instance becomes the registry owner (it
-     * acquires the runtime for the pinned serial, configures + starts the shared
-     * session, and pulls the main mix); the rest attach inside their own
-     * setActive. setProcessing(true) on all. */
-    for (int k = 0; k < N; k++) {
-        if (insts[k]->component->setActive(true) != kResultOk)
-            die("multi-instance: setActive failed for alias " + std::to_string(k));
-        insts[k]->processor->setProcessing(true);
-    }
-    printf("multi-instance: %d aliases active (alias 0 = owner / main mix)\n", N);
-
-    /* Shared transport context (owner-anchored inside the plugin). */
     ProcessContext ctx{};
     ctx.sampleRate = rate;
     ctx.state = ProcessContext::kPlaying;
@@ -291,14 +237,12 @@ static int run_multi_instance(VST3::Hosting::Module::Ptr &module, const VST3::Ho
         ctx.tempo = bpm;
         ctx.projectTimeMusic = 0;
     }
-    for (int k = 0; k < N; k++) insts[k]->pd.processContext = &ctx;
+    pd.processContext = &ctx;
 
-    const int32 owner_ch = insts[0]->out_ch;
     size_t total = (size_t)(seconds * rate);
     size_t done = 0;
-    std::vector<float> capture; /* OWNER main mix only */
-    capture.reserve(total * (size_t)owner_ch);
-    std::vector<bool> first_block(N, true);
+    std::vector<float> capture; /* bus 0 main mix */
+    capture.reserve(total * (size_t)out_ch);
 
 #ifdef __APPLE__
     if (realtime) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -315,118 +259,93 @@ static int run_multi_instance(VST3::Hosting::Module::Ptr &module, const VST3::Ho
         size_t n = std::min((size_t)block, total - done);
         if (bpm > 0) ctx.projectTimeSamples = (TSamples)done;
 
-        /* Per-instance param-change + event lists must outlive process(): one
-         * vector entry per alias, kept alive for the whole block. */
-        std::vector<ParameterChanges> pcs(N), opcs(N);
-        std::vector<EventList> evs(N);
+        pd.numSamples = (int32)n;
 
+        ParameterChanges pcs, opcs;
+        pd.inputParameterChanges = &pcs;
+        pd.outputParameterChanges = &opcs;
+
+        /* Inject every active channel's notes/chord into the ONE instance, each
+         * on its own MIDI channel == its device part, transposed by channel so
+         * the parts are distinct pitches — a real multitimbral spread. */
+        EventList evl;
         for (int k = 0; k < N; k++) {
-            Inst &in = *insts[k];
-            in.pd.numSamples = (int32)n;
-
-            /* block-0: pin this alias's Part param so the device routes it. */
-            if (first_block[k]) {
-                int32 qi = 0;
-                auto *q = pcs[k].addParameterData(kPartParamId, qi);
-                int32 pi = 0;
-                if (q) q->addPoint(0, in.channel / 15.0, pi);
-                first_block[k] = false;
-            }
-            in.pd.inputParameterChanges = &pcs[k];
-            in.pd.outputParameterChanges = &opcs[k];
-
-            /* notes/chord on THIS alias's channel == its device part. Each alias
-             * gets its base note transposed by its channel so the parts are
-             * distinct pitches — a real multitimbral spread, not a unison. */
+            int ch = channels[k];
             if (!chord.empty()) {
                 size_t onAt = (size_t)(0.1 * rate);
                 bool last = done + n >= total;
                 for (int cn : chord) {
-                    int pitch = cn + in.channel;
+                    int pitch = cn + ch;
                     if (onAt >= done && onAt < done + n) {
                         Event ev{};
                         ev.type = Event::kNoteOnEvent;
                         ev.sampleOffset = (int32)(onAt - done);
-                        ev.noteOn.channel = (int16)in.channel;
+                        ev.noteOn.channel = (int16)ch;
                         ev.noteOn.pitch = (int16)pitch;
                         ev.noteOn.velocity = 0.8f;
                         ev.noteOn.noteId = -1;
-                        evs[k].addEvent(ev);
+                        evl.addEvent(ev);
                     }
                     if (last) {
                         Event ev{};
                         ev.type = Event::kNoteOffEvent;
                         ev.sampleOffset = (int32)(n > 0 ? n - 1 : 0);
-                        ev.noteOff.channel = (int16)in.channel;
+                        ev.noteOff.channel = (int16)ch;
                         ev.noteOff.pitch = (int16)pitch;
                         ev.noteOff.velocity = 0;
                         ev.noteOff.noteId = -1;
-                        evs[k].addEvent(ev);
+                        evl.addEvent(ev);
                     }
                 }
             }
             for (size_t ni = 0; ni < notes.size(); ni++) {
                 int64_t on_at = (int64_t)((double)ni * note_period * rate);
                 int64_t off_at = on_at + (int64_t)(0.75 * note_period * rate);
-                int pitch = notes[ni] + in.channel;
+                int pitch = notes[ni] + ch;
                 if (on_at >= (int64_t)done && on_at < (int64_t)(done + n)) {
                     Event ev{};
                     ev.type = Event::kNoteOnEvent;
                     ev.sampleOffset = (int32)(on_at - (int64_t)done);
-                    ev.noteOn.channel = (int16)in.channel;
+                    ev.noteOn.channel = (int16)ch;
                     ev.noteOn.pitch = (int16)pitch;
                     ev.noteOn.velocity = 0.9f;
                     ev.noteOn.noteId = -1;
-                    evs[k].addEvent(ev);
+                    evl.addEvent(ev);
                 }
                 if (off_at >= (int64_t)done && off_at < (int64_t)(done + n)) {
                     Event ev{};
                     ev.type = Event::kNoteOffEvent;
                     ev.sampleOffset = (int32)(off_at - (int64_t)done);
-                    ev.noteOff.channel = (int16)in.channel;
+                    ev.noteOff.channel = (int16)ch;
                     ev.noteOff.pitch = (int16)pitch;
                     ev.noteOff.velocity = 0.f;
                     ev.noteOff.noteId = -1;
-                    evs[k].addEvent(ev);
+                    evl.addEvent(ev);
                 }
             }
-            in.pd.inputEvents = &evs[k];
         }
+        pd.inputEvents = &evl;
 
-        /* Drive every alias this block. The owner (alias 0) renders the main mix
-         * that sums all engaged parts; attached aliases are audio-silent (P5) but
-         * their notes/Part param reach the shared session via the owner's pump. */
-        for (int k = 0; k < N; k++) {
-            if (insts[k]->processor->process(insts[k]->pd) != kResultOk)
-                die("multi-instance: process failed for alias " + std::to_string(k));
-        }
+        if (processor->process(pd) != kResultOk) die("multi-channel: process failed");
 
-        /* Capture ONLY the owner's output = the device main mix. */
+        /* Capture bus 0 = the device main mix (sums every engaged part). */
         for (size_t s = 0; s < n; s++)
-            for (int32 c = 0; c < owner_ch; c++)
-                capture.push_back(insts[0]->pd.outputs[0].channelBuffers32[c][s]);
+            for (int32 c = 0; c < out_ch; c++)
+                capture.push_back(pd.outputs[0].channelBuffers32[c][s]);
 
         if (bpm > 0) ctx.projectTimeMusic += (double)n * bpm / (60.0 * rate);
         done += n;
         ctx.projectTimeSamples += (TSamples)n;
     }
 
-    for (int k = 0; k < N; k++) insts[k]->processor->setProcessing(false);
-
-    /* Teardown in REVERSE order: attached aliases deactivate (releasing their
-     * registry handle + event source) before the owner, so the owner — the last
-     * holder — is the one that stops + destroys the shared runtime. This reverse
-     * setActive(false) loop IS the teardown; the later destruction of the Inst
-     * objects (vector unwind, forward order) only terminates the now-idle
-     * component/controllers — the shared runtime is already gone, so that order
-     * is immaterial. */
-    for (int k = N - 1; k >= 0; k--) insts[k]->component->setActive(false);
+    processor->setProcessing(false);
+    component->setActive(false);
 
     /* ---- output (owner main mix), same oracle as the single-instance path ---- */
     double rms = 0;
     for (float v : capture) rms += (double)v * v;
     rms = capture.empty() ? 0 : sqrt(rms / capture.size());
-    printf("processed %zu samples x %d ch (owner main mix), rms=%.5f\n", done, owner_ch, rms);
+    printf("processed %zu samples x %d ch (bus 0 main mix), rms=%.5f\n", done, out_ch, rms);
 
     uint64_t hash = harp_fnv1a(capture.data(), capture.size() * sizeof(float));
     char hashhex[17];
@@ -434,11 +353,11 @@ static int run_multi_instance(VST3::Hosting::Module::Ptr &module, const VST3::Ho
     if (do_hash) printf("output-hash: %s\n", hashhex);
     if (do_json)
         printf("{\"frames\":%zu,\"channels\":%d,\"rate\":%u,\"rms\":%.6f,\"hash\":\"%s\","
-               "\"instances\":%d}\n",
-               capture.size() / (size_t)(owner_ch ? owner_ch : 1), owner_ch, rate, rms, hashhex, N);
+               "\"parts\":%d}\n",
+               capture.size() / (size_t)(out_ch ? out_ch : 1), out_ch, rate, rms, hashhex, N);
 
     if (!out_path.empty()) {
-        if (!harp_write_wav16(out_path, capture, (uint32_t)owner_ch, rate))
+        if (!harp_write_wav16(out_path, capture, (uint32_t)out_ch, rate))
             die("cannot write " + out_path);
         printf("-> %s\n", out_path.c_str());
     }
