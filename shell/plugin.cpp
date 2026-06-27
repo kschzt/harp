@@ -585,6 +585,15 @@ public:
                         }
                         continue;
                     }
+                    if (isPerChanParamId(id)) {
+                        /* M2 PER-CHANNEL PARAM: a satellite track's MIDI CC on channel N, host-
+                         * mapped via IMidiMapping (getMidiControllerAssignment) to this synthetic
+                         * id. Decode (channel, device param) and queue a param-set with §9.4 key 5
+                         * = channel, so ONE main instance drives every part's params. Immediate
+                         * set (CC is stepped at block boundaries; no per-(channel,param) ramp). */                        rt.queueParamSet(source_, perChanParamDevId(id), (float)v, ts,
+                                         perChanParamChannel(id));
+                        continue;
+                    }
                     if (idx == SIZE_MAX) {
                         rt.queueParamSet(source_, id, (float)v, ts);
                         continue;
@@ -1014,6 +1023,13 @@ public:
         if (cc == kPitchBend) { id = mpeMidiId((uint32_t)channel, kMpeAxisBend); return kResultTrue; }
         if (cc == kAfterTouch) { id = mpeMidiId((uint32_t)channel, kMpeAxisPressure); return kResultTrue; }
         if (cc == 74) { id = mpeMidiId((uint32_t)channel, kMpeAxisTimbre); return kResultTrue; }
+        /* M2 PER-CHANNEL DEVICE PARAMS: GP CC kPerChanCcBase+i on channel N -> part N's device
+         * param (i+1). A satellite MIDI track routes its CC to the main on its channel; the
+         * processor decodes the synthetic id and queues a param-set with §9.4 key 5 = N. */
+        if (cc >= (CtrlNumber)kPerChanCcBase && cc < (CtrlNumber)(kPerChanCcBase + kNumParams)) {
+            id = perChanParamId((uint32_t)channel, (uint32_t)(cc - (CtrlNumber)kPerChanCcBase) + 1u);
+            return kResultTrue;
+        }
         return kResultFalse;
     }
 

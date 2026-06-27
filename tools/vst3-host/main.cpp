@@ -62,6 +62,14 @@ enum { kMpeAxisBend = 0, kMpeAxisTimbre = 1, kMpeAxisPressure = 2 };
 static inline uint32_t mpeMidiId(uint32_t chan, uint32_t axis) {
     return kMpeMidiBase + (chan & 0xf) * kMpeMidiAxes + axis;
 }
+/* M2 per-channel device-param ids — mirrored from shell/shell_constants.h (base 0x4000, stride
+ * 16). --set-ch CH:ID=V sends part CH's device param ID through the SAME synthetic-id path a
+ * satellite's MIDI CC arrives on after the host's IMidiMapping, exercising the processor decode. */
+static const uint32_t kPerChanParamBase = 0x4000u;
+static const uint32_t kPerChanStride = 16u;
+static inline uint32_t perChanParamId(uint32_t chan, uint32_t param /*1-based*/) {
+    return kPerChanParamBase + (chan & 0xf) * kPerChanStride + ((param - 1u) & 0xf);
+}
 
 static int die(const std::string &msg) {
     fprintf(stderr, "harp-vst3-host: %s\n", msg.c_str());
@@ -663,6 +671,15 @@ int main(int argc, char **argv) {
             if (eq == std::string::npos) die("--set wants ID=VALUE");
             sets.push_back({(uint32_t)strtoul(kv.substr(0, eq).c_str(), nullptr, 0),
                             atof(kv.substr(eq + 1).c_str())});
+        } else if (a == "--set-ch") { /* M2: CH:ID=V — set part CH's device param ID (per-channel) */
+            std::string kv = next();
+            auto colon = kv.find(':');
+            auto eq = kv.find('=');
+            if (colon == std::string::npos || eq == std::string::npos || eq < colon)
+                die("--set-ch wants CH:ID=VALUE");
+            uint32_t ch = (uint32_t)strtoul(kv.substr(0, colon).c_str(), nullptr, 0);
+            uint32_t pid = (uint32_t)strtoul(kv.substr(colon + 1, eq - colon - 1).c_str(), nullptr, 0);
+            sets.push_back({perChanParamId(ch, pid), atof(kv.substr(eq + 1).c_str())});
         } else if (a == "--set-at") { /* SEC:ID=V — apply a param mid-render (§15.5 offline edit) */
             std::string kv = next();
             auto colon = kv.find(':');
