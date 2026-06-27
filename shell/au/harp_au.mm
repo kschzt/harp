@@ -81,16 +81,11 @@ static void au_meter_name(AudioUnitParameterID id, char *buf, size_t n) {
         snprintf(buf, n, "Meter Part %u %s", slot, mname);
 }
 
-/* The "Part" routing parameter id (98), its step count, and the recall
- * component-state header (kStateHeaderMagic/kStateHeaderLen) are SHARED with the
- * VST3 shell via shell_constants.h — both formats must agree for a project's
- * component state to move between VST3 and AU byte-for-byte (P6;
- * cross-format-recall-test.sh). HOST-SIDE routing only: au_SetParameter special-
- * cases id 98 out of the device param-set path (exactly as the VST3 process()
- * does), so it never affects the wire or param-map-hash. The Part is reported
- * AFTER the 12 device params in the parameter list; default 0 => part 0, the
- * single-instance/golden default. kPartParamId is used where an
- * AudioUnitParameterID is expected (== uint32_t). */
+/* The recall component-state header (kStateHeaderMagic/kStateHeaderLen) is SHARED
+ * with the VST3 + CLAP shells via shell_constants.h — all formats must agree for
+ * a project's component state to move between them byte-for-byte
+ * (cross-format-recall-test.sh). Its part byte is now FROZEN 0x00 (the multi-out
+ * main owns all 16 parts; the retired per-instance "Part" param is gone). */
 
 struct HarpAU {
     AudioComponentPlugInInterface iface; /* MUST be first */
@@ -164,15 +159,6 @@ struct HarpAU {
      * Indexed by (id - kMeterIdBase); silent floor (0) until the first echo. */
     float meterShadow[kNumMeterParams];
 
-    /* This instance's multitimbral PART (§9.4 channel, 0..15) — the per-instance
-     * routing the "Part" param (id 98) drives, mirroring the VST3 shell. DEFAULT =
-     * HARP_CHANNEL env if set, else 0: the headless au-host path is unchanged and a
-     * fresh in-DAW instance starts on part 0. au_apply_classinfo may override it
-     * (recall), and a live Part param edit re-parts the source mid-session. Drives
-     * the instance's event-source channel at activate (au_Initialize) and on change
-     * (au_SetParameter). */
-    uint8_t part = 0;
-
     /* Raw recall bundle staged by au_apply_classinfo (setState) BEFORE a runtime
      * exists — ClassInfo is restored on project-open, before AudioUnitInitialize.
      * The OWNER applies it via setStateBundle() right before start(), reproducing
@@ -192,7 +178,6 @@ struct HarpAU {
         paramShadow[8] = 0.6f;  /* Division 1/16 (id 9 -> idx 8) */
         paramShadow[10] = 0.0f; /* Octaves 1 (id 11 -> idx 10) */
         paramShadow[11] = 0.0f; /* Glide off (id 12 -> idx 11; was [12] — an OOB write past paramShadow[12]) */
-        part = envChannelDefault();
         outFormat.mSampleRate = 48000;
         outFormat.mFormatID = kAudioFormatLinearPCM;
         outFormat.mFormatFlags =
@@ -219,26 +204,6 @@ struct HarpAU {
     }
 
     HarpRuntime *runtime() const { return rt_.get(); }
-
-    /* The Part default the env pins: HARP_CHANNEL (the headless --channel path)
-     * clamped 0..15, else 0 — mirrors the VST3 shell so the env path is unchanged.
-     * start() ALSO reads HARP_CHANNEL into the owner source, so applyPart() is a
-     * no-op vs the env (and asserts a recalled/automated Part otherwise). */
-    static uint8_t envChannelDefault() {
-        if (const char *e = getenv("HARP_CHANNEL"); e && e[0]) {
-            int v = atoi(e);
-            if (v >= 0 && v <= 15) return (uint8_t)v;
-        }
-        return 0;
-    }
-
-    /* Drive THIS instance's event-source channel to `part` (its part) — the
-     * runtime's built-in owner source. Stores into EventSource::chan (the eventPump
-     * re-reads it per event), so re-parting takes effect without a restart. nullptr
-     * source (unacquired) = no-op. */
-    void applyPart() {
-        if (source) source->chan.store(part & 0xf, std::memory_order_relaxed);
-    }
 
     /* Drop our audio sinks before the runtime is torn down (after which the reader
      * never demuxes into a freed ring). The event source is the runtime's own owner
@@ -342,11 +307,9 @@ static OSStatus au_Initialize(void *self) {
     au->registerActivePartSinks();
     rt->start(rate); /* deviceless = silence */
     au->source = rt->ownerSource();
-    /* P6: pin the source to THIS instance's part. start() seeds the channel from
-     * HARP_CHANNEL; part was seeded from the SAME env (or recalled by
-     * au_apply_classinfo), so for the env/golden path this is a no-op (part 0 / the
-     * env value), and for a recalled/automated Part it asserts the saved part. */
-    au->applyPart();
+    /* The owner source's default channel is seeded inside start() from HARP_CHANNEL
+     * (the headless --channel path); notes carry their own channel->part in the
+     * UMP, so there's nothing per-instance to pin. */
     au->initialized = true;
     return noErr;
 }
@@ -413,7 +376,7 @@ static CFMutableDictionaryRef au_make_classinfo(HarpAU *au) {
         blob.reserve(kStateHeaderLen + bundle.size());
         blob.insert(blob.end(), kStateHeaderMagic,
                     kStateHeaderMagic + sizeof kStateHeaderMagic);
-        blob.push_back((uint8_t)(au->part & 0xf));
+        blob.push_back((uint8_t)0x00); /* part byte FROZEN 0x00 (multi-out main owns all parts) */
         blob.insert(blob.end(), bundle.begin(), bundle.end());
         CFDataRef data = CFDataCreate(nullptr, blob.data(), (CFIndex)blob.size());
         CFDictionarySetValue(d, CFSTR("harp-bundle"), data);
@@ -438,18 +401,15 @@ static OSStatus au_apply_classinfo(HarpAU *au, CFPropertyListRef plist) {
     if (data && CFGetTypeID(data) == CFDataGetTypeID()) {
         const uint8_t *raw = CFDataGetBytePtr(data);
         size_t rawLen = (size_t)CFDataGetLength(data);
-        /* P6 recall-safe Part: a NEW blob begins with the versioned header (magic
-         * + part byte); strip it and adopt the Part. An OLD blob is a raw recall
-         * bundle (first byte a CBOR map, never the header magic): detected by the
-         * magic mismatch, it loads byte-compatibly with Part=0 (left at its
-         * env/default seed). Everything past the header is the SAME bundle bytes the
-         * device round-trips, byte-identical to the VST3 shell's setState. */
+        /* A NEW blob begins with the versioned header (magic + part byte); strip
+         * it. The part byte is FROZEN 0x00 / IGNORED (the multi-out main owns all
+         * parts). An OLD header-less blob (first byte a CBOR map, never the magic)
+         * loads byte-compatibly. Everything past the header is the SAME bundle
+         * bytes the device round-trips, byte-identical to the VST3 shell. */
         const uint8_t *bundle = raw;
         size_t blen = rawLen;
         if (rawLen >= kStateHeaderLen &&
             memcmp(raw, kStateHeaderMagic, sizeof kStateHeaderMagic) == 0) {
-            au->part = (uint8_t)(raw[sizeof kStateHeaderMagic] & 0xf);
-            au->applyPart(); /* live restore (usually a no-op pre-activate) */
             bundle += kStateHeaderLen;
             blen -= kStateHeaderLen;
         }
@@ -608,19 +568,17 @@ static OSStatus au_GetProperty(void *self, AudioUnitPropertyID prop,
                 *ioSize = 0;
                 return noErr;
             }
-            /* 12 device params, then the host-side "Part" router (id 98), then the
-             * §9.9 readonly meter params (ids 0x1000+, peak/rms per slot) last */
-            const UInt32 total = kNumAuParams + 1 + kNumMeterParams;
+            /* the device params, then the §9.9 readonly meter params (ids 0x1000+,
+             * peak/rms per slot). (The host-side "Part" router is retired.) */
+            const UInt32 total = kNumAuParams + kNumMeterParams;
             UInt32 n = *ioSize / sizeof(AudioUnitParameterID);
             if (n > total) n = total;
             auto *ids = (AudioUnitParameterID *)outData;
             for (UInt32 i = 0; i < n; i++) {
                 if (i < kNumAuParams)
                     ids[i] = kAuParams[i].id;
-                else if (i == kNumAuParams)
-                    ids[i] = kPartParamId;
                 else
-                    ids[i] = kMeterIdBase + (i - kNumAuParams - 1); /* contiguous meter range */
+                    ids[i] = kMeterIdBase + (i - kNumAuParams); /* contiguous meter range */
             }
             *ioSize = n * sizeof(AudioUnitParameterID);
             return noErr;
@@ -628,27 +586,6 @@ static OSStatus au_GetProperty(void *self, AudioUnitPropertyID prop,
         case kAudioUnitProperty_ParameterInfo: {
             auto *info = (AudioUnitParameterInfo *)outData;
             memset(info, 0, sizeof *info);
-            if (elem == kPartParamId) {
-                /* "Part" (id 98): the host-side multitimbral-part router. Stepped
-                 * over 16 parts (0..15), integer/indexed, default 0 => part 0, the
-                 * single-instance/golden default. Writable + per-instance so each
-                 * alias can own a distinct part and the choice persists with the
-                 * project. HOST-SIDE only — NOT a device param (it never enters the
-                 * param-set path or the param-map-hash). */
-                info->flags = kAudioUnitParameterFlag_IsReadable |
-                              kAudioUnitParameterFlag_IsWritable |
-                              kAudioUnitParameterFlag_HasCFNameString |
-                              kAudioUnitParameterFlag_CFNameRelease;
-                info->cfNameString =
-                    CFStringCreateWithCString(nullptr, "Part", kCFStringEncodingUTF8);
-                strncpy(info->name, "Part", sizeof info->name - 1);
-                info->unit = kAudioUnitParameterUnit_Indexed;
-                info->minValue = 0;
-                info->maxValue = (Float32)kPartStepCount; /* 0..15 */
-                info->defaultValue = 0;
-                *ioSize = sizeof(AudioUnitParameterInfo);
-                return noErr;
-            }
             if (isMeterId((uint32_t)elem)) {
                 /* §9.9 readonly meter: READABLE but NOT WRITABLE — the AU
                  * read-only equivalent of VST3's kIsReadOnly. A host shows the
@@ -826,10 +763,6 @@ static OSStatus au_GetParameter(void *self, AudioUnitParameterID param,
                                 AudioUnitParameterValue *out) {
     HarpAU *au = (HarpAU *)self;
     if (scope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidScope;
-    if (param == kPartParamId) { /* host-side router: surface this instance's part */
-        *out = (Float32)au->part;
-        return noErr;
-    }
     if (param < 1 || (param > kNumAuParams && !isMeterId((uint32_t)param)))
         return kAudioUnitErr_InvalidParameter;
     /* drain device echoes into the shadows so hosts see panel moves AND live
@@ -841,12 +774,15 @@ static OSStatus au_GetParameter(void *self, AudioUnitParameterID param,
     if (au->runtime()) {
         uint32_t id;
         float v;
-        while (au->runtime()->popEcho(au->part, id, v)) { /* only THIS instance's part (§9.4) */
-            if (id >= 1 && id <= kNumAuParams)
-                au->paramShadow[id - 1] = v;
-            else if (isMeterId(id))
-                au->meterShadow[id - kMeterIdBase] = v;
-        }
+        /* multi-out main owns ALL 16 parts: drain every part's echo ring (empty
+         * parts yield nothing, so a part-0-only render is byte-identical). */
+        for (uint32_t p = 0; p < (uint32_t)HarpAU::kNumParts; p++)
+            while (au->runtime()->popEcho(p, id, v)) {
+                if (id >= 1 && id <= kNumAuParams)
+                    au->paramShadow[id - 1] = v;
+                else if (isMeterId(id))
+                    au->meterShadow[id - kMeterIdBase] = v;
+            }
     }
     *out = isMeterId((uint32_t)param) ? au->meterShadow[(uint32_t)param - kMeterIdBase]
                                       : au->paramShadow[param - 1];
@@ -858,17 +794,6 @@ static OSStatus au_SetParameter(void *self, AudioUnitParameterID param,
                                 AudioUnitParameterValue value, UInt32 offset) {
     HarpAU *au = (HarpAU *)self;
     if (scope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidScope;
-    if (param == kPartParamId) {
-        /* HOST-SIDE routing only: re-part THIS instance live and do NOT queue a
-         * device param-set (id 98 is not a device param). Indexed 0..15 =>
-         * part = round(value), clamped. The eventPump re-reads the source channel
-         * per event, so the change applies from the next event with no restart. */
-        if (value < 0) value = 0;
-        if (value > (Float32)kPartStepCount) value = (Float32)kPartStepCount;
-        au->part = (uint8_t)(value + 0.5f);
-        au->applyPart();
-        return noErr;
-    }
     if (param < 1 || param > kNumAuParams) return kAudioUnitErr_InvalidParameter;
     if (value < 0) value = 0;
     if (value > 1) value = 1;
@@ -893,12 +818,7 @@ static OSStatus au_ScheduleParameters(void *self, const AudioUnitParameterEvent 
             au_SetParameter(self, ev[i].parameter, ev[i].scope, ev[i].element,
                             ev[i].eventValues.immediate.value,
                             ev[i].eventValues.immediate.bufferOffset);
-        else if (ev[i].parameter == kPartParamId) {
-            /* a ramp on the host-side router makes no musical sense — re-part to the
-             * ramp's end value immediately (host-side only, no device event). */
-            au_SetParameter(self, kPartParamId, ev[i].scope, ev[i].element,
-                            ev[i].eventValues.ramp.endValue, 0);
-        } else { /* ramp: start/end values over a frame span -> §9.4 ramp */
+        else { /* ramp: start/end values over a frame span -> §9.4 ramp */
             HarpRuntime *rt = au->runtime();
             const auto &r = ev[i].eventValues.ramp;
             if (rt) {

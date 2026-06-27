@@ -53,14 +53,6 @@ static constexpr uint32_t kCutoffId = 3; /* the per-voice-modulatable param (§9
 /* per-voice expression mod targets (pitch bend / loudness) — shared with the VST3
  * shell + mirrored from device.h, in shell_constants.h: kHarpModPitchBend/Pressure. */
 
-static uint8_t envChannelDefault() {
-    if (const char *e = getenv("HARP_CHANNEL"); e && e[0]) {
-        int v = atoi(e);
-        if (v >= 0 && v <= 15) return (uint8_t)v;
-    }
-    return 0;
-}
-
 /* ------------------------------------------------------------------ plugin */
 struct HarpClap {
     clap_plugin_t plugin;       /* MUST be first: host holds a clap_plugin_t* */
@@ -71,7 +63,6 @@ struct HarpClap {
     double rate = 48000.0;
     uint32_t maxFrames = 4096;
     bool offline = false; /* render ext: offline bounce -> blocking pull (byte-exact) */
-    uint8_t part = envChannelDefault(); /* §9.4 multitimbral part (HARP_CHANNEL) */
     std::vector<uint8_t> pendingState;  /* staged by state.load before activate */
     double paramVals[kNumParams];       /* cache for params.get_value (UI only) */
     std::vector<float> interleaved;     /* pull scratch (stereo) */
@@ -196,7 +187,7 @@ static bool st_save(const clap_plugin_t *p, const clap_ostream_t *os) {
      * project round-trips byte-transparently across all three formats. */
     uint8_t header[kStateHeaderLen];
     memcpy(header, kStateHeaderMagic, sizeof kStateHeaderMagic);
-    header[sizeof kStateHeaderMagic] = (uint8_t)(h->part & 0xf);
+    header[sizeof kStateHeaderMagic] = 0x00; /* part byte FROZEN 0x00 (multi-out main owns all parts) */
     if (os->write(os, header, sizeof header) != (int64_t)sizeof header) return false;
     /* With a device, write the Recall Bundle (shared with VST3/AU — cross-format
      * project moves ride it). With NO device the bundle is empty, but the host still
@@ -237,7 +228,7 @@ static bool st_load(const clap_plugin_t *p, const clap_istream_t *is) {
     if (raw.size() < kStateHeaderLen ||
         memcmp(raw.data(), kStateHeaderMagic, sizeof kStateHeaderMagic) != 0)
         return false;
-    h->part = (uint8_t)(raw[sizeof kStateHeaderMagic] & 0xf);
+    /* part byte (raw[3]) is FROZEN 0x00 / IGNORED — the multi-out main owns all parts. */
     raw.erase(raw.begin(), raw.begin() + kStateHeaderLen);
     /* A device-less save (st_save) stored the tagged param cache instead of a bundle.
      * Restore it so get_value round-trips with no hardware. A real bundle (the device

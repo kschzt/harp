@@ -8,7 +8,7 @@
  *   au-host [--type aumu --subtype rfdv --manu HARP]
  *           [--set ID=V]... [--notes N,..] [--chord N,..] [--bpm B]
  *           [--loop A:B] [--block N] [--seconds S] [--out f.wav] [--hash]
- *           [--part N] [--save-state FILE] [--load-state FILE]
+ *           [--save-state FILE] [--load-state FILE]
  *           [--mpe-chord N,..] [--mpe-members N] [--mpe-range SEMIS]
  *           [--mpe-bend SEMIS --mpe-bend-idx K] [--mpe-press 0..1 --mpe-press-idx K]
  *           [--mpe-timbre 0..1 --mpe-timbre-idx K]
@@ -19,7 +19,7 @@
  * carries the per-note pitch/pressure/timbre as §9.5 per-voice mods. A neutral
  * --mpe-chord therefore hashes identically to the same notes via plain --chord.
  *
- * --part/--save-state/--load-state mirror tools/vst3-host so a project can be
+ * --save-state/--load-state mirror tools/vst3-host so a project can be
  * MOVED across formats: the on-disk state file uses the exact same layout
  * ([u32 comp_len][comp][u32 ctrl_len][ctrl]) and the comp bytes are the same
  * 'HP1'+part+bundle both shells persist, so a file written by either host loads
@@ -44,7 +44,6 @@ static void die(const std::string &m) {
 static const OSType kHarpAuType = 'aumu';
 static const OSType kHarpAuSubtype = 'rfdv';
 static const OSType kHarpAuManu = 'HARP';
-static constexpr AudioUnitParameterID kHarpPartParamId = 98; /* host-side router */
 
 /* ---- on-disk state container: [u32 comp_len][comp][u32 ctrl_len][ctrl] ----
  *
@@ -184,7 +183,6 @@ int main(int argc, char **argv) {
     std::string out_path, save_state_path, load_state_path;
     bool do_hash = false;
     int instances = 1; /* >1: prove N AU instances coexist in one process */
-    int part = -1; /* 0..15: set the host-side Part param (id 98); -1 = leave default */
     /* MULTI-OUT (M4): the §9.4 note channel + which output element to capture, plus
      * per-channel device-param CC injection — the AU mirror of clap-host/vst3-host. A
      * note on MIDI channel C routes to part C (UMP), which streams on output element C+1
@@ -250,12 +248,7 @@ int main(int argc, char **argv) {
             save_state_path = need("--save-state");
         else if (a == "--load-state")
             load_state_path = need("--load-state");
-        else if (a == "--part") {
-            /* host-side multitimbral router (id 98), mirroring vst3-host --part.
-             * 0..15: the per-instance part this AU owns, persisted in the state. */
-            part = atoi(need("--part").c_str());
-            if (part < 0 || part > 15) die("--part wants 0..15");
-        } else if (a == "--hash")
+        else if (a == "--hash")
             do_hash = true;
         else if (a == "--instances")
             instances = atoi(need("--instances").c_str());
@@ -356,15 +349,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "au-host: state restored from %s (%zu bytes)\n",
                 load_state_path.c_str(), comp.size());
     }
-
-    /* --part: set the host-side Part router (id 98) BEFORE Initialize so the
-     * owner source is pinned to this part at start() (mirrors vst3-host, which
-     * sets it before setActive). au_SetParameter's Part path just stores part +
-     * applyPart() (a no-op pre-activate), so this is safe before Initialize. A
-     * recalled Part from --load-state is overridden here only if --part is given. */
-    if (part >= 0)
-        AudioUnitSetParameter(au, kHarpPartParamId, kAudioUnitScope_Global, 0,
-                              (AudioUnitParameterValue)part, 0);
 
     if (AudioUnitInitialize(au) != noErr) die("initialize failed");
 

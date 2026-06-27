@@ -69,18 +69,12 @@ static const char *const kEngineTables[][kNumParams] = { HARP_SHELL_ENGINE_TABLE
 static constexpr int kNumEngineTables = (int)(sizeof(kEngineTables) / sizeof(kEngineTables[0]));
 static inline bool engSlotHidden(const char *s) { return s && strcmp(s, "—") == 0; }
 #endif
-/* HOST-SIDE routing parameter (NOT a device param): which multitimbral PART
- * (§9.4 channel 0..15) this plugin instance owns. Stepped+automatable so a DAW
- * can show/persist it per-instance and several aliases each pick a distinct
- * part (the P5c gap — see setActive). It must NOT enter the device param-set
- * path (process() special-cases it, exactly like kPanicParamId) and must NOT
- * affect param-map-hash (it isn't a device param).
- *
- * kPartParamId / kPartStepCount and the recall component-state header
- * (kStateHeaderMagic / kStateHeaderLen) are SHARED with the AU shell via
- * shell_constants.h — both formats must agree for a project to move between them
- * (cross-format-recall-test.sh). See that header for why 'H'=0x48 can never start
- * a recall bundle (so an old header-less state migrates to Part 0). */
+/* The recall component-state header (kStateHeaderMagic / kStateHeaderLen) is
+ * SHARED with the AU + CLAP shells via shell_constants.h — all formats must agree
+ * for a project to move between them (cross-format-recall-test.sh). Its part byte
+ * is now FROZEN 0x00 (the multi-out main owns all parts; the retired per-instance
+ * Part param is gone). See that header for why 'H'=0x48 can never start a recall
+ * bundle (so an old header-less state still migrates cleanly). */
 /* hidden parameter the DAW's panic (CC 120/123) maps onto via IMidiMapping
  * (VST3-only — the AU surfaces panic through MIDI CC directly, no param) */
 static constexpr uint32_t kPanicParamId = 99;
@@ -158,8 +152,18 @@ public:
         /* MULTI-OUT (M1): track which per-part output bus the host routes (buses 1..16);
          * registerActivePartSinks (at setActive, before start) registers a demux sink for
          * each active one, so only routed parts stream. Bus 0 (main mix) is always present. */
-        if (type == kAudio && dir == kOutput && index >= 1 && index <= kNumParts)
+        if (type == kAudio && dir == kOutput && index >= 1 && index <= kNumParts) {
             partBusActive_[index - 1] = (state != 0);
+            /* MID-SESSION activation: if the host routes a new part bus AFTER the
+             * session is live (runtime acquired + started — runtime() is non-null
+             * only then), register its demux sink NOW. registerAudioSink while
+             * running_ raises the runtime's re-negotiation, widening the
+             * audio.start slot union so the new part streams without a restart.
+             * Pre-start runtime() is null; the sink is registered by setActive
+             * before start, unchanged (the golden path). */
+            if (state && runtime())
+                registerActivePartSinks();
+        }
         return AudioEffect::activateBus(type, dir, index, state);
     }
 
@@ -221,12 +225,9 @@ public:
             registerActivePartSinks();
             runtime()->start(rate_);
             source_ = runtime()->ownerSource();
-            /* P6: pin the source to THIS instance's part. start() seeds the channel
-             * from HARP_CHANNEL (the headless --channel path); part_ was seeded from
-             * the SAME env (or recalled by setState), so for the env/golden path this
-             * is a no-op (part 0 / the env value), and for a recalled/automated Part
-             * it asserts the saved part. */
-            applyPart();
+            /* The owner source's default channel is seeded inside start() from
+             * HARP_CHANNEL (the headless --channel path); notes carry their own
+             * channel->part in the UMP, so there's nothing per-instance to pin. */
         } else {
             /* Release: drop our audio sinks (releaseSource, below) before
              * rt_.reset() tears down the runtime — the reader must stop demuxing
@@ -458,16 +459,6 @@ public:
                         rt.queueNote(source_, ump_all_notes_off(), 0);
                         continue;
                     }
-                    if (id == kPartParamId) {
-                        /* HOST-SIDE routing only: re-part THIS instance live and
-                         * do NOT queue a device param-set (id 98 is not a device
-                         * param). Stepped 0..15 => part = round(norm * 15). The
-                         * source channel is re-read per event, so the change
-                         * applies from the next event with no restart. */
-                        part_ = (uint8_t)(v * (double)kPartStepCount + 0.5);
-                        applyPart();
-                        continue;
-                    }
                     if (isPerChanParamId(id)) {
                         /* M2 PER-CHANNEL PARAM: a satellite track's MIDI CC on channel N, host-
                          * mapped via IMidiMapping (getMidiControllerAssignment) to this synthetic
@@ -566,20 +557,24 @@ public:
         for (int k = 0; k < kNumParts; k++)
             if (partSinks_[k]) renderBus(k + 1, partSinks_[k], false);
 
-        /* device front-panel echoes (§9.4) -> output parameter changes (the echo
-         * ring is single-consumer; this instance is its sole owner). */
+        /* device front-panel echoes (§9.4) -> output parameter changes. The
+         * multi-out main owns ALL 16 parts, so drain every part's echo ring (the
+         * echo ring is single-consumer; this instance is its sole owner). Parts
+         * with no engaged voice yield nothing, so a part-0-only render is
+         * byte-identical to the old single-part drain. */
         {
             uint32_t id;
             float v;
-            while (rt.popEcho(part_, id, v)) { /* only THIS instance's part (§9.4) */
-                if (!data.outputParameterChanges) continue; /* drain regardless */
-                int32 qi = 0;
-                IParamValueQueue *q = data.outputParameterChanges->addParameterData(id, qi);
-                if (q) {
-                    int32 pi = 0;
-                    q->addPoint(0, v, pi);
+            for (uint32_t p = 0; p < (uint32_t)kNumParts; p++)
+                while (rt.popEcho(p, id, v)) {
+                    if (!data.outputParameterChanges) continue; /* drain regardless */
+                    int32 qi = 0;
+                    IParamValueQueue *q = data.outputParameterChanges->addParameterData(id, qi);
+                    if (q) {
+                        int32 pi = 0;
+                        q->addPoint(0, v, pi);
+                    }
                 }
-            }
         }
         return kResultOk;
     }
@@ -592,17 +587,15 @@ public:
         if (!runtime()) return kResultFalse;
         std::vector<uint8_t> bundle;
         if (!runtime()->getStateBundle(bundle)) return kResultFalse;
-        /* P6 recall-safe Part: write the versioned header (magic + part byte)
-         * AHEAD of the unchanged bundle bytes. The device still receives the
-         * SAME bundle on reload (setState strips the header before
-         * setStateBundle), so the recall round-trip is byte-transparent; the
-         * header just carries this instance's per-project Part. */
+        /* Write the versioned header (magic + part byte) AHEAD of the unchanged
+         * bundle bytes. The device receives the SAME bundle on reload (setState
+         * strips the header before setStateBundle), so the round-trip is
+         * byte-transparent. The part byte is FROZEN 0x00 — the multi-out main owns
+         * all parts, so there is no per-instance Part to carry (a part-0 instance
+         * always wrote 0x00 here, so the cross-format-recall oracle is unchanged). */
         uint8_t header[kStateHeaderLen];
         memcpy(header, kStateHeaderMagic, sizeof kStateHeaderMagic);
-        /* part byte: low nibble = part. (Bit 7 was the retired raw-MPE toggle; it
-         * is now always 0 — an MPE-off instance always wrote 0 there, so the
-         * cross-format-recall oracle is byte-identical.) */
-        header[sizeof kStateHeaderMagic] = (uint8_t)(part_ & kStatePartMask);
+        header[sizeof kStateHeaderMagic] = 0x00;
         int32 written = 0;
         if (state->write(header, (int32)sizeof header, &written) != kResultOk)
             return kResultFalse;
@@ -618,24 +611,19 @@ public:
             if (got < (int32)sizeof buf) break;
         }
         if (raw.empty()) return kResultFalse;
-        /* P6 recall-safe Part: a NEW component state begins with the versioned
-         * header (magic + part byte); strip it and adopt the Part. An OLD state
-         * is a raw recall bundle (first byte a CBOR map, never the header magic):
-         * detected by the magic mismatch, it loads byte-compatibly with Part=0
-         * (left at its env/default seed). Everything past the header is the SAME
-         * bundle bytes the device round-trips, so getState/setState stays
-         * byte-transparent to the recall tests. */
+        /* A NEW component state begins with the versioned header (magic + part
+         * byte); strip it. The part byte is FROZEN 0x00 and IGNORED — the
+         * multi-out main owns all parts, so there is nothing per-instance to
+         * restore; an old project's non-zero part byte (or the retired MPE bit 7)
+         * is simply dropped. An OLD header-less state (first byte a CBOR map,
+         * never the magic) loads byte-compatibly. Everything past the header is
+         * the SAME bundle bytes the device round-trips. */
         std::vector<uint8_t> bundle;
         if (raw.size() >= kStateHeaderLen &&
             memcmp(raw.data(), kStateHeaderMagic, sizeof kStateHeaderMagic) == 0) {
-            uint8_t pb = raw[sizeof kStateHeaderMagic];
-            part_ = (uint8_t)(pb & kStatePartMask);
-            /* bit 7 (the retired raw-MPE toggle) is ignored — old MPE-on projects
-             * still load, MPE just no longer engages. */
-            applyPart(); /* live restore (usually a no-op pre-activate; setActive re-applies) */
             bundle.assign(raw.begin() + kStateHeaderLen, raw.end());
         } else {
-            bundle = std::move(raw); /* MIGRATION: header-less old state -> Part=0 */
+            bundle = std::move(raw); /* MIGRATION: header-less old state */
         }
         if (bundle.empty()) return kResultFalse;
         /* ALWAYS stash the raw bundle: it is this instance's project state. (On
@@ -722,36 +710,10 @@ private:
      * setStateBundle() right before start(), reproducing today's
      * stage-before-start ordering. */
     std::vector<uint8_t> pendingState_;
-    /* This instance's multitimbral PART (§9.4 channel, 0..15) — the per-instance
-     * routing the "Part" param (id 98) drives. DEFAULT = HARP_CHANNEL env if set,
-     * else 0: the headless out-of-process host (harp-vst3-host --channel) still
-     * pins the part through the env exactly as before, and a fresh in-DAW instance
-     * starts on part 0. setState may override it (recall), and a live param edit
-     * re-parts the source mid-session. Drives the instance's event-source channel
-     * at activate and on change (see setActive / process). */
-    uint8_t part_ = envChannelDefault();
     /* Phase 3: VST3 Note Expression -> §9.5 per-voice modulation. A host noteId
      * names the note; the device addresses a voice by its §9.5 key. The bridge
      * (noteId -> voice key) is shared with the CLAP shell — note_voice_map.h. */
     NoteVoiceMap noteVoices_;
-    /* The Part default the env pins: HARP_CHANNEL (the headless --channel path)
-     * clamped 0..15, else 0. Read once to seed part_ so the env path is unchanged
-     * (start() ALSO reads HARP_CHANNEL into the owner source, so applyPart()
-     * below is a no-op vs the env). */
-    static uint8_t envChannelDefault() {
-        if (const char *e = getenv("HARP_CHANNEL"); e && e[0]) {
-            int v = atoi(e);
-            if (v >= 0 && v <= 15) return (uint8_t)v;
-        }
-        return 0;
-    }
-    /* Drive THIS instance's event-source channel to part_ (its part) — the
-     * runtime's built-in owner source. Storing into EventSource::chan (re-read
-     * per event on drain) re-parts without a restart. nullptr source
-     * (unacquired) = no-op. */
-    void applyPart() {
-        if (source_) source_->chan.store(part_ & 0xf, std::memory_order_relaxed);
-    }
     bool offline_ = false;
     /* per-param ramp-synthesis state: last emitted point + pending folded
      * point awaiting the 256-sample thinning interval */
@@ -809,13 +771,8 @@ public:
             parameters.addParameter(title, nullptr, p.stepCount, p.defaultVal,
                                     ParameterInfo::kCanAutomate, p.id);
         }
-        /* "Part" (id 98): the host-side multitimbral-part router. Stepped over
-         * 16 parts (stepCount 15), default 0 => normalized 0 => part 0, the
-         * single-instance / golden default. Automatable + per-instance so each
-         * shell alias in a DAW can own a distinct part and the choice persists
-         * with the project (see HarpProcessor::getState/setState). */
-        parameters.addParameter(STR16("Part"), nullptr, kPartStepCount, 0,
-                                ParameterInfo::kCanAutomate, kPartParamId);
+        /* (The per-instance "Part" param is retired — the multi-out main owns all
+         * 16 parts and routes a note to part = its MIDI channel; §9.4.) */
         parameters.addParameter(STR16("Panic"), nullptr, 0, 0,
                                 ParameterInfo::kIsHidden, kPanicParamId);
         /* §9.9 OUTPUT METERS: the device's readonly per-part + main-mix peak/RMS
@@ -877,15 +834,13 @@ public:
         }
         if (raw.empty()) return kResultFalse;
         /* The controller gets the SAME component blob as the processor's
-         * setState — so it must strip the P6 header too (NEW state) before
-         * parsing the bundle, and surface the recalled Part on its param so the
-         * DAW shows it. An OLD header-less state parses whole, Part stays 0. */
+         * setState — so it must strip the HP1 header too (NEW state) before
+         * parsing the bundle. The part byte is FROZEN 0x00 / IGNORED (no per-
+         * instance Part to surface). An OLD header-less state parses whole. */
         const uint8_t *bundle = raw.data();
         size_t blen = raw.size();
         if (raw.size() >= kStateHeaderLen &&
             memcmp(raw.data(), kStateHeaderMagic, sizeof kStateHeaderMagic) == 0) {
-            uint8_t pb = raw[sizeof kStateHeaderMagic];
-            setParamNormalized(kPartParamId, (double)(pb & kStatePartMask) / (double)kPartStepCount);
             bundle += kStateHeaderLen;
             blen -= kStateHeaderLen;
         }

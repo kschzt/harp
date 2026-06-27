@@ -9,12 +9,9 @@
 #include <cstddef>
 #include <cstdint>
 
-/* "Part" parameter: per-instance multitimbral routing (which device part 0..15
- * this shell instance drives). HOST-SIDE ROUTING ONLY — both shells special-case
- * it out of the device param-set path, so it never enters the wire or
- * param-map-hash. id 98 sits just below the VST3 Panic param (99). */
-static constexpr uint32_t kPartParamId = 98;
-static constexpr int kPartStepCount = 15; /* 16 parts (0..15); VST3 stepCount = N-1 */
+/* The per-instance "Part" parameter (id 98) is RETIRED: the multi-out main owns
+ * all 16 parts and routes each note to part = its MIDI channel (§9.4), so there
+ * is no single per-instance part to expose, automate, or persist. */
 
 /* Recall component-state header, prepended to the recall bundle by getState and
  * stripped by setState: the 3-byte magic 'HP1' + 1 part byte. 'H' (0x48) can never
@@ -23,11 +20,12 @@ static constexpr int kPartStepCount = 15; /* 16 parts (0..15); VST3 stepCount = 
 static const uint8_t kStateHeaderMagic[3] = {'H', 'P', '1'};
 static constexpr size_t kStateHeaderLen = sizeof kStateHeaderMagic + 1; /* magic + part byte */
 
-/* The part byte is 0..15 (4 bits) in the recall header. Bit 7 was the retired
- * raw-MIDI MPE-enable toggle; it is now always written 0 and ignored on read (an
- * MPE-off instance always wrote 0 there, so the cross-format-recall oracle stays
- * byte-identical, and old 'HP1' MPE-on projects load fine — MPE just no longer
- * engages). kStateMpeBit is kept only to mask the bit out of an old part byte. */
+/* The part byte is now FROZEN to 0x00 by every writer and IGNORED by every
+ * reader: the multi-out main owns all parts, so there is no per-instance part to
+ * persist (and bit 7 was the retired MPE toggle). An MPE-off, part-0 instance
+ * always wrote 0x00 there, so the cross-format-recall oracle stays byte-identical;
+ * old 'HP1' projects with a non-zero part byte load fine — the byte is dropped.
+ * kStatePartMask / kStateMpeBit are kept vestigial to document the byte's layout. */
 static constexpr uint8_t kStatePartMask = 0x0fu;
 static constexpr uint8_t kStateMpeBit = 0x80u; /* vestigial: bit 7 of an old part byte */
 
