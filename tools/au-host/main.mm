@@ -185,6 +185,17 @@ int main(int argc, char **argv) {
     bool do_hash = false;
     int instances = 1; /* >1: prove N AU instances coexist in one process */
     int part = -1; /* 0..15: set the host-side Part param (id 98); -1 = leave default */
+    /* MULTI-OUT (M4): the §9.4 note channel + which output element to capture, plus
+     * per-channel device-param CC injection — the AU mirror of clap-host/vst3-host. A
+     * note on MIDI channel C routes to part C (UMP), which streams on output element C+1
+     * (element 0 = main mix). --set-ch CH:ID=V injects GP CC kPerChanCcBase+(ID-1) on
+     * channel CH -> part CH's device param ID (§9.4 key 5). Defaults (channel 0, capture
+     * element 0, no set-ch) keep every existing render byte-identical. */
+    static const uint8_t kPerChanCcBase = 102;
+    int noteChannel = 0;   /* 0..15: MIDI channel for --notes/--chord */
+    int captureElem = 0;   /* 0 = main mix, 1..16 = part (elem-1) */
+    struct SetCh { int ch, pid; double v; };
+    std::vector<SetCh> setChs;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -248,7 +259,20 @@ int main(int argc, char **argv) {
             do_hash = true;
         else if (a == "--instances")
             instances = atoi(need("--instances").c_str());
-        else
+        else if (a == "--channel") {
+            noteChannel = atoi(need("--channel").c_str());
+            if (noteChannel < 0 || noteChannel > 15) die("--channel wants 0..15");
+        } else if (a == "--capture-element") {
+            captureElem = atoi(need("--capture-element").c_str());
+            if (captureElem < 0 || captureElem > 16) die("--capture-element wants 0..16");
+        } else if (a == "--set-ch") {
+            /* CH:ID=V -> a GP CC for part CH's device param ID (1-based). */
+            int ch, pid;
+            double v;
+            if (sscanf(need("--set-ch").c_str(), "%d:%d=%lf", &ch, &pid, &v) != 3)
+                die("--set-ch wants CH:ID=VALUE");
+            setChs.push_back({ch, pid, v});
+        } else
             die("unknown arg: " + a);
     }
 
@@ -295,6 +319,14 @@ int main(int argc, char **argv) {
     if (AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat,
                              kAudioUnitScope_Output, 0, &f, sizeof f) != noErr)
         die("set format failed");
+    /* MULTI-OUT (M4): activate the captured PART element (1..16) by giving it a stream
+     * format BEFORE Initialize — the AU arms a demux sink for that part at start(), just
+     * as a DAW that wires the part bus would. Element 0 (main mix) is always present. */
+    if (captureElem >= 1 &&
+        AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat,
+                             kAudioUnitScope_Output, (AudioUnitElement)captureElem, &f,
+                             sizeof f) != noErr)
+        die("set part-element format failed");
     UInt32 offline = 1; /* deterministic: block on the wire, never pad */
     AudioUnitSetProperty(au, kAudioUnitProperty_OfflineRender,
                          kAudioUnitScope_Global, 0, &offline, sizeof offline);
@@ -368,6 +400,16 @@ int main(int argc, char **argv) {
     abl.mBuffers[0] = {1, (UInt32)(block * sizeof(float)), bufL.data()};
     abl.mBuffers[1] = {1, (UInt32)(block * sizeof(float)), bufR.data()};
 
+    /* MULTI-OUT (M4): a SECOND buffer list for the captured part element. Element 0 is
+     * rendered every cycle (it is the session clock + fills the part caches); when
+     * --capture-element names a part (>=1) we then render THAT element and capture it. */
+    std::vector<float> cbufL(block), cbufR(block);
+    uint8_t cablStorage[sizeof(AudioBufferList) + sizeof(AudioBuffer)] = {};
+    AudioBufferList &cabl = *reinterpret_cast<AudioBufferList *>(cablStorage);
+    cabl.mNumberBuffers = 2;
+    cabl.mBuffers[0] = {1, (UInt32)(block * sizeof(float)), cbufL.data()};
+    cabl.mBuffers[1] = {1, (UInt32)(block * sizeof(float)), cbufR.data()};
+
     size_t done = 0;
     while (done < total) {
         size_t n = std::min((size_t)block, total - done);
@@ -376,18 +418,33 @@ int main(int argc, char **argv) {
             sim.ppq + 1e-9 >= sim.loop_b)
             sim.ppq = sim.loop_a + (sim.ppq - sim.loop_b);
 
+        /* MULTI-OUT (M4): inject the per-channel device-param CCs once, at the very start
+         * (offset 0 of the first block) — a GP CC kPerChanCcBase+(ID-1) on channel CH, so
+         * the multi-out main routes it to part CH's device param ID (§9.4 key 5). Mirrors
+         * clap-host --set-ch (raw MIDI CC, channel carries the part). */
+        if (done == 0)
+            for (auto &sc : setChs) {
+                int v = (int)(sc.v * 127.0 + 0.5);
+                if (v < 0) v = 0;
+                if (v > 127) v = 127;
+                MusicDeviceMIDIEvent(au, 0xB0 | (UInt32)(sc.ch & 0x0f),
+                                     (UInt32)(kPerChanCcBase + (sc.pid - 1)), (UInt32)v, 0);
+            }
+
         /* schedules MIRROR tools/vst3-host EXACTLY (offsets and the
          * float->MIDI velocity rounding), so the two shells produce the
-         * same wire traffic and therefore the same hash */
+         * same wire traffic and therefore the same hash. MULTI-OUT (M4): notes ride
+         * MIDI channel `noteChannel` so they route to part `noteChannel` (default 0 =
+         * byte-identical to the single-part path). */
         for (size_t ni = 0; ni < notes.size(); ni++) {
             int64_t onAt = (int64_t)((double)ni * note_period * rate);
             int64_t offAt = onAt + (int64_t)(0.75 * note_period * rate);
             if (onAt >= (int64_t)done && onAt < (int64_t)(done + n))
-                MusicDeviceMIDIEvent(au, 0x90, (UInt32)notes[ni],
+                MusicDeviceMIDIEvent(au, 0x90 | (UInt32)noteChannel, (UInt32)notes[ni],
                                      (UInt32)(0.9f * 127.f + 0.5f) /* = vst3 0.9f */,
                                      (UInt32)(onAt - (int64_t)done));
             if (offAt >= (int64_t)done && offAt < (int64_t)(done + n))
-                MusicDeviceMIDIEvent(au, 0x80, (UInt32)notes[ni], 0,
+                MusicDeviceMIDIEvent(au, 0x80 | (UInt32)noteChannel, (UInt32)notes[ni], 0,
                                      (UInt32)(offAt - (int64_t)done));
         }
         for (int cn : chord) {
@@ -493,11 +550,26 @@ int main(int argc, char **argv) {
         ts.mFlags = kAudioTimeStampSampleTimeValid;
         abl.mBuffers[0].mDataByteSize = (UInt32)(n * sizeof(float));
         abl.mBuffers[1].mDataByteSize = (UInt32)(n * sizeof(float));
+        /* Element 0 EVERY cycle: it advances the device clock and (multi-out) drains every
+         * active part sink into the AU's per-element cache. */
         OSStatus rc = AudioUnitRender(au, &flags, &ts, 0, (UInt32)n, &abl);
         if (rc != noErr) die("render failed: " + std::to_string(rc));
+        /* MULTI-OUT (M4): capture a PART element (1..16) by rendering it AFTER element 0
+         * (it serves the cache element 0 just filled); else capture the main mix (elem 0). */
+        const float *capL = bufL.data(), *capR = bufR.data();
+        if (captureElem >= 1) {
+            AudioUnitRenderActionFlags cflags = 0;
+            cabl.mBuffers[0].mDataByteSize = (UInt32)(n * sizeof(float));
+            cabl.mBuffers[1].mDataByteSize = (UInt32)(n * sizeof(float));
+            OSStatus crc = AudioUnitRender(au, &cflags, &ts, (UInt32)captureElem,
+                                           (UInt32)n, &cabl);
+            if (crc != noErr) die("part-element render failed: " + std::to_string(crc));
+            capL = cbufL.data();
+            capR = cbufR.data();
+        }
         for (size_t s = 0; s < n; s++) {
-            capture.push_back(bufL[s]);
-            capture.push_back(bufR[s]);
+            capture.push_back(capL[s]);
+            capture.push_back(capR[s]);
         }
         if (sim.active) {
             sim.samples += n;

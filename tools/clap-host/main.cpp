@@ -115,7 +115,12 @@ union AnyEvent {
     clap_event_param_value_t pval;
     clap_event_param_mod_t pmod;
     clap_event_note_expression_t nexp;
+    clap_event_midi_t midi;
 };
+/* M4 per-channel device-param ids — mirrored from shell/shell_constants.h. --set-ch CH:ID=V
+ * sends a raw MIDI CC (GP CC kPerChanCcBase+(ID-1) on channel CH) — exactly how a DAW's MIDI CC
+ * reaches the CLAP shell, exercising its CLAP_EVENT_MIDI per-channel-param decode. */
+static const uint8_t kPerChanCcBase = 102;
 struct InEvents {
     std::vector<AnyEvent> evs;
     clap_input_events_t list;
@@ -141,6 +146,9 @@ int main(int argc, char **argv) {
     double bend = 0.0, pressure = 0.0;
     int bend_idx = 0, press_idx = 0;
     std::vector<std::pair<uint32_t, double>> sets;
+    int capturePort = 0, outPorts = 1; /* M4 multi-out: which output port to capture; how many to allocate */
+    struct SetCh { int ch, pid; double v; };
+    std::vector<SetCh> setChs; /* M4 per-channel params: (channel, device param 1-based, value) -> MIDI CC */
     std::vector<int> notes, chord;
     std::string out_path;
     bool do_hash = false;
@@ -172,7 +180,17 @@ int main(int argc, char **argv) {
         else if (a == "--out") out_path = next(i);
         else if (a == "--hash") do_hash = true;
         else if (a == "--toggle-offline-at") toggle_offline_at = atof(next(i).c_str());
-        else if (a == "--set") {
+        else if (a == "--capture-port") { /* M4: capture output port N (0 = main mix, 1..16 = parts) */
+            capturePort = atoi(next(i).c_str());
+            if (outPorts < capturePort + 1) outPorts = capturePort + 1;
+        } else if (a == "--out-ports") outPorts = atoi(next(i).c_str());
+        else if (a == "--set-ch") { /* M4: CH:ID=V -> raw MIDI CC for part CH's device param ID */
+            std::string s = next(i);
+            size_t colon = s.find(':'), eq = s.find('=');
+            if (colon == std::string::npos || eq == std::string::npos || eq < colon)
+                die("--set-ch wants CH:ID=VALUE");
+            setChs.push_back({atoi(s.c_str()), atoi(s.c_str() + colon + 1), atof(s.c_str() + eq + 1)});
+        } else if (a == "--set") {
             std::string s = next(i);
             size_t eq = s.find('=');
             if (eq == std::string::npos) die("--set wants ID=VALUE");
@@ -229,8 +247,22 @@ int main(int argc, char **argv) {
 
     /* ---- render loop: blocks of `block`, total = seconds*rate ---- */
     size_t total = (size_t)(seconds * rate);
-    std::vector<float> Lbuf(block), Rbuf(block), capture;
+    std::vector<float> capture;
     capture.reserve(total * 2);
+    /* M4 multi-out: allocate `outPorts` stereo output ports; capture `capturePort`. With the
+     * defaults (1 port, capture port 0) this is the byte-identical single-output path. */
+    if (capturePort >= outPorts) outPorts = capturePort + 1;
+    std::vector<std::vector<float>> obufL((size_t)outPorts, std::vector<float>(block));
+    std::vector<std::vector<float>> obufR((size_t)outPorts, std::vector<float>(block));
+    std::vector<float *> ochans((size_t)outPorts * 2);
+    std::vector<clap_audio_buffer_t> abufs((size_t)outPorts);
+    for (int pr = 0; pr < outPorts; pr++) {
+        ochans[(size_t)pr * 2 + 0] = obufL[(size_t)pr].data();
+        ochans[(size_t)pr * 2 + 1] = obufR[(size_t)pr].data();
+        abufs[(size_t)pr] = clap_audio_buffer_t{};
+        abufs[(size_t)pr].data32 = &ochans[(size_t)pr * 2];
+        abufs[(size_t)pr].channel_count = 2;
+    }
     size_t onAt = (size_t)(0.1 * rate); /* --chord note-on, matches the VST3 host */
     int64_t steady = 0;
     bool first = true;
@@ -270,6 +302,15 @@ int main(int argc, char **argv) {
                 e.pval.channel = -1;
                 e.pval.key = -1;
                 e.pval.value = kv.second;
+                in.evs.push_back(e);
+            }
+            for (auto &sc : setChs) { /* M4: per-channel param as a raw MIDI CC (channel carries the part) */
+                AnyEvent e{};
+                hdr(e, CLAP_EVENT_MIDI, sizeof e.midi, 0);
+                e.midi.port_index = 0;
+                e.midi.data[0] = (uint8_t)(0xB0 | (sc.ch & 0x0f));            /* CC, channel = part */
+                e.midi.data[1] = (uint8_t)(kPerChanCcBase + (sc.pid - 1));    /* GP CC for device param */
+                e.midi.data[2] = (uint8_t)(sc.v * 127.0 + 0.5);
                 in.evs.push_back(e);
             }
         }
@@ -356,25 +397,21 @@ int main(int argc, char **argv) {
         }
 
         clap_output_events_t oe{nullptr, oe_try_push};
-        float *chans[2] = {Lbuf.data(), Rbuf.data()};
-        clap_audio_buffer_t ab{};
-        ab.data32 = chans;
-        ab.channel_count = 2;
         clap_process_t pc{};
         pc.steady_time = steady;
         pc.frames_count = n;
         pc.transport = nullptr; /* free-running (no arp in the CLAP gate) */
         pc.audio_inputs = nullptr;
-        pc.audio_outputs = &ab;
+        pc.audio_outputs = abufs.data();
         pc.audio_inputs_count = 0;
-        pc.audio_outputs_count = 1;
+        pc.audio_outputs_count = (uint32_t)outPorts;
         pc.in_events = &in.list;
         pc.out_events = &oe;
         if (plugin->process(plugin, &pc) < 0) die("process failed");
 
-        for (uint32_t s = 0; s < n; s++) { /* interleaved L,R — matches the VST3 host */
-            capture.push_back(Lbuf[s]);
-            capture.push_back(Rbuf[s]);
+        for (uint32_t s = 0; s < n; s++) { /* interleaved L,R from the captured port (default 0 = main) */
+            capture.push_back(obufL[(size_t)capturePort][s]);
+            capture.push_back(obufR[(size_t)capturePort][s]);
         }
         steady += n;
         done += n;

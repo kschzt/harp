@@ -131,6 +131,22 @@ else run multiout-iso   scripts/multiout-iso-test.sh; fi
 if [ "$OSID" = windows ]; then skip multiout-perchan "perl-alarm harness (Windows multi-out coverage pending)"
 else run multiout-perchan scripts/multiout-perchan-test.sh; fi
 
+# MULTI-OUT (M4): the SAME multi-out contract through the CLAP host — 17 ports
+# (clap_plugin_audio_ports), per-part isolation, and per-channel CC routed as a raw
+# CLAP_EVENT_MIDI (§9.4 key 5). Proves the multi-out main is first-class in CLAP, not just
+# VST3. POSIX-only (perl-alarm harness) + needs the clap-host binary.
+if [ "$OSID" = windows ]; then skip multiout-clap "perl-alarm harness (Windows multi-out coverage pending)"
+elif have "$CHOST"; then run multiout-clap scripts/multiout-clap-test.sh
+else skip multiout-clap "clap-host not built on $OSID"; fi
+
+# MULTI-OUT (M4): the SAME contract through the AU host — 17 output ELEMENTS (per-element
+# render, the main-mix pull on element 0 paces the device + caches the parts), per-part
+# isolation, and per-channel CC routed as raw MusicDeviceMIDIEvent (§9.4 key 5). The AU
+# golden bytes match the VST3/CLAP multi-out bounces exactly. macOS only (no AU elsewhere);
+# the script self-skips if au-host / the installed component are absent.
+if [ "$OSID" = macos ]; then run multiout-au scripts/multiout-au-test.sh
+else skip multiout-au "AU is macOS-only (no au-host / component on $OSID)"; fi
+
 # §11.4 action 3 "Open read-only": dirty the live (harp-probe) + pick choice 2 via the device
 # --panel-sock, then assert the explicit read-only pick SUPPRESSES live writes (med-open-ro-noop).
 # POSIX-only (MinGW device panel is a stub) + probe-gated; auto-enables when both land on a platform.
