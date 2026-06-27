@@ -30,6 +30,7 @@
 #include "note_voice_map.h"
 #include "runtime.h"
 #include "runtime_registry.h"
+#include "shell_config.h" /* per-product identity/params/device-filter (default = refdev) */
 #include "shell_constants.h"
 #include "ump.h"
 
@@ -42,33 +43,38 @@ static_assert(HARP_MPE_MOD_TIMBRE == 3u, "MPE timbre must be Filter Cutoff (para
 using namespace Steinberg;
 using namespace Steinberg::Vst;
 
-/* Frozen identity — see docs/vst3-shell-plan.md. NEVER change. */
-static const FUID kHarpProcessorUID(0xB520EC1F, 0x856F4A80, 0xA09D6455, 0x12430ACB);
-static const FUID kHarpControllerUID(0x3AF7D698, 0x0DB04F6E, 0x8F107EEF, 0x7480467A);
+/* Frozen identity — see docs/vst3-shell-plan.md. NEVER change. Values come from
+ * shell_config.h (default = these refdev UIDs; a downstream product overrides). */
+static const FUID kHarpProcessorUID(HARP_SHELL_PROC_FUID);
+static const FUID kHarpControllerUID(HARP_SHELL_CTRL_FUID);
 
-/* Mirrors the refdev's parameter set; replaced by evt.params descriptors
- * once the event plane lands. */
+/* The device parameter set (shell_config.h HARP_SHELL_PARAMS; default = refdev).
+ * `labels` is nullptr for a plain param, or a "A|B|C" pipe-delimited enum for a
+ * named picker (registered as a StringListParameter when HARP_SHELL_LABELED_PARAMS
+ * is defined). Replaced by evt.params descriptors once the event plane lands. */
 struct DevParam {
     uint32_t id;
     const char *name;
     int32 stepCount;   /* 0 = continuous (VST3: stepCount = steps - 1) */
     double defaultVal; /* must mirror the device defaults (recall sanity) */
+    const char *labels; /* nullptr, or "A|B|C" enum labels (stepCount+1 of them) */
 };
-/* Device ids are CONTIGUOUS 1..12 (engine 2.1.0): the drone's old id 7 ("Drone
- * Mix", briefly mis-shipped here as a phantom "FX Send") is gone and the set was
- * renumbered with no hole, so the id<->index map below (id == array index + 1)
- * holds exactly — see process()'s inputParameterChanges path. */
-static const DevParam kParams[] = {
-    {1, "Osc Pitch", 0, 0.5},    {2, "Osc Shape", 0, 0.5},
-    {3, "Filter Cutoff", 0, 0.5}, {4, "Filter Reso", 0, 0.5},
-    {5, "Env Attack", 0, 0.5},   {6, "Env Release", 0, 0.5},
-    {7, "Master Level", 0, 0.5}, /* was id 8 (the phantom FX Send at id 7 is gone) */
-    /* the arp (device params 8-11, renumbered from 9-12; param-map-hash moved) */
-    {8, "Arp Mode", 4, 0.0},     {9, "Arp Division", 5, 0.6},
-    {10, "Arp Gate", 0, 0.5},    {11, "Arp Octaves", 3, 0.0},
-    {12, "Glide", 0, 0.0}, /* was id 13; 0 = off, portamento is opt-in now */
-};
+/* The refdev default set lives in shell_config.h's HARP_SHELL_PARAMS (a downstream
+ * product overrides it). It MUST mirror the device's contiguous 1..12 ids (engine
+ * 2.1.0: the drone's old id 7 / phantom "FX Send" is gone, the set renumbered with
+ * no hole) so id == array index + 1 holds — see process()'s inputParameterChanges. */
+static const DevParam kParams[] = { HARP_SHELL_PARAMS };
 static constexpr int kNumParams = sizeof(kParams) / sizeof(kParams[0]);
+#ifdef HARP_SHELL_ENGINE_TABLES
+/* Per-engine slot labels (a product that defines HARP_SHELL_ENGINE_TABLES): row e =
+ * engine e's titles, column k = the title for param id (k+1); "—" hides the slot. The
+ * controller re-titles ids 2..kNumParams from this when the Engine param changes, so
+ * the UI shows the selected engine's REAL controls. Mirrors the device's per-engine
+ * param map; harp ships none — the refdev keeps its single static name set. */
+static const char *const kEngineTables[][kNumParams] = { HARP_SHELL_ENGINE_TABLES };
+static constexpr int kNumEngineTables = (int)(sizeof(kEngineTables) / sizeof(kEngineTables[0]));
+static inline bool engSlotHidden(const char *s) { return s && strcmp(s, "—") == 0; }
+#endif
 /* HOST-SIDE routing parameter (NOT a device param): which multitimbral PART
  * (§9.4 channel 0..15) this plugin instance owns. Stepped+automatable so a DAW
  * can show/persist it per-instance and several aliases each pick a distinct
@@ -942,6 +948,25 @@ public:
         tresult r = EditController::initialize(context);
         if (r != kResultOk) return r;
         for (auto &p : kParams) {
+#ifdef HARP_SHELL_LABELED_PARAMS
+            if (p.labels) { /* a NAMED picker: register the enum labels so the DAW shows them */
+                auto *sl = new Steinberg::Vst::StringListParameter(UString256(p.name), p.id);
+                const char *s = p.labels;
+                while (*s) {
+                    const char *e = strchr(s, '|');
+                    size_t len = e ? (size_t)(e - s) : strlen(s);
+                    char buf[64];
+                    if (len >= sizeof buf) len = sizeof buf - 1;
+                    memcpy(buf, s, len);
+                    buf[len] = 0;
+                    sl->appendString(UString256(buf));
+                    if (!e) break;
+                    s = e + 1;
+                }
+                parameters.addParameter(sl);
+                continue;
+            }
+#endif
             UString256 title(p.name);
             parameters.addParameter(title, nullptr, p.stepCount, p.defaultVal,
                                     ParameterInfo::kCanAutomate, p.id);
@@ -1064,11 +1089,51 @@ public:
                 setParamNormalized(kv.first, kv.second);
         return kResultOk;
     }
+#ifdef HARP_SHELL_ENGINE_TABLES
+    /* PER-ENGINE PARAM RELABEL. The device's param NAMES change with the selected
+     * engine (slot IDs stay fixed, so automation/recall survive). The controller tracks
+     * the Engine param and re-titles ids 2..kNumParams from kEngineTables[engine]; on a
+     * change it asks the host to re-read titles. The engine index uses the device's
+     * (int)(v*N) select so the shown labels match the rendered engine. */
+    int currentEngine_ = 0;
+    static int engineIndexFor(double norm) {
+        int e = (int)(norm * kNumEngineTables);
+        return e < 0 ? 0 : (e >= kNumEngineTables ? kNumEngineTables - 1 : e);
+    }
+    tresult PLUGIN_API setParamNormalized(ParamID id, ParamValue value) override {
+        tresult r = EditController::setParamNormalized(id, value);
+        if (id == (ParamID)(HARP_SHELL_ENGINE_PARAM_ID)) {
+            int e = engineIndexFor(value);
+            if (e != currentEngine_) {
+                currentEngine_ = e;
+                if (componentHandler)
+                    componentHandler->restartComponent(Steinberg::Vst::kParamTitlesChanged);
+            }
+        }
+        return r;
+    }
+    tresult PLUGIN_API getParameterInfo(int32 paramIndex, ParameterInfo &info) override {
+        tresult r = EditController::getParameterInfo(paramIndex, info);
+        if (r != kResultOk) return r;
+        if (info.id >= 2 && info.id <= (ParamID)kNumParams && currentEngine_ < kNumEngineTables) {
+            const char *t = kEngineTables[currentEngine_][info.id - 1];
+            if (t) {
+                /* Always relabel + keep the slot VISIBLE. Dynamically toggling kIsHidden on an
+                 * engine switch makes hosts (Live) leave a "phantom"/removed-param ghost in the
+                 * automation lane (the more->fewer-params case). A fixed-size bank that only ever
+                 * RELABELS avoids that; an unused slot just shows its "—" name instead of vanishing. */
+                UString(info.title, 128).fromAscii(t);
+                info.flags &= ~ParameterInfo::kIsHidden;
+            }
+        }
+        return r;
+    }
+#endif
 };
 
 /* ---------------- factory ---------------- */
 
-#define stringPluginName "HARP RefDev"
+#define stringPluginName HARP_SHELL_PLUGIN_NAME
 
 BEGIN_FACTORY_DEF("HARP Project", "https://github.com/kschzt/harp",
                   "mailto:harp@example.invalid")

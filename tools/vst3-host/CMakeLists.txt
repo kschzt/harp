@@ -202,6 +202,34 @@ if(LIBUSB_FOUND)
   endif()
   message(STATUS "harp-shell: building VST3 shell with libusb")
 
+  # ---- harp-runtime-probe: headless HarpRuntime driver (test tool, no VST3 host) ----
+  # Drives the SAME runtime core Live uses (connect, audio.start, note, pullAudio) so the
+  # shell's eth audio path can be tested end-to-end without a DAW.
+  find_package(Threads REQUIRED)
+  add_executable(harp-runtime-probe
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime-probe.cpp
+    ${HARP_ROOT}/shell/runtime.cpp
+    ${HARP_ROOT}/shell/runtime_registry.cpp
+    ${HARP_ROOT}/host/usb_io.c
+    ${HARP_ROOT}/host/sock_io.c
+    ${HARP_ROOT}/host/rtp.c
+    ${HARP_ROOT}/host/freerun.c
+    ${HARP_ROOT}/host/client.c
+    ${HARP_ROOT}/core/src/cbor.c
+    ${HARP_ROOT}/core/src/sha256.c
+    ${HARP_ROOT}/core/src/frame.c
+    ${HARP_ROOT}/core/src/object.c
+    ${HARP_ROOT}/core/src/store.c
+    ${HARP_ROOT}/core/src/envelope.c
+    ${HARP_ROOT}/core/src/link.c
+    ${HARP_ROOT}/core/src/audio.c
+    ${HARP_PLAT_SRC})
+  target_include_directories(harp-runtime-probe PRIVATE
+    ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell ${LIBUSB_INCLUDE_DIRS})
+  target_compile_definitions(harp-runtime-probe PRIVATE HAVE_LIBUSB)
+  target_link_directories(harp-runtime-probe PRIVATE ${LIBUSB_LIBRARY_DIRS})
+  target_link_libraries(harp-runtime-probe PRIVATE ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc harp_mdns Threads::Threads)
+
   # ---- the HARP CLAP shell (shell/clap) — the SAME runtime core, CLAP-only ----
   # A third shell over HarpRuntime (no VST3 SDK; CLAP is a header-only ABI). Built
   # as a MODULE named harp-clap.clap that the host dlopen()s. CLAP's per-note
@@ -432,6 +460,62 @@ if(LIBUSB_FOUND)
   # Back-compat alias referenced by docs/CI.
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_custom_target(install-linux DEPENDS install-live)
+  endif()
+
+  # ---- optional downstream shell variant (generic; no product strings here) ----
+  # A product that ships this shell as its OWN plugin (own name/UIDs/param map/
+  # device filter — see shell/shell_config.h) builds a SECOND VST3 from these SAME
+  # sources by configuring with:
+  #   -DHARP_SHELL_VARIANT_NAME=<target>      (CMake target + build-bundle name)
+  #   -DHARP_SHELL_VARIANT_CONFIG=<config.h>  (header #defining HARP_SHELL_* macros)
+  #   [-DHARP_SHELL_VARIANT_INCDIR=<dir>]     (dir of that header, on the include path)
+  #   [-DHARP_SHELL_VARIANT_BUNDLE=<name>]    (installed bundle dir, default = NAME)
+  # The config header lives OUTSIDE this repo, so harp carries no product-specific
+  # strings — only this generic mechanism + the refdev default in shell_config.h.
+  if(HARP_SHELL_VARIANT_NAME AND HARP_SHELL_VARIANT_CONFIG)
+    smtg_add_vst3plugin(${HARP_SHELL_VARIANT_NAME}
+      ${SHELL_MAIN}
+      ${HARP_ROOT}/shell/plugin.cpp ${HARP_ROOT}/shell/runtime.cpp
+      ${HARP_ROOT}/shell/runtime_registry.cpp
+      ${HARP_ROOT}/host/usb_io.c ${HARP_ROOT}/host/sock_io.c ${HARP_ROOT}/host/rtp.c
+      ${HARP_ROOT}/host/freerun.c ${HARP_ROOT}/host/client.c
+      ${HARP_ROOT}/core/src/cbor.c ${HARP_ROOT}/core/src/sha256.c
+      ${HARP_ROOT}/core/src/frame.c ${HARP_ROOT}/core/src/object.c
+      ${HARP_ROOT}/core/src/store.c ${HARP_ROOT}/core/src/envelope.c
+      ${HARP_ROOT}/core/src/link.c ${HARP_ROOT}/core/src/audio.c
+      ${HARP_PLAT_SRC})
+    target_include_directories(${HARP_SHELL_VARIANT_NAME} PRIVATE
+      ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
+      ${LIBUSB_INCLUDE_DIRS} ${HARP_SHELL_VARIANT_INCDIR})
+    target_compile_definitions(${HARP_SHELL_VARIANT_NAME} PRIVATE HAVE_LIBUSB
+      HARP_SHELL_CONFIG_HEADER="${HARP_SHELL_VARIANT_CONFIG}")
+    target_link_directories(${HARP_SHELL_VARIANT_NAME} PRIVATE ${LIBUSB_LIBRARY_DIRS})
+    target_link_libraries(${HARP_SHELL_VARIANT_NAME} PRIVATE sdk ${LIBUSB_LIBRARIES}
+      ${HARP_PLAT_LIBS} harp_asrc harp_mdns)
+    if(WIN32)
+      target_link_libraries(${HARP_SHELL_VARIANT_NAME} PRIVATE setupapi ole32 ws2_32)
+    endif()
+    if(NOT HARP_SHELL_VARIANT_BUNDLE)
+      set(HARP_SHELL_VARIANT_BUNDLE "${HARP_SHELL_VARIANT_NAME}")
+    endif()
+    message(STATUS "harp shell variant: ${HARP_SHELL_VARIANT_NAME} "
+                   "-> '${HARP_SHELL_VARIANT_BUNDLE}.vst3' (config ${HARP_SHELL_VARIANT_CONFIG})")
+    if(APPLE)
+      add_custom_command(TARGET ${HARP_SHELL_VARIANT_NAME} POST_BUILD
+        COMMAND codesign --force --deep -s - "$<TARGET_BUNDLE_DIR:${HARP_SHELL_VARIANT_NAME}>")
+    endif()
+    add_custom_target(install-${HARP_SHELL_VARIANT_NAME}
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${HARP_VST3_DEST}"
+      COMMAND ${CMAKE_COMMAND} -E rm -rf "${HARP_VST3_DEST}/${HARP_SHELL_VARIANT_BUNDLE}.vst3"
+      COMMAND ${CMAKE_COMMAND} -E copy_directory
+              "$<TARGET_BUNDLE_DIR:${HARP_SHELL_VARIANT_NAME}>"
+              "${HARP_VST3_DEST}/${HARP_SHELL_VARIANT_BUNDLE}.vst3"
+      DEPENDS ${HARP_SHELL_VARIANT_NAME}
+      COMMENT "Installing ${HARP_SHELL_VARIANT_BUNDLE}.vst3 to ${HARP_VST3_DEST}")
+    if(APPLE)
+      add_custom_command(TARGET install-${HARP_SHELL_VARIANT_NAME} POST_BUILD
+        COMMAND codesign --force --deep -s - "${HARP_VST3_DEST}/${HARP_SHELL_VARIANT_BUNDLE}.vst3")
+    endif()
   endif()
 
   # ---- the Audio Unit shell (macOS): same runtime, second format ----

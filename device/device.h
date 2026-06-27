@@ -96,8 +96,11 @@ typedef struct {
 /* fixed count so sizeof tricks aren't needed across modules. 12 since the drone
  * removal dropped "Drone Mix" (the old id 7); the arp added four params earlier.
  * The ids are CONTIGUOUS 1..12 again (renumbered at 2.1.0 — no hole), so a shell
- * can map id<->index directly. */
+ * can map id<->index directly. Overridable (-DNPARAMS=N) so a downstream device
+ * (the Jetson GPU synth) can grow its bank without touching the refdev — stays 12. */
+#ifndef NPARAMS
 #define NPARAMS 12
+#endif
 extern dev_param g_params[NPARAMS];
 
 /* Per-part param value access (P3). The atomic value lives in part::pval
@@ -356,6 +359,13 @@ typedef struct {
     const char *engine_ver; /* §12.2 TEST seam (--engine-ver X.Y.Z): override the reported engine
                                semver in the identity; NULL => ENGINE_VERSION. Lets a test save a
                                bundle at one engine major and open it on a device reporting another. */
+    const char *product;     /* --product STRING: override the §12 identity product/model name +
+                                the front-panel product + the mDNS instance name. NULL => "harp-refdev"
+                                ("HARP refdev" for mDNS). Lets a downstream daemon
+                                identify as itself without touching the protocol media-types. */
+    const char *engine_name; /* --engine-name STRING: override the reported engine NAME in the §12
+                                identity; NULL => ENGINE_ID. The recall media-type (PARAMS_MEDIA) is
+                                NOT affected — only the human-readable identity string. */
     char serial[64];
     harp_hash param_map_hash;
     uint64_t boot_count;
@@ -445,6 +455,18 @@ void evq_push(dev_event ev);
 void evq_reset_for_new_stream(void);
 void *audio_thread(void *arg);
 void audio_stop(device *d);
+/* The render seam: audio_thread/host_paced_loop (audio_loop.c, in harpdevice)
+ * reach the synth ONLY through these two — render n samples at stream position
+ * pos, and reset every part's voices. engine.c implements the refdev's pair; a
+ * downstream daemon supplies its own. */
+uint16_t render_output(audio_state *a, float *out, uint32_t n, float rate, uint64_t pos);
+void engine_voices_cold(void);   /* audio.start: cold-reset voices */
+void engine_voices_quiet(void);  /* audio_stop: free voices + clear panic */
+/* §9.3 mid-session param-map change: an engine that mutates its advertised param
+ * table at runtime (e.g. a multi-engine synth swapping engines) sets an internal
+ * flag; the session loop polls this seam (take = read-and-clear, any thread) and,
+ * when set, recomputes the hash + sends core.changed. The refdev returns 0. */
+int engine_param_map_dirty_take(void);
 /* §8.7 RTP/UDP emit of one rendered block; no-op unless a->rtp_fd >= 0.
  * Defined in harp-deviced.c so engine.c stays free of socket code. */
 void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, uint64_t msc);
@@ -501,6 +523,9 @@ void encode_param_array_automatable(harp_cbuf *b);
  * tables to assert the hash changes iff stored automation is invalidated. */
 void encode_param_array_from(harp_cbuf *b, const dev_param *table, size_t n);
 void compute_param_map_hash(device *d);
+/* §9.3 mid-session: recompute the param-map-hash after g_params changed (no boot
+ * assertion); returns true if the map changed so the caller can send core.changed. */
+bool refresh_param_map_hash(device *d);
 void live_ref_touch(device *d, bool dirty);
 void live_cache_flush(device *d);
 bool front_panel_set(device *d, uint32_t id, double v);          /* the panel's part 0 */

@@ -375,6 +375,20 @@ void encode_param_array(harp_cbuf *b) {
     }
 }
 
+/* §9.3/§9.9 DETERMINISM HINGE: hash the AUTOMATABLE subset ONLY. The hash
+ * protects stored automation lanes ("change iff invalidates stored automation");
+ * readonly outputs are never automation targets, so adding / removing meters does
+ * NOT invalidate any lane and MUST NOT move the hash. Hashing the automatable
+ * params keeps param-map-hash byte-identical to pre-meter firmware -> identity +
+ * recall stay byte-identical. No assertion: callable at boot AND mid-session. */
+static void hash_param_map_into(device *d) {
+    harp_cbuf b;
+    harp_cbuf_init(&b);
+    encode_param_array_automatable(&b);
+    d->param_map_hash = harp_hash_compute(b.buf, b.len);
+    harp_cbuf_free(&b);
+}
+
 void compute_param_map_hash(device *d) {
     /* P3 lockstep guard: every part boots from PVAL_DEFAULTS (engine.c), which
      * MUST equal g_params[].def in id order. This runs once at boot (main),
@@ -383,17 +397,20 @@ void compute_param_map_hash(device *d) {
      * caught immediately instead of as a silent recall/golden drift. */
     for (size_t i = 0; i < NPARAMS; i++)
         assert(engine_part_param_get(0, g_params[i].id) == g_params[i].def);
-    harp_cbuf b;
-    harp_cbuf_init(&b);
-    /* §9.3/§9.9 DETERMINISM HINGE: hash the AUTOMATABLE subset ONLY. The hash
-     * protects stored automation lanes ("change iff invalidates stored
-     * automation"); readonly outputs are never automation targets, so adding /
-     * removing meters does NOT invalidate any lane and MUST NOT move the hash.
-     * Hashing the 12 automatable params keeps param-map-hash byte-identical to
-     * pre-meter firmware -> identity + recall stay byte-identical. */
-    encode_param_array_automatable(&b);
-    d->param_map_hash = harp_hash_compute(b.buf, b.len);
-    harp_cbuf_free(&b);
+    hash_param_map_into(d);
+}
+
+/* §9.3 mid-session re-announce: a device whose advertised param MAP changes at
+ * runtime (e.g. a multi-engine synth swapping the g_params labels/defaults when
+ * the user picks a different engine) calls this AFTER it has updated g_params.
+ * Recomputes the hash WITHOUT the boot lockstep assertion (values are live now,
+ * not factory defaults) and returns true if the map actually changed — the caller
+ * then sends core.changed so hosts re-read evt.params. GENERIC: the refdev never
+ * mutates g_params, so it never calls this and its map stays static. */
+bool refresh_param_map_hash(device *d) {
+    harp_hash prev = d->param_map_hash;
+    hash_param_map_into(d);
+    return memcmp(prev.b, d->param_map_hash.b, HARP_HASH_LEN) != 0;
 }
 
 /* ---------------- ref helpers ---------------- */
