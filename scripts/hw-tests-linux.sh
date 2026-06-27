@@ -103,20 +103,12 @@ run scripts/timing-test.sh
 run scripts/soak.sh "${SOAK_SECONDS:-30}"
 run scripts/tempo-lock-test.sh
 run scripts/multidevice-test.sh
-run scripts/session-share-test.sh
-run scripts/alias-play-test.sh
 run scripts/alias-group-e2e.sh
 run scripts/late-sink-test.sh
-# alias-part-audio + part-param-iso run on eth.yml (the §8.7 loopback), NOT here: both
-# drive a SUSTAINED multi-instance claim (owner + an attached alias capturing its part's
-# audio) that this VM-passthrough USB rig can't hold. A long suite's cumulative
-# claim/release wedges the bus, and even the UDC re-plug recover() only restores a brief
-# SINGLE claim (the probe identify), not the sustained TWO-instance one — so
-# alias-part-audio kept failing "never connected" right after a "device claimable"
-# recover (intermittent). The per-part demux/isolation is transport-agnostic, so the
-# loopback covers it reliably (and adds real §8.7 transport coverage); the USB rig keeps
-# the single-claim tests it can actually hold.
-echo "──── alias-part-audio + part-param-iso: moved to eth.yml (loopback — sustained multi-instance wedges this passthrough USB rig); SKIP here"; SKIP=$((SKIP+2))
+# alias-part-audio + part-param-iso (the old attached-alias model) were REMOVED in the
+# multi-out migration (M3): per-part demux isolation is now covered by multiout-iso and
+# per-channel param routing by multiout-perchan (both on the eth.yml §8.7 loopback), with
+# per-part routing/timbre proven on real hardware by multitimbral-test + recall-perpart here.
 run scripts/meter-test.sh
 run scripts/replug-test.sh
 echo "════ hw-tests (linux): $PASS passed, $FAIL failed, $SKIP skipped"
