@@ -33,32 +33,26 @@
 #include "diag_rings.h" /* §14.4 host-context-B: SessionHistory + RuntimeLog rings */
 #include "ring.h"
 
-/* §9.4 multitimbral event MERGE (P5). One physical HARP unit is one session
- * with one event plane; several shells can share that session (P4 registry),
- * each OWNING a part (channel). Each such shell registers its OWN event SOURCE
- * — a TimedRing + a channel — and the eventPump drains ALL registered sources
- * onto the one wire, stamping every event with its source's channel. So a
- * multitimbral group of aliases actually PLAYS: shell A injects notes/params on
- * part 0, shell B on part 1, …, all merged onto the device.
+/* §9.4 event plane. One physical HARP unit is one session with one event plane,
+ * driven by ONE owning instance — a device is one multi-out MAIN instance per
+ * claim, so the P4/P5 multi-shell sharing + per-part event-source MERGE is
+ * RETIRED (no registry, no source array, no merge). The runtime's built-in event
+ * SOURCE (ownerSource_) — a TimedRing + a channel — is the SOLE producer of the
+ * wire's event stream; the eventPump drains it, stamping every event with the
+ * source's channel. Multitimbral play is now one instance feeding 16 channels
+ * (channel C -> part C), not N shells each on one part.
  *
- * Each source is strictly SPSC: ONE producer (the owning instance's audio /
- * control thread calling queue*) and ONE consumer (the eventPump). The merge
- * adds no multi-producer ring — the pump just iterates a SET of SPSC rings.
- * The only shared mutable structure is the source REGISTRY (sources added on
- * acquire, removed on release); it is synchronised against the pump's iteration
- * by a short mutex that the audio thread never touches (acquire/release are off
- * the audio path).
+ * The source is strictly SPSC: ONE producer (the owning instance's audio /
+ * control thread calling queue*) and ONE consumer (the eventPump). There is no
+ * shared source registry and no lock on the event path — the pump drains the one
+ * fixed ring with its one channel, byte-identical to the pre-P5 timedRing_ +
+ * chan_ path (the golden gate).
  *
- * SINGLE-INSTANCE is unchanged: the owner's source is the runtime's built-in
- * source (ownerSource_), always present, always slot 0. With one instance the
- * pump drains exactly that one ring with that one channel — byte-identical to
- * the pre-P5 timedRing_ + chan_ path (the golden gate).
- *
- * SCOPE: this struct is the EVENT plane merge. The per-part AUDIO demux (each
- * alias hearing only its own part) is implemented separately by the AudioSink
- * registry below (P5b) — the owner's reader() splits the device frame into
- * per-part sink rings; an instance with no sink still pulls the summed MAIN MIX,
- * the byte-identical default. */
+ * SCOPE: this struct is the EVENT plane. The per-part AUDIO demux (the multi-out
+ * main splitting the device frame across its per-part output buses) is a separate
+ * concern, the AudioSink registry below — the reader() splits the device frame
+ * into per-part sink rings; bus 0 pulls the summed MAIN MIX, the byte-identical
+ * default. */
 struct EventSource {
     TimedRing ring;            /* this instance's outbound events (SPSC) */
     std::atomic<uint8_t> chan; /* the part (§9.4 key 5) every event carries */
@@ -245,42 +239,22 @@ public:
      * its notes and one shell fully owns its part. DEFAULT 0 => encode omits
      * the key => byte-identical wire (golden gate). Set before start() (the
      * event pump reads it per event); a no-op mid-session is harmless since
-     * the pump re-reads it per event. ATTACHED instances set their part on
-     * their OWN source via the channel passed to registerSource(). */
+     * the pump re-reads it per event. */
     void setChannel(uint8_t channel) {
         ownerSource_.chan.store(channel & 0xf, std::memory_order_relaxed);
     }
     uint8_t channel() const { return ownerSource_.chan.load(std::memory_order_relaxed); }
 
-    /* ---- per-instance event source (P5 merge) ----
-     * The OWNER drives ownerSource(); an ATTACHED instance registers its OWN
-     * source (its part) on acquire and removes it on release. queue* take the
-     * source so each instance pushes to ITS ring (the SPSC producer side) —
-     * the eventPump drains every registered source onto the one wire. */
+    /* ---- the event source ----
+     * One private runtime per instance, so there is ONE event source: the
+     * runtime's built-in ownerSource_. queue* take it so the instance pushes to
+     * ITS ring (the SPSC producer side); the eventPump drains it onto the wire.
+     * (The attached-source merge — registerSource/unregisterSource across a
+     * shared runtime — is retired with the sharing registry.) */
     EventSource *ownerSource() { return &ownerSource_; }
-    /* Register an attached instance's source for `channel` (its part). The
-     * eventPump begins draining it on its next pass; safe to call mid-session
-     * (acquire is off the audio path). Returns the source to queue* against, or
-     * nullptr if the device's parts are all taken (kMaxSources sources already
-     * registered) — that instance is then EVENT-DORMANT: it passes the nullptr
-     * to queue*, which drops its events rather than racing a 17th producer onto
-     * the owner's SPSC ring (see queue*). */
-    EventSource *registerSource(uint8_t channel);
-    /* Remove an attached source on release and free it. The runtime owns the
-     * sources it allocated in registerSource; the producer must be quiescent
-     * (the host stops process() before release). unregisterSource removes the
-     * source from the registry FIRST (under the lock, so the eventPump never
-     * touches it again), THEN drains its leftover queued-but-unwritten events —
-     * dropping them (the part is gone) but DECREMENTING the event fence by that
-     * count, so the device's consume target stays consistent and surviving
-     * parts keep tight timing (see the impl). Idempotent on nullptr / the owner
-     * source (which persists for the whole session). */
-    void unregisterSource(EventSource *src);
 
     /* ---- audio thread (all lock-free) ---- */
-    /* Each takes the calling instance's EventSource (its SPSC producer side).
-     * Single-instance passes ownerSource(); the merge is the only difference
-     * from the pre-P5 single-ring path. */
+    /* Each takes the owner EventSource (its SPSC producer side) via ownerSource(). */
     /* MULTI-OUT M2: `channel` is the device part this param/ramp targets (§9.4 key 5). The
      * default kChanFromSource (0xff) resolves to the source's own channel at queue time — so
      * every existing caller is byte-identical. A multi-out main passes an explicit channel (a
@@ -325,10 +299,10 @@ public:
      * instance whose slots aren't in the live union gets silence until the next
      * audio.start — the P5b mid-attach limitation, documented in audioStart). */
     AudioSink *registerAudioSink(const std::vector<uint32_t> &slots);
-    /* Remove + free a sink on release. Like unregisterSource: take sinksMutex_,
-     * remove from the registry FIRST (so reader() can't touch it again), then
-     * free it. The producer (reader, if alive) iterates only the registry under
-     * the lock, so the removed sink is ours alone to free. Idempotent on null. */
+    /* Remove + free a sink on release: take sinksMutex_, remove from the registry
+     * FIRST (so reader() can't touch it again), then free it. The producer
+     * (reader, if alive) iterates only the registry under the lock, so the removed
+     * sink is ours alone to free. Idempotent on null. */
     void unregisterAudioSink(AudioSink *sink);
 
     /* SSI of the next sample pullAudio will deliver: the stream-domain "now"
@@ -898,16 +872,6 @@ private:
     std::atomic<uint64_t> evDrops_{0};    /* events lost to ring overflow — never silent */
     uint64_t evDropsLogged_ = 0;
     std::atomic<bool> panicPending_{false}; /* a note-off was lost: all-off NOW */
-    /* A 17th alias's registerSource() returned nullptr (table full at
-     * kMaxSources parts): that instance is EVENT-DORMANT — queue* drops its
-     * events rather than racing them onto the owner's SPSC ring. The audio
-     * thread only raises the flag (RT-safe, no syscall); the eventPump emits
-     * the one-shot log. */
-    std::atomic<bool> dormantSrcSeen_{false};   /* set by queue* on a null source */
-    std::atomic<bool> dormantSrcLogged_{false}; /* the pump logged it once */
-    /* event-dormant (null-source) drop: raise the flag the pump logs. Audio
-     * thread only — no allocation, no I/O. */
-    void noteDormant() { dormantSrcSeen_.store(true, std::memory_order_relaxed); }
 
     /* §14.4 host-context-B instrumentation rings. SessionHistory is CONTROL-PATH
      * (recorded at the §12.1 transition sites on the supervisor/feeder/reader
@@ -940,14 +904,14 @@ private:
      * (not yet written — queue time is what a racing pacing frame must
      * respect). Audio thread increments (queue*); the feeder stamps it into
      * fenced pacing frames; the device renders a range only after consuming
-     * that many evt messages. unregisterSource decrements it by a released
-     * source's leftover (queued-but-unwritten) events, so the high-water mark
-     * stays equal to what the device will actually consume. Resets with the
-     * session, like the SSI domain.
+     * that many evt messages. With one session-long source there is nothing to
+     * subtract (the retired per-source release used to remove a freed source's
+     * leftover queued-but-unwritten events); the count is the owner's queued
+     * events. Resets with the session, like the SSI domain.
      *
-     * MONOTONIC across re-negotiations (P5b): queue* only ever fetch_add's it and
-     * unregisterSource fetch_sub's it — a re-neg NEVER store(0)'s it (that would
-     * race the lock-free queue* on the audio/control threads — the old B2 race).
+     * MONOTONIC across re-negotiations: queue* only ever fetch_add's it — a re-neg
+     * NEVER store(0)'s it (that would race the lock-free queue* on the audio/
+     * control threads — the old B2 race).
      * The value a pacing frame FENCES with is (evtQueuedSeq_ - evtEpochBase_): the
      * events queued SINCE the current epoch's audio.start. See evtEpochBase_. */
     std::atomic<uint32_t> evtQueuedSeq_{0};
@@ -1049,34 +1013,13 @@ private:
      * P5b mid-attach limitation — see audioStart). */
     std::vector<uint32_t> unionSlots_;
 
-    /* P5 event-source MERGE (see EventSource doc above). The OWNER source is
-     * built in and always present — it IS the pre-P5 timedRing_ + chan_, so a
-     * single instance drains exactly this one ring with this one channel
-     * (byte-identical golden path). Attached instances register additional
-     * sources; the eventPump iterates the whole set.
-     *
-     * The registry is a fixed array of source pointers guarded by a short
-     * mutex (sourcesMutex_). The eventPump holds that mutex while it DRAINS
-     * every registered source's ring INTO its batch buffer (pure memory work —
-     * pop + encode, no I/O), and writes the wire only AFTER unlocking; it never
-     * holds the lock across the wire write. registerSource/unregisterSource take
-     * the same mutex to add/remove a source — both off the RT audio path. The
-     * audio thread's queue* never touch the registry at all (the producer
-     * already holds its own source pointer). So no source ring ever becomes
-     * multi-producer, and the only cross-thread sharing — the pointer array —
-     * is mutated only off the RT path under that mutex.
-     *
-     * SAFE-FREE + FENCE: unregisterSource removes a source from the array
-     * (under the lock) before draining/freeing it, so a pump pass either drains
-     * it fully before it disappears or never sees it — it can never pop a freed
-     * ring. The same drain also decrements evtQueuedSeq_ by the source's
-     * leftover events, keeping the fence consistent for surviving parts (see
-     * unregisterSource). */
+    /* The one event source. It IS the pre-P5 timedRing_ + chan_: a single instance
+     * (now the only kind) drains exactly this one ring with this one channel — the
+     * byte-identical golden path. The audio thread's queue* is its sole SPSC
+     * producer; the eventPump is its sole consumer, so no lock is needed. (The
+     * attached-source array + sourcesMutex_ merge is retired with the sharing
+     * registry.) */
     EventSource ownerSource_{0};
-    static constexpr size_t kMaxSources = 16; /* one per multitimbral part */
-    std::mutex sourcesMutex_;
-    EventSource *sources_[kMaxSources] = {&ownerSource_};
-    size_t nSources_ = 1; /* owner source occupies slot 0 for the session */
 
     ParamRing echoRing_;  /* device front-panel echoes -> outputParameterChanges */
     std::atomic<uint64_t> ssiRead_{0};
@@ -1188,10 +1131,9 @@ private:
         return (double)kBlock;
     }
 
-    /* (the OWNER instance's part lives in ownerSource_.chan — see above; an
-     * ATTACHED instance's part lives in the source it got from registerSource.
-     * Notes don't read it — their channel is already baked into the UMP word
-     * by the shell; only param sets/ramps need the per-source channel.) */
+    /* (the instance's part lives in ownerSource_.chan — see above. Notes don't
+     * read it — their channel is already baked into the UMP word by the shell;
+     * only param sets/ramps need the source channel.) */
 
     /* §11.4 archive-name disambiguation (written under ctlMutex_ in pushStateLocked): the last
      * archive/duplicate ref name minted + a per-session sequence, so two DISTINCT displacing pushes

@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -86,8 +87,7 @@ public:
 
     ~HarpFxProcessor() override {
         releaseSource();
-        runtime_release(handle_);
-        handle_ = RuntimeHandle{};
+        rt_.reset();
     }
 
     static FUnknown *createInstance(void *) {
@@ -108,57 +108,44 @@ public:
         rate_ = (uint32_t)setup.sampleRate;
         maxBlock_ = (uint32_t)setup.maxSamplesPerBlock;
         offline_ = setup.processMode == kOffline;
-        if (runtime() && owner()) runtime()->configure(rate_, maxBlock_);
+        if (runtime()) runtime()->configure(rate_, maxBlock_);
         if (runtime()) runtime()->setOffline(offline_);
         return AudioEffect::setupProcessing(setup);
     }
 
     tresult PLUGIN_API setActive(TBool state) override {
         if (state) {
-            if (handle_.rt) {
+            if (rt_) {
                 releaseSource();
-                runtime_release(handle_);
-                handle_ = RuntimeHandle{};
+                rt_.reset();
             }
-            /* §8.8 OWNERSHIP — an FX insert is PER-TRACK: each instance must drive
-             * its OWN host-paced session THROUGH the device (H->D track audio in,
-             * D->H wet). It must NEVER attach as a registry NON-OWNER. A non-owner
-             * runs NONE of the session setup below — no setFxInputSlots, no start(),
-             * no source_ — so process() falls into its !source_ path and the track
-             * goes SILENT. That is exactly the Ableton failure: a transient scan
-             * instance grabs ownership of the shared-by-serial runtime first, the
-             * LIVE insert attaches owner=false, and its output is pure silence
-             * (the device reverberated nothing because no input ever reached it).
-             *
-             * So DECOUPLE the registry key from device targeting: ALWAYS acquire a
-             * FRESH, unshared, always-owner runtime (the empty-serial golden path in
-             * runtime_acquire). Nothing is lost — the device is single-claim, so a
-             * host-paced INPUT session was never shareable across inserts anyway.
-             *   - Device binding is UNAFFECTED: selectDevice() dials HARP_ETH_DEVICE
-             *     (or the USB serial), NOT the registry key.
-             *   - The §12.2 device-identity gate is PRESERVED: setStateBundle() below
-             *     records the bundle's wanted serial (wantSerial_) for the serial-
-             *     differs read-only hold, independent of the registry key. */
-            handle_ = runtime_acquire("");
-            if (owner()) { /* always true now — the guard is a defensive invariant */
-                runtime()->configure(rate_, maxBlock_);
-                runtime()->setOffline(offline_);
-                /* §8.8: arm the host->device EFFECT input BEFORE start(), so
-                 * audio.start declares the in-slots (key 3) and the feeder carries
-                 * the track audio in the H->D payload. The instrument shell never
-                 * calls this, so its wire stays byte-identical (the golden gate).
-                 * Arming also FORCES host-paced (wantHostPacedMode()), so an armed FX
-                 * is never free-running — it returns the wet in live playback too. */
-                runtime()->setFxInputSlots(kFxInSlots);
-                if (!pendingState_.empty())
-                    runtime()->setStateBundle(pendingState_.data(), pendingState_.size());
-                runtime()->start(rate_);
-                source_ = runtime()->ownerSource();
-            }
+            /* §8.8 OWNERSHIP — an FX insert is PER-TRACK: each instance drives its
+             * OWN private host-paced session THROUGH the device (H->D track audio
+             * in, D->H wet). Every instance owns its runtime outright (the
+             * share-by-serial registry is retired), so the Ableton "non-owner
+             * insert renders silence" failure is structurally impossible: there is
+             * no shared runtime to attach to as a non-owner. Device binding is the
+             * runtime's own job: selectDevice() dials HARP_ETH_DEVICE (or the USB
+             * serial); the §12.2 device-identity gate is preserved because
+             * setStateBundle() below records the bundle's wanted serial
+             * (wantSerial_) for the serial-differs read-only hold. */
+            rt_ = runtime_acquire();
+            runtime()->configure(rate_, maxBlock_);
+            runtime()->setOffline(offline_);
+            /* §8.8: arm the host->device EFFECT input BEFORE start(), so
+             * audio.start declares the in-slots (key 3) and the feeder carries
+             * the track audio in the H->D payload. The instrument shell never
+             * calls this, so its wire stays byte-identical (the golden gate).
+             * Arming also FORCES host-paced (wantHostPacedMode()), so an armed FX
+             * is never free-running — it returns the wet in live playback too. */
+            runtime()->setFxInputSlots(kFxInSlots);
+            if (!pendingState_.empty())
+                runtime()->setStateBundle(pendingState_.data(), pendingState_.size());
+            runtime()->start(rate_);
+            source_ = runtime()->ownerSource();
         } else {
             releaseSource();
-            runtime_release(handle_);
-            handle_ = RuntimeHandle{};
+            rt_.reset();
         }
         return AudioEffect::setActive(state);
     }
@@ -318,20 +305,20 @@ public:
         }
         if (raw.empty()) return kResultFalse;
         pendingState_ = raw;
-        if (owner() && runtime())
+        if (runtime())
             return runtime()->setStateBundle(raw.data(), raw.size()) ? kResultOk : kResultFalse;
         return kResultOk;
     }
 
 private:
-    RuntimeHandle handle_;
+    std::unique_ptr<HarpRuntime> rt_;
     EventSource *source_ = nullptr;
     void releaseSource() {
-        if (source_ && runtime()) runtime()->unregisterSource(source_);
+        /* source_ is the runtime's own owner source — freed with the runtime; just
+         * forget it here (run before rt_.reset()). */
         source_ = nullptr;
     }
-    HarpRuntime *runtime() const { return handle_.rt; }
-    bool owner() const { return handle_.owner; }
+    HarpRuntime *runtime() const { return rt_.get(); }
     uint32_t rate_ = 48000;
     uint32_t maxBlock_ = 1024;
     bool offline_ = false;

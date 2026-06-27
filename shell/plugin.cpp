@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <memory>
 #include <vector>
 
 #include "pluginterfaces/base/fplatform.h"
@@ -123,14 +124,13 @@ class HarpProcessor : public AudioEffect {
 public:
     HarpProcessor() { setControllerClass(kHarpControllerUID); }
 
-    /* Defensive teardown: the host calls setActive(false) before destroying
-     * us (which releases the handle), but if it doesn't, release here so the
-     * shared refcount is correct and a private runtime is not leaked — the
-     * same net cleanup the old by-value member's ~HarpRuntime gave. */
+    /* Defensive teardown: the host calls setActive(false) before destroying us
+     * (which resets rt_), but if it doesn't, tear down here so the private
+     * runtime is not leaked — the same net cleanup the old by-value member's
+     * ~HarpRuntime gave. */
     ~HarpProcessor() override {
-        releaseSource(); /* attached: drop our event source before the runtime */
-        runtime_release(handle_);
-        handle_ = RuntimeHandle{};
+        releaseSource(); /* drop our audio sinks before the runtime */
+        rt_.reset();
     }
 
     static FUnknown *createInstance(void *) {
@@ -176,13 +176,12 @@ public:
         offline_ = setup.processMode == kOffline;
         /* The ring cushion (and thus reported latency) scales with the DAW's
          * block size — a 1024-sample pull needs a deeper ring than a 64-sample
-         * one. We CAPTURE the params here and let the OWNER apply them via
-         * rt->configure() at acquire time (setActive), so the single-instance
-         * sequence configure()->start() stays byte-identical even though the
-         * runtime now comes from the registry. setupProcessing runs while
-         * inactive (no runtime yet) for a fresh instance; if a runtime is
-         * already acquired (a re-setup) and we own it, configure it now too. */
-        if (runtime() && owner()) runtime()->configure(rate_, maxBlock_);
+         * one. We CAPTURE the params here and apply them via rt->configure() at
+         * acquire time (setActive), so the single-instance sequence
+         * configure()->start() stays byte-identical. setupProcessing runs while
+         * inactive (no runtime yet) for a fresh instance; if a runtime is already
+         * acquired (a re-setup), configure it now too. */
+        if (runtime()) runtime()->configure(rate_, maxBlock_);
         /* §8.3-over-§8.7: tell the runtime BEFORE the session starts whether this is
          * an offline bounce, so an Ethernet binding negotiates host-paced
          * (deterministic) instead of free-running RTP. No-op on USB. */
@@ -193,120 +192,65 @@ public:
     tresult PLUGIN_API setActive(TBool state) override {
         if (state) {
             /* Idempotent against a redundant setActive(true) (some hosts double-
-             * activate): drop any handle we already hold before re-acquiring, so
-             * we never leak a reference or strand a shared session's refcount.
-             * Drop our event source first too (same ordering rule as release). */
-            if (handle_.rt) {
+             * activate): tear down any runtime we already hold before re-acquiring,
+             * so we never leak one. Drop our audio sinks first (same ordering rule
+             * as release). */
+            if (rt_) {
                 releaseSource();
-                runtime_release(handle_);
-                handle_ = RuntimeHandle{};
+                rt_.reset();
             }
-            /* Acquire the (possibly shared) runtime for THIS instance's target
-             * unit. The wanted serial is the explicit target, in priority:
-             *   1. HARP_DEVICE_SERIAL env — the field/test pin (also how the
-             *      out-of-process host forces a unit, like HARP_OUT_SLOTS).
-             *   2. the loaded bundle's usb serial, if the project pinned one.
-             *   3. else "" — NO explicit target -> a fresh, UNSHARED runtime
-             *      that auto-selects, byte-identical to the old by-value member
-             *      (the golden / single-instance / #16 multi-device gate). */
-            std::string wantSerial;
-            if (const char *e = getenv("HARP_DEVICE_SERIAL"); e && e[0])
-                wantSerial = e;
-            else if (!pendingState_.empty())
-                wantSerial = HarpRuntime::bundleWantedSerial(pendingState_.data(),
-                                                             pendingState_.size());
-
-            handle_ = runtime_acquire(wantSerial);
-            if (owner()) {
-                /* First/sole instance for this unit: drive it exactly as the
-                 * old by-value runtime did — configure, stage the project's
-                 * bundle (stage-before-start, as setState did pre-acquire),
-                 * then start. The owner's event source is the runtime's built-
-                 * in ownerSource_ (its channel is set inside start() from
-                 * HARP_CHANNEL — byte-identical single-instance path). */
-                runtime()->configure(rate_, maxBlock_);
-                /* §8.3-over-§8.7: apply the offline flag captured at setupProcessing
-                 * (which runs before the runtime is acquired) BEFORE start(), so
-                 * selectDevice negotiates host-paced for an Ethernet offline bounce. */
-                runtime()->setOffline(offline_);
-                if (!pendingState_.empty())
-                    runtime()->setStateBundle(pendingState_.data(), pendingState_.size());
-                /* MULTI-OUT (M1): per-part sinks are registered per ACTIVATED output bus
-                 * (registerActivePartSinks, driven by the host's activateBus) BEFORE start()
-                 * — so a host that routes only the main mix keeps the 2-slot union (golden
-                 * byte-identical) and a host routing N parts streams 2+2N slots. Registering
-                 * all 16 unconditionally is wrong: it forces a 34-channel union even for the
-                 * main-mix-only case, and a 34-ch free-running RTP frame (256·34·4 = 34 KB)
-                 * exceeds the datagram size. Activatable = only routed parts stream. */
-                registerActivePartSinks();
-                runtime()->start(rate_);
-                source_ = runtime()->ownerSource();
-                /* P6: pin the owner source to THIS instance's part. start() seeds
-                 * the channel from HARP_CHANNEL (the headless --channel path);
-                 * part_ was seeded from the SAME env (or recalled by setState),
-                 * so for the env/golden path this is a no-op (part 0 / the env
-                 * value), and for a recalled/automated Part it asserts the saved
-                 * part — the per-instance routing the env alone could not give. */
-                applyPart();
-            } else {
-                /* ATTACHED (P5): the shared session is already configured/
-                 * started and streaming under the sibling owner. This instance
-                 * is NO LONGER DORMANT FOR EVENTS — it registers its OWN event
-                 * source (its part) and queues notes/params on it; the owner's
-                 * eventPump merges every source onto the one session, so the
-                 * group PLAYS multitimbrally. */
-                /* P6 (closes the P5c gap): this instance registers its OWN source
-                 * on ITS part — part_, the per-instance "Part" param (id 98).
-                 * part_ defaults to the HARP_CHANNEL env (so the headless tsan/
-                 * host --channel path is unchanged) but is per-instance state that
-                 * setState RECALLS and a live Part edit re-parts: in a real DAW
-                 * each alias now owns a DISTINCT part that persists with the
-                 * project, instead of every instance collapsing onto the one
-                 * process-global env value. */
-                source_ = runtime()->registerSource(part_);
-                /* P5b per-part AUDIO (OPT-IN). DEFAULT (env unset): this attached
-                 * instance stays AUDIO-SILENT exactly as P5 — the owner pulls the
-                 * summed main mix and we emit silence, byte-identical to before
-                 * P5b. When HARP_PART_AUDIO is set the instance OPTS IN to its OWN
-                 * part's audio: it registers a per-part sink for that part's
-                 * stereo pair (P2.2 slots {2+2k,3+2k}), which the owner's reader
-                 * demuxes out of the shared device stream, and process() pulls
-                 * THAT sink instead of silence. (See sink_ + process().)
-                 *
-                 * P5b LIMITATION: the audio.start UNION is fixed when the OWNER
-                 * starts. A sink registered here AFTER the owner has started is in
-                 * the registry but its slots are not in the live union, so it
-                 * reads silence until the next audio.start. DAW tracks activate
-                 * together at project load, so registering every part's sink
-                 * before the owner starts puts them all in the union — a mid-
-                 * session glitchy restart is worse than this fixed-at-start union
-                 * (see HarpRuntime::audioStart). */
-                if (const char *e = getenv("HARP_PART_AUDIO"); e && e[0] && e[0] != '0') {
-                    std::vector<uint32_t> slots = {2u + 2u * part_, 3u + 2u * part_};
-                    sink_ = runtime()->registerAudioSink(slots);
-                }
-            }
+            /* Construct THIS instance's private runtime. There is no sharing —
+             * every instance owns its own. Device SELECTION is the runtime's own
+             * job (HarpRuntime::selectDevice): HARP_DEVICE_SERIAL env, else the
+             * loaded bundle's usb serial (applied via setStateBundle below), else
+             * auto-select + singleton-kill — so two instances on different units
+             * bind different devices with no shared registry to coordinate. */
+            rt_ = runtime_acquire();
+            /* Drive it exactly as the old by-value runtime did — configure, stage
+             * the project's bundle (stage-before-start, as setState did), then
+             * start. The event source is the runtime's built-in ownerSource_ (its
+             * channel is set inside start() from HARP_CHANNEL — byte-identical
+             * single-instance path). */
+            runtime()->configure(rate_, maxBlock_);
+            /* §8.3-over-§8.7: apply the offline flag captured at setupProcessing
+             * (which runs before the runtime is acquired) BEFORE start(), so
+             * selectDevice negotiates host-paced for an Ethernet offline bounce. */
+            runtime()->setOffline(offline_);
+            if (!pendingState_.empty())
+                runtime()->setStateBundle(pendingState_.data(), pendingState_.size());
+            /* MULTI-OUT (M1): per-part sinks are registered per ACTIVATED output bus
+             * (registerActivePartSinks, driven by the host's activateBus) BEFORE start()
+             * — so a host that routes only the main mix keeps the 2-slot union (golden
+             * byte-identical) and a host routing N parts streams 2+2N slots. Registering
+             * all 16 unconditionally is wrong: it forces a 34-channel union even for the
+             * main-mix-only case, and a 34-ch free-running RTP frame (256·34·4 = 34 KB)
+             * exceeds the datagram size. Activatable = only routed parts stream. */
+            registerActivePartSinks();
+            runtime()->start(rate_);
+            source_ = runtime()->ownerSource();
+            /* P6: pin the source to THIS instance's part. start() seeds the channel
+             * from HARP_CHANNEL (the headless --channel path); part_ was seeded from
+             * the SAME env (or recalled by setState), so for the env/golden path this
+             * is a no-op (part 0 / the env value), and for a recalled/automated Part
+             * it asserts the saved part. */
+            applyPart();
         } else {
-            /* Release: an ATTACHED instance first removes its event source so
-             * the owner's eventPump stops draining it and never touches a freed
-             * source (unregisterSource is a no-op on the owner source / null).
-             * MUST happen BEFORE runtime_release — release may be the last one,
-             * which stops+destroys the runtime; unregistering after that would
-             * touch a freed runtime. Then drop the reference: the LAST holder of
-             * a shared runtime stops+destroys it (joining its threads); a
-             * private (unshared) runtime is torn down outright. */
+            /* Release: drop our audio sinks (releaseSource, below) before
+             * rt_.reset() tears down the runtime — the reader must stop demuxing
+             * into a ring before it is freed. rt_.reset() stops+destroys the
+             * runtime outright (joining its threads), like the old by-value
+             * member's ~HarpRuntime. */
             /* §14.4 host-context-A TRIGGER (test/diagnostic, OPT-IN by env): the
              * out-of-process host's --diag-bundle flag sets HARP_DIAG_BUNDLE_OUT
              * to a file path. We capture the runtime's diag bundle HERE — after
              * the render is complete (the host calls setActive(false) post-
              * process) and while the session is still up — and write the bytes.
              * getDiagBundle() is READ-ONLY off the control path (no audio-path
-             * effect), so this is invisible to the render. Only the OWNER (which
-             * drives the live session) captures; an unset env is the no-op golden
-             * path. The runtime reaches this from the in-process plugin module,
-             * since the registry it owns lives inside this .vst3, not the host. */
+             * effect), so this is invisible to the render; an unset env is the
+             * no-op golden path. The runtime reaches this from the in-process
+             * plugin module (the .vst3), not the host. */
             if (const char *p = getenv("HARP_DIAG_BUNDLE_OUT");
-                p && p[0] && owner() && runtime()) {
+                p && p[0] && runtime()) {
                 bool anon = false;
                 if (const char *a = getenv("HARP_DIAG_BUNDLE_ANON"); a && a[0] && a[0] != '0')
                     anon = true;
@@ -326,7 +270,7 @@ public:
              * render (the offline goldens stay byte-identical). Only the OWNER (which
              * drives the live session) measures; an unset env is the no-op golden path. */
             if (const char *li = getenv("HARP_LOOPBACK_IN");
-                li && li[0] && owner() && runtime() && runtime()->loopbackArmed()) {
+                li && li[0] && runtime() && runtime()->loopbackArmed()) {
                 HarpRuntime::LoopbackResult lr = runtime()->measureLoopback();
                 fprintf(stdout,
                         "loopback: in=%d out=%d rate=%u armed=%d echo=%d ok=%d "
@@ -337,8 +281,7 @@ public:
                 fflush(stdout);
             }
             releaseSource();
-            runtime_release(handle_);
-            handle_ = RuntimeHandle{};
+            rt_.reset();
         }
         return AudioEffect::setActive(state);
     }
@@ -346,16 +289,9 @@ public:
     uint32 PLUGIN_API getLatencySamples() override {
         /* The reported latency is a pure function of the DAW block size, so it
          * is byte-identical whether we ask the live runtime or compute it
-         * statically (the runtime now arrives from the registry at activate-
-         * time, so a host querying latency in the inactive window has nothing
-         * to ask). An OWNER reports its live runtime's value.
-         *
-         * P5: an ATTACHED instance must report the SAME latency as the owner.
-         * Its audio bus is silent, but it now SENDS events stamped at
-         * streamPos() + latencySamples() (full PDC) — so the host must delay
-         * this instance's EVENT timeline by that same latency, or the part's
-         * notes/automation land misaligned against the owner's. (Reporting 0
-         * was a P4 leftover from when attached instances were fully dormant.) */
+         * statically (the runtime is constructed at activate-time, so a host
+         * querying latency in the inactive window has nothing to ask). A live
+         * instance reports its runtime's value; otherwise compute it. */
         if (runtime()) return runtime()->latencySamples();
         return HarpRuntime::latencyFor(maxBlock_);
     }
@@ -364,10 +300,9 @@ public:
         return symbolicSampleSize == kSample32 ? kResultTrue : kResultFalse;
     }
 
-    /* Zero the output bus and flag it silent. Routed here by: a pre-acquire call
-     * (no runtime yet), and an attached instance with NO per-part audio sink (the
-     * default — audio-silent, though it still merges EVENTS per P5). No runtime
-     * touch, no event queueing — just clean silence so the host bus is well-defined. */
+    /* Zero the output bus and flag it silent. Routed here by a pre-acquire call
+     * (no runtime yet / queried before activate). No runtime touch, no event
+     * queueing — just clean silence so the host bus is well-defined. */
     tresult processSilence(ProcessData &data) {
         if (data.numOutputs < 1 || data.numSamples <= 0 ||
             data.outputs[0].numChannels < 1 || !data.outputs[0].channelBuffers32)
@@ -387,15 +322,9 @@ public:
         if (!runtime() || !source_) return processSilence(data);
 
         HarpRuntime &rt = *runtime();
-        const bool isOwner = owner();
-        /* P5: ATTACHED instances are NO LONGER DORMANT FOR EVENTS — they queue
-         * notes/params on THEIR OWN source (source_), which the owner's
-         * eventPump merges onto the one session, so the multitimbral group
-         * PLAYS. What they still MUST NOT touch is the OWNER-only state: the
-         * single audio ring (one consumer — they emit silence, not pull) and
-         * the transport-change detector (one driver — the owner anchors the
-         * session's musical time; an attached feedTransport would push a
-         * second, conflicting transport stream). AUDIO demux per part is P5b. */
+        /* One private runtime per instance (the sharing registry is retired), so
+         * this instance is always its own owner: it drives transport, pulls the
+         * main mix + every per-part demux sink, and drains the echo ring. */
 
         /* Stream-domain "now" for this block: events at DAW offset s map to
          * SSI base + s; the latency term is repaid by the host's PDC, so
@@ -413,7 +342,7 @@ public:
          * the project grid by construction. Transport is global, so only the
          * owner drives it (queueTransport pins it to the owner source anyway —
          * but the change DETECTOR must run on one thread, the owner's). */
-        if (isOwner && data.processContext) {
+        if (data.processContext) {
             const ProcessContext &pc = *data.processContext;
             rt.feedTransport((pc.state & ProcessContext::kPlaying) != 0,
                              (pc.state & ProcessContext::kTempoValid) != 0, pc.tempo,
@@ -545,8 +474,8 @@ public:
                         /* HOST-SIDE routing only: re-part THIS instance live and
                          * do NOT queue a device param-set (id 98 is not a device
                          * param). Stepped 0..15 => part = round(norm * 15). The
-                         * eventPump re-reads the source channel per event, so the
-                         * change applies from the next event with no restart. */
+                         * source channel is re-read per event, so the change
+                         * applies from the next event with no restart. */
                         part_ = (uint8_t)(v * (double)kPartStepCount + 0.5);
                         applyPart();
                         continue;
@@ -625,20 +554,11 @@ public:
             }
         }
 
-        /* AUDIO. The OWNER pulls the shared session's MAIN MIX (audioRing_, the
-         * one consumer — it sums every part this group injected above). An
-         * ATTACHED instance has two cases:
-         *   - default (no per-part sink): AUDIO-SILENT, exactly as P5. It must
-         *     NOT pull audioRing_ (a second consumer corrupts the SPSC tail and
-         *     steals the owner's samples) nor drain the echo ring (also single-
-         *     consumer). Byte-identical to pre-P5b.
-         *   - P5b opt-in (sink_ set): pull ITS OWN per-part ring — the owner's
-         *     reader DEMUXED this instance's slot columns out of the shared
-         *     device stream into sink_. That is its own SPSC ring (the owner's
-         *     reader is the sole producer, this process() the sole consumer), so
-         *     no SPSC invariant is touched. It still must NOT drain the echo ring
-         *     (owner-only). */
-        if (!isOwner && !sink_) return processSilence(data);
+        /* AUDIO. This instance pulls its session's MAIN MIX off bus 0 (audioRing_,
+         * the one consumer — it sums every part injected above) and each routed
+         * per-part bus off its demux sink (partSinks_, each its own SPSC ring the
+         * reader is the sole producer of). It is the sole consumer of all of them
+         * and of the echo ring — there is no second instance to contend. */
         if (data.numSamples <= 0) return kResultOk;
 
         /* MULTI-OUT (M1) audio write. renderBus pulls `data.numSamples` frames for ONE
@@ -689,20 +609,17 @@ public:
             if (haveBus) data.outputs[busIdx].silenceFlags = 0;
         };
 
-        /* Bus 0: the OWNER's summed main mix (no-sink ring, byte-identical to the shipped
-         * single-output path); an attached instance still renders ITS part into bus 0. */
-        renderBus(0, isOwner ? nullptr : sink_, isOwner);
-        /* Buses 1..16: the owner's per-part demux. Drain EVERY registered sink each block
-         * (the reader produces into all 16 rings whether or not their bus is routed), write
+        /* Bus 0: the summed main mix (no-sink ring, byte-identical to the shipped
+         * single-output path). */
+        renderBus(0, nullptr, true);
+        /* Buses 1..16: per-part demux. Drain EVERY registered sink each block (the
+         * reader produces into all 16 rings whether or not their bus is routed), write
          * the active part buses, discard the rest — no overflow, no bleed between parts. */
-        if (isOwner)
-            for (int k = 0; k < kNumParts; k++)
-                if (partSinks_[k]) renderBus(k + 1, partSinks_[k], false);
+        for (int k = 0; k < kNumParts; k++)
+            if (partSinks_[k]) renderBus(k + 1, partSinks_[k], false);
 
-        /* device front-panel echoes (§9.4) -> output parameter changes: OWNER
-         * ONLY (the echo ring is single-consumer). An attached per-part instance
-         * skips this — it rendered its part's audio above and is done. */
-        if (!isOwner) return kResultOk;
+        /* device front-panel echoes (§9.4) -> output parameter changes (the echo
+         * ring is single-consumer; this instance is its sole owner). */
         {
             uint32_t id;
             float v;
@@ -720,9 +637,8 @@ public:
     }
 
     /* component state = Recall Bundle (§15.3). getStateBundle is a ctlMutex_-
-     * guarded READ of the shared device state, so it is safe for an ATTACHED
-     * instance too — it reports the same project state the shared session
-     * holds. With no runtime yet (queried before activate) there is nothing
+     * guarded READ of the device state — it reports this instance's project
+     * state. With no runtime yet (queried before activate) there is nothing
      * to pull. */
     tresult PLUGIN_API getState(IBStream *state) override {
         if (!runtime()) return kResultFalse;
@@ -775,57 +691,41 @@ public:
             bundle = std::move(raw); /* MIGRATION: header-less old state -> Part=0 */
         }
         if (bundle.empty()) return kResultFalse;
-        /* ALWAYS stash the raw bundle: it is this instance's project state and
-         * the source of the registry's wanted serial at acquire time. (On
+        /* ALWAYS stash the raw bundle: it is this instance's project state. (On
          * project-open setState lands before setupProcessing/setActive, so the
          * runtime usually does not exist yet — staging here reproduces today's
-         * stage-before-start; the owner applies it just before start().) */
+         * stage-before-start; it is applied just before start().) */
         pendingState_ = bundle;
 
-        if (owner() && runtime())
-            /* Live, sole/owning instance: push now, exactly as before. */
+        if (runtime())
+            /* Live instance: push now, exactly as before. */
             return runtime()->setStateBundle(bundle.data(), bundle.size()) ? kResultOk
                                                                       : kResultFalse;
-        /* ATTACHED: the shared session is the OWNER's to (re)assert — an
-         * attached push would fight the owner's "Live wins" bundle on one
-         * device. So we only stage locally (P5 will route per-part state). */
-        /* No runtime yet: staged above; the owner will apply it at activate. */
+        /* No runtime yet: staged above; it is applied just before start(). */
         return kResultOk;
     }
 
 private:
-    /* The runtime this instance drives — obtained from the PROCESS-GLOBAL
-     * registry (P4), not owned by value. Instances that target the SAME unit
-     * (same explicit serial) share ONE runtime / ONE USB claim; that is what
-     * makes multitimbral aliasing possible (P5). A single instance, or one
-     * that auto-selects (no explicit serial), gets its OWN fresh runtime with
-     * handle_.owner == true and behaves BYTE-IDENTICALLY to the old by-value
-     * member. See runtime_registry.h for the "not the old singleton" rule.
-     *   owner == true:  drive the session — configure / pull MAIN-MIX audio /
-     *                   anchor transport / get+set state — and queue events on
-     *                   the runtime's built-in OWNER source (byte-identical to
-     *                   today for a single instance).
-     *   owner == false: ATTACHED (P5) — a sibling owns and streams the shared
-     *                   session. This instance is no longer dormant for EVENTS:
-     *                   it queues notes/params on its OWN registered source_
-     *                   (its part), which the owner's eventPump merges onto the
-     *                   one session, so the group PLAYS multitimbrally. It stays
-     *                   AUDIO-SILENT (the owner pulls the summed main mix; per-
-     *                   part audio demux is the follow-up P5b) and does NOT
-     *                   anchor transport (the owner is canonical) or push state
-     *                   (the owner's bundle wins on the one device). */
-    RuntimeHandle handle_;
-    /* This instance's event SOURCE (P5): the runtime's built-in owner source
-     * for an owner, a per-instance registered source for an attached one. All
-     * queue* route through it so each instance is the SOLE producer of its own
-     * SPSC ring. nullptr until acquired (process() emits silence then). */
+    /* The runtime this instance drives — its OWN, private, owned by unique_ptr
+     * (the process-global sharing registry is retired: one multi-out main
+     * instance per device claim, so there is nothing to share). Behaves
+     * BYTE-IDENTICALLY to the old by-value member / the old empty-serial owner:
+     * this instance configures it, pulls the main mix + every per-part demux
+     * sink, anchors transport, get/sets state, and queues events on the
+     * runtime's built-in owner source. Two instances on different units bind
+     * different devices because HarpRuntime::selectDevice() does, not a table.
+     * nullptr until acquired at setActive (process() emits silence then). */
+    std::unique_ptr<HarpRuntime> rt_;
+    /* This instance's event SOURCE: always the runtime's built-in owner source
+     * (the one and only source — the per-instance attached-source merge is
+     * retired with the sharing registry). All queue* route through it so this
+     * instance is the SOLE producer of its SPSC ring. nullptr until acquired
+     * (process() emits silence then). */
     EventSource *source_ = nullptr;
-    /* P5b per-part AUDIO sink: an ATTACHED instance that OPTED IN (HARP_PART_AUDIO)
-     * registers a sink for its part's stereo pair; the owner's reader demuxes the
-     * shared stream into it and process() pulls IT instead of emitting silence.
-     * nullptr for the owner, for the default audio-silent attached instance, or
-     * when the sink table is full — process() then pulls main mix (owner) or
-     * silence (attached), exactly as P5. */
+    /* RETIRED (was the P5b attached per-part audio opt-in): the attached-instance
+     * sink is gone with the owner/attached model — a satellite is MIDI-only now,
+     * and the main instance pulls every part's audio through partSinks_ below.
+     * Kept as a permanently-null vestige so process()'s pull path is unchanged. */
     AudioSink *sink_ = nullptr;
     /* MULTI-OUT (M1): the OWNER/main instance is a Kontakt/Overbridge-style multi-out
      * synth — it exposes 17 stereo buses (bus 0 = main mix, buses 1..16 = the per-part
@@ -840,48 +740,40 @@ private:
      * as a demux sink only when active, so a main-mix-only host keeps the 2-slot union
      * (golden byte-identical) — the activatable Kontakt/Overbridge model. */
     bool partBusActive_[kNumParts] = {false};
-    /* Register a demux sink for each ACTIVE per-part bus that doesn't have one yet (owner
-     * only). Called before start() so the slots enter the fixed audio.start union. */
+    /* Register a demux sink for each ACTIVE per-part bus that doesn't have one yet.
+     * Called before start() so the slots enter the fixed audio.start union. */
     void registerActivePartSinks() {
-        if (!owner() || !runtime()) return;
+        if (!runtime()) return;
         for (int k = 0; k < kNumParts; k++)
             if (partBusActive_[k] && !partSinks_[k]) {
                 std::vector<uint32_t> slots = {2u + 2u * (uint32_t)k, 3u + 2u * (uint32_t)k};
                 partSinks_[k] = runtime()->registerAudioSink(slots);
             }
     }
-    /* Drop our event source. For an ATTACHED instance this removes + frees the
-     * source we registered (after which the owner's eventPump never touches it);
-     * for an owner / unacquired instance it is a no-op (the owner source belongs
-     * to the runtime and persists for the session). MUST run before
-     * runtime_release (a last release destroys the runtime). Idempotent. */
+    /* Drop our audio sinks before the runtime is torn down (after which the reader
+     * never demuxes into a freed ring). The event source_ is the runtime's own
+     * owner source — it is freed WITH the runtime, so we just forget it here. MUST
+     * run before rt_.reset() (which destroys the runtime). Idempotent. */
     void releaseSource() {
-        /* P5b: drop our per-part audio sink too (after which the owner's reader
-         * never demuxes into it / touches a freed ring), before the source and
-         * before runtime_release. No-op when we never registered one (the
-         * default audio-silent attached path / owner). */
-        /* MULTI-OUT (M1): drop the owner's 16 per-part sinks too (after which the reader
-         * never demuxes into a freed ring), before the source and runtime_release. */
+        /* MULTI-OUT (M1): drop the 16 per-part sinks (after which the reader never
+         * demuxes into a freed ring), before forgetting the source and resetting rt_. */
         for (int k = 0; k < kNumParts; k++) {
             if (partSinks_[k] && runtime()) runtime()->unregisterAudioSink(partSinks_[k]);
             partSinks_[k] = nullptr;
         }
         if (sink_ && runtime()) runtime()->unregisterAudioSink(sink_);
         sink_ = nullptr;
-        if (source_ && runtime()) runtime()->unregisterSource(source_);
         source_ = nullptr;
     }
-    HarpRuntime *runtime() const { return handle_.rt; }
-    bool owner() const { return handle_.owner; }
+    HarpRuntime *runtime() const { return rt_.get(); }
     uint32_t rate_ = 48000;
     uint32_t maxBlock_ = 1024; /* captured in setupProcessing; the owner feeds
                                   it to rt->configure() at acquire/start time
                                   (the ring cushion scales with it) */
     /* Raw recall bundle staged by setState BEFORE a runtime exists (state is
-     * restored on project-open, before setActive/acquire). The OWNER applies
-     * it via setStateBundle() right before start(), reproducing today's
-     * stage-before-start ordering. Also the source of the wanted serial used
-     * as the registry key when no HARP_DEVICE_SERIAL env pins one. */
+     * restored on project-open, before setActive/acquire). It is applied via
+     * setStateBundle() right before start(), reproducing today's
+     * stage-before-start ordering. */
     std::vector<uint8_t> pendingState_;
     /* This instance's multitimbral PART (§9.4 channel, 0..15) — the per-instance
      * routing the "Part" param (id 98) drives. DEFAULT = HARP_CHANNEL env if set,
@@ -904,9 +796,8 @@ private:
     bool mpeEnabled_ = false;
     /* The Part default the env pins: HARP_CHANNEL (the headless --channel path)
      * clamped 0..15, else 0. Read once to seed part_ so the env path is unchanged
-     * (start() ALSO reads HARP_CHANNEL into the owner source, so for the owner
-     * applyPart() below is a no-op vs the env; for an attached instance we pass
-     * part_ to registerSource). */
+     * (start() ALSO reads HARP_CHANNEL into the owner source, so applyPart()
+     * below is a no-op vs the env). */
     static uint8_t envChannelDefault() {
         if (const char *e = getenv("HARP_CHANNEL"); e && e[0]) {
             int v = atoi(e);
@@ -914,11 +805,10 @@ private:
         }
         return 0;
     }
-    /* Drive THIS instance's event-source channel to part_ (its part). For the
-     * owner this is the runtime's built-in owner source; for an attached instance
-     * it is the source it registered. Both store into EventSource::chan (the
-     * eventPump re-reads it per event), so re-parting takes effect without a
-     * restart. nullptr source (unacquired / event-dormant 17th alias) = no-op. */
+    /* Drive THIS instance's event-source channel to part_ (its part) — the
+     * runtime's built-in owner source. Storing into EventSource::chan (re-read
+     * per event on drain) re-parts without a restart. nullptr source
+     * (unacquired) = no-op. */
     void applyPart() {
         if (source_) source_->chan.store(part_ & 0xf, std::memory_order_relaxed);
         mpe_.setPart(part_); /* the zone collapses every MPE note + mod onto this part */

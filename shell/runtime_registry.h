@@ -1,78 +1,42 @@
-/* Runtime registry (P4) — process-global sharing of a HarpRuntime by the
- * EXPLICIT wanted serial, so several plugin/host instances that target the
- * SAME physical HARP unit share ONE runtime, ONE USB session, ONE claim.
+/* Per-device runtime construction + the §8.4 admission ledger.
  *
- * WHY: a HARP device is a single transport client — exactly one claim per
- * unit. Two instances each opening their own runtime against the same unit
- * is a claim conflict; the second loses. Multitimbral aliasing (P5: several
- * shells, one device, one part each) therefore needs the shells to ride a
- * single shared session. P4 lays that prerequisite: the table that lets a
- * second instance ATTACH to the first's runtime instead of fighting for the
- * device.
+ * HISTORY: this TU once hosted a process-global registry that SHARED one
+ * HarpRuntime across plugin instances naming the same serial (the P4/P5
+ * multitimbral-alias model — N shells, one device, one claim, owner+attached
+ * refcount + an event-source merge). That model is RETIRED: a device is now
+ * ONE multi-out MAIN instance per claim (17 buses, channel->part routing), so
+ * every runtime is private to its single owner and there is nothing to share.
+ * Multi-device (two units in one project) still works because each main
+ * instance gets its own private runtime and HarpRuntime::selectDevice() binds
+ * a DIFFERENT unit per serial — selection, not a shared table, is what keeps
+ * two units apart.
  *
- * THIS IS NOT THE OLD GLOBAL SINGLETON. The retired singleton handed device
- * #1 to EVERY instance — it broke #16 multi-device (two tracks, two units).
- * The registry shares a runtime ONLY between instances that EXPLICITLY ask
- * for the SAME serial. An instance that does not name a serial (wantSerial
- * == "") is given its OWN fresh, UNREGISTERED runtime — never shared, never
- * looked up — so the auto-select / single-instance path is byte-identical to
- * a runtime owned by value (the golden-render gate). Two instances on
- * DIFFERENT serials likewise get different runtimes and bind different units.
+ * What remains in this TU: (1) the runtime construction seam below, and (2) the
+ * §8.4 bandwidth ledger, which still needs ONE process-global home reached by
+ * every independent per-device runtime.
  *
- * SELECTION IS UNCHANGED. The registry keys on the serial the CALLER hands
- * it; it does no device selection of its own. The owner runtime still runs
- * the exact HarpRuntime::selectDevice() policy (HARP_DEVICE_SERIAL / bundle
- * usb-identity / first-unclaimed). The registry only decides share-vs-fresh.
+ * SELECTION IS UNCHANGED and lives ENTIRELY in HarpRuntime::selectDevice()
+ * (HARP_DEVICE_SERIAL env / bundle usb-identity / first-unclaimed +
+ * singleton-kill). The construction seam does NO selection — it just hands back
+ * a fresh runtime the owner drives by value (configure / start / pull / state).
  */
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 class HarpRuntime;
 
-/* A reference to a runtime obtained from the registry.
- *   rt    — the runtime to drive (owner) or merely observe (attached).
- *   owner — true: THIS handle created the runtime and drives it exactly as a
- *           by-value runtime does today (configure / pull audio / queue
- *           events / get+set state). false: an ATTACHED handle — the shared
- *           session is already streaming under the owner; this handle must
- *           NOT touch the runtime's SPSC audio ring or event queue (single-
- *           producer/single-consumer invariants), only read shared state.
- * A default-constructed handle (rt == nullptr) is the "released / never
- * acquired" state; release() on it is a no-op. */
-struct RuntimeHandle {
-    HarpRuntime *rt = nullptr;
-    bool owner = false;
-};
-
-/* Acquire a runtime for `wantSerial`.
- *   wantSerial == ""        -> ALWAYS a fresh, unregistered runtime (owner=true,
- *                              never shared) — the auto-select / single-instance
- *                              path, identical to owning a HarpRuntime by value.
- *   wantSerial present in table -> attach: bump the refcount, return the
- *                              EXISTING runtime (owner=false).
- *   wantSerial absent from table -> create a runtime, register it under the
- *                              serial, return it (owner=true).
- * Thread-safe: called from multiple plugin-instance threads. The OWNER caller
- * is responsible for configure()/start() — the registry does not start the
- * runtime, so the owner's first-bind path stays byte-identical to today. */
-RuntimeHandle runtime_acquire(const std::string &wantSerial);
-
-/* Release a handle. refcount--; the LAST release of a registered (shared)
- * runtime stops() and destroys it and removes it from the table. Releasing an
- * owner of an UNREGISTERED (empty-serial) runtime stops+destroys it directly.
- * Idempotent on a default/zeroed handle. Thread-safe. Calling stop() joins the
- * supervisor/reader/pump threads, exactly as ~HarpRuntime would. */
-void runtime_release(const RuntimeHandle &h);
-
-/* P4 LIMITATION (owner handoff): only the OWNER drives the shared session;
- * ATTACHED handles are dormant. If the owner releases while an attached sibling
- * is still alive, the runtime stays alive (refcount > 0) but undriven — the
- * session quiesces (no pull -> the feeder stops pacing -> the device idles), no
- * crash, and it is torn down at the last release. In practice instances of one
- * project activate/deactivate together, so this is an edge. P5 (where attached
- * instances become per-part drivers) introduces real owner handoff. */
+/* Construct a fresh, PRIVATE runtime. Every caller gets its own — there is no
+ * sharing — so this is byte-identical to owning a HarpRuntime by value (the
+ * golden-render path, the old empty-serial case, now the only case). The owner
+ * drives configure()/start() itself; device selection is
+ * HarpRuntime::selectDevice()'s job (env / bundle / auto-select), not this
+ * seam's. Returned by unique_ptr: the owner's lifetime IS the runtime's — its
+ * dtor (~HarpRuntime) calls stop(), joining the supervisor/reader/pump threads,
+ * exactly as the retired runtime_release did before destroying. */
+std::unique_ptr<HarpRuntime> runtime_acquire();
 
 /* §8.4 admission-control ledger — process-global, keyed by transport PATH (one USB
  * controller / eth segment carries several device sessions but ONE bandwidth budget).
