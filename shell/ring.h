@@ -74,6 +74,11 @@ struct TimedEv {
     uint32_t a; /* param id or UMP word */
     float v;    /* value / ramp target */
     uint64_t ts, end;
+    /* MULTI-OUT M2: the device part this event targets (§9.4 key 5), resolved at QUEUE time
+     * from the caller's channel (a satellite's MIDI channel N -> part N) or, when unspecified,
+     * the source's own channel — so a single main instance drives every part per-event instead
+     * of one fixed part per source. A note (kind 2) carries its channel in the UMP word instead. */
+    uint8_t channel = 0;
 };
 
 class TimedRing {

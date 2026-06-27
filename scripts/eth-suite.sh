@@ -125,6 +125,12 @@ else run part-filter    scripts/part-filter-eth-test.sh; fi
 if [ "$OSID" = windows ]; then skip multiout-iso "multiout-iso uses the POSIX perl-alarm harness (Windows multi-out coverage pending)"
 else run multiout-iso   scripts/multiout-iso-test.sh; fi
 
+# MULTI-OUT (M2): per-channel PARAMS — one main instance edits any part's device params per
+# event (a satellite's MIDI CC on channel N -> part N's param, §9.4 key 5). Routing + isolation
+# via deterministic offline hashes. POSIX-only (the perl-alarm capture harness).
+if [ "$OSID" = windows ]; then skip multiout-perchan "perl-alarm harness (Windows multi-out coverage pending)"
+else run multiout-perchan scripts/multiout-perchan-test.sh; fi
+
 # §11.4 action 3 "Open read-only": dirty the live (harp-probe) + pick choice 2 via the device
 # --panel-sock, then assert the explicit read-only pick SUPPRESSES live writes (med-open-ro-noop).
 # POSIX-only (MinGW device panel is a stub) + probe-gated; auto-enables when both land on a platform.
