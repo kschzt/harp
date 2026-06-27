@@ -55,6 +55,29 @@ static constexpr bool isMpeMidiId(uint32_t id) {
     return id >= kMpeMidiBase && id < kMpeMidiBase + kMpeMidiCount;
 }
 
+/* MULTI-OUT M2 — PER-CHANNEL DEVICE PARAMS. A satellite track's MIDI CC on channel N controls
+ * part N's device param P (1..12). The host maps (channel N, GP CC kPerChanCcBase+i) -> a
+ * synthetic param id here (via IMidiMapping), the processor decodes it back to (N, P) and queues
+ * a param-set with §9.4 key 5 = N — one main instance drives every part's params. Stride 16 (>=
+ * the 12 device params) keeps the decode pure bit math and clear of the 1..13 params, the 0x2000
+ * mod ids, the 0x3000 MPE ids, and the 97/98/99 host params. */
+static constexpr uint32_t kPerChanParamBase = 0x4000u;
+static constexpr uint32_t kPerChanStride = 16u;                 /* id slots per channel (12 used) */
+static constexpr uint32_t kPerChanCount = 16u * kPerChanStride; /* 16 channels */
+static constexpr uint32_t kPerChanCcBase = 102u;               /* GP CC 102+i -> device param i+1 */
+static constexpr uint32_t perChanParamId(uint32_t chan, uint32_t param /*1-based*/) {
+    return kPerChanParamBase + (chan & 0xf) * kPerChanStride + ((param - 1u) & 0xf);
+}
+static constexpr bool isPerChanParamId(uint32_t id) {
+    return id >= kPerChanParamBase && id < kPerChanParamBase + kPerChanCount;
+}
+static constexpr uint8_t perChanParamChannel(uint32_t id) {
+    return (uint8_t)(((id - kPerChanParamBase) / kPerChanStride) & 0xf);
+}
+static constexpr uint32_t perChanParamDevId(uint32_t id) { /* device param 1..12 */
+    return ((id - kPerChanParamBase) & (kPerChanStride - 1u)) + 1u;
+}
+
 /* §9.5 per-voice EXPRESSION mod targets (the MPE pitch/pressure axes). A shell
  * sends these via queueMod to drive a voice's pitch bend (SEMITONES) and
  * loudness (gain); they are NOT §9.3 params — they route to the device's

@@ -1768,7 +1768,8 @@ void HarpRuntime::stop() {
  * producer on the owner's ring, breaking the SPSC invariant the whole merge
  * rests on. A 17th part legitimately contributes nothing to a 16-part device,
  * so the event is simply dropped (logged once via dormantSrcLogged_). */
-void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t ts) {
+void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t ts,
+                                uint8_t channel) {
     if (!src) return noteDormant();
     if (readOnlyDefault_.load(std::memory_order_relaxed) || roExplicit_.load(std::memory_order_relaxed)) {
         /* §12.2/§11.4: read-only hold — a live param edit MUST NOT reach a mismatched-engine
@@ -1777,13 +1778,18 @@ void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t
         roWrDrops_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    if (src->ring.push({0, id, v, ts, 0}))
+    /* M2 per-event part: an explicit channel (a satellite's MIDI channel N) targets part N;
+     * the default resolves to the source's own channel (byte-identical for every prior caller). */
+    uint8_t ch = (channel == kChanFromSource)
+                     ? (uint8_t)(src->chan.load(std::memory_order_relaxed) & 0xf)
+                     : (uint8_t)(channel & 0xf);
+    if (src->ring.push({0, id, v, ts, 0, ch}))
         evtQueuedSeq_.fetch_add(1, std::memory_order_release);
     else
         evDrops_.fetch_add(1, std::memory_order_relaxed);
 }
 void HarpRuntime::queueRamp(EventSource *src, uint32_t id, float target, uint64_t start,
-                            uint64_t end) {
+                            uint64_t end, uint8_t channel) {
     if (!src) return noteDormant();
     if (readOnlyDefault_.load(std::memory_order_relaxed) || roExplicit_.load(std::memory_order_relaxed)) {
         /* §12.2/§11.4: read-only hold — drop the automation write so it can't reach the
@@ -1791,7 +1797,10 @@ void HarpRuntime::queueRamp(EventSource *src, uint32_t id, float target, uint64_
         roWrDrops_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    if (src->ring.push({1, id, target, start, end}))
+    uint8_t ch = (channel == kChanFromSource)
+                     ? (uint8_t)(src->chan.load(std::memory_order_relaxed) & 0xf)
+                     : (uint8_t)(channel & 0xf);
+    if (src->ring.push({1, id, target, start, end, ch}))
         evtQueuedSeq_.fetch_add(1, std::memory_order_release);
     else
         evDrops_.fetch_add(1, std::memory_order_relaxed);
@@ -1816,8 +1825,12 @@ void HarpRuntime::queueMod(EventSource *src, uint32_t id, float offset,
     if (!src) return noteDormant();
     /* kind 4 = mod; the §9.5 voice key rides in `end` (it is a packed uint, not
      * a timestamp). A dropped mod is benign — it leaves the base value as-is, no
-     * stuck state — so unlike a note we do not escalate to panic on overflow. */
-    if (src->ring.push({4, id, offset, ts, voice}))
+     * stuck state — so unlike a note we do not escalate to panic on overflow.
+     * M2: carry the source's channel as the part FALLBACK — a per-voice mod still
+     * derives its part from the voice key (encodeModEvent), a part-wide mod (voice 0)
+     * uses this channel, byte-identical to the prior src.chan path. */
+    uint8_t ch = (uint8_t)(src->chan.load(std::memory_order_relaxed) & 0xf);
+    if (src->ring.push({4, id, offset, ts, voice, ch}))
         evtQueuedSeq_.fetch_add(1, std::memory_order_release);
     else
         evDrops_.fetch_add(1, std::memory_order_relaxed);
@@ -2507,24 +2520,26 @@ void HarpRuntime::feeder() {
  * Transport (kind 3) is global and only ever lives on the owner source. */
 int HarpRuntime::drainSource(EventSource &src, harp_cbuf &batch, harp_cbuf &msgbuf,
                              int budget) {
-    uint8_t chan = src.chan.load(std::memory_order_relaxed);
+    /* M2: the target part (§9.4 key 5) is PER EVENT — te.channel, resolved at queue time
+     * from the caller's explicit channel (a satellite's MIDI channel N) or this source's own
+     * channel. So one main instance drives every part; an attached single-channel source is
+     * byte-identical (its events all carry src.chan). Notes carry their channel in the UMP word. */
+    (void)src; /* channel now travels in each TimedEv, not read from the source here */
     TimedEv te;
     int sent = 0;
     for (; sent < budget && src.ring.pop(te); sent++) {
-        harp_cbuf_reset(&msgbuf);
-        if (te.kind == 0)
-            encodeParamEvent(&msgbuf, te.a, te.v, te.ts, chan);
+        harp_cbuf_reset(&msgbuf);        if (te.kind == 0)
+            encodeParamEvent(&msgbuf, te.a, te.v, te.ts, te.channel);
         else if (te.kind == 1)
-            encodeRampEvent(&msgbuf, te.a, te.v, te.ts, te.end, chan);
+            encodeRampEvent(&msgbuf, te.a, te.v, te.ts, te.end, te.channel);
         else if (te.kind == 3) {
             double ppq;
             memcpy(&ppq, &te.end, sizeof ppq);
             encodeTransportEvent(&msgbuf, te.a, te.v, ppq, te.ts);
         } else if (te.kind == 4)
             /* mod (§9.4): the voice key rides in `end`; a per-voice mod takes its
-             * part from the voice key, a part-wide mod (voice 0) from this source's
-             * channel — so a zone-wide MPE master bend reaches this part, not 0. */
-            encodeModEvent(&msgbuf, te.a, te.v, te.ts, (uint32_t)te.end, chan);
+             * part from the voice key, a part-wide mod (voice 0) from te.channel. */
+            encodeModEvent(&msgbuf, te.a, te.v, te.ts, (uint32_t)te.end, te.channel);
         else
             encodeUmpEvent(&msgbuf, te.a, te.ts);
         harp_frame_hdr h = {HARP_FRAME_FVER, HARP_STREAM_EVT, HARP_FLAG_FIN,
