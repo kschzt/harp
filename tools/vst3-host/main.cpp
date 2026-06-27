@@ -93,6 +93,50 @@ fail:
     return false;
 }
 
+/* ---- DAW bus-arrangement negotiation (IAudioProcessor::setBusArrangements) ----
+ *
+ * A real DAW (Ableton Live) ADVERTISES its track's speaker layout to the plugin
+ * via IAudioProcessor::setBusArrangements BEFORE setupProcessing/setActive, and
+ * routes audio to the input bus only for an arrangement the plugin ACCEPTS. This
+ * harness historically skipped that call — so a plugin whose setBusArrangements
+ * rejected the host's layout (or whose SDK-base default mishandled an INPUT bus)
+ * would be mis-driven in a DAW yet sail through here. We now emulate it: offer
+ * each declared bus its own channel count (mono/stereo) and report the plugin's
+ * tresult. When the offered arrangement already matches what the plugin declared
+ * (the common case — both HARP shells declare what they want) the SDK base accepts
+ * and nothing about the render changes, so this is a no-op for a plugin with no
+ * input bus (the instrument golden stays byte-identical). Returns the plugin's
+ * tresult (kResultTrue = accepted). */
+static SpeakerArrangement arr_for(int32 nch) {
+    switch (nch) {
+        case 0:  return SpeakerArr::kEmpty;
+        case 1:  return SpeakerArr::kMono;
+        case 2:  return SpeakerArr::kStereo;
+        default: return SpeakerArr::kStereo;
+    }
+}
+static tresult negotiate_buses(IComponent *component, IAudioProcessor *processor, bool verbose) {
+    int32 nin = component->getBusCount(kAudio, kInput);
+    int32 nout = component->getBusCount(kAudio, kOutput);
+    std::vector<SpeakerArrangement> ins((size_t)nin), outs((size_t)nout);
+    for (int32 i = 0; i < nin; i++) {
+        BusInfo b{};
+        component->getBusInfo(kAudio, kInput, i, b);
+        ins[(size_t)i] = arr_for(b.channelCount);
+    }
+    for (int32 i = 0; i < nout; i++) {
+        BusInfo b{};
+        component->getBusInfo(kAudio, kOutput, i, b);
+        outs[(size_t)i] = arr_for(b.channelCount);
+    }
+    tresult r = processor->setBusArrangements(ins.empty() ? nullptr : ins.data(), nin,
+                                              outs.empty() ? nullptr : outs.data(), nout);
+    if (verbose)
+        printf("bus-arrangements: setBusArrangements(in=%d, out=%d, stereo/mono) -> %s\n", nin,
+               nout, r == kResultTrue ? "accepted" : (r == kResultFalse ? "REJECTED" : "other"));
+    return r;
+}
+
 /* ---- multi-instance (P6): a multitimbral alias GROUP through the REAL plugin ----
  *
  * The single-instance host above loads ONE plugin/component/controller and
@@ -390,6 +434,203 @@ static int run_multi_instance(VST3::Hosting::Module::Ptr &module, const VST3::Ho
     return 0;
 }
 
+/* ---- FX multi-insert (§8.8): faithful model of a DAW loading two HARP-FX inserts ----
+ *
+ * The single-instance path makes the SOLE FX the registry owner, so it always arms
+ * its host-paced session and returns the reverb — it cannot reproduce the Ableton
+ * "FX on a track is silent" bug, where a TRANSIENT scan instance grabs ownership of
+ * the by-serial shared runtime first and the LIVE insert attaches as a NON-OWNER
+ * (which runs no session setup -> process() has no event source -> the track goes
+ * silent). run_multi_instance only ever captures the OWNER (alias 0), so it can't
+ * see a non-owner's output either.
+ *
+ * This loads N harp-fx-shell instances in ONE process, all pinned to ONE device
+ * serial (so they share via the P4 registry exactly as two FX inserts in Live do),
+ * activates them OWNER-FIRST, feeds the SAME track audio (--input) to each, and
+ * captures a CHOSEN insert (default the LAST = the non-owner). With --fx-drop-owner
+ * it tears insert 0 down before the capture loop — the transient scan instance going
+ * away — leaving the captured insert as the lone survivor, the precise condition from
+ * the Ableton log (one live insert, non-owner, silent).
+ *
+ *   PRE-FIX  capture #1 -> rms ~0  (the Ableton silence, reproduced headlessly)
+ *   POST-FIX capture #1 -> non-silent (each insert now owns its own session)
+ *
+ * Returns the process exit code. */
+static int run_fx_instances(VST3::Hosting::Module::Ptr &module, const VST3::Hosting::ClassInfo &ci,
+                            int n_inst, int capture_idx, bool drop_owner, const std::string &serial,
+                            uint32_t rate, uint32_t block, double seconds,
+                            const std::string &input_kind, double sine_hz, bool realtime,
+                            const std::string &out_path, bool do_hash, bool do_json,
+                            const std::string &expect_hash) {
+    /* Pin the serial for the whole process BEFORE any setActive: every FX instance
+     * reads HARP_DEVICE_SERIAL and (pre-fix) hands it to the registry, so all N
+     * share ONE runtime / ONE claim and only insert 0 owns it. */
+#ifdef _WIN32
+    _putenv_s("HARP_DEVICE_SERIAL", serial.c_str());
+#else
+    setenv("HARP_DEVICE_SERIAL", serial.c_str(), 1);
+#endif
+    if (capture_idx < 0 || capture_idx >= n_inst) capture_idx = n_inst - 1;
+    printf("fx-instances: %d FX inserts, serial=%s, capture=#%d%s\n", n_inst, serial.c_str(),
+           capture_idx, drop_owner ? ", drop-owner (scan instance torn down before capture)" : "");
+
+    auto factory = module->getFactory();
+    struct Inst {
+        IPtr<PlugProvider> provider;
+        OPtr<IComponent> component;
+        OPtr<IEditController> controller;
+        FUnknownPtr<IAudioProcessor> processor{nullptr};
+        HostProcessData pd;
+        int32 out_ch = 0, in_ch = 0, nin = 0, nout = 0;
+    };
+    std::vector<std::unique_ptr<Inst>> insts((size_t)n_inst);
+
+    for (int k = 0; k < n_inst; k++) {
+        auto in = std::make_unique<Inst>();
+        in->provider = owned(new PlugProvider(factory, ci, true));
+        if (!in->provider || !in->provider->initialize())
+            die("fx-instances: provider init failed for insert " + std::to_string(k));
+        in->component = in->provider->getComponent();
+        in->controller = in->provider->getController();
+        if (!in->component) die("fx-instances: no component for insert " + std::to_string(k));
+        in->processor = FUnknownPtr<IAudioProcessor>(in->component);
+        if (!in->processor) die("fx-instances: component is not an IAudioProcessor");
+        in->nin = in->component->getBusCount(kAudio, kInput);
+        in->nout = in->component->getBusCount(kAudio, kOutput);
+        for (int32 i = 0; i < in->nin; i++) in->component->activateBus(kAudio, kInput, i, true);
+        for (int32 i = 0; i < in->nout; i++) in->component->activateBus(kAudio, kOutput, i, true);
+        if (in->nout == 0) die("fx-instances: insert has no audio output bus");
+        /* DAW arrangement negotiation, like Ableton (stereo in / stereo out). */
+        negotiate_buses(in->component.get(), in->processor, k == 0);
+        BusInfo ob{};
+        in->component->getBusInfo(kAudio, kOutput, 0, ob);
+        in->out_ch = ob.channelCount;
+        if (in->nin > 0) {
+            BusInfo ib{};
+            in->component->getBusInfo(kAudio, kInput, 0, ib);
+            in->in_ch = ib.channelCount;
+        }
+        ProcessSetup setup{realtime ? kRealtime : kOffline, kSample32, (int32)block,
+                           (SampleRate)rate};
+        if (in->processor->setupProcessing(setup) != kResultOk)
+            die("fx-instances: setupProcessing failed for insert " + std::to_string(k));
+        if (!in->pd.prepare(*in->component, (int32)block, kSample32))
+            die("fx-instances: process data prepare failed");
+        insts[(size_t)k] = std::move(in);
+    }
+
+    /* Activate OWNER-FIRST: insert 0 acquires the shared-by-serial runtime (the
+     * registry owner), the rest attach owner=false — Ableton's exact lifecycle. */
+    for (int k = 0; k < n_inst; k++) {
+        if (insts[(size_t)k]->component->setActive(true) != kResultOk)
+            die("fx-instances: setActive failed for insert " + std::to_string(k));
+        insts[(size_t)k]->processor->setProcessing(true);
+    }
+    printf("fx-instances: %d inserts active (insert 0 = first to acquire / registry owner)\n",
+           n_inst);
+
+    /* --fx-drop-owner: tear insert 0 down (the transient scan instance Ableton
+     * discards) before the capture, leaving the captured insert as the survivor. */
+    if (drop_owner && n_inst >= 2) {
+        insts[0]->processor->setProcessing(false);
+        insts[0]->component->setActive(false);
+        insts[0].reset(); /* release -> runtime_release on insert 0's handle */
+        printf("fx-instances: dropped insert 0 (scan instance); capturing survivor #%d\n",
+               capture_idx);
+    }
+
+    ProcessContext ctx{};
+    ctx.sampleRate = rate;
+    ctx.state = ProcessContext::kPlaying;
+    for (int k = 0; k < n_inst; k++)
+        if (insts[(size_t)k]) insts[(size_t)k]->pd.processContext = &ctx;
+
+    Inst *cap = insts[(size_t)capture_idx].get();
+    if (!cap) die("fx-instances: captured insert was dropped (do not --fx-capture the dropped owner)");
+    const int32 out_ch = cap->out_ch;
+    size_t total = (size_t)(seconds * rate), done = 0;
+    std::vector<float> capture;
+    capture.reserve(total * (size_t)out_ch);
+    double phase = 0;
+
+#ifdef __APPLE__
+    if (realtime) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    auto rt0 = std::chrono::steady_clock::now();
+    while (done < total) {
+        if (realtime) {
+            double target = (double)done / rate;
+            double elapsed =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - rt0).count();
+            if (target > elapsed)
+                std::this_thread::sleep_for(std::chrono::duration<double>(target - elapsed));
+        }
+        size_t n = std::min((size_t)block, total - done);
+        for (int k = 0; k < n_inst; k++) {
+            Inst *in = insts[(size_t)k].get();
+            if (!in) continue;
+            in->pd.numSamples = (int32)n;
+            /* feed the same --input track signal to every insert's input bus */
+            if (in->nin > 0 && in->pd.inputs) {
+                for (int32 c = 0; c < in->in_ch; c++) {
+                    float *buf = in->pd.inputs[0].channelBuffers32[c];
+                    for (size_t s = 0; s < n; s++) {
+                        if (input_kind == "sine")
+                            buf[s] = 0.5f * (float)sin(2.0 * M_PI *
+                                                       (phase + (double)s * sine_hz / rate));
+                        else if (input_kind == "impulse")
+                            buf[s] = (done == 0 && s == 0) ? 1.0f : 0.0f;
+                        else
+                            buf[s] = 0.0f;
+                    }
+                }
+            }
+            in->pd.inputParameterChanges = nullptr;
+            in->pd.outputParameterChanges = nullptr;
+            in->pd.inputEvents = nullptr;
+            if (in->processor->process(in->pd) != kResultOk)
+                die("fx-instances: process failed for insert " + std::to_string(k));
+        }
+        phase += (double)n * sine_hz / rate;
+        for (size_t s = 0; s < n; s++)
+            for (int32 c = 0; c < out_ch; c++)
+                capture.push_back(cap->pd.outputs[0].channelBuffers32[c][s]);
+        done += n;
+    }
+
+    for (int k = n_inst - 1; k >= 0; k--) {
+        if (!insts[(size_t)k]) continue;
+        insts[(size_t)k]->processor->setProcessing(false);
+        insts[(size_t)k]->component->setActive(false);
+    }
+
+    double rms = 0;
+    for (float v : capture) rms += (double)v * v;
+    rms = capture.empty() ? 0 : sqrt(rms / capture.size());
+    printf("processed %zu samples x %d ch (FX insert #%d), rms=%.5f\n", done, out_ch, capture_idx,
+           rms);
+    uint64_t hash = harp_fnv1a(capture.data(), capture.size() * sizeof(float));
+    char hashhex[17];
+    snprintf(hashhex, sizeof hashhex, "%016llx", (unsigned long long)hash);
+    if (do_hash) printf("output-hash: %s\n", hashhex);
+    if (do_json)
+        printf("{\"frames\":%zu,\"channels\":%d,\"rate\":%u,\"rms\":%.6f,\"hash\":\"%s\","
+               "\"fx_instances\":%d,\"capture\":%d}\n",
+               capture.size() / (size_t)(out_ch ? out_ch : 1), out_ch, rate, rms, hashhex, n_inst,
+               capture_idx);
+    if (!out_path.empty()) {
+        if (!harp_write_wav16(out_path, capture, (uint32_t)out_ch, rate))
+            die("cannot write " + out_path);
+        printf("-> %s\n", out_path.c_str());
+    }
+    if (!expect_hash.empty() && expect_hash != hashhex) {
+        fprintf(stderr, "harp-vst3-host: FAIL expected hash %s, got %s\n", expect_hash.c_str(),
+                hashhex);
+        return 3;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
@@ -405,6 +646,7 @@ int main(int argc, char **argv) {
                 "       [--diag-bundle FILE | --diag-bundle-anon FILE]\n"
                 "       [--loopback IN,OUT]\n"
                 "       [--instances N | --aliases ch0,ch1,..] [--serial SERIAL]\n"
+                "       [--fx-instances N [--fx-capture K] [--fx-drop-owner]]\n"
                 "  --diag-bundle FILE   §14.4 host-context-A: after the render, capture\n"
                 "             the runtime's diag bundle (device-section + host counters +\n"
                 "             audio-config) and write the CBOR to FILE (read-only, no\n"
@@ -424,7 +666,15 @@ int main(int argc, char **argv) {
                 "  --aliases L     like --instances but with an explicit channel list,\n"
                 "             e.g. --aliases 0,1,2,3 (one alias per channel)\n"
                 "  --serial S      serial to pin for the shared claim (default: env\n"
-                "             HARP_DEVICE_SERIAL or PI4B-0001); multi-instance only\n");
+                "             HARP_DEVICE_SERIAL or PI4B-0001); multi-instance only\n"
+                "  --fx-instances N  §8.8: load N harp-fx-shell inserts in ONE process,\n"
+                "             all pinned to ONE device serial (default KR260-FX01), activated\n"
+                "             OWNER-FIRST, each fed --input; captures --fx-capture K (default\n"
+                "             the LAST = the non-owner). Reproduces the Ableton FX-track-silent\n"
+                "             bug headlessly: pre-fix capture of a non-owner is rms~0.\n"
+                "  --fx-capture K  which insert to capture (default last/non-owner)\n"
+                "  --fx-drop-owner tear insert 0 down before the capture loop (the transient\n"
+                "             DAW scan instance going away), leaving the captured insert alone\n");
         return 2;
     }
     std::string plugin_path = argv[1];
@@ -487,6 +737,12 @@ int main(int argc, char **argv) {
      * single-instance, the byte-identical golden/timing/recall path. */
     std::vector<int> alias_channels; /* one entry per instance; channel == device part */
     std::string mt_serial;           /* serial to pin for the shared claim */
+    /* §8.8 FX multi-insert: >=1 enables run_fx_instances — N coexisting harp-fx-shell
+     * inserts sharing one device serial, owner-first, capturing fx_capture (default
+     * the last = the NON-OWNER) to reproduce the Ableton "FX track silent" bug. */
+    int fx_instances = 0;       /* 0 = off (single-instance / instrument paths unchanged) */
+    int fx_capture = -1;        /* which insert to capture; <0 => last (non-owner) */
+    bool fx_drop_owner = false; /* tear insert 0 down before capture (scan instance leaves) */
     /* §14.4 host-context-A: --diag-bundle OUTFILE captures the runtime's diag
      * bundle after the render and writes the CBOR bytes to OUTFILE. The runtime
      * lives inside the dlopen'd plugin (not this host), so we reach it the way
@@ -638,8 +894,15 @@ int main(int argc, char **argv) {
                 pos++;
             }
             if (alias_channels.empty()) die("--aliases wants ch0,ch1,..");
-        } else if (a == "--serial") { /* serial to pin for the shared claim (P6) */
+        } else if (a == "--serial") { /* serial to pin for the shared claim (P6 / FX) */
             mt_serial = next();
+        } else if (a == "--fx-instances") { /* §8.8 FX multi-insert repro: N inserts */
+            fx_instances = atoi(next().c_str());
+            if (fx_instances < 1 || fx_instances > 16) die("--fx-instances wants 1..16");
+        } else if (a == "--fx-capture") { /* which insert to capture (default last/non-owner) */
+            fx_capture = atoi(next().c_str());
+        } else if (a == "--fx-drop-owner") { /* drop insert 0 (scan instance) before capture */
+            fx_drop_owner = true;
         } else if (a == "--ramp") { /* ID=V0:V1 over the whole duration */
             std::string kv = next();
             RampSpec r{};
@@ -850,6 +1113,20 @@ int main(int argc, char **argv) {
                                   do_json, expect_hash);
     }
 
+    /* §8.8 FX multi-insert repro: N coexisting harp-fx-shell inserts sharing one
+     * device serial. The single-instance path below is untouched (and unreached) —
+     * the golden/recall tests pass no --fx-instances, so they fall straight through. */
+    if (fx_instances >= 1) {
+        std::string serial = mt_serial;
+        if (serial.empty()) {
+            const char *e = getenv("HARP_DEVICE_SERIAL");
+            serial = (e && e[0]) ? e : std::string("KR260-FX01");
+        }
+        return run_fx_instances(module, audio_ci, fx_instances, fx_capture, fx_drop_owner, serial,
+                                rate, block, seconds, input_kind, sine_hz, realtime, out_path,
+                                do_hash, do_json, expect_hash);
+    }
+
     provider = owned(new PlugProvider(factory, audio_ci, true));
     if (!provider || !provider->initialize()) die("no audio effect class / init failed");
 
@@ -912,6 +1189,13 @@ int main(int argc, char **argv) {
         in_ch = inBus.channelCount;
     }
     printf("buses: %d in (%d ch), %d out (%d ch)\n", nin, in_ch, nout, out_ch);
+
+    /* Negotiate speaker arrangements the way a DAW does (Ableton offers stereo/stereo
+     * before activating) — BEFORE setupProcessing/setActive. For the instrument (no
+     * input bus) this matches the declared stereo out, the SDK base accepts, and the
+     * render is byte-identical; for the FX it confirms the stereo-in/stereo-out layout
+     * Ableton routes track audio through. */
+    negotiate_buses(component.get(), processor, true);
 
     /* ---- processing setup ----
      * Default: no wall clock, declared kOffline so plugins bridging real
