@@ -79,10 +79,21 @@ struct HarpClap {
      * exact ringing voice — the SAME bridge the VST3 shell uses (note_voice_map.h). */
     NoteVoiceMap noteVoices;
 
+    /* MULTI-OUT (M4): the CLAP main exposes 17 stereo output ports (port 0 = main mix,
+     * ports 1..16 = the per-part pairs). partSinks_[k] demuxes part k's pair (slots
+     * {2+2k,3+2k}); registered before start() (the fixed audio.start union). CLAP has no
+     * activatable-port concept, so all 16 register — port 0 stays byte-identical (main mix). */
+    static constexpr int kNumParts = 16;
+    AudioSink *partSinks_[kNumParts] = {nullptr};
+
     HarpRuntime *rt() const { return handle.rt; }
     bool owner() const { return handle.owner; }
 
     void releaseSource() {
+        for (int k = 0; k < kNumParts; k++) {
+            if (partSinks_[k] && rt()) rt()->unregisterAudioSink(partSinks_[k]);
+            partSinks_[k] = nullptr;
+        }
         if (source && rt()) rt()->unregisterSource(source);
         source = nullptr;
     }
@@ -91,13 +102,20 @@ struct HarpClap {
 static HarpClap *self(const clap_plugin_t *p) { return (HarpClap *)p->plugin_data; }
 
 /* ------------------------------------------------------------- audio-ports */
-static uint32_t ap_count(const clap_plugin_t *, bool is_input) { return is_input ? 0 : 1; }
+/* MULTI-OUT (M4): 17 stereo output ports — port 0 = summed main mix (IS_MAIN, the
+ * byte-identical single-output path), ports 1..16 = the per-part stereo pairs. */
+static uint32_t ap_count(const clap_plugin_t *, bool is_input) { return is_input ? 0u : 17u; }
 static bool ap_get(const clap_plugin_t *, uint32_t index, bool is_input,
                    clap_audio_port_info_t *info) {
-    if (is_input || index != 0) return false;
-    info->id = 0;
-    snprintf(info->name, sizeof info->name, "Stereo Out");
-    info->flags = CLAP_AUDIO_PORT_IS_MAIN;
+    if (is_input || index > 16) return false;
+    info->id = index;
+    if (index == 0) {
+        snprintf(info->name, sizeof info->name, "Main Mix");
+        info->flags = CLAP_AUDIO_PORT_IS_MAIN;
+    } else {
+        snprintf(info->name, sizeof info->name, "Part %u", index);
+        info->flags = 0;
+    }
     info->channel_count = 2;
     info->port_type = CLAP_PORT_STEREO;
     info->in_place_pair = CLAP_INVALID_ID;
@@ -324,6 +342,22 @@ static void applyEvent(HarpClap *h, const clap_event_header_t *hdr, uint64_t bas
         }
         break;
     }
+    case CLAP_EVENT_MIDI: {
+        /* M2 PER-CHANNEL PARAMS (M4 CLAP): raw MIDI carries the channel directly — no IMidiMapping
+         * roundtrip (unlike VST3). A GP CC kPerChanCcBase+i on channel N edits part N's device
+         * param (i+1) with §9.4 key 5 = N, so ONE main instance drives every part's params. */
+        auto *e = (const clap_event_midi *)hdr;
+        uint8_t status = (uint8_t)(e->data[0] & 0xf0), chan = (uint8_t)(e->data[0] & 0x0f);
+        if (status == 0xB0) { /* control change */
+            uint8_t cc = e->data[1], val = e->data[2];
+            if (cc >= kPerChanCcBase && cc < kPerChanCcBase + kNumParams)
+                rt.queueParamSet(h->source, (uint32_t)(cc - kPerChanCcBase) + 1u,
+                                 (float)val / 127.0f, ts, chan);
+            else if (cc == 120 || cc == 123) /* all-sound-off / all-notes-off -> panic */
+                rt.queueNote(h->source, ump_all_notes_off(), 0);
+        }
+        break;
+    }
     default: break; /* transport is handled in process() — it needs the block size */
     }
 }
@@ -406,6 +440,13 @@ static bool pl_activate(const clap_plugin_t *p, double sample_rate, uint32_t /*m
         h->rt()->setOffline(h->offline); /* §8.3-over-§8.7: host-paced eth if offline (before start) */
         if (!h->pendingState.empty())
             h->rt()->setStateBundle(h->pendingState.data(), h->pendingState.size());
+        /* MULTI-OUT (M4): register all 16 per-part sinks BEFORE start() so they enter the FIXED
+         * audio.start union (no mid-session re-neg). The reader demuxes each part's pair into its
+         * ring; pl_process writes the host-provided output ports and drains the rest. */
+        for (int k = 0; k < HarpClap::kNumParts; k++) {
+            std::vector<uint32_t> slots = {2u + 2u * (uint32_t)k, 3u + 2u * (uint32_t)k};
+            h->partSinks_[k] = h->rt()->registerAudioSink(slots);
+        }
         h->rt()->start((uint32_t)h->rate);
         h->source = h->rt()->ownerSource();
     } else {
@@ -455,32 +496,42 @@ static clap_process_status pl_process(const clap_plugin_t *p, const clap_process
     }
     if (h->owner() && pc->transport) applyTransport(h, pc->transport, pc->frames_count, base);
 
-    /* pull the device's host-paced audio and de-interleave into the stereo bus.
-     * Offline bounce blocks for the exact samples (deterministic / byte-exact);
-     * realtime takes what's there (silence on underrun) — same policy as VST3. */
-    if (pc->audio_outputs_count < 1 || !pc->audio_outputs[0].data32 ||
-        pc->audio_outputs[0].channel_count < 1) {
-        writeSilence(pc);
-        return CLAP_PROCESS_CONTINUE;
-    }
-    float *L = pc->audio_outputs[0].data32[0];
-    float *R = pc->audio_outputs[0].channel_count > 1 ? pc->audio_outputs[0].data32[1] : nullptr;
-
-    uint32_t remaining = pc->frames_count, written = 0;
-    float *tmp = h->interleaved.data();
-    while (remaining > 0) {
-        uint32_t chunk = remaining > h->maxFrames ? h->maxFrames : remaining;
-        if (h->offline)
-            h->rt()->pullAudioBlocking(tmp, chunk, 1000);
-        else
-            h->rt()->pullAudio(tmp, chunk);
-        for (uint32_t s = 0; s < chunk; s++) {
-            L[written + s] = tmp[2 * s];
-            if (R) R[written + s] = tmp[2 * s + 1];
+    /* MULTI-OUT (M4): pull the device's host-paced audio into each output port — port 0 = main
+     * mix (the no-sink pull, byte-identical), ports 1..16 = the per-part demux sinks. renderPort
+     * ALWAYS drains its ring (the reader fills every registered sink whether or not its port is
+     * routed) and writes the port only if the host provided a buffer — no overflow, no bleed.
+     * Offline bounce blocks for the exact samples (byte-exact); realtime takes what's there. */
+    auto renderPort = [&](uint32_t portIdx, AudioSink *sk, bool mainMix) {
+        float *L = nullptr, *Rr = nullptr;
+        if (portIdx < pc->audio_outputs_count && pc->audio_outputs[portIdx].data32 &&
+            pc->audio_outputs[portIdx].channel_count >= 1) {
+            L = pc->audio_outputs[portIdx].data32[0];
+            Rr = pc->audio_outputs[portIdx].channel_count > 1 ? pc->audio_outputs[portIdx].data32[1]
+                                                              : nullptr;
         }
-        written += chunk;
-        remaining -= chunk;
-    }
+        uint32_t remaining = pc->frames_count, written = 0;
+        float *tmp = h->interleaved.data();
+        while (remaining > 0) {
+            uint32_t chunk = remaining > h->maxFrames ? h->maxFrames : remaining;
+            if (mainMix) {
+                if (h->offline) h->rt()->pullAudioBlocking(tmp, chunk, 1000);
+                else h->rt()->pullAudio(tmp, chunk);
+            } else {
+                if (h->offline) h->rt()->pullAudioBlocking(sk, tmp, chunk, 1000);
+                else h->rt()->pullAudio(sk, tmp, chunk);
+            }
+            if (L)
+                for (uint32_t s = 0; s < chunk; s++) {
+                    L[written + s] = tmp[2 * s];
+                    if (Rr) Rr[written + s] = tmp[2 * s + 1];
+                }
+            written += chunk;
+            remaining -= chunk;
+        }
+    };
+    renderPort(0, nullptr, true); /* main mix */
+    for (int k = 0; k < HarpClap::kNumParts; k++)
+        if (h->partSinks_[k]) renderPort((uint32_t)(k + 1), h->partSinks_[k], false);
     return CLAP_PROCESS_CONTINUE;
 }
 

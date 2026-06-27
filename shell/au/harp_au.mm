@@ -134,6 +134,31 @@ struct HarpAU {
      * nullptr for the owner / default audio-silent attached instance. */
     AudioSink *sink = nullptr;
 
+    /* MULTI-OUT (M4): the Kontakt/Overbridge-style multi-out main — ONE instance owns
+     * the whole device and exposes 17 stereo output elements: element 0 = the summed
+     * MAIN MIX (byte-identical to the single-output path), elements 1..16 = the per-part
+     * pairs. Exactly mirrors the VST3 shell (HarpProcessor) and the CLAP plugin.
+     *   partBusActive_[k]  — the host SET a stream format on output element k+1 (the AU
+     *                        analogue of VST3's activateBus). DEFAULT false, so a normal
+     *                        single-output instance (only element 0 touched) registers NO
+     *                        part sinks and streams the 2-slot union — BYTE-IDENTICAL to
+     *                        the shipped golden. Set in au_SetProperty(StreamFormat).
+     *   partSinks_[k]      — the owner's demux sink for part k (slots {2+2k,3+2k}); the
+     *                        runtime reader demuxes the shared stream into each. Registered
+     *                        BEFORE start() for the active buses (registerActivePartSinks).
+     *   partBuf_[k]        — per-element interleaved L/R cache. AU renders ONE element per
+     *                        call (unlike VST3/CLAP's single all-bus call), and the MAIN
+     *                        pull is the session clock (advances ssiRead_), so element 0
+     *                        pulls the main mix AND drains every active part sink into its
+     *                        cache; elements 1..16 then serve their cached block. This keeps
+     *                        the single device clock and drains every registered ring once
+     *                        per cycle (no overflow), order-independent across elements. */
+    static constexpr int kNumParts = 16;
+    bool partBusActive_[kNumParts] = {false};
+    AudioSink *partSinks_[kNumParts] = {nullptr};
+    float *partBuf_[kNumParts] = {nullptr};   /* maxFrames*2 each (interleaved) */
+    UInt32 cachedFrames_ = 0;                  /* frames in partBuf_ from the last element-0 pull */
+
     bool initialized = false;
     bool offline = false;
     Float64 sampleRate = 48000;
@@ -219,6 +244,7 @@ struct HarpAU {
         free(scratch[0]);
         free(scratch[1]);
         free(interleaved);
+        for (int k = 0; k < kNumParts; k++) free(partBuf_[k]);
         if (presentPreset.presetName) CFRelease(presentPreset.presetName);
     }
 
@@ -257,8 +283,30 @@ struct HarpAU {
     void releaseSource() {
         if (sink && runtime()) runtime()->unregisterAudioSink(sink);
         sink = nullptr;
+        /* MULTI-OUT (M4): drop the owner's per-part demux sinks (same ordering — sinks
+         * before the source/handle). Idempotent; a non-multi-out instance has none. */
+        for (int k = 0; k < kNumParts; k++) {
+            if (partSinks_[k] && runtime()) runtime()->unregisterAudioSink(partSinks_[k]);
+            partSinks_[k] = nullptr;
+        }
         if (source && runtime()) runtime()->unregisterSource(source);
         source = nullptr;
+    }
+
+    /* MULTI-OUT (M4): register a demux sink for each ACTIVE part output element, BEFORE
+     * start() so the per-part slot pairs enter the audio.start union (the P5b mid-attach
+     * limitation — a sink added after start needs a re-negotiation). Mirrors the VST3
+     * shell's registerActivePartSinks exactly: only buses the host gave a stream format
+     * (partBusActive_) stream, so a single-output instance keeps the 2-slot main-mix union
+     * (byte-identical golden). Owner only; idempotent. */
+    void registerActivePartSinks() {
+        if (!runtime() || !owner()) return;
+        for (int k = 0; k < kNumParts; k++) {
+            if (partBusActive_[k] && !partSinks_[k]) {
+                std::vector<uint32_t> slots = {2u + 2u * (uint32_t)k, 3u + 2u * (uint32_t)k};
+                partSinks_[k] = runtime()->registerAudioSink(slots);
+            }
+        }
     }
 };
 
@@ -277,8 +325,17 @@ static OSStatus au_alloc_scratch(HarpAU *au) {
     au->scratch[0] = (float *)calloc(au->maxFrames, sizeof(float));
     au->scratch[1] = (float *)calloc(au->maxFrames, sizeof(float));
     au->interleaved = (float *)calloc((size_t)au->maxFrames * 2, sizeof(float));
-    return (au->scratch[0] && au->scratch[1] && au->interleaved) ? noErr
-                                                                 : kAudio_MemFullError;
+    bool ok = au->scratch[0] && au->scratch[1] && au->interleaved;
+    /* MULTI-OUT (M4): one interleaved L/R cache per part element, sized to maxFrames.
+     * Element 0's pull drains every active part sink into these; elements 1..16 serve
+     * their cache. Reallocated here whenever maxFrames changes (host re-config). */
+    for (int k = 0; k < HarpAU::kNumParts; k++) {
+        free(au->partBuf_[k]);
+        au->partBuf_[k] = (float *)calloc((size_t)au->maxFrames * 2, sizeof(float));
+        ok = ok && au->partBuf_[k];
+    }
+    au->cachedFrames_ = 0;
+    return ok ? noErr : kAudio_MemFullError;
 }
 
 /* ---------------- lifecycle ---------------- */
@@ -328,6 +385,10 @@ static OSStatus au_Initialize(void *self) {
         rt->setOffline(au->offline); /* §8.3-over-§8.7: host-paced eth if offline (before start) */
         if (!au->pendingState.empty())
             rt->setStateBundle(au->pendingState.data(), au->pendingState.size());
+        /* MULTI-OUT (M4): register the active part demux sinks into the audio.start union
+         * BEFORE start() — exactly the VST3 ordering. A single-output host activated no
+         * part buses, so this is a no-op and the main-mix union is byte-identical. */
+        au->registerActivePartSinks();
         rt->start(rate); /* deviceless = silence */
         au->source = rt->ownerSource();
         /* P6: pin the owner source to THIS instance's part. start() seeds the
@@ -574,11 +635,18 @@ static OSStatus au_GetProperty(void *self, AudioUnitPropertyID prop,
             return noErr;
         case kAudioUnitProperty_StreamFormat:
             if (scope == kAudioUnitScope_Input) return kAudioUnitErr_InvalidElement;
+            if (scope == kAudioUnitScope_Output && elem > (UInt32)HarpAU::kNumParts)
+                return kAudioUnitErr_InvalidElement; /* 0..16 only */
+            /* All 17 output elements share one stereo float format. */
             *(AudioStreamBasicDescription *)outData = au->outFormat;
             *ioSize = sizeof(AudioStreamBasicDescription);
             return noErr;
         case kAudioUnitProperty_ElementCount:
-            *(UInt32 *)outData = scope == kAudioUnitScope_Input ? 0 : 1;
+            /* MULTI-OUT (M4): no input; 17 OUTPUT elements (0 = main mix, 1..16 = parts),
+             * the Kontakt-style multi-out main. A host that only wires element 0 gets the
+             * byte-identical single-output behaviour (no part bus activated -> no sink). */
+            *(UInt32 *)outData =
+                scope == kAudioUnitScope_Input ? 0 : (UInt32)(HarpAU::kNumParts + 1);
             *ioSize = sizeof(UInt32);
             return noErr;
         case kAudioUnitProperty_MaximumFramesPerSlice:
@@ -746,14 +814,23 @@ static OSStatus au_SetProperty(void *self, AudioUnitPropertyID prop,
         case kAudioUnitProperty_StreamFormat: {
             if (scope == kAudioUnitScope_Input) return kAudioUnitErr_InvalidElement;
             if (au->initialized) return kAudioUnitErr_Initialized;
+            if (scope == kAudioUnitScope_Output && elem > (UInt32)HarpAU::kNumParts)
+                return kAudioUnitErr_InvalidElement; /* only 0..16 exist */
             const auto *f = (const AudioStreamBasicDescription *)inData;
             if (f->mFormatID != kAudioFormatLinearPCM ||
                 f->mChannelsPerFrame != 2 || f->mBitsPerChannel != 32 ||
                 !(f->mFormatFlags & kAudioFormatFlagIsFloat) ||
                 !(f->mFormatFlags & kAudioFormatFlagIsNonInterleaved))
                 return kAudioUnitErr_FormatNotSupported;
+            /* All 17 output elements are stereo float; one shared outFormat (sample rate)
+             * suffices. MULTI-OUT (M4): a format SET on a PART element (1..16) is the host
+             * declaring it will wire that part — the AU analogue of VST3 activateBus. It
+             * arms the demux sink that au_Initialize registers before start(). Element 0
+             * (main mix) is always present and never needs arming. */
+            if (scope == kAudioUnitScope_Output && elem >= 1)
+                au->partBusActive_[elem - 1] = true;
             au->outFormat = *f;
-            au_notify(au, prop, scope, 0);
+            au_notify(au, prop, scope, elem);
             return noErr;
         }
         case kAudioUnitProperty_MaximumFramesPerSlice:
@@ -947,7 +1024,15 @@ static OSStatus au_MIDIEvent(void *self, UInt32 status, UInt32 data1, UInt32 dat
         MpeMod m = mpe.channelPressure(chan, (uint8_t)data1);
         if (m.valid) rt->queueMod(src, HARP_MPE_MOD_PRESSURE, m.value, m.voiceKey, ts);
     } else if (kind == 0xB0) { /* control change */
-        if (data1 == 120 || data1 == 123) {
+        if (data1 >= kPerChanCcBase && data1 < kPerChanCcBase + kNumAuParams) {
+            /* MULTI-OUT (M2/M4): a GP CC kPerChanCcBase+i on channel N edits part N's
+             * device param (i+1) with §9.4 key 5 = N — so ONE main instance drives every
+             * part's params (a satellite's MIDI CC on its channel). Raw MIDI carries the
+             * channel directly (no IMidiMapping roundtrip, like CLAP). Intercepted BEFORE
+             * the MPE timbre path so the per-part param range is never swallowed as CC. */
+            rt->queueParamSet(src, (uint32_t)(data1 - kPerChanCcBase) + 1u,
+                              (float)data2 / 127.0f, ts, chan);
+        } else if (data1 == 120 || data1 == 123) {
             rt->queueNote(src, ump_all_notes_off(), 0); /* panic, now */
             mpe.reset(); /* drop stale channel->voice bindings + RPN parse state */
         } else { /* CC74 timbre (Y) -> Filter Cutoff; CC 101/100/6/38 -> RPN/MCM
@@ -1008,22 +1093,56 @@ static OSStatus au_render_silence(HarpAU *au, AudioBufferList *ioData,
     return noErr;
 }
 
+/* Deinterleave one stereo interleaved block into the host's output (or our scratch),
+ * summing L+R for a mono host bus. Shared by the main-mix and per-part element paths. */
+static void au_write_stereo(HarpAU *au, AudioBufferList *ioData, UInt32 nFrames,
+                            const float *interleaved) {
+    float *dst[2];
+    au_resolve_dst(au, ioData, nFrames, dst);
+    if (ioData->mNumberBuffers >= 2) {
+        for (UInt32 s = 0; s < nFrames; s++) {
+            dst[0][s] = interleaved[2 * s];
+            dst[1][s] = interleaved[2 * s + 1];
+        }
+    } else { /* mono host bus: sum */
+        for (UInt32 s = 0; s < nFrames; s++)
+            dst[0][s] = 0.5f * (interleaved[2 * s] + interleaved[2 * s + 1]);
+    }
+}
+
 static OSStatus au_Render(void *self, AudioUnitRenderActionFlags *ioFlags,
                           const AudioTimeStamp *ts, UInt32 bus, UInt32 nFrames,
                           AudioBufferList *ioData) {
     HarpAU *au = (HarpAU *)self;
     (void)ioFlags;
     (void)ts;
-    if (bus != 0) return kAudioUnitErr_InvalidElement;
     if (!au->initialized) return kAudioUnitErr_Uninitialized;
     if (nFrames > au->maxFrames) return kAudioUnitErr_TooManyFramesToProcess;
     if (!ioData || ioData->mNumberBuffers < 1) return kAudio_ParamError;
+    if (bus > (UInt32)HarpAU::kNumParts) return kAudioUnitErr_InvalidElement; /* 0..16 */
 
     HarpRuntime *rt = au->runtime();
     /* Unacquired (rendered before activate): clean silence. */
     if (!rt || !au->source) return au_render_silence(au, ioData, nFrames);
 
     const bool isOwner = au->owner();
+
+    /* MULTI-OUT (M4) PART ELEMENTS (1..16): serve the cache element 0's pull filled THIS
+     * cycle. AU renders one element per call, so the device clock (the main-mix pull that
+     * advances ssiRead_) lives on element 0; it also drains every active part sink into
+     * partBuf_. Here we just hand back part (bus-1)'s cached block. An attached instance
+     * (no parts), an inactive/unrouted part, or a frame count that doesn't match the cached
+     * block -> clean silence. No runtime touch on this path. */
+    if (bus >= 1) {
+        int k = (int)bus - 1;
+        if (isOwner && au->partSinks_[k] && au->cachedFrames_ == nFrames)
+            au_write_stereo(au, ioData, nFrames, au->partBuf_[k]);
+        else
+            au_render_silence(au, ioData, nFrames);
+        return noErr;
+    }
+
+    /* ELEMENT 0 (main mix) — the session clock: transport + the device pull, once/cycle. */
 
     /* §9.7 transport: OWNER ONLY. Transport is global (the owner anchors the
      * session's musical time); an attached feedTransport would push a second,
@@ -1044,42 +1163,43 @@ static OSStatus au_Render(void *self, AudioUnitRenderActionFlags *ioFlags,
                           rt->streamPos() + rt->latencySamples());
     }
 
-    /* AUDIO. The OWNER pulls the shared session's MAIN MIX (the one consumer —
-     * it sums every part). An ATTACHED instance is AUDIO-SILENT by default (it must
-     * NOT pull the main-mix ring — a second consumer corrupts the SPSC tail and
-     * steals the owner's samples), unless it OPTED IN to its own part's audio (P5b
-     * sink), in which case it pulls ITS demuxed per-part ring. Mirrors the VST3
-     * shell's process() exactly. */
-    if (!isOwner && !au->sink) return au_render_silence(au, ioData, nFrames);
+    /* AUDIO. The OWNER pulls the shared session's MAIN MIX (the one main-ring consumer —
+     * it sums every part) AND drains every active part sink into its element cache: the
+     * SAME pull set, in the SAME order, as the VST3 shell's process() (main bus 0, then
+     * each part bus). An ATTACHED instance is AUDIO-SILENT by default (it must NOT pull the
+     * main-mix ring — a second consumer corrupts the SPSC tail and steals the owner's
+     * samples), unless it OPTED IN to its own part's audio (P5b sink). */
+    if (!isOwner && !au->sink) {
+        au->cachedFrames_ = 0;
+        return au_render_silence(au, ioData, nFrames);
+    }
 
-    /* pull interleaved from the relevant ring; deinterleave into the host's buffers
-     * (or our scratch, when the host passes mData = NULL). The OWNER pulls the
-     * main-mix ring (the no-sink pullAudio — byte-identical); an opted-in attached
-     * instance pulls its demuxed per-part sink. */
     if (isOwner) {
         if (au->offline)
             rt->pullAudioBlocking(au->interleaved, nFrames, 1000);
         else
-            rt->pullAudio(au->interleaved, nFrames);
+            rt->pullAudio(au->interleaved, nFrames); /* RT: silence on underrun */
+        /* drain every active part sink for THIS cycle. The reader demuxes one device frame
+         * into ALL rings together, so after the main pull each sink ring holds the same
+         * range; draining fills partBuf_ and keeps the rings from overflowing (the reader
+         * is their sole producer — an undrained sink would stall). */
+        for (int k = 0; k < HarpAU::kNumParts; k++) {
+            if (!au->partSinks_[k]) continue;
+            if (au->offline)
+                rt->pullAudioBlocking(au->partSinks_[k], au->partBuf_[k], nFrames, 1000);
+            else
+                rt->pullAudio(au->partSinks_[k], au->partBuf_[k], nFrames);
+        }
+        au->cachedFrames_ = nFrames;
     } else {
         if (au->offline)
             rt->pullAudioBlocking(au->sink, au->interleaved, nFrames, 1000);
         else
             rt->pullAudio(au->sink, au->interleaved, nFrames);
+        au->cachedFrames_ = 0; /* attached instance exposes no part elements */
     }
 
-    float *dst[2];
-    au_resolve_dst(au, ioData, nFrames, dst);
-    if (ioData->mNumberBuffers >= 2) {
-        for (UInt32 s = 0; s < nFrames; s++) {
-            dst[0][s] = au->interleaved[2 * s];
-            dst[1][s] = au->interleaved[2 * s + 1];
-        }
-    } else { /* mono host bus: sum */
-        for (UInt32 s = 0; s < nFrames; s++)
-            dst[0][s] =
-                0.5f * (au->interleaved[2 * s] + au->interleaved[2 * s + 1]);
-    }
+    au_write_stereo(au, ioData, nFrames, au->interleaved);
     return noErr;
 }
 
