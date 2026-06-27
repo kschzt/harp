@@ -14,25 +14,25 @@
  *   - the DAW main thread: queueParamSet/Ramp/Note/Transport flooding +
  *     periodic getStateBundle/setStateBundle (the control ops that take
  *     ctlMutex_ — where the last real race lived).
- *   - optionally two runtimes at once (--instances 2): the multi-device
- *     path, two devices, two of every thread.
+ *   - the multi-out MAIN (--instances N): ONE owner instance owning the whole
+ *     device and N parts, exactly as the M3 multi-out shell does.
  *
- * Runtimes now come from the PROCESS-GLOBAL registry (P4), exactly as the
- * plugin obtains them — so --instances N exercises the registry's concurrent
- * acquire/release under TSan. With HARP_DEVICE_SERIAL set, all N instances
- * name the SAME serial: ONE owner runtime / ONE claim, N-1 attached handles
- * (the shared-session path). With no serial, each instance gets its OWN fresh
- * unregistered runtime (the multi-device path) — every instance is an owner.
+ * MULTI-OUT MODEL (M3): the registry's share-by-serial / owner+attached model is
+ * gone. ONE owner runtime is acquired (runtime_acquire — the empty-serial PRIVATE
+ * owner path, or HARP_DEVICE_SERIAL to pin the unit). --instances N is the number
+ * of ACTIVE PARTS the single owner drives on channels 0..N-1; parts 1..N-1 each
+ * get a per-part demux SINK registered on the owner BEFORE start (the audio.start
+ * union), exactly as the multi-out shell registers its active part buses.
  *
- * P5 EVENT MERGE: each instance drives its OWN event source on its OWN channel
- * (owner ch0, attached ch1..N-1), so a shared-serial --instances N exercises N
- * SPSC event sources MERGED onto one session under TSan — the new cross-thread
- * structure (the source registry: register on acquire, the owner's eventPump
- * iterating the set, remove on release) gets hammered exactly as a multitimbral
- * group of aliases would hammer it. AUDIO stays owner-only: only the owner
- * pulls the (one-consumer) main-mix ring; attached instances are audio-silent
- * (P5b adds per-part audio), so only the owner spawns an audio thread. EVERY
- * instance spawns a control thread that floods its source — that is the merge.
+ * ONE control thread is the SOLE producer of the owner source's SPSC ring (there
+ * is no per-instance source merge any more — that is deleted in M3): it floods
+ * notes/params across ALL N channels, the channel carried per-event (queueNote
+ * bakes it in the UMP word; queueParamSet via the §9.4-key-5 channel arg), so the
+ * device demuxes each part. The owner's audio thread pulls + (--out) captures the
+ * summed main mix; a designated part's sink thread captures that part's demuxed
+ * audio (the non-silent-demux proof). That is the multi-out main's real
+ * concurrency under TSan: supervisor/feeder/reader/eventPump + the audio + sink
+ * pulls + the one control producer + the part sinks.
  *
  * Clean exit code 0 + no "WARNING: ThreadSanitizer" in stderr = pass.
  */
@@ -151,15 +151,17 @@ static void part_audio_thread(HarpRuntime *rt, AudioSink *sink, uint32_t block, 
     }
 }
 
-/* the simulated DAW main/control thread for ONE instance: flood THIS instance's
- * event SOURCE (the SPSC producer side it owns) and — owner only — periodically
- * run a getState/setState round-trip (the ctlMutex_ path). `src` is the
- * instance's source: the owner's built-in source or an attached instance's
- * registered one. `isOwner` gates the owner-only surface (transport anchor,
- * state ops); attached instances inject notes/params on their part, exactly as
- * an attached plugin's process() now does, while the OWNER's eventPump merges
- * every source onto the one session. */
-static void control_thread(HarpRuntime *rt, EventSource *src, bool isOwner,
+/* the simulated DAW main/control thread: flood the multi-out main's ONE event
+ * SOURCE (the owner source — single producer of its SPSC ring, exactly as the
+ * shell's process() is) across ALL `nParts` channels/parts. A DAW with N part
+ * tracks routed to the one HARP instance delivers their MIDI on channels 0..N-1
+ * through the single plugin input; the eventPump consumes them in order and the
+ * device demuxes per part (§9.4 key 5 = channel). queueNote bakes the channel
+ * into the UMP word; queueParamSet carries it explicitly (M2). One thread = one
+ * producer keeps the SPSC contract — there is no per-instance source merge any
+ * more (the multi-out main owns all parts on one source). Also runs the periodic
+ * getState/setState round-trip (the ctlMutex_ stress) + anchors transport. */
+static void control_thread(HarpRuntime *rt, EventSource *src, int nParts,
                            int seconds) {
     (void)seconds; /* flood for the whole RUN lifetime (gate on g_run), not a fixed
                     * seconds*1000 counter — see the loop note below. */
@@ -177,47 +179,43 @@ static void control_thread(HarpRuntime *rt, EventSource *src, bool isOwner,
      * the thread is joined at run end, so g_run always bounds it. */
     while (g_run.load(std::memory_order_relaxed)) {
         uint64_t base = rt->streamPos() + rt->latencySamples();
-        uint8_t chan = src->chan.load(std::memory_order_relaxed) & 0xf;
-        float iso = chan < g_iso_levels.size() ? g_iso_levels[chan] : -1.f;
-        if (iso >= 0.f) {
-            /* param-isolation e2e: a CONTROLLED, audible voice on THIS part —
-             * fixed tone + fast env so each struck note sounds, and level = this
-             * part's HARP_ISO_LEVELS entry. No random flood, so the captured sink's
-             * energy tracks THIS part's level alone (routed via the source channel /
-             * §9.4 key 5), letting the test isolate per-part param routing. */
-            rt->queueParamSet(src, 3, 0.7f, base);  /* tone */
-            rt->queueParamSet(src, 5, 0.05f, base); /* fast attack */
-            rt->queueParamSet(src, 6, 0.1f, base);  /* fast decay */
-            rt->queueParamSet(src, 7, iso, base);   /* level (Master Level = id 7 post-2.1.0 renumber) — the variable under test */
-        } else {
-            /* params, ramps, notes — the whole queue* surface, on OUR source.
-             * Flood the 7 CONTINUOUS synth params (ids 1..7: Osc/Filter/Env/Master) ONLY.
-             * Pre-2.1.0 this was `n % 8` (ids 1..8) — safe then because id 8 WAS Master
-             * Level (the last continuous param; the drone's old id 7 was an empty hole).
-             * The renumber made id 8 the STEPPED Arp Mode, so `n % 8` began randomly
-             * switching the arpeggiator ON, retriggering notes into a wildly louder,
-             * non-deterministic mix that collapsed alias-play's per-part separation
-             * (single-RMS ~1k -> ~3-12k). Keep the flood off the arp/control band (8..12). */
-            rt->queueParamSet(src, 1 + (n % 7), (float)(n % 100) / 100.f, base + (n % 256));
-            rt->queueRamp(src, 3, (float)(n % 50) / 50.f, base, base + 256);
+        /* Drive EACH active part on its OWN channel from this ONE source (single
+         * producer — the SPSC contract). A part's params/notes route by §9.4 key 5
+         * = the channel: queueParamSet carries it per-event (M2 channel arg) and
+         * queueNote bakes it into the UMP word. This is exactly what the multi-out
+         * main does when a DAW routes N part tracks to the one HARP instance. */
+        for (int p = 0; p < nParts; p++) {
+            uint8_t chan = (uint8_t)(p & 0xf);
+            float iso = chan < g_iso_levels.size() ? g_iso_levels[chan] : -1.f;
+            if (iso >= 0.f) {
+                /* param-isolation e2e: a CONTROLLED, audible voice on THIS part —
+                 * fixed tone + fast env so each struck note sounds, and level = this
+                 * part's HARP_ISO_LEVELS entry, carried on `chan` (§9.4 key 5). So the
+                 * captured part sink's energy tracks THIS part's level alone, isolating
+                 * per-part param routing. */
+                rt->queueParamSet(src, 3, 0.7f, base, chan);  /* tone */
+                rt->queueParamSet(src, 5, 0.05f, base, chan); /* fast attack */
+                rt->queueParamSet(src, 6, 0.1f, base, chan);  /* fast decay */
+                rt->queueParamSet(src, 7, iso, base, chan);   /* level (Master Level id 7) — under test */
+            } else {
+                /* the CONTINUOUS-param flood (ids 1..7: Osc/Filter/Env/Master), on THIS
+                 * part's channel. Keep off the arp/control band (8..12): id 8 is the
+                 * STEPPED Arp Mode and flooding it would randomly retrigger notes into a
+                 * non-deterministic mix that collapses per-part separation. */
+                rt->queueParamSet(src, 1 + (n % 7), (float)(n % 100) / 100.f, base + (n % 256), chan);
+                rt->queueRamp(src, 3, (float)(n % 50) / 50.f, base, base + 256, chan);
+            }
+            /* notes carry their channel in the UMP word (§9.4 — the eventPump does not
+             * restamp note channels), so each part SOUNDS and the device demuxes it. */
+            uint32_t nch = (uint32_t)chan << 16;
+            if (n % 7 == 0)
+                rt->queueNote(src, 0x20900000u | nch | ((60 + (n % 12)) << 8) | 0x50, base);
+            if (n % 11 == 0)
+                rt->queueNote(src, 0x20800000u | nch | ((60 + (n % 12)) << 8) | 0x40, base);
         }
-        /* Bake THIS source's channel (part) into the note's UMP word, exactly as
-         * a DAW/shell does (the eventPump does NOT restamp note channels — §9.4
-         * "notes already carry their channel in the word"). Without this every
-         * instance played part 0 and the attached per-part audio sinks (P5b)
-         * captured pure silence; on its own channel each attached instance now
-         * SOUNDS its part, so the demux carries real signal. The owner is ch0, so
-         * its notes are unchanged (golden-irrelevant: tsan-host isn't the oracle). */
-        uint32_t nch = (uint32_t)chan << 16;
-        if (n % 7 == 0)
-            rt->queueNote(src, 0x20900000u | nch | ((60 + (n % 12)) << 8) | 0x50, base);
-        if (n % 11 == 0)
-            rt->queueNote(src, 0x20800000u | nch | ((60 + (n % 12)) << 8) | 0x40, base);
-        /* transport is global (owner-anchored): the owner drives it, exactly as
-         * plugin.cpp gates feedTransport to the owner. queueTransport pins it to
-         * the owner source whatever we pass, but only the owner SHOULD call it. */
-        if (isOwner) rt->queueTransport(src, 0x29, 120.0, (double)n * 0.01, base);
-        if (isOwner && g_state_stress && n % 200 == 0 && rt->connected()) { /* op under ctlMutex_ */
+        /* transport is global (ONE stream, the multi-out main anchors it). */
+        rt->queueTransport(src, 0x29, 120.0, (double)n * 0.01, base);
+        if (g_state_stress && n % 200 == 0 && rt->connected()) { /* op under ctlMutex_ */
             rt->getStateBundle(bundle);
             if (!bundle.empty()) rt->setStateBundle(bundle.data(), bundle.size());
         }
@@ -283,82 +281,44 @@ int main(int argc, char **argv) {
     fprintf(stderr, "tsan-host: %d instance(s), %d s, block %u, serial=\"%s\"\n", instances,
             seconds, block, wantSerial.c_str());
 
-    std::vector<RuntimeHandle> handles;
-    std::vector<EventSource *> sources; /* one per instance, parallel to handles */
-    std::vector<AudioSink *> sinks;     /* one per instance (nullptr unless --part-audio attached) */
+    /* MULTI-OUT: ONE owner instance owns the whole device and every part — the
+     * registry's share-by-serial / owner+attached model is gone (M3). `instances`
+     * is now the number of ACTIVE PARTS the single owner drives (channels 0..N-1);
+     * parts 1..N-1 each get a demux sink registered on the owner, exactly as the
+     * multi-out shell registers its active part buses. The flag name is kept so the
+     * scripts pass --instances unchanged. */
+    int nParts = instances < 1 ? 1 : instances;
+    RuntimeHandle owner = runtime_acquire(wantSerial); /* empty serial -> a fresh PRIVATE owner */
+    std::vector<AudioSink *> sinks(nParts, nullptr);   /* sinks[p] = part p's demux sink (p>=1) */
+    int capturePart = nParts > 1 ? 1 : 0;              /* the part whose sink the play-proof captures */
     std::vector<std::thread> audio, control;
-    /* Acquire all handles first so the concurrent-acquire bookkeeping (and, for
-     * a shared serial, the owner/attached split) is established before driving.
-     * The owner of a shared serial is the first acquire; the rest attach. */
-    for (int k = 0; k < instances; k++) handles.push_back(runtime_acquire(wantSerial));
-    sinks.assign(handles.size(), nullptr);
-    /* P5b: register every attached instance's PER-PART AUDIO SINK on the owner
-     * runtime BEFORE the owner starts, so its slots enter the audio.start UNION
-     * (computeUnionSlotsLocked, called from start()->audioStart). Registered
-     * after start they'd be in the registry but not the live union (the P5b
-     * fixed-at-start limitation) — so the harness, like a DAW activating tracks
-     * together at load, registers them up front. Owner-only --part-audio is
-     * harmless: with one instance there is no attached sink, the union stays
-     * {0,1}, and the owner pulls the byte-identical main mix. For a shared serial
-     * every attached handle's rt is the owner runtime, so the sink lands there.
-     *
-     * --late-sink DEFERS this: the sinks are registered AFTER the owner has
-     * started + run (below), so each lands in the registry but NOT the live
-     * audio.start union — the P5b RE-NEGOTIATION path the feeder must fix. The
-     * default (before-start) path is unchanged. */
+
+    /* Register parts 1..N-1's demux sinks BEFORE start so their slots enter the
+     * audio.start UNION (computeUnionSlotsLocked) — the before-start path a DAW
+     * activating its part tracks at load takes. --late-sink defers this to exercise
+     * the RE-NEGOTIATION. With N==1 there is no part sink: the union stays {0,1} and
+     * the owner pulls the byte-identical main mix. */
     if (partAudio && !lateSink)
-        for (size_t k = 0; k < handles.size(); k++)
-            if (!handles[k].owner) {
-                std::vector<uint32_t> slots = {2u + 2u * (uint32_t)(k & 0xf),
-                                               3u + 2u * (uint32_t)(k & 0xf)};
-                sinks[k] = handles[k].rt->registerAudioSink(slots);
-            }
-    /* Only OWNER runtimes are configured/started — an attached instance shares
-     * the owner's already-started session, exactly as plugin.cpp does. */
-    for (auto &h : handles) {
-        if (!h.owner) continue;
-        h.rt->configure(48000, block);
-        h.rt->start(48000); /* device-less is fine — supervisor retries, threads still run */
-    }
-    /* P5: bind each instance to its OWN event source on its OWN channel — the
-     * owner uses the runtime's built-in source (ch0, set by start's HARP_CHANNEL
-     * read; we leave it at 0 here), an attached instance REGISTERS a source for
-     * its part (ch1..N-1). This is the merge: N SPSC sources on one session.
-     * (registerSource must run after the owner has started — the source array
-     * lives in the owner's runtime; for a shared serial every handle's rt is
-     * that same owner runtime, so the attached registers there.) */
-    for (size_t k = 0; k < handles.size(); k++) {
-        RuntimeHandle &h = handles[k];
-        if (h.owner)
-            sources.push_back(h.rt->ownerSource());
-        else
-            sources.push_back(h.rt->registerSource((uint8_t)(k & 0xf)));
-    }
-    /* let the supervisors connect/claim before flooding */
+        for (int p = 1; p < nParts; p++) {
+            std::vector<uint32_t> slots = {2u + 2u * (uint32_t)p, 3u + 2u * (uint32_t)p};
+            sinks[p] = owner.rt->registerAudioSink(slots);
+        }
+    owner.rt->configure(48000, block);
+    owner.rt->start(48000); /* device-less is fine — supervisor retries, threads still run */
+    EventSource *src = owner.rt->ownerSource();
+
+    /* let the supervisor connect/claim before flooding */
     struct timespec s = {1, 0};
     nanosleep(&s, nullptr);
-    /* Drive EVERY instance's event source (the merge under TSan): each control
-     * thread is the SOLE producer of its source's ring, the owner's eventPump
-     * the sole consumer of all of them. AUDIO stays owner-only — the main-mix
-     * ring has one consumer (P5b adds per-part audio), so only owners spawn an
-     * audio thread; attached instances are audio-silent, matching process(). */
-    bool capturerAssigned = false;
-    bool sinkCapturerAssigned = false;
-    for (size_t k = 0; k < handles.size(); k++) {
-        RuntimeHandle &h = handles[k];
-        if (h.owner) {
-            audio.emplace_back(audio_thread, h.rt, block, !capturerAssigned); /* first owner captures */
-            capturerAssigned = true;
-        } else if (sinks[k]) {
-            /* P5b opt-in: this attached instance pulls its OWN demuxed part sink —
-             * its sole consumer, fed by the owner's reader demux. The new SPSC
-             * structure under TSan. The FIRST attached sink also captures, so the
-             * play-proof can show it is non-silent (the alias hears its part). */
-            audio.emplace_back(part_audio_thread, h.rt, sinks[k], block, !sinkCapturerAssigned);
-            sinkCapturerAssigned = true;
-        }
-        control.emplace_back(control_thread, h.rt, sources[k], h.owner, seconds);
-    }
+
+    /* The owner's main-mix audio thread (captures g_capture for --out); the
+     * designated part's sink thread (captures g_sink_capture, the non-silent demux
+     * proof); and ONE control thread driving all N parts' channels on the owner
+     * source — single producer, exactly as the shell's process() is. */
+    audio.emplace_back(audio_thread, owner.rt, block, !outPath.empty());
+    if (partAudio && !lateSink && capturePart >= 1 && sinks[capturePart])
+        audio.emplace_back(part_audio_thread, owner.rt, sinks[capturePart], block, true);
+    control.emplace_back(control_thread, owner.rt, src, nParts, seconds);
     if (!lateSink) {
         for (int t = 0; t < seconds; t++) nanosleep(&s, nullptr);
     } else {
@@ -381,10 +341,8 @@ int main(int argc, char **argv) {
          * the registry — but on a healthy rig this lands a true mid-session
          * re-negotiation. A short settle lets the initial {0,1} union stream a
          * bit first so the re-neg is visibly a CHANGE. */
-        HarpRuntime *owner = nullptr;
-        for (auto &h : handles)
-            if (h.owner) { owner = h.rt; break; }
-        for (int t = 0; t < 50 && owner && !owner->connected(); t++) {
+        HarpRuntime *ownerRt = owner.rt;
+        for (int t = 0; t < 50 && ownerRt && !ownerRt->connected(); t++) {
             struct timespec ms100 = {0, 100000000L};
             nanosleep(&ms100, nullptr);
         }
@@ -404,18 +362,15 @@ int main(int argc, char **argv) {
          * below. So the proof can never accumulate the pre-re-neg silence — it is
          * deterministic, not 7/8. */
         g_capture_armed.store(false, std::memory_order_release);
-        uint32_t baseReneg = owner ? owner->renegCount() : 0;
-        for (size_t k = 0; k < handles.size(); k++) {
-            RuntimeHandle &h = handles[k];
-            if (h.owner) continue;
-            std::vector<uint32_t> slots = {2u + 2u * (uint32_t)(k & 0xf),
-                                           3u + 2u * (uint32_t)(k & 0xf)};
-            sinks[k] = h.rt->registerAudioSink(slots); /* -> re-negotiation */
-            if (sinks[k]) {
-                audio.emplace_back(part_audio_thread, h.rt, sinks[k], block,
-                                   !sinkCapturerAssigned);
-                sinkCapturerAssigned = true;
-            }
+        uint32_t baseReneg = ownerRt ? ownerRt->renegCount() : 0;
+        /* register parts 1..N-1's sinks NOW (mid-session) on the OWNER runtime -> each
+         * raises audioRenegPending_; the designated capturePart's sink thread captures
+         * the post-re-neg audio (the non-silent proof the feeder added its slots live). */
+        for (int p = 1; p < nParts; p++) {
+            std::vector<uint32_t> slots = {2u + 2u * (uint32_t)p, 3u + 2u * (uint32_t)p};
+            sinks[p] = ownerRt->registerAudioSink(slots); /* -> re-negotiation */
+            if (sinks[p])
+                audio.emplace_back(part_audio_thread, ownerRt, sinks[p], block, p == capturePart);
         }
         /* Wait for the re-negotiation(s) to FULLY SETTLE before arming. With
          * several late sinks registering near-simultaneously the feeder may run
@@ -429,10 +384,10 @@ int main(int argc, char **argv) {
          * fail, not a hang. */
         uint32_t lastReneg = baseReneg;
         int stable = 0;
-        for (int t = 0; t < 60 && owner && g_run.load(); t++) {
+        for (int t = 0; t < 60 && ownerRt && g_run.load(); t++) {
             struct timespec ms100 = {0, 100000000L};
             nanosleep(&ms100, nullptr);
-            uint32_t rc = owner->renegCount();
+            uint32_t rc = ownerRt->renegCount();
             if (rc != lastReneg) { lastReneg = rc; stable = 0; }       /* a (further) re-neg */
             else if (rc != baseReneg && ++stable >= 5) break;          /* re-neg'd + stable 500 ms */
         }
@@ -445,16 +400,13 @@ int main(int argc, char **argv) {
     g_run.store(false);
     for (auto &th : control) th.join();
     for (auto &th : audio) th.join();
-    /* Teardown order matches plugin.cpp: an attached instance removes its event
-     * source AND its per-part audio sink BEFORE releasing its handle (a last
-     * release destroys the runtime; unregistering after would touch a freed
-     * runtime). unregisterSource on the owner source / nullptr and
-     * unregisterAudioSink on nullptr are no-ops. */
-    for (size_t k = 0; k < handles.size(); k++) {
-        if (!handles[k].owner && sinks[k]) handles[k].rt->unregisterAudioSink(sinks[k]);
-        if (!handles[k].owner && sources[k]) handles[k].rt->unregisterSource(sources[k]);
-        runtime_release(handles[k]);
-    }
+    /* Teardown order matches plugin.cpp: unregister the part sinks BEFORE releasing
+     * the runtime (release destroys it; unregistering after would touch freed memory).
+     * unregisterAudioSink on nullptr is a no-op; the owner source is the runtime's
+     * built-in one, so there is nothing to unregister for it. */
+    for (int p = 1; p < nParts; p++)
+        if (sinks[p]) owner.rt->unregisterAudioSink(sinks[p]);
+    runtime_release(owner);
     /* --out: emit the owner main-mix content hash (and a listening-aid WAV) on
      * the SAME oracle vst3-host uses. The play-proof script compares this across
      * a ch0-only run and an N-channel alias-group run: a different hash means the
