@@ -60,17 +60,28 @@ target_include_directories(harpcore PUBLIC core/include)
 # gnu11 dialect + pthreads (winpthreads) and clock_gettime are native: the POSIX-only
 # AF_UNIX front panel is gated out, and the accept/audio paths use recv/send
 # (host/sock_io.c) since Winsock SOCKETs reject fd read/write.
-add_executable(harp-deviced
-  device/harp-deviced.c # main + transports
-  device/engine.c       # synth, event queue, audio threads
+# harpdevice: the reusable device-protocol library — the §5/§9/§11 session loop +
+# content-addressed state, with NO CPU-synth coupling. session.c/state.c reach the
+# engine only through the seam (g_params[] + engine_*, device.h) and the front panel
+# only through front_panel_set — so a downstream daemon links this
+# lib and supplies its own engine + panel. harp-deviced is just one such daemon.
+add_library(harpdevice STATIC
   device/state.c        # engine <-> content-addressed objects
   device/session.c      # protocol handlers + session loop
+  device/audio_loop.c   # the §8.7/§8.3 render+emit loop (render_output seam)
+)
+target_include_directories(harpdevice PUBLIC device host)
+target_link_libraries(harpdevice PUBLIC harpcore ${HARP_MATH_LIB})
+
+add_executable(harp-deviced
+  device/harp-deviced.c # main + transports
+  device/engine.c       # the refdev synth = the engine seam impl (g_params[] + engine_*)
   host/rtp.c            # §8.7 RTP packetization (--rtp-out emit)
   host/sock_io.c        # §8.7 eth control socket io (recv/send + deadline-aware pre-hello read, §16)
   ${HARP_PLAT_SRC}      # §16 DoS: harp_now_ns for the pre-hello read deadline
 )
 target_include_directories(harp-deviced PRIVATE host)
-target_link_libraries(harp-deviced harpcore ${HARP_MATH_LIB} ${HARP_PLAT_LIBS})
+target_link_libraries(harp-deviced harpdevice ${HARP_PLAT_LIBS})
 if(WIN32)
   # On Windows the device daemon is a MinGW build (winpthreads + winsock); the MSVC
   # target is the plugin/host, not this. panel.c (AF_UNIX) is gated out — POSIX-only;

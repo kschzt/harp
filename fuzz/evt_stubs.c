@@ -72,6 +72,10 @@ bool evq_full(void) { return false; } /* never full -> the note-off escalation b
 void evq_reset_for_new_stream(void) {}
 void engine_all_notes_off(void) {}
 void engine_note_off_if(uint32_t note) { (void)note; }
+/* §9.3 mid-session re-announce seam: the refdev never swaps its param map, so the
+ * dirty-take always returns 0 — the session loop's re-announce branch (refresh +
+ * core.changed) is never taken on the fuzz parse path. */
+int engine_param_map_dirty_take(void) { return 0; }
 void live_ref_touch(device *d, bool dirty) {
     (void)d;
     (void)dirty;
@@ -97,6 +101,12 @@ void engine_part_param_put(int part_idx, uint32_t id, float v) {
  * (compiled into this fuzz TU via the #include), so they are NOT stubbed here. */
 void encode_param_array(harp_cbuf *b) {
     (void)b;
+    abort();
+}
+/* only reached inside the §9.3 re-announce branch, which the dirty-take stub (returns
+ * 0) never enters — so it never runs on the parse path. */
+bool refresh_param_map_hash(device *d) {
+    (void)d;
     abort();
 }
 int engine_load_snapshot(device *d, const harp_hash *snap_h) {
