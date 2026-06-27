@@ -74,6 +74,10 @@ static void host_paced_loop(device *d) {
      * Only the one looped channel is kept (not the whole multi-slot payload), so
      * the audio thread's stack stays small. Untouched unless loopback_on. */
     float lpb_col[AUDIO_MAX_NSAMPLES];
+    /* §8.8 audio.fx: planar input columns for an effect engine, allocated once per stream
+     * (n_in_slots × AUDIO_MAX_NSAMPLES). NULL for a synth (engine_is_fx()==0) → never demuxed. */
+    if (engine_is_fx() && a->n_in_slots > 0 && !a->fx_in)
+        a->fx_in = calloc((size_t)a->n_in_slots * AUDIO_MAX_NSAMPLES, sizeof(float));
     /* buffered endpoint reads (packet-multiple, see ffs.c) */
     uint8_t rbuf[16384];
     size_t rlen = 0, rpos = 0;
@@ -171,6 +175,12 @@ static void host_paced_loop(device *d) {
                 if (a->in_slots[c] == a->loopback_in_slot) { in_col = c; break; }
         bool keep = lpb && in_col >= 0 && h.slots > 0 && (size_t)in_col < h.slots &&
                     h.nsamples <= AUDIO_MAX_NSAMPLES;
+        /* §8.8 audio.fx: in addition to the single-column loopback, demux ALL host input
+         * columns into a->fx_in (planar) for an EFFECT engine. A synth has engine_is_fx()==0
+         * → fxmode false → this is inert and the discard/golden path is byte-identical. */
+        bool fxmode = engine_is_fx() && a->fx_in && a->n_in_slots > 0 && h.slots > 0 &&
+                      h.nsamples <= AUDIO_MAX_NSAMPLES;
+        size_t fxcols = fxmode ? (a->n_in_slots <= h.slots ? a->n_in_slots : h.slots) : 0;
         size_t stride = (size_t)h.slots * 4; /* bytes per interleaved sample-row */
         size_t base = (size_t)in_col * 4;    /* first byte of in_col within a row  */
         size_t pcur = 0;                     /* absolute byte offset within payload */
@@ -179,13 +189,17 @@ static void host_paced_loop(device *d) {
             if (rpos < rlen) {
                 size_t take = rlen - rpos;
                 if (take > skip) take = skip;
-                if (keep) {
-                    /* copy only the bytes that fall in the in_col float of each row */
+                if (keep || fxmode) {
                     for (size_t i = 0; i < take; i++) {
-                        size_t inrow = (pcur + i) % stride;
-                        if (inrow >= base && inrow < base + 4)
-                            ((uint8_t *)lpb_col)[((pcur + i) / stride) * 4 +
-                                                 (inrow - base)] = rbuf[rpos + i];
+                        size_t off = pcur + i, inrow = off % stride, smp = off / stride;
+                        if (keep && inrow >= base && inrow < base + 4)         /* §14.3 loopback col */
+                            ((uint8_t *)lpb_col)[smp * 4 + (inrow - base)] = rbuf[rpos + i];
+                        if (fxmode) {                                          /* §8.8 all FX in-cols */
+                            size_t col = inrow >> 2;
+                            if (col < fxcols)
+                                ((uint8_t *)(a->fx_in + col * AUDIO_MAX_NSAMPLES))
+                                    [smp * 4 + (inrow & 3)] = rbuf[rpos + i];
+                        }
                     }
                 }
                 pcur += take;
@@ -198,6 +212,7 @@ static void host_paced_loop(device *d) {
             rlen = (size_t)r;
             rpos = 0;
         }
+        a->fx_in_n = (uint16_t)(fxmode ? h.nsamples : 0); /* §8.8: samples for the FX render */
         uint32_t n = h.nsamples;
         if (n > AUDIO_MAX_NSAMPLES) {
             CTR_INC(d->frame_errors);

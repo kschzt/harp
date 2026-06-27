@@ -1307,6 +1307,13 @@ void engine_voices_quiet(void) {
     }
 }
 
+/* §8.8 engine role. The reference engine is a SYNTH (note → audio); it has no audio input,
+ * so it returns 0 and `a->fx_in` is never demuxed — the golden render path is byte-identical.
+ * An EFFECT engine (e.g. harp-fx's reverb, which replaces this translation unit like
+ * jetson-synth does) overrides this to 1; the device then advertises `audio.fx` (§6.2) and
+ * audio_loop.c's host_paced_loop demuxes the H→D input into `a->fx_in` for render_output. */
+int engine_is_fx(void) { return 0; }
+
 uint16_t render_output(audio_state *a, float *out, uint32_t n, float rate,
                        uint64_t pos) {
     /* TEST/MEASUREMENT tone (harp-deviced --tone HZ): a pure stereo sine,

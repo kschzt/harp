@@ -271,7 +271,13 @@ bool HarpRuntime::audioStart(uint32_t rate) {
      * (0 free-running RTP, 1 loopback, else 2 host-paced), float32. */
     {
         uint32_t outCh = (uint32_t)unionSlots_.size();
-        uint32_t inCh = freeRunning_.load(std::memory_order_relaxed) ? 0u : (loopbackArmed() ? 1u : 2u);
+        /* IN columns declared on the wire: 0 free-running RTP (no H→D audio); else
+         * §8.8 FX in-slots when armed, the single loopback column when probing, or the
+         * historical 2 host-paced pacing columns (slots=0 frames, but [0,1] declared). */
+        uint32_t inCh = freeRunning_.load(std::memory_order_relaxed)
+                            ? 0u
+                            : (fxArmed() ? (uint32_t)fxInSlots_.size()
+                                         : (loopbackArmed() ? 1u : 2u));
         uint64_t needBps = (uint64_t)(outCh + inCh) * 4ull * rate;
         std::string pathKey;
         if (transport_ && transport_->kind() == ShellTransport::Kind::Usb) {
@@ -359,7 +365,13 @@ bool HarpRuntime::audioStart(uint32_t rate) {
          * input column (d->audio.in_slots = {in}); the probe then injects on that one
          * column. This only matters once diag.loopback.start arms the device — off
          * the probe the device ignores in_slots and the render is unchanged. */
-        if (loopbackArmed()) {
+        if (fxArmed()) {
+            /* §8.8 audio.fx: declare the device's input columns; the feeder fills
+             * them with the track audio process() pushes (writeFxInput). The device
+             * (engine_is_fx()) demuxes these columns into a->fx_in and returns WET. */
+            harp_cbor_array(&req, fxInSlots_.size());
+            for (uint32_t s : fxInSlots_) harp_cbor_uint(&req, s);
+        } else if (loopbackArmed()) {
             harp_cbor_array(&req, 1);
             harp_cbor_uint(&req, (uint64_t)loopbackIn_);
         } else {
@@ -1194,6 +1206,13 @@ static std::string discoverEthDevice() {
  * stale free-running ring). Pre-start / no-session / USB are early no-ops. */
 void HarpRuntime::setOffline(bool o) {
     bool prev = wantHostPaced_.exchange(o, std::memory_order_release);
+    /* §8.8: an effect device is INHERENTLY host-paced (the host drives audio
+     * THROUGH it; free-running RTP has no H→D input path). So an armed FX session
+     * is ALWAYS host-paced and the DAW's live<->offline toggle must NEVER re-dial
+     * it to free-running — wantHostPacedMode() stays true either way, so there is no
+     * mode to flip. Gate the whole toggle on fxArmed(); the instrument (never armed)
+     * keeps its exact free-running/host-paced live/offline flip behaviour below. */
+    if (fxArmed()) return;
     if (prev == o) return;                                          /* idempotent: no change */
     if (!running_.load(std::memory_order_acquire)) return;          /* pre-start: first dial reads it */
     if (!connected_.load(std::memory_order_acquire)) return;        /* no live session: next sessionUp reads it */
@@ -1235,7 +1254,8 @@ ShellTransport *HarpRuntime::selectDevice() {
                 if (target.empty()) return nullptr; /* none resolved this cycle — supervisor retries */
                 log_msg("mDNS: discovered network device %s — dialing", target.c_str());
             }
-            return EthTransport::dial(target.c_str(), wantHostPaced_.load(std::memory_order_relaxed));
+            /* §8.8: an armed effect (fxArmed) always dials host-paced — see wantHostPacedMode(). */
+            return EthTransport::dial(target.c_str(), wantHostPacedMode());
         }
 
     /* reconnect: pinned to the exact unit this instance already owns — the
@@ -1246,7 +1266,7 @@ ShellTransport *HarpRuntime::selectDevice() {
             /* §4.4.3/§12.3: this instance is pinned to a NETWORK synth — re-dial the same
              * address (a transient drop keeps it), and if the synth renumbered, re-browse for
              * one. Never fall into the USB-only lookup below, which could never resume it. */
-            bool hp = wantHostPaced_.load(std::memory_order_relaxed);
+            bool hp = wantHostPacedMode(); /* §8.8: an armed FX always re-dials host-paced */
             if (ShellTransport *t = EthTransport::dial(boundEthHostport_.c_str(), hp)) return t;
             std::string disc = allowDiscovery_.load(std::memory_order_relaxed) ? discoverEthDevice() : std::string();
             if (!disc.empty()) {
@@ -1313,7 +1333,8 @@ ShellTransport *HarpRuntime::selectDevice() {
     std::string disc = allowDiscovery_.load(std::memory_order_relaxed) ? discoverEthDevice() : std::string();
     if (!disc.empty()) {
         log_msg("mDNS: discovered network device %s — dialing", disc.c_str());
-        return EthTransport::dial(disc.c_str(), wantHostPaced_.load(std::memory_order_relaxed));
+        /* §8.8: an armed effect (fxArmed) always dials host-paced — see wantHostPacedMode(). */
+        return EthTransport::dial(disc.c_str(), wantHostPacedMode());
     }
     return nullptr;
 }
@@ -2103,8 +2124,22 @@ void HarpRuntime::encodeRampEvent(harp_cbuf *m, uint32_t id, float target,
  * request, and the late-arriving samples for those positions are dropped
  * (padDebtFloats_) when they show up. The wrong policy — playing late
  * arrivals anyway — grows latency by every pad and audibly "echoes" the
- * missing moment while the DAW grid drifts. */
+ * missing moment while the DAW grid drifts.
+ *
+ * §8.8 audio.fx EXCEPTION: an armed effect (fxArmed) is a FIXED-LATENCY DELAY
+ * LINE, not a 1:1 free-running synth stream. Its wet is inherently PDC-late
+ * (round-trip ≈ the reported latencySamples()): the first ~PDC pulls
+ * legitimately underrun while the H→D→wet pipeline primes, then the wet flows
+ * continuously (the device runs faster than real-time, so once primed the ring
+ * stays full). For the FX, a late wet IS the signal — just delayed by the PDC
+ * the plugin already reports (the DAW compensates) — NOT a dropout to skip.
+ * Dropping it (the spent-position policy) re-empties the ring every block and
+ * yields 100% silence. So skip the settle for the FX: the PDC-late wet
+ * accumulates in audioRing_ and plays. fxArmed()/fxInSlots_ is fixed before
+ * start() (never mutated mid-session), so reading it here is race-free, and the
+ * INSTRUMENT shell never arms it — its synth/free-running path is unchanged. */
 void HarpRuntime::settlePadDebt() {
+    if (fxArmed()) return;
     while (padDebtFloats_) {
         float scratch[1024];
         size_t take = padDebtFloats_ < 1024 ? padDebtFloats_ : 1024;
@@ -2166,7 +2201,13 @@ size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
     ssiRead_.fetch_add(nFrames, std::memory_order_relaxed);
     if (got < want) {
         memset(dst + got, 0, (want - got) * sizeof(float));
-        padDebtFloats_ += want - got;
+        /* §8.8: only the 1:1 synth path owes droppable pad debt. For an armed FX
+         * (fxArmed) this short read is PRIMING silence while the fixed-latency wet
+         * pipeline fills — the wet is PDC-late, not spent — so DON'T schedule a drop
+         * (settlePadDebt early-returns for the FX too). We still COUNT the underrun:
+         * for the FX these are the expected handful of priming blocks, after which the
+         * ring stays full and there are none. fxInSlots_ is fixed before start(). */
+        if (!fxArmed()) padDebtFloats_ += want - got;
         if (connected_.load(std::memory_order_acquire)) {
             underruns_.fetch_add(1, std::memory_order_relaxed);
             padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
@@ -2284,6 +2325,18 @@ size_t HarpRuntime::pullAudioBlocking(AudioSink *sink, float *dst, size_t nFrame
         waited++;
     }
     return 0;
+}
+
+/* §8.8 audio.fx: the FX shell's process() pushes the track's input here each
+ * block; the feeder pops kBlock-frame chunks and frames them H→D (see feeder()).
+ * Interleaved by fxInSlots_.size() columns (mono in => 1). Lock-free SPSC — the
+ * feeder is the sole consumer. No-op (returns 0) when not armed, so the
+ * instrument shell never touches this. Drops the tail on overflow (the feeder
+ * fell behind: the output underruns in lockstep, which the pull side counts). */
+size_t HarpRuntime::writeFxInput(const float *interleaved, size_t nFrames) {
+    if (fxInSlots_.empty() || !interleaved || nFrames == 0) return 0;
+    size_t cols = fxInSlots_.size();
+    return fxInRing_.write(interleaved, nFrames * cols) / cols;
 }
 
 /* ---------------- feeder thread ---------------- */
@@ -2438,8 +2491,18 @@ void HarpRuntime::feeder() {
         /* the cap bounds the frame END: a frame starting under the cap but
          * extending past it would cover timestamps the current block can
          * still mint (measured: mid-frame note-ons applied a frame late) */
+        /* §8.8 audio.fx: when the shell armed an effect input, each pacing frame
+         * CARRIES the track audio (process() pushed it via writeFxInput) on
+         * `fxCols` interleaved columns; the device demuxes them into a->fx_in and
+         * returns WET. Not armed (the instrument) => fxCols==0 => the byte-identical
+         * slots=0 pacing frame, no payload, no input gate. */
+        const size_t fxCols = fxArmed() ? fxInSlots_.size() : 0;
         while (ringFrames < (size_t)targetFrames_ && inFlight < ahead_ &&
                ssi_ + kBlock <= frontierCap) {
+            /* §8.8: only pace once the track input for this range is in the SPSC
+             * ring — this couples the H→D input 1:1 to the D→H wet the reader fills,
+             * so dry and wet stay sample-aligned (the lockstep host-paced effect). */
+            if (fxCols && fxInRing_.readAvailable() < kBlock * fxCols) break;
             /* every pacing frame carries the event fence (§8.3.1): the
              * count of events queued so far this session. Any event queued
              * before this instant is guaranteed consumed device-side
@@ -2449,12 +2512,13 @@ void HarpRuntime::feeder() {
              * until the fence closed the order by construction). */
             harp_audio_hdr pace = {HARP_AUDIO_FVER,
                                    HARP_AUDIO_DIR_H2D | HARP_AUDIO_FENCE,
-                                   0,
+                                   (uint16_t)fxCols, /* slots: 0 instrument, N §8.8 FX in-cols */
                                    0,
                                    ssi_,
                                    (uint16_t)kBlock,
                                    HARP_AUDIO_FMT_F32};
-            uint8_t ph[HARP_AUDIO_HDR_LEN + HARP_AUDIO_FENCE_LEN];
+            /* header + 4 fence bytes (+ §8.8 FX input payload: kBlock × fxCols f32) */
+            uint8_t ph[HARP_AUDIO_HDR_LEN + HARP_AUDIO_FENCE_LEN + kBlock * kMaxFxInCols * 4];
             harp_audio_hdr_encode(&pace, ph);
             /* §8.3.1 fence = events queued SINCE this stream's audio.start =
              * monotonic high-water MINUS the current epoch baseline. At the initial
@@ -2473,7 +2537,16 @@ void HarpRuntime::feeder() {
             ph[HARP_AUDIO_HDR_LEN + 1] = (uint8_t)(seq >> 8);
             ph[HARP_AUDIO_HDR_LEN + 2] = (uint8_t)(seq >> 16);
             ph[HARP_AUDIO_HDR_LEN + 3] = (uint8_t)(seq >> 24);
-            if (!transport_->audioWrite(ph, sizeof ph, 8)) break;
+            size_t frameLen = HARP_AUDIO_HDR_LEN + HARP_AUDIO_FENCE_LEN;
+            if (fxCols) {
+                /* the device demuxes payload column c (in_slots order) into
+                 * a->fx_in[c]; writeFxInput already interleaved process()'s input
+                 * by fxCols, so a straight ring read fills the payload in column
+                 * order. The availability gate above guarantees a full block. */
+                fxInRing_.read((float *)(ph + frameLen), (size_t)kBlock * fxCols);
+                frameLen += (size_t)kBlock * fxCols * 4;
+            }
+            if (!transport_->audioWrite(ph, (int)frameLen, 8)) break;
             ssi_ += kBlock;
             framesSent_++;
             inFlight++;

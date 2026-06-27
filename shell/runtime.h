@@ -209,6 +209,34 @@ public:
     }
     bool loopbackArmed() const { return loopbackIn_ >= 0 && loopbackOut_ >= 0; }
 
+    /* §8.8 audio.fx — host→device EFFECT INPUT (insert/send). An effect shell
+     * (shell/fx_plugin.cpp) arms this BEFORE start() with the device's input
+     * slots (the harp-fx reverb reads a single MONO column → {0}); audio.start
+     * then declares them in key 3 (active-slots-in) and the host-paced feeder
+     * carries the track audio process() pushes (writeFxInput) in the H→D payload
+     * on those columns — instead of the empty slots=0 pacing frame. The device
+     * returns WET only on active-slots-out (key 4) and the SHELL holds the dry
+     * and mixes (§8.8: dry/wet is the host's). DEFAULT empty => NOT an effect:
+     * the feeder sends the byte-identical slots=0 pacing frame and writeFxInput
+     * is a no-op, so the instrument shell's render is untouched (the golden gate).
+     * Arming this also FORCES host-paced (wantHostPacedMode()): an effect is driven
+     * THROUGH (H→D in, D→H wet), which free-running RTP cannot express, so an FX
+     * negotiates host-paced for BOTH live and offline — the device renders each H→D
+     * block to wet identically whether the stream is bounded (offline) or continuous
+     * (live), so live playback returns the wet instead of silence. */
+    void setFxInputSlots(const std::vector<uint32_t> &slots) {
+        fxInSlots_ = slots;
+        if (fxInSlots_.size() > kMaxFxInCols) fxInSlots_.resize(kMaxFxInCols);
+    }
+    bool fxArmed() const { return !fxInSlots_.empty(); }
+    /* Audio-thread (process()) producer of the H→D effect input. Pushes nFrames,
+     * interleaved by fxInSlots_.size() columns (mono in => 1 column). The feeder
+     * pops kBlock-frame chunks and frames them H→D; lock-free SPSC (the feeder is
+     * the sole consumer). Drops on overflow (the feeder fell behind — the output
+     * underruns in lockstep anyway). No-op + returns 0 when not armed. Returns
+     * frames actually written. */
+    size_t writeFxInput(const float *interleaved, size_t nFrames);
+
     /* The multitimbral part (§9.4, key 5) the OWNER instance drives: notes
      * already carry their channel in the UMP word (the shell stamps it per-
      * event), but parameter sets/ramps had no channel — so on a multi-part
@@ -483,6 +511,10 @@ public:
 private:
 
     static constexpr uint32_t kBlock = 256; /* pacing block, samples */
+    /* §8.8 audio.fx: max host→device input columns the feeder frames per pacing
+     * block (bounds the on-stack H→D payload buffer). A reverb is mono in (1);
+     * a stereo-in effect is 2. setFxInputSlots clamps to this. */
+    static constexpr uint32_t kMaxFxInCols = 2;
 
     /* Event headroom: one block, whichever flavor is larger. Together with
      * the feeder's frontier cap (cap = read + target + headroom − dawBlock)
@@ -734,6 +766,21 @@ private:
     bool snapshotLocked(harp_hash *out);
     bool fetchClosureLocked(const harp_hash &root);
     bool pushStateLocked(const harp_hash &target);
+
+    /* §8.8 audio.fx mode law: an EFFECT device is INHERENTLY host-paced — the host
+     * must drive audio THROUGH it (H→D track in, D→H wet). A free-running RTP
+     * binding has NO H→D input path (the device emits its own audio), so an armed
+     * effect would receive no input and return silence. So whenever the §8.8
+     * in-slots are armed (fxArmed()), force host-paced REGARDLESS of the DAW's
+     * offline/live state — the proven host-paced feeder + reader then carry the
+     * track audio and fill the wet in LIVE playback exactly as in an offline bounce.
+     * The INSTRUMENT shell never arms fxInSlots_, so this is exactly wantHostPaced_
+     * for it (free-running live, host-paced offline) — the golden path is untouched.
+     * Read off the RT path (selectDevice/setOffline); fxInSlots_ is set once before
+     * start() and never mutated, so reading it cross-thread is race-free. */
+    bool wantHostPacedMode() const {
+        return wantHostPaced_.load(std::memory_order_relaxed) || fxArmed();
+    }
 
     ShellTransport *transport_ = nullptr; /* the active binding (USB now; Ethernet next) */
     std::atomic<bool> freeRunning_{false}; /* cached transport_->isFreeRunning() (set at
@@ -1110,6 +1157,16 @@ private:
      * builds an H->D payload. Set via setLoopbackSlots() before audioStart(); read
      * by audioStart() (to declare the in-slot in key 3) and by measureLoopback(). */
     int loopbackIn_ = -1, loopbackOut_ = -1;
+
+    /* §8.8 audio.fx input (host→device EFFECT). Empty => NOT an effect (the
+     * instrument default): the feeder sends slots=0 pacing and writeFxInput is
+     * inert, byte-identical to pre-§8.8. Non-empty => the device input columns
+     * audio.start declares (key 3) and the feeder carries in the H→D payload.
+     * fxInRing_ is the SPSC handoff from process() (producer) to the feeder
+     * (consumer), sized like audioRing_; allocated unconditionally (memory only,
+     * never touched off the FX path, so the instrument render is unaffected). */
+    std::vector<uint32_t> fxInSlots_;
+    FloatRing fxInRing_{1 << 15};
 
     /* §6.4 latency-profile, cached from the hello identity (key 8) at
      * helloAndIdentity(). Indexed implicitly by rate (matched in expectedLoopback).
