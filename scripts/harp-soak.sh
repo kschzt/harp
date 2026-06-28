@@ -179,6 +179,20 @@ while [ "$round" -lt "$ROUNDS" ]; do
     if [ -n "$h1" ] && [ "$h1" = "$h2" ]; then log "--- offline host-paced determinism: bit-exact ($h1) ---"
     else log "--- offline host-paced: MISMATCH h1=${h1:-EMPTY} h2=${h2:-EMPTY} (REGRESSION/hang) ---"; fi
   fi
+  # every 20th round: RECALL UNDER CHURN — save the device state with distinctive params, perturb
+  # the device with a burst of reconnects (each setting a DIFFERENT value), then load the saved
+  # state on a fresh connect and assert the render is BIT-EXACT to the saved one. The §11.4 recall
+  # round-trip must survive churn: the loaded state must override the churned params (map + audio).
+  if [ $((round % 20)) -eq 0 ]; then
+    rh() { env HARP_ETH_DEVICE=kria.local:47987 HARP_RECONCILE_TIMEOUT_MS=0 "$HOST" "$BUNDLE" "$@" \
+           --channel 1 --part 1 --notes 50,53,57,60 --seconds 4 --hash 2>/dev/null | grep -oE 'output-hash: [0-9a-f]+' | awk '{print $2}'; }
+    hA="$(rh --set 3=0.55 --set 7=0.72 --save-state /tmp/soak-recall.state)"
+    for c in 1 2 3; do env HARP_ETH_DEVICE=kria.local:47987 HARP_RECONCILE_TIMEOUT_MS=0 "$HOST" "$BUNDLE" \
+        --set 7=0.4 --channel 1 --part 1 --notes 50 --seconds 1 --realtime --out /tmp/churn.wav >/dev/null 2>&1; done
+    hB="$(rh --load-state /tmp/soak-recall.state)"
+    if [ -n "$hA" ] && [ "$hA" = "$hB" ]; then log "--- recall-under-churn: bit-exact ($hA) survived 3 reconnects ---"
+    else log "--- recall-under-churn: MISMATCH hA=${hA:-EMPTY} hB=${hB:-EMPTY} (state lost/drifted under churn) ---"; fi
+  fi
   # every 30th round: a MULTI-MINUTE DRIFT stream on kria — the §7.3 free-running RTP clock
   # recovery should hold a BOUNDED clock_drift_ppb with NO reanchors over minutes (the 60s
   # sustained leg is too short to surface slow drift). Sample the drift gauge before/after, count
