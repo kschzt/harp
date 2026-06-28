@@ -85,29 +85,41 @@ def gen_counter(prog, sc, seed=11):          # ANSWERS the lead — call-and-res
                 out.append(cur); mi += 1
     return out
 
-def _render(name, seconds, bar, bass, arp, mel, counter, arp_ep):  # build 4 voices + render+mix
-    csv = lambda L: ','.join(str(int(x)) for x in L)
+def section_env(nsec, lo=0.6, hi=1.0):     # TERRACED dynamics: a plateau per section, MIDDLE loudest
+    half = (nsec - 1) / 2.0 if nsec > 1 else 1.0
+    pts = []
+    for i in range(nsec):
+        w = round(lo + (hi - lo) * (1.0 - abs(i - (nsec - 1) / 2.0) / half), 3)  # peak at the middle
+        a, b = i / nsec, (i + 1) / nsec
+        pts += [[round(a + 0.03, 3), w], [round(b - 0.03, 3), w]]   # flat across the section, short ramps between
+    return [[0.0, pts[0][1]]] + pts + [[1.0, pts[-1][1]]]
+
+def melody_section_env(nsec):              # the lead: silent INTRO, then follow the section dynamics
+    return [[0.0, 0.0], [0.14, 0.0]] + [p for p in section_env(nsec, 0.62, 1.0) if p[0] > 0.14]
+
+def _render(name, seconds, bar, bass, arp, mel, counter, arp_ep, envs=None):  # build 4 voices + render+mix
+    csv = lambda L: ','.join(str(int(x)) for x in L); E = envs or {}
     # FORM: the piece has an ARC. bass+arp carry a sparse, filter-closed INTRO and build;
     # the lead stays SILENT until ~1/4 in, enters for the climax, then everything RESOLVES.
     comp = {'name': name, 'seconds': seconds, 'layers': [
         {'tag': 'bass', 'ep': 'kria.local:47987',
          'sets': ['2=0.4', '4=0.22', '5=0.04', '6=0.55', '7=0.92'],
          'ramp': ['3=0.26:0.40'],                      # cutoff opens slowly — a low swell
-         'env': [[0,0.55],[0.18,0.8],[0.6,1.0],[0.88,1.0],[1.0,0.6]],   # gentle swell + settle
+         'env': E.get('bass', [[0,0.55],[0.18,0.8],[0.6,1.0],[0.88,1.0],[1.0,0.6]]),  # form arc (or per-section)
          'notes': csv(bass), 'note_period': round(bar / 4, 3), 'level': 1.0, 'pan': 0.0},
         {'tag': 'arp', 'ep': arp_ep,
          'sets': ['1=0.06', '12=0.55', '16=0.04', '17=0.45'],
          'lfo': ['13=0.06'],                            # FM brightness breathes (slow LFO)
-         'env': [[0,0.45],[0.12,0.7],[0.5,1.0],[0.85,1.0],[1.0,0.55]],  # the bed builds in
+         'env': E.get('arp', [[0,0.45],[0.12,0.7],[0.5,1.0],[0.85,1.0],[1.0,0.55]]),  # the bed builds in
          'notes': csv(arp), 'note_period': round(bar / 8, 3), 'level': 0.4, 'pan': -0.32},
         {'tag': 'melody', 'ep': 'kria.local:47987',
          'sets': ['2=0.55', '4=0.4', '5=0.02', '6=0.38', '7=0.95'],
          'ramp': ['3=0.40:0.90'],                       # cutoff BUILDS — the lead opens up
-         'env': [[0,0.0],[0.16,0.0],[0.26,1.0],[0.7,1.0],[0.9,0.85],[1.0,0.3]],  # enters late, leads, fades
+         'env': E.get('melody', [[0,0.0],[0.16,0.0],[0.26,1.0],[0.7,1.0],[0.9,0.85],[1.0,0.3]]),  # enters late, leads
          'notes': csv(mel), 'note_period': round(bar / 4, 3), 'level': 1.0, 'pan': 0.3},
         {'tag': 'counter', 'ep': 'kria.local:47987',    # ANSWERS the lead across the stereo field
          'sets': ['2=0.45', '3=0.42', '4=0.3', '5=0.03', '6=0.5', '7=0.9'],   # darker, FIXED cutoff
-         'env': [[0,0.45],[0.16,0.66],[0.5,0.6],[0.85,0.68],[1.0,0.42]],      # carries the intro, ducks under the peak
+         'env': E.get('counter', [[0,0.45],[0.16,0.66],[0.5,0.6],[0.85,0.68],[1.0,0.42]]),  # carries intro, ducks
          'notes': csv(counter), 'note_period': round(bar / 4, 3), 'level': 0.72, 'pan': -0.18},
     ]}
     json.dump(comp, open(f'/tmp/{name}.json', 'w'))
@@ -134,15 +146,17 @@ def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetso
         mel += gen_melody(chords, sc, seed + si); counter += gen_counter(chords, sc, seed + si + 4)
         nbars += len(chords)
     seconds = round(nbars * bar + 2.0, 1)
+    nsec = len(sections); se = section_env(nsec)   # TERRACED per-section dynamics — the middle section LIFTS
+    envs = {'bass': se, 'arp': se, 'counter': se, 'melody': melody_section_env(nsec)}
     print(f"{name}: form [{'-'.join(m for m, _ in sections)}] on key {key}, {nbars} bars @ {bpm}bpm = {seconds}s")
-    _render(name, seconds, bar, bass, arp, mel, counter, arp_ep)
+    _render(name, seconds, bar, bass, arp, mel, counter, arp_ep, envs)
 
 if __name__ == '__main__':
-    # Movement X — A-B-A MODAL CONTRAST on a single D tonic: A is D AEOLIAN (dark, bVI/bVII),
-    # B lifts to D DORIAN (the major IV is the only change — the 6th rises Bb->B, a held-breath
-    # brightening), then A returns. Same root throughout so the ear hears the mode shift, not a
-    # key change. Ternary form = the least-elementary structure yet.
-    A = [(50, 'm9'), (46, 'maj7'), (48, 'majadd9'), (50, 'm9')]   # D aeolian: Dm9 Bbmaj7 Cadd9 Dm9
-    B = [(50, 'm9'), (55, 'majadd9'), (50, 'm7'), (55, 'maj7')]   # D dorian: Dm9 Gadd9 Dm7 Gmaj7 (major IV)
-    compose_form('movement-x-aba-modal', 50, [('aeolian', A), ('dorian', B), ('aeolian', A)],
-                 bpm=60, reps_each=1, seed=47)
+    # Movement XI — A-B-A on a single E tonic with PER-SECTION DYNAMICS: A is E PHRYGIAN (dark,
+    # bII), B lifts to E PHRYGIAN-DOMINANT (the 3rd rises G->G#, the "Spanish gypsy" brightening)
+    # AND is dynamically the loudest (terraced section_env), then A returns dark + settles. The
+    # mode-shift and the loudness-lift now reinforce each other — a real climax, not a smooth swell.
+    A = [(52, 'm7'), (53, 'maj7'), (50, 'm7'), (52, 'm7')]   # E phrygian: Em7 Fmaj7 Dm7 Em7
+    B = [(52, '7'), (53, 'maj7'), (45, 'm'), (52, '7')]      # E phrygian-DOMINANT: E7 Fmaj7 Am E7 (3rd G->G#)
+    compose_form('movement-xi-aba-phrygian', 52, [('phrygian', A), ('phrygian_dominant', B), ('phrygian', A)],
+                 bpm=58, reps_each=1, seed=53)
