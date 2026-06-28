@@ -27,6 +27,8 @@
 
 #include "render_check.h"
 
+#include <csignal>
+
 #include "base/source/fobject.h"
 #include "pluginterfaces/base/funknown.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -64,6 +66,18 @@ static int die(const std::string &msg) {
     fprintf(stderr, "harp-vst3-host: %s\n", msg.c_str());
     exit(1);
 }
+
+/* GRACEFUL STOP (USB never-wedge): a SIGTERM/SIGINT (the soak harness's pause `pkill`, or a
+ * CLI Ctrl-C) must break the render loop and let the NORMAL teardown run — setActive(false) ->
+ * runtime release -> sessionDown -> harp_usb_close (release_interface + close). That clean close
+ * is what lets macOS deconfigure the gadget so the NEXT claim re-ENABLEs it. An ungraceful kill
+ * skips that close and can leave the gadget parked in ffs_ep0_read "waiting for enable" — a wedge
+ * NO host-side libusb op (claim/set_config/reset_device, all measured) can recover; only a device
+ * daemon restart can. So: catch the signal, set a flag, return through the existing teardown. The
+ * handler does only an async-signal-safe flag store; SIGKILL stays uncatchable (covered by the
+ * harness's daemon-restart auto-recovery). See docs/usb-wedge-rootcause.md. */
+static volatile sig_atomic_t g_stop = 0;
+static void on_stop_signal(int sig) { (void)sig; g_stop = 1; }
 
 
 
@@ -238,6 +252,7 @@ static int run_multi_instance(VST3::Hosting::Module::Ptr &module, const VST3::Ho
 #endif
     auto rt0 = std::chrono::steady_clock::now();
     while (done < total) {
+        if (g_stop) break; /* SIGTERM/SIGINT -> leave the loop into the normal teardown (clean USB close) */
         if (realtime) {
             double target = (double)done / rate;
             double elapsed =
@@ -535,6 +550,7 @@ static int run_fx_instances(VST3::Hosting::Module::Ptr &module, const VST3::Host
 #endif
     auto rt0 = std::chrono::steady_clock::now();
     while (done < total) {
+        if (g_stop) break; /* SIGTERM/SIGINT -> leave the loop into the normal teardown (clean USB close) */
         if (realtime) {
             double target = (double)done / rate;
             double elapsed =
@@ -613,6 +629,8 @@ static int run_fx_instances(VST3::Hosting::Module::Ptr &module, const VST3::Host
 }
 
 int main(int argc, char **argv) {
+    signal(SIGTERM, on_stop_signal); /* graceful USB close on the soak's pause-pkill / a CLI Ctrl-C */
+    signal(SIGINT, on_stop_signal);
     if (argc < 2) {
         fprintf(stderr,
                 "usage: harp-vst3-host PLUGIN.vst3 [--list] [--rate N] [--block N]\n"
@@ -1221,6 +1239,7 @@ int main(int argc, char **argv) {
 #endif
     auto rt0 = std::chrono::steady_clock::now();
     while (done < total) {
+        if (g_stop) break; /* SIGTERM/SIGINT -> leave the loop into the normal teardown (clean USB close) */
         if (realtime) { /* wall-clock pacing: process() at DAW cadence */
             double target = (double)done / rate;
             double elapsed =

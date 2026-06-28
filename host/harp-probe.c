@@ -2141,6 +2141,12 @@ int main(int argc, char **argv) {
         if (want && !want[0]) want = NULL;
         p.io = harp_usb_open_serial(want);
         if (!p.io) return 1;
+        /* Bound the hello/identity reads internally so a wedged daemon (enumerated, not
+         * draining the endpoint) makes the probe RETURN + release the interface cleanly,
+         * instead of relying on an external `perl alarm` that SIGALRM-kills it mid-claim —
+         * an ungraceful exit that leaves a torn frame and can wedge the next claimant. The
+         * shell sets this via setCtlTimeout; harp-probe did not. (USB only; eth is socket-bounded.) */
+        harp_usb_set_ctl_timeout(p.io, 8000);
 #else
         die("built without libusb; -d usb unavailable");
 #endif
