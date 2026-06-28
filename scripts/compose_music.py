@@ -108,6 +108,18 @@ def section_env(nsec, lo=0.6, hi=1.0):     # TERRACED dynamics: a plateau per se
 def melody_section_env(nsec):              # the lead: silent INTRO, then follow the section dynamics
     return [[0.0, 0.0], [0.14, 0.0]] + [p for p in section_env(nsec, 0.62, 1.0) if p[0] > 0.14]
 
+def add_frame(key, bass, arp, mel, counter, pad):   # a pad-only INTRO bar + a resolving CODA bar —
+    pn = bass_root(key) + 12; bn = bass_root(key)     # open on the pad alone, close on the tonic with
+    return ([-1, -1, -1, -1] + bass + [bn, -1, -1, -1],   # the pad sustaining (everyone else rests)
+            [-1] * 8 + arp + [-1] * 8,
+            [-1, -1, -1, -1] + mel + [-1, -1, -1, -1],
+            [-1, -1, -1, -1] + counter + [-1, -1, -1, -1],
+            [pn] + pad + [pn])
+
+def reframe(env, nbars):       # remap a [0..1]-over-main env into the framed piece (+1 intro, +1 coda bar)
+    tot = nbars + 2.0; lo, hi = 1.0 / tot, (nbars + 1.0) / tot
+    return [[0.0, env[0][1]]] + [[round(lo + f * (hi - lo), 4), g] for f, g in env] + [[1.0, env[-1][1]]]
+
 def _render(name, seconds, bar, bass, arp, mel, counter, pad, arp_ep, envs=None):  # build 5 voices + mix
     csv = lambda L: ','.join(str(int(x)) for x in L); E = envs or {}
     # FORM: the piece has an ARC. bass+arp carry a sparse, filter-closed INTRO and build;
@@ -144,8 +156,9 @@ def compose(name, key, mode, prog, bpm=64, reps=2, seed=7, arp_ep='jetson.local:
     beat = 60.0 / bpm; bar = 4 * beat; chords = prog * reps; sc = scale_range(key, mode)
     bass = gen_bass(chords); arp = gen_arp(chords)
     mel = gen_melody(chords, sc, seed); counter = gen_counter(chords, sc, seed + 4); pad = gen_pad(chords)
-    seconds = round(len(chords) * bar + 2.0, 1)
-    print(f"{name}: {mode} on key {key}, {len(chords)} bars @ {bpm}bpm = {seconds}s; prog {prog} x{reps}")
+    bass, arp, mel, counter, pad = add_frame(key, bass, arp, mel, counter, pad)   # pad-only INTRO + CODA bars
+    seconds = round((len(chords) + 2) * bar + 2.0, 1)
+    print(f"{name}: {mode} on key {key}, {len(chords)}+2 bars @ {bpm}bpm = {seconds}s; prog {prog} x{reps}")
     _render(name, seconds, bar, bass, arp, mel, counter, pad, arp_ep)
 
 def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetson.local:7777'):
@@ -160,18 +173,19 @@ def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetso
         bass += gen_bass(chords); arp += gen_arp(chords); pad += gen_pad(chords)
         mel += gen_melody(chords, sc, seed + si); counter += gen_counter(chords, sc, seed + si + 4)
         nbars += len(chords)
-    seconds = round(nbars * bar + 2.0, 1)
-    nsec = len(sections); se = section_env(nsec)   # TERRACED per-section dynamics — the middle section LIFTS
-    envs = {'bass': se, 'arp': se, 'counter': se, 'pad': se, 'melody': melody_section_env(nsec)}
-    print(f"{name}: form [{'-'.join(m for m, _ in sections)}] on key {key}, {nbars} bars @ {bpm}bpm = {seconds}s")
+    bass, arp, mel, counter, pad = add_frame(key, bass, arp, mel, counter, pad)   # pad-only INTRO + CODA bars
+    seconds = round((nbars + 2) * bar + 2.0, 1)
+    nsec = len(sections); se = reframe(section_env(nsec), nbars)   # terraced dynamics, shifted into the frame
+    envs = {'bass': se, 'arp': se, 'counter': se, 'pad': se, 'melody': reframe(melody_section_env(nsec), nbars)}
+    print(f"{name}: form [{'-'.join(m for m, _ in sections)}] on key {key}, {nbars}+2 bars @ {bpm}bpm = {seconds}s")
     _render(name, seconds, bar, bass, arp, mel, counter, pad, arp_ep, envs)
 
 if __name__ == '__main__':
-    # Movement XVI — A-B-A on a single A tonic that TIGHTENS into the middle: A is A AEOLIAN (the
-    # gentle minor-v Em7), B raises the 7th G->G# into A HARMONIC MINOR — the minor-v becomes the
-    # gothic E7 DOMINANT, a leading-tone pulling hard back to the tonic — then A relaxes. The new
-    # WALKING BASS (octave/5th ascents + descents) gives the low end real movement under it all.
-    A = [(45, 'm9'), (53, 'maj7'), (52, 'm7'), (45, 'm9')]      # A aeolian: Am9 Fmaj7 Em7 Am9 (minor v)
-    B = [(45, 'madd9'), (50, 'm7'), (52, '7'), (45, 'madd9')]   # A harmonic minor: Am(add9) Dm7 E7 (G#)
-    compose_form('movement-xvi-aba-tighten', 45, [('aeolian', A), ('harmonic_minor', B), ('aeolian', A)],
-                 bpm=60, reps_each=1, seed=73)
+    # Movement XVII — A-B-A on a single D tonic, now FRAMED: a pad-only intro breathes in, then A
+    # is D DORIAN (the bright major-IV G), B raises the 7th C->C# into D MELODIC MINOR (the tonic
+    # turns minor-MAJOR noir, the jazz-minor glow), A returns, and a resolving CODA settles on the
+    # tonic with the pad alone. A proper opening and ending bracket the journey for the first time.
+    A = [(50, 'm9'), (55, 'majadd9'), (48, 'maj7'), (50, 'm9')]   # D dorian: Dm9 Gadd9 Cmaj7 Dm9 (major IV)
+    B = [(50, 'mmaj9'), (55, '7'), (52, 'm7'), (50, 'mmaj9')]     # D melodic minor: Dm(maj9) G7 Em7 (C#)
+    compose_form('movement-xvii-aba-framed', 50, [('dorian', A), ('melodic_minor', B), ('dorian', A)],
+                 bpm=60, reps_each=1, seed=79)
