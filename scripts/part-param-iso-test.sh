@@ -8,8 +8,9 @@
 # to part 0's.
 #
 # THE SIGNAL — sink-rms, part 1's demuxed PART-1 audio (slots {2,3}), as the harness
-# prints it. param 8 is the per-part LEVEL (the front panel's "8"), so part 1's
-# energy tracks part 1's param-8 monotonically. Three runs (HARP_ISO_LEVELS =
+# prints it. param 7 is the per-part Master Level (the contiguous 2.1.0 map — the
+# old id 8 closed up when the drone's id 7 was removed), so part 1's energy tracks
+# part 1's param-7 monotonically. Three runs (HARP_ISO_LEVELS =
 # "<part0>,<part1>", each part driven with ONLY a controlled tone+env+level — no
 # random flood, so the sink's energy is part 1's level alone):
 #   HIGH  = 0.2,0.9  part 1 loud   -> sink-rms high
@@ -66,7 +67,7 @@ median() {
     printf '%s\n' "$@" | sort -g | sed -n "$(((n + 1) / 2))p"
 }
 
-# sink_rms LEVELS — run a 2-instance shared session with HARP_ISO_LEVELS=LEVELS and
+# sink_rms LEVELS — run ONE multi-out owner driving 2 parts with HARP_ISO_LEVELS=LEVELS and
 # --part-audio, echo the part-1 sink RMS (median of $SAMPLES, retries the
 # transient post-teardown claim race exactly as alias-part-audio-test).
 # ONE device claim per config, $SAMPLES internal windows (tsan-host --rms-windows):
@@ -122,7 +123,7 @@ if [ "$ROUTES" = 1 ] && [ "$ISOLATED" = 1 ]; then
     exit 0
 elif [ "$ROUTES" != 1 ]; then
     echo "PART-PARAM-ISO FAIL: part 1 level did not route (HIGH $HI not > 2×LOW $LO) —"
-    echo "   part 1's param-8 did not reach part 1's audio"
+    echo "   part 1's param-7 (Master Level) did not reach part 1's audio"
     exit 1
 else
     echo "PART-PARAM-ISO FAIL: cross-talk (XTALK $XT >= 0.5×HIGH $HI) — driving the owner's"

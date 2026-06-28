@@ -106,12 +106,13 @@ run scripts/multidevice-test.sh
 run scripts/alias-group-e2e.sh
 run scripts/late-sink-test.sh
 # alias-part-audio + part-param-iso run on eth.yml (the §8.7 loopback / eth-tests.sh, both
-# rate-lock AND varispeed-ASRC), NOT here: both drive a SUSTAINED multi-instance claim that
-# this VM-passthrough USB rig can't hold. The per-part demux/isolation is transport-agnostic,
-# so the loopback covers it reliably (and adds real §8.7 multichannel-ASRC coverage); the USB
-# rig keeps the single-claim tests it can actually hold. (M3 migrates these to one multi-out
-# instance — TODO; the eth-tests.sh dependency is why they are not deletable yet.)
-echo "──── alias-part-audio + part-param-iso: run on eth.yml (loopback — sustained multi-instance wedges this passthrough USB rig); SKIP here"; SKIP=$((SKIP+2))
+# rate-lock AND varispeed-ASRC), NOT here: both sustain a WIDE multi-part stream (the full
+# slot union) that this VM-passthrough USB rig can't hold reliably. The per-part demux/
+# isolation is transport-agnostic, so the loopback covers it reliably (and adds real §8.7
+# multichannel-ASRC coverage); the USB rig keeps the tests it can actually hold. (M3 DONE:
+# both now drive the single-owner multi-out harness — tsan-host's one private runtime + the
+# per-part sinks, no registry — but stay on the loopback; eth-tests.sh depends on them.)
+echo "──── alias-part-audio + part-param-iso: run on eth.yml (loopback — the sustained wide multi-part stream wedges this passthrough USB rig); SKIP here"; SKIP=$((SKIP+2))
 run scripts/meter-test.sh
 run scripts/replug-test.sh
 echo "════ hw-tests (linux): $PASS passed, $FAIL failed, $SKIP skipped"

@@ -43,8 +43,9 @@ if pgrep -x "Live" >/dev/null 2>&1; then
     exit 3
 fi
 
-# SETTLE once into a known, fully-deterministic voice: audible level (8), a
-# chosen tone (3), and a FAST envelope (attack 5, release 6) so a 1.5 s window
+# SETTLE once into a known, fully-deterministic voice: audible Master Level (id
+# 7, the contiguous 2.1.0 map), a chosen tone (Filter Cutoff 3), and a FAST
+# envelope (attack 5, release 6) so a 1.5 s window
 # fully captures each note's attack+decay and the hash is stable run-to-run.
 # (The drone is gone — a part is silent until a note plays.) Done once; every
 # render below inherits it.

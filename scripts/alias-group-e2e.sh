@@ -71,7 +71,7 @@ fi
 echo "── alias-group-e2e: one main instance on $SERIAL driven on $INSTANCES channels — expect a multi-part mix"
 
 # SETTLE once into a known, AUDIBLE, deterministic voice through the plugin
-# (mirrors multitimbral-test.sh): audible level (8), a chosen tone (3), and a FAST
+# (mirrors multitimbral-test.sh): audible Master Level (id 7, the 2.1.0 map), a chosen tone (3), and a FAST
 # envelope (attack 5, release 6) so each struck note's full attack+decay lands
 # inside the capture and the hash is stable run-to-run. The drone is gone, so the
 # struck notes are the only sound — without an audible patch the mix would be
