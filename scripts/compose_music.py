@@ -15,6 +15,7 @@ CH = {'m9':[0,3,7,10,14], 'm7':[0,3,7,10], 'm':[0,3,7], 'madd9':[0,3,7,14],
       'sus2':[0,2,7], '7':[0,4,7,10], '9':[0,4,7,10,14], 'm7b5':[0,3,6,10]}
 MODE = {'aeolian':[0,2,3,5,7,8,10], 'dorian':[0,2,3,5,7,9,10], 'phrygian':[0,1,3,5,7,8,10],
         'harmonic_minor':[0,2,3,5,7,8,11], 'melodic_minor':[0,2,3,5,7,9,11],
+        'phrygian_dominant':[0,1,4,5,7,8,10],            # phrygian w/ a MAJOR 3rd — flamenco/exotic dark
         'minor':[0,2,3,5,7,8,10]}
 
 def scale_range(key, mode, lo=36, hi=84):
@@ -67,10 +68,28 @@ def gen_melody(prog, sc, seed=7):            # motif + arc + RHYTHM (rests = phr
                 out.append(cur); mi += 1
     return out
 
+def gen_counter(prog, sc, seed=11):          # ANSWERS the lead — call-and-response. Lower
+    random.seed(seed); out = []               # register, CONTRARY (descending) motion, and an
+    cmotif = [0, -2, -1, -3]                   # INTERLOCKED rhythm: it plays in the lead's rests.
+    for i, (root, ct) in enumerate(prog):
+        tones = [root + t for t in CH[ct]]
+        cur = snap(random.choice(tones[:3]) + 3, sc)     # mid — under the lead, over the arp
+        mask = [1 - b for b in RHYTHMS[i % len(RHYTHMS)]] # COMPLEMENT of the lead's cell
+        mi = 0
+        for beat in range(4):
+            if mask[beat] == 0:
+                out.append(-1)                            # rest — yield to the lead
+            else:
+                if mi > 0:
+                    cur = snap(cur + cmotif[mi % len(cmotif)], sc)
+                out.append(cur); mi += 1
+    return out
+
 def compose(name, key, mode, prog, bpm=64, reps=2, seed=7, arp_ep='jetson.local:7777'):
     beat = 60.0 / bpm; bar = 4 * beat; chords = prog * reps
     sc = scale_range(key, mode)
     bass = gen_bass(chords); arp = gen_arp(chords); mel = gen_melody(chords, sc, seed)
+    counter = gen_counter(chords, sc, seed + 4)
     seconds = round(len(chords) * bar + 2.0, 1)
     csv = lambda L: ','.join(str(int(x)) for x in L)
     # FORM: the piece has an ARC. bass+arp carry a sparse, filter-closed INTRO and build;
@@ -91,14 +110,18 @@ def compose(name, key, mode, prog, bpm=64, reps=2, seed=7, arp_ep='jetson.local:
          'ramp': ['3=0.40:0.90'],                       # cutoff BUILDS — the lead opens up
          'env': [[0,0.0],[0.16,0.0],[0.26,1.0],[0.7,1.0],[0.9,0.85],[1.0,0.3]],  # enters late, leads, fades
          'notes': csv(mel), 'note_period': round(bar / 4, 3), 'level': 1.0, 'pan': 0.3},
+        {'tag': 'counter', 'ep': 'kria.local:47987',    # ANSWERS the lead across the stereo field
+         'sets': ['2=0.45', '3=0.42', '4=0.3', '5=0.03', '6=0.5', '7=0.9'],   # darker, FIXED cutoff
+         'env': [[0,0.45],[0.16,0.66],[0.5,0.6],[0.85,0.68],[1.0,0.42]],      # carries the intro, ducks under the peak
+         'notes': csv(counter), 'note_period': round(bar / 4, 3), 'level': 0.72, 'pan': -0.18},
     ]}
     json.dump(comp, open(f'/tmp/{name}.json', 'w'))
     print(f"{name}: {mode} on key {key}, {len(chords)} bars @ {bpm}bpm = {seconds}s; prog {prog} x{reps}")
     subprocess.run(['python3', '/Users/jak/src/harp-win/scripts/compose.py', f'/tmp/{name}.json'])
 
 if __name__ == '__main__':
-    # Movement VII — D MELODIC MINOR (noir/jazz-minor): i(mMaj9) - iv9 - bVImaj7 - V7,
-    # the raised C# gives the A7→i leading-tone cadence; the minor-major tonic is the sound
-    # of film noir. Now with a real FORM ARC (sparse intro → lead enters → peak → resolve).
-    P = [(50, 'mmaj9'), (43, 'm9'), (46, 'maj7'), (45, '7')]
-    compose('movement-vii-melodicminor', 50, 'melodic_minor', P, bpm=56, reps=2, seed=37)
+    # Movement VIII — E PHRYGIAN DOMINANT (flamenco/Andalusian dark): I7 - bIImaj7 - iv7 - I7,
+    # the b2(F) over a major-3rd(G#) tonic is the exotic, brooding flamenco cadence. Now with a
+    # COUNTER-MELODY answering the lead across the stereo field (call-and-response).
+    P = [(52, '7'), (53, 'maj7'), (50, 'm7'), (52, '7')]
+    compose('movement-viii-phrygiandom', 52, 'phrygian_dominant', P, bpm=58, reps=2, seed=41)
