@@ -85,12 +85,7 @@ def gen_counter(prog, sc, seed=11):          # ANSWERS the lead — call-and-res
                 out.append(cur); mi += 1
     return out
 
-def compose(name, key, mode, prog, bpm=64, reps=2, seed=7, arp_ep='jetson.local:7777'):
-    beat = 60.0 / bpm; bar = 4 * beat; chords = prog * reps
-    sc = scale_range(key, mode)
-    bass = gen_bass(chords); arp = gen_arp(chords); mel = gen_melody(chords, sc, seed)
-    counter = gen_counter(chords, sc, seed + 4)
-    seconds = round(len(chords) * bar + 2.0, 1)
+def _render(name, seconds, bar, bass, arp, mel, counter, arp_ep):  # build 4 voices + render+mix
     csv = lambda L: ','.join(str(int(x)) for x in L)
     # FORM: the piece has an ARC. bass+arp carry a sparse, filter-closed INTRO and build;
     # the lead stays SILENT until ~1/4 in, enters for the climax, then everything RESOLVES.
@@ -116,12 +111,38 @@ def compose(name, key, mode, prog, bpm=64, reps=2, seed=7, arp_ep='jetson.local:
          'notes': csv(counter), 'note_period': round(bar / 4, 3), 'level': 0.72, 'pan': -0.18},
     ]}
     json.dump(comp, open(f'/tmp/{name}.json', 'w'))
-    print(f"{name}: {mode} on key {key}, {len(chords)} bars @ {bpm}bpm = {seconds}s; prog {prog} x{reps}")
     subprocess.run(['python3', '/Users/jak/src/harp-win/scripts/compose.py', f'/tmp/{name}.json'])
 
+def compose(name, key, mode, prog, bpm=64, reps=2, seed=7, arp_ep='jetson.local:7777'):
+    beat = 60.0 / bpm; bar = 4 * beat; chords = prog * reps; sc = scale_range(key, mode)
+    bass = gen_bass(chords); arp = gen_arp(chords)
+    mel = gen_melody(chords, sc, seed); counter = gen_counter(chords, sc, seed + 4)
+    seconds = round(len(chords) * bar + 2.0, 1)
+    print(f"{name}: {mode} on key {key}, {len(chords)} bars @ {bpm}bpm = {seconds}s; prog {prog} x{reps}")
+    _render(name, seconds, bar, bass, arp, mel, counter, arp_ep)
+
+def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetson.local:7777'):
+    # sections = [(mode, prog), ...] in order. A-B-A modal contrast = [A, B, A] over ONE tonic
+    # (key), so only the MODE colour shifts between sections (e.g. aeolian->dorian->aeolian: just
+    # the 6th moves). Each voice is generated per-section against that section's scale and
+    # concatenated; the form-arc env spans the whole piece (so B, the middle, is the peak).
+    beat = 60.0 / bpm; bar = 4 * beat
+    bass = []; arp = []; mel = []; counter = []; nbars = 0
+    for si, (mode, prog) in enumerate(sections):
+        chords = prog * reps_each; sc = scale_range(key, mode)
+        bass += gen_bass(chords); arp += gen_arp(chords)
+        mel += gen_melody(chords, sc, seed + si); counter += gen_counter(chords, sc, seed + si + 4)
+        nbars += len(chords)
+    seconds = round(nbars * bar + 2.0, 1)
+    print(f"{name}: form [{'-'.join(m for m, _ in sections)}] on key {key}, {nbars} bars @ {bpm}bpm = {seconds}s")
+    _render(name, seconds, bar, bass, arp, mel, counter, arp_ep)
+
 if __name__ == '__main__':
-    # Movement VIII — E PHRYGIAN DOMINANT (flamenco/Andalusian dark): I7 - bIImaj7 - iv7 - I7,
-    # the b2(F) over a major-3rd(G#) tonic is the exotic, brooding flamenco cadence. Now with a
-    # COUNTER-MELODY answering the lead across the stereo field (call-and-response).
-    P = [(52, '7'), (53, 'maj7'), (50, 'm7'), (52, '7')]
-    compose('movement-viii-phrygiandom', 52, 'phrygian_dominant', P, bpm=58, reps=2, seed=41)
+    # Movement X — A-B-A MODAL CONTRAST on a single D tonic: A is D AEOLIAN (dark, bVI/bVII),
+    # B lifts to D DORIAN (the major IV is the only change — the 6th rises Bb->B, a held-breath
+    # brightening), then A returns. Same root throughout so the ear hears the mode shift, not a
+    # key change. Ternary form = the least-elementary structure yet.
+    A = [(50, 'm9'), (46, 'maj7'), (48, 'majadd9'), (50, 'm9')]   # D aeolian: Dm9 Bbmaj7 Cadd9 Dm9
+    B = [(50, 'm9'), (55, 'majadd9'), (50, 'm7'), (55, 'maj7')]   # D dorian: Dm9 Gadd9 Dm7 Gmaj7 (major IV)
+    compose_form('movement-x-aba-modal', 50, [('aeolian', A), ('dorian', B), ('aeolian', A)],
+                 bpm=60, reps_each=1, seed=47)
