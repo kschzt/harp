@@ -39,6 +39,7 @@ static bool ffs_read_exact(harp_io *io, void *buf, size_t n) {
 static bool ffs_write_all(harp_io *io, const void *buf, size_t n) {
     ffs_io *f = (ffs_io *)io;
     const uint8_t *p = buf;
+    size_t total = n;
     while (n) {
         ssize_t r = write(f->ep_in, p, n);
         if (r < 0) {
@@ -49,6 +50,20 @@ static bool ffs_write_all(harp_io *io, const void *buf, size_t n) {
         }
         p += r;
         n -= (size_t)r;
+    }
+    /* ZLP terminator (§4.3): a framed message whose length is an exact multiple of
+     * the bulk-IN wMaxPacketSize (512 @ high-speed, see ffs.c) ends on a FULL packet
+     * with no short packet to terminate the transfer. Linux's host stack auto-
+     * terminates, but macOS libusb BLOCKS the bulk-IN read waiting for the
+     * terminator — so the hello/identity round-trip hangs (the device sessions up
+     * but never "answers" on a Mac; CI on Linux is unaffected, which is why this
+     * survived). Emit a zero-length packet so every message ends short. A 0-byte
+     * write is a harmless no-op over the socketpair the unit test uses. */
+    if (total && (total % 512) == 0) {
+        ssize_t r;
+        do { r = write(f->ep_in, "", 0); } while (r < 0 && errno == EINTR);
+        if (r < 0 && errno != ESHUTDOWN) /* message already delivered; ZLP failure is non-fatal */
+            atomic_fetch_add_explicit(&g_usb_errors, 1, memory_order_relaxed);
     }
     return true;
 }
