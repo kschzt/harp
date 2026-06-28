@@ -10,6 +10,12 @@
 set -ex
 SERIAL="${1:-PI4B-0001}"
 
+# The board's HARP tree lives in the INVOKING (sudo) user's home — derive it
+# instead of hardcoding a path, so a box provisioned as jak (or any user, not
+# just ci) installs a correct unit. Was /home/ci (broke jak boards).
+RUNUSER="${SUDO_USER:-$(id -un)}"
+RUNHOME="$(eval echo "~$RUNUSER")"
+
 # 1. dwc2 peripheral mode (otg_mode=1 forces xhci host mode on the Pi 4;
 #    some images also ship an explicit dr_mode=host overlay — neutralize
 #    both, then add peripheral, or the two dwc2 overlays fight)

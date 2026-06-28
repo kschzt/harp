@@ -380,10 +380,63 @@ static int run_multi_instance(VST3::Hosting::Module::Ptr &module, const VST3::Ho
  *   POST-FIX capture #1 -> non-silent (each insert now owns its own session)
  *
  * Returns the process exit code. */
+
+/* --input wav:PATH — load a PCM/float WAV as the FX insert's input TRACK, so a
+ * rendered synth phrase can be fed through harp-fx (the §8.8 insert chain) instead
+ * of a sine/impulse test signal. Returns interleaved float samples + channel count. */
+static bool load_wav(const std::string &path, std::vector<float> &out, int &ch_out) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char tag[4]; uint32_t u32;
+    if (fread(tag, 1, 4, f) != 4 || memcmp(tag, "RIFF", 4)) { fclose(f); return false; }
+    if (fread(&u32, 4, 1, f) != 1) { fclose(f); return false; }
+    if (fread(tag, 1, 4, f) != 4 || memcmp(tag, "WAVE", 4)) { fclose(f); return false; }
+    uint16_t fmt = 1, ch = 1, bits = 16; bool haveFmt = false;
+    std::vector<uint8_t> data;
+    while (fread(tag, 1, 4, f) == 4) {
+        uint32_t sz; if (fread(&sz, 4, 1, f) != 1) break;
+        if (!memcmp(tag, "fmt ", 4)) {
+            uint16_t af, nch, ba, bps; uint32_t sr, br;
+            fread(&af,2,1,f); fread(&nch,2,1,f); fread(&sr,4,1,f);
+            fread(&br,4,1,f); fread(&ba,2,1,f); fread(&bps,2,1,f);
+            fmt = af; ch = nch; bits = bps; haveFmt = true;
+            if (sz > 16) fseek(f, (long)(sz - 16), SEEK_CUR);
+        } else if (!memcmp(tag, "data", 4)) {
+            data.resize(sz); size_t got = fread(data.data(), 1, sz, f); data.resize(got);
+            break;
+        } else {
+            fseek(f, (long)((sz + 1) & ~1u), SEEK_CUR); /* chunks are word-aligned */
+        }
+    }
+    fclose(f);
+    if (!haveFmt || data.empty()) return false;
+    ch_out = ch ? ch : 1;
+    if (fmt == 3 && bits == 32) {
+        size_t n = data.size() / 4; out.resize(n); memcpy(out.data(), data.data(), n * 4);
+    } else if (fmt == 1 && bits == 16) {
+        size_t n = data.size() / 2; out.resize(n);
+        const int16_t *p = (const int16_t *)data.data();
+        for (size_t i = 0; i < n; i++) out[i] = p[i] / 32768.0f;
+    } else if (fmt == 1 && bits == 32) {
+        size_t n = data.size() / 4; out.resize(n);
+        const int32_t *p = (const int32_t *)data.data();
+        for (size_t i = 0; i < n; i++) out[i] = (float)(p[i] / 2147483648.0);
+    } else if (fmt == 1 && bits == 24) {
+        size_t n = data.size() / 3; out.resize(n);
+        for (size_t i = 0; i < n; i++) {
+            int32_t v = (int32_t)(((uint32_t)data[i*3] << 8) | ((uint32_t)data[i*3+1] << 16) |
+                                  ((uint32_t)data[i*3+2] << 24));
+            out[i] = (float)(v / 2147483648.0);
+        }
+    } else { return false; }
+    return true;
+}
+
 static int run_fx_instances(VST3::Hosting::Module::Ptr &module, const VST3::Hosting::ClassInfo &ci,
                             int n_inst, int capture_idx, bool drop_owner, const std::string &serial,
                             uint32_t rate, uint32_t block, double seconds,
-                            const std::string &input_kind, double sine_hz, bool realtime,
+                            const std::string &input_kind, double sine_hz,
+                            const std::vector<float> &input_wav, int input_wav_ch, bool realtime,
                             const std::string &out_path, bool do_hash, bool do_json,
                             const std::string &expect_hash) {
     /* Pin the serial for the whole process BEFORE any setActive: every FX instance
@@ -504,7 +557,11 @@ static int run_fx_instances(VST3::Hosting::Module::Ptr &module, const VST3::Host
                                                        (phase + (double)s * sine_hz / rate));
                         else if (input_kind == "impulse")
                             buf[s] = (done == 0 && s == 0) ? 1.0f : 0.0f;
-                        else
+                        else if (input_kind == "wav") {
+                            size_t idx = (size_t)(done + s) * (size_t)input_wav_ch +
+                                         (size_t)(input_wav_ch > 1 ? std::min((int)c, input_wav_ch - 1) : 0);
+                            buf[s] = idx < input_wav.size() ? input_wav[idx] : 0.0f;
+                        } else
                             buf[s] = 0.0f;
                     }
                 }
@@ -619,6 +676,9 @@ int main(int argc, char **argv) {
      * off; mutually exclusive with --load-state (the pre-activate path). */
     std::string load_state_after_path;
     double sine_hz = 440.0;
+    std::string input_wav_path;        /* --input wav:PATH — FX insert source track */
+    std::vector<float> input_wav;      /* interleaved samples of input_wav_path */
+    int input_wav_ch = 1;
     std::vector<std::pair<uint32_t, double>> sets;
     /* §15.5 offline-edit hook: --set-at SEC:ID=V applies a param mid-render (vs --set at
      * t=0), so a param can be edited AFTER a mid-render device disconnect and we can prove
@@ -720,8 +780,10 @@ int main(int argc, char **argv) {
             input_kind = next();
             auto colon = input_kind.find(':');
             if (colon != std::string::npos) {
-                sine_hz = atof(input_kind.substr(colon + 1).c_str());
+                std::string rest = input_kind.substr(colon + 1);
                 input_kind = input_kind.substr(0, colon);
+                if (input_kind == "wav") input_wav_path = rest;   /* --input wav:PATH */
+                else sine_hz = atof(rest.c_str());                /* --input sine:HZ  */
             }
         } else if (a == "--bpm") {
             bpm = atof(argv[++i]);
@@ -1007,6 +1069,12 @@ int main(int argc, char **argv) {
     /* §8.8 FX multi-insert repro: N coexisting harp-fx-shell inserts sharing one
      * device serial. The single-instance path below is untouched (and unreached) —
      * the golden/recall tests pass no --fx-instances, so they fall straight through. */
+    if (input_kind == "wav") {
+        if (!load_wav(input_wav_path, input_wav, input_wav_ch))
+            die("--input wav: could not read WAV " + input_wav_path);
+        printf("fx input: wav '%s' (%zu frames, %d ch)\n", input_wav_path.c_str(),
+               input_wav_ch ? input_wav.size() / (size_t)input_wav_ch : 0, input_wav_ch);
+    }
     if (fx_instances >= 1) {
         std::string serial = mt_serial;
         if (serial.empty()) {
@@ -1014,7 +1082,8 @@ int main(int argc, char **argv) {
             serial = (e && e[0]) ? e : std::string("KR260-FX01");
         }
         return run_fx_instances(module, audio_ci, fx_instances, fx_capture, fx_drop_owner, serial,
-                                rate, block, seconds, input_kind, sine_hz, realtime, out_path,
+                                rate, block, seconds, input_kind, sine_hz, input_wav, input_wav_ch,
+                                realtime, out_path,
                                 do_hash, do_json, expect_hash);
     }
 
@@ -1180,7 +1249,11 @@ int main(int argc, char **argv) {
                                                    (phase + (double)s * sine_hz / rate));
                     else if (input_kind == "impulse")
                         buf[s] = (done == 0 && s == 0) ? 1.0f : 0.0f;
-                    else
+                    else if (input_kind == "wav") {
+                        size_t idx = (size_t)(done + s) * (size_t)input_wav_ch +
+                                     (size_t)(input_wav_ch > 1 ? std::min((int)c, input_wav_ch - 1) : 0);
+                        buf[s] = idx < input_wav.size() ? input_wav[idx] : 0.0f;
+                    } else
                         buf[s] = 0.0f;
                 }
             }
