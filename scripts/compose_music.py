@@ -30,10 +30,16 @@ def bass_root(root):
     while b < 35: b += 12
     return b
 
-def gen_bass(prog):                          # root, REST, root, 5th — groove + space (-1=rest)
+def gen_bass(prog):                          # root-anchored bassline with MOVEMENT (-1=rest) — rotating
+    cells = [                                 # cells of root/5th/octave + a rest for groove, not static
+        lambda b: [b, -1, b, b + 7],          # root, REST, root, 5th (the groove)
+        lambda b: [b, b + 7, -1, b + 12],     # root, 5th, REST, octave (an ascent)
+        lambda b: [b, -1, b + 7, b],          # root, REST, 5th, root (a rock)
+        lambda b: [b + 12, b + 7, b, -1],     # octave, 5th, root, REST (a descent)
+    ]
     out = []
-    for root, ct in prog:
-        b = bass_root(root); out += [b, -1, b, b + 7]
+    for i, (root, ct) in enumerate(prog):
+        b = bass_root(root); out += cells[i % len(cells)](b)
     return out
 
 def gen_arp(prog, reg_lo=52, reg_hi=74):     # VOICE-LED: chord tones placed in a STABLE
@@ -161,11 +167,11 @@ def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetso
     _render(name, seconds, bar, bass, arp, mel, counter, pad, arp_ep, envs)
 
 if __name__ == '__main__':
-    # Movement XIV — A-B-A on a single C tonic, the gentlest shadow: A is C DORIAN (the bright major-IV
-    # F lifting it out of pure minor), B clouds to C AEOLIAN (the 6th lowers A->Ab, the b6 darkening),
-    # then A clears again. With the new atmospheric PAD — a sustained dark drone beneath everything —
-    # for cinematic depth. A shadow passing over a still surface.
-    A = [(48, 'm9'), (53, 'majadd9'), (46, 'maj7'), (48, 'm9')]  # C dorian: Cm9 Fadd9 Bbmaj7 Cm9 (major IV)
-    B = [(48, 'm9'), (44, 'maj7'), (46, 'majadd9'), (48, 'm9')]  # C aeolian: Cm9 Abmaj7 Bbadd9 Cm9 (b6 Ab)
-    compose_form('movement-xiv-aba-shadow', 48, [('dorian', A), ('aeolian', B), ('dorian', A)],
-                 bpm=62, reps_each=1, seed=67)
+    # Movement XVI — A-B-A on a single A tonic that TIGHTENS into the middle: A is A AEOLIAN (the
+    # gentle minor-v Em7), B raises the 7th G->G# into A HARMONIC MINOR — the minor-v becomes the
+    # gothic E7 DOMINANT, a leading-tone pulling hard back to the tonic — then A relaxes. The new
+    # WALKING BASS (octave/5th ascents + descents) gives the low end real movement under it all.
+    A = [(45, 'm9'), (53, 'maj7'), (52, 'm7'), (45, 'm9')]      # A aeolian: Am9 Fmaj7 Em7 Am9 (minor v)
+    B = [(45, 'madd9'), (50, 'm7'), (52, '7'), (45, 'madd9')]   # A harmonic minor: Am(add9) Dm7 E7 (G#)
+    compose_form('movement-xvi-aba-tighten', 45, [('aeolian', A), ('harmonic_minor', B), ('aeolian', A)],
+                 bpm=60, reps_each=1, seed=73)
