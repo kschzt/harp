@@ -179,5 +179,26 @@ while [ "$round" -lt "$ROUNDS" ]; do
     if [ -n "$h1" ] && [ "$h1" = "$h2" ]; then log "--- offline host-paced determinism: bit-exact ($h1) ---"
     else log "--- offline host-paced: MISMATCH h1=${h1:-EMPTY} h2=${h2:-EMPTY} (REGRESSION/hang) ---"; fi
   fi
+  # every 30th round: a MULTI-MINUTE DRIFT stream on kria — the §7.3 free-running RTP clock
+  # recovery should hold a BOUNDED clock_drift_ppb with NO reanchors over minutes (the 60s
+  # sustained leg is too short to surface slow drift). Sample the drift gauge before/after, count
+  # reanchors (host) + the ERRC delta (device); a reanchor spike or a counter delta = a clock fault.
+  if [ $((round % 30)) -eq 0 ]; then
+    log "--- drift: 4-min stream on kria (free-run clock-recovery stability over minutes) ---"
+    cb="$(err_counters "-d kria.local:47987")"
+    db="$(pt -d kria.local:47987 counters 2>/dev/null | grep -oE 'clock_drift_ppb = -?[0-9]+' | grep -oE -- '-?[0-9]+$')"
+    dout=$(env HARP_ETH_DEVICE=kria.local:47987 HARP_RECONCILE_TIMEOUT_MS=0 "$HOST" "$BUNDLE" \
+          --set 3=0.5 --set 7=0.7 --channel 1 --part 1 \
+          --notes 50,53,57,60,55,58,62,53 --seconds 240 --realtime --out "$OUT/drift-latest.wav" 2>&1)
+    ca="$(err_counters "-d kria.local:47987")"; dd="$(counter_delta "$cb" "$ca")"
+    da="$(pt -d kria.local:47987 counters 2>/dev/null | grep -oE 'clock_drift_ppb = -?[0-9]+' | grep -oE -- '-?[0-9]+$')"
+    # reanchors aren't in the host's render summary — read the kria daemon journal (best-effort).
+    re="$(ssh -o ConnectTimeout=6 -o BatchMode=yes ubuntu@kria.local 'journalctl -u harp-deviced --no-pager -n 6 2>/dev/null | grep -oE "[0-9]+ reanchors" | tail -1' 2>/dev/null)"
+    und="$(echo "$dout" | grep -oE 'underruns: [0-9]+' | head -1)"
+    fl=""
+    [ -n "$dd" ] && fl="  COUNTER-DELTA[$(echo "$dd"|tr '\n' ';')]"
+    rn="$(echo "${re:-0}" | grep -oE '[0-9]+')"; { [ -n "$rn" ] && [ "$rn" -gt 2 ]; } 2>/dev/null && fl="$fl  REANCHOR-SPIKE($re)"
+    log "--- drift result: clock_drift_ppb ${db:-?}->${da:-?} ${re:-reanchors=?} ${und:-} ${fl:-ok} ---"
+  fi
 done
 log "=== SOAK END (round $round) ==="
