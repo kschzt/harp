@@ -1393,7 +1393,19 @@ bool HarpRuntime::sessionUp() {
             transport_ = nullptr;
             return false;
         }
-        transport_->setCtlTimeout(0); /* hello ok — restore blocking recv for the live session */
+        /* hello ok. Bound the live-session ctl request-response recv (NOT infinite blocking):
+         * a request whose response is LOST or delayed — the device parking/closing mid-teardown,
+         * a dropped frame — must not wedge the recv forever. On Windows a blocking Winsock recv
+         * cannot be interrupted, so an unbounded request recv hangs the supervisor thread and
+         * stop()'s join never returns -> the host process hangs until a watchdog kills it (the
+         * intermittent staged-connected "host HUNG"). sock_read_exact returns false on
+         * SO_RCVTIMEO (WSAETIMEDOUT != WSAEINTR), so the request fails fast and the host makes
+         * progress. 8s is generous (the hello round-trip above is bounded to 2s; healthy
+         * responses are <100ms) and well under the 30s host watchdog, with margin for several
+         * timed-out requests in one teardown. POLL-GATED reads (linkPoll-then-recv, e.g. the
+         * §11.4 reconcile's panel-pick loop and any async core.changed) only recv when data is
+         * already readable, so this never fires for them — only an actually-missing response. */
+        transport_->setCtlTimeout(8000);
         log_msg("connected: %s %s (serial %s, engine %s %s)", vendorName_.c_str(),
                 productName_.c_str(), serial_.c_str(), engineId_.c_str(),
                 engineVer_.c_str());
@@ -1597,6 +1609,9 @@ void HarpRuntime::sessionDown() {
     if (!transport_) return;
     std::lock_guard<std::mutex> lk(ctlMutex_);
     if (wasConnected) {
+        /* audio.stop's response recv is bounded by the session-wide ctl timeout set after
+         * hello (8s, see sessionUp) — a missing ack during teardown can no longer wedge the
+         * supervisor thread / stop()'s join (the Windows "host HUNG"). */
         audioStopLocked();
         /* drain the tail of the stream so the device thread can park */
         uint8_t junk[16384];
