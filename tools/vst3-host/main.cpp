@@ -1062,6 +1062,17 @@ int main(int argc, char **argv) {
                    VST3::StringConvert::convert(info.title).c_str(),
                    info.defaultNormalizedValue, info.flags);
         }
+        /* MULTI-OUT (M5): enumerate every declared OUTPUT bus by name + channel count,
+         * so main-multi-output-test can assert the 17-bus whole-device layout (bus 0
+         * main mix + buses 1..16 per-part, all stereo). */
+        int32 nob = component->getBusCount(kAudio, kOutput);
+        printf("output-buses (%d):\n", nob);
+        for (int32 i = 0; i < nob; i++) {
+            BusInfo b{};
+            component->getBusInfo(kAudio, kOutput, i, b);
+            printf("  out-bus[%d] \"%s\" channels=%d\n", i,
+                   VST3::StringConvert::convert(b.name).c_str(), b.channelCount);
+        }
     }
 
     /* ---- bus setup ---- */

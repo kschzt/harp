@@ -83,6 +83,7 @@ skip() { echo "⏭ SKIP $1 — $2"; RESULTS="$RESULTS
 SKIP  $1 — $2"; }
 
 # ---- the conformance list (one source of truth for all OSes) ----
+run main-multi-out     scripts/main-multi-output-test.sh     # M5: 17-bus whole-device output layout (host-side, all OS)
 run eth-tests          scripts/eth-tests.sh                  # bit-exact + multichannel ASRC over RTP
 run offline-golden     scripts/offline-golden-eth.sh         # deterministic host-paced bounce
 run corrupt-cbor       scripts/corrupt-cbor-eth-test.sh      # §8.7 hostile-frame fault injection
