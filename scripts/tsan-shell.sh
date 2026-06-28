@@ -9,9 +9,12 @@
 # Not a cloud-CI gate — it needs a real board on the bus. Run on the rig or
 # any machine with a HARP device. Clean = no "WARNING: ThreadSanitizer".
 #
-# Two devices on the bus exercises the richest interleaving (two live USB
-# sessions, claim contention); one device still covers the full runtime +
-# the device-less retry path.
+# M3 multi-out model: tools/tsan-host acquires ONE private owner runtime and
+# --instances N drives N device PARTS on channels 0..N-1 (the share-by-serial
+# registry is gone — there is no second in-process session to interleave). One
+# board on the bus covers the full runtime (feeder/reader/eventPump/part-sinks)
+# under load; with no board the device-less connect/retry path still gets
+# sanitized.
 set -e
 cd "$(dirname "$0")/.."
 
@@ -47,18 +50,17 @@ run() {
 FAIL=0
 run single   --instances 1 --seconds 12 --block 256
 run tight    --instances 1 --seconds 15 --block 64
-run multidev --instances 2 --seconds 15 --block 256
-[ "$NDEV" -lt 2 ] && echo "  (multidev ran with 1 device: one live + one in device-less retry;" \
-    && echo "   connect a second board for two live USB sessions)"
+run twoparts --instances 2 --seconds 15 --block 256   # one owner driving 2 parts
 
-# multitimbral MERGE (P5): PIN one serial so the N instances SHARE one runtime
-# and the eventPump drains N per-instance event sources concurrently — this is
-# the only config that TSan-covers the multi-source merge (without a pinned
-# serial, --instances spins up N independent owners and never merges).
+# multitimbral PARTS (P5): pin a board and drive ONE owner across 4 parts. The
+# eventPump drains the single owner source while the feeder/reader service all 4
+# parts' rings concurrently — the densest event+audio config the runtime
+# sanitizes. (The old "N instances SHARE one runtime / merge N per-instance
+# sources" is gone with the registry: there is exactly one owner now.)
 SERIAL=$(./build/harp-probe list 2>/dev/null | grep -oE 'PI4B-[0-9]+' | head -1)
 if [ -n "$SERIAL" ]; then
     export HARP_DEVICE_SERIAL="$SERIAL"
-    run merge --instances 4 --seconds 15 --block 256
+    run parts --instances 4 --seconds 15 --block 256
     # P5b: --part-audio adds the per-part AUDIO demux to the merge — the owner's
     # reader() now ALSO splits each device frame into every attached instance's
     # sink ring (one producer, each sink one consumer), on top of the event
@@ -90,7 +92,7 @@ if [ -n "$SERIAL" ]; then
     unset HARP_LATE_SETTLE_MS
     unset HARP_DEVICE_SERIAL
 else
-    echo "  merge: SKIP (no board on the bus to pin for the shared-runtime merge)"
+    echo "  parts: SKIP (no board on the bus to pin the owner runtime)"
 fi
 
 [ "$FAIL" = 0 ] && echo "TSAN-SHELL PASS (runtime threads race-free)" || { echo "TSAN-SHELL FAIL"; exit 1; }
