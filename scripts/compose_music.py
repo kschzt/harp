@@ -42,6 +42,8 @@ def gen_arp(prog, reg_lo=52, reg_hi=74):     # VOICE-LED: chord tones placed in 
         pcs = set((root + i) % 12 for i in CH[ct])   # jumping octaves with the root)
         voicing = sorted(n for n in range(reg_lo, reg_hi + 1) if n % 12 in pcs)
         v = voicing[:5] if len(voicing) >= 5 else voicing
+        if len(v) >= 4:                        # DROP-2: drop the 2nd-from-top an octave — opens the
+            v = sorted(v[:-2] + [v[-2] - 12, v[-1]])   # close voicing into a lusher, wider spread
         pat = v + v[-2:0:-1]
         while len(pat) < 8: pat += pat
         out += pat[:8]
@@ -152,11 +154,11 @@ def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetso
     _render(name, seconds, bar, bass, arp, mel, counter, arp_ep, envs)
 
 if __name__ == '__main__':
-    # Movement XI — A-B-A on a single E tonic with PER-SECTION DYNAMICS: A is E PHRYGIAN (dark,
-    # bII), B lifts to E PHRYGIAN-DOMINANT (the 3rd rises G->G#, the "Spanish gypsy" brightening)
-    # AND is dynamically the loudest (terraced section_env), then A returns dark + settles. The
-    # mode-shift and the loudness-lift now reinforce each other — a real climax, not a smooth swell.
-    A = [(52, 'm7'), (53, 'maj7'), (50, 'm7'), (52, 'm7')]   # E phrygian: Em7 Fmaj7 Dm7 Em7
-    B = [(52, '7'), (53, 'maj7'), (45, 'm'), (52, '7')]      # E phrygian-DOMINANT: E7 Fmaj7 Am E7 (3rd G->G#)
-    compose_form('movement-xi-aba-phrygian', 52, [('phrygian', A), ('phrygian_dominant', B), ('phrygian', A)],
-                 bpm=58, reps_each=1, seed=53)
+    # Movement XIII — A-B-A on a single G tonic that DARKENS into the middle (the opposite arc): A
+    # is G AEOLIAN (natural minor), B sinks to G PHRYGIAN (the 2nd drops A->Ab, the bII Abmaj7 a black
+    # Spanish weight), then A lifts back. The per-section dynamics make B both LOUDER and DARKER — a
+    # heavy, looming centre rather than a bright climax. Lusher now too (the drop-2 arp voicings).
+    A = [(43, 'm9'), (51, 'maj7'), (53, 'majadd9'), (43, 'm9')]  # G aeolian: Gm9 Ebmaj7 Fadd9 Gm9
+    B = [(43, 'm7'), (44, 'maj7'), (41, 'm7'), (43, 'm7')]       # G phrygian: Gm7 Abmaj7 Fm7 Gm7 (bII Ab)
+    compose_form('movement-xiii-aba-darken', 43, [('aeolian', A), ('phrygian', B), ('aeolian', A)],
+                 bpm=60, reps_each=1, seed=61)
