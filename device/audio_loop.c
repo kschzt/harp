@@ -410,6 +410,14 @@ void audio_stop(device *d) {
     /* render thread is joined: free every voice + clear pending panic so nothing
      * leaks into the next stream (the engine owns the voice/part layout). */
     engine_voices_quiet();
+    /* §8.8: free the FX input-demux buffer the loop allocated for THIS stream. It is sized for
+     * this stream's n_in_slots; leaving it across streams both leaks it (at device exit) and
+     * would be reused at the wrong size if a later FX stream requests more slots (the start-side
+     * `!a->fx_in` guard only allocates when NULL). Re-allocated on the next FX start. */
+    if (d->audio.fx_in) {
+        free(d->audio.fx_in);
+        d->audio.fx_in = NULL;
+    }
     fprintf(stderr, "harp-deviced: audio stream stopped (%llu reanchors)\n",
             (unsigned long long)d->audio.reanchors);
 }

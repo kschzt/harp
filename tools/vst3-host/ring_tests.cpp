@@ -57,6 +57,9 @@ static void test_float_ring_stress() {
             float chunk[37];
             size_t n = std::min(sizeof chunk / sizeof(float), N - sent);
             for (size_t i = 0; i < n; i++) chunk[i] = (float)(sent + i);
+            /* the loop fills chunk[0..n), exactly what write reads; cppcheck can't prove the
+             * variable-length loop covers it (false positive). */
+            /* cppcheck-suppress uninitvar */
             size_t w = r.write(chunk, n);
             sent += w;
         }
