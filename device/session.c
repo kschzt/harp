@@ -1971,6 +1971,142 @@ static void handle_dev_gc(device *d, const harp_env *e) {
 
 /* ---------------- dispatch ---------------- */
 
+/* The handful of request methods whose handler is short enough that it lived inline in the
+ * handle_ctl strcmp chain. Factored out here so EVERY method dispatches through one uniform
+ * table below (device, env) -> void — behavior is byte-identical (the bodies moved verbatim,
+ * e.X -> e->X). */
+static void handle_identify(device *d, const harp_env *e) {
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, true);
+    encode_identity(d, &m);
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+static void handle_ping(device *d, const harp_env *e) {
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, e->has_body);
+    if (e->has_body) harp_cbuf_put(&m, e->body, e->body_len);
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+static void handle_bye(device *d, const harp_env *e) {
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, false);
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+    d->closing = true;
+}
+static void handle_time_ping(device *d, const harp_env *e) {
+    /* §7.2 host-device time correlation: {0 => (epoch,msc) at receipt,
+     * 1 => (epoch,msc) at transmit}. msc is the device's monotonic
+     * microsecond clock (the refdev has no analog sample clock in
+     * host-paced mode; free-running MSC rides the stream header, §8.2).
+     * The host brackets this with its own send/recv stamps and solves
+     * the offset NTP-style; transmit-receipt = device turnaround. */
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint64_t recv_us = (uint64_t)t0.tv_sec * 1000000 + (uint64_t)t0.tv_nsec / 1000;
+    uint32_t epoch = d->audio.epoch;
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, true);
+    harp_cbor_map(&m, 2);
+    harp_cbor_uint(&m, 0);
+    harp_cbor_array(&m, 2);
+    harp_cbor_uint(&m, epoch);
+    harp_cbor_uint(&m, recv_us);
+    harp_cbor_uint(&m, 1);
+    harp_cbor_array(&m, 2);
+    harp_cbor_uint(&m, epoch);
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    harp_cbor_uint(&m, (uint64_t)t1.tv_sec * 1000000 + (uint64_t)t1.tv_nsec / 1000);
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+static void handle_notify_changed(device *d, const harp_env *e) {
+    /* §5.5 conformance seam: the refdev has no spontaneous identity mutation, so a test
+     * drives the core.changed sender from here. body {0 => tstr topic}, default "identity".
+     * The ntf is emitted BEFORE this response so the host routes it during the request wait. */
+    char topic[32] = "identity";
+    if (e->has_body) {
+        harp_cdec b;
+        harp_cdec_init(&b, e->body, e->body_len);
+        uint64_t n, key;
+        const char *s;
+        size_t sl;
+        if (harp_cdec_map(&b, &n) && n >= 1 && harp_cdec_uint(&b, &key) && key == 0 &&
+            harp_cdec_text(&b, &s, &sl)) {
+            size_t cl = sl < sizeof topic - 1 ? sl : sizeof topic - 1;
+            memcpy(topic, s, cl);
+            topic[cl] = 0;
+        }
+    }
+    ntf_core_changed(d, topic);
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, false);
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+}
+static void handle_restart(device *d, const harp_env *e) {
+    /* dev-loop helper: exit cleanly so systemd (Restart=always) respawns
+     * the daemon from the (possibly updated) binary on disk — the
+     * fw.commit pattern in miniature, no root needed for deploys */
+    harp_cbuf m;
+    harp_cbuf_init(&m);
+    rsp_head(&m, e->rid, e->method, false);
+    send_ctl(d, &m);
+    harp_cbuf_free(&m);
+    fprintf(stderr, "harp-deviced: restart requested; exiting for respawn\n");
+    audio_stop(d);
+    exit(0);
+}
+
+/* §5 control dispatch: method name -> handler. EXACT-match only (no prefixes), so the order
+ * is irrelevant to behavior — every method name is unique. Adding a method = one row here +
+ * its handler. The wire contract (which method does what) is golden-locked by the device
+ * conformance suite. */
+typedef void (*harp_ctl_handler)(device *d, const harp_env *e);
+static const struct {
+    const char *method;
+    harp_ctl_handler fn;
+} CTL_HANDLERS[] = {
+    {"core.hello", handle_hello},
+    {"core.identify", handle_identify},
+    {"core.ping", handle_ping},
+    {"core.bye", handle_bye},
+    {"time.ping", handle_time_ping},
+    {"state.refs", handle_state_refs},
+    {"state.snapshot", handle_state_snapshot},
+    {"state.have", handle_state_have},
+    {"state.want", handle_state_want},
+    {"state.send", handle_state_send},
+    {"state.refset", handle_state_refset},
+    {"evt.params", handle_evt_params},
+    {"evt.format", handle_evt_format},
+    {"evt.parse", handle_evt_parse},
+    {"audio.start", handle_audio_start},
+    {"audio.stop", handle_audio_stop},
+    {"audio.trim", handle_audio_trim},
+    {"diag.counters", handle_diag_counters},
+    {"diag.bundle", handle_diag_bundle},                 /* §14.4 device-section embedded verbatim host-side */
+    {"diag.loopback.start", handle_diag_loopback_start}, /* §14.3 round-trip: arm the digital loop */
+    {"diag.loopback.stop", handle_diag_loopback_stop},
+    {"x.harp-refdev.knob", handle_knob},
+    {"x.harp.reconcile.offer", handle_reconcile_offer},
+    {"x.harp.reconcile.poll", handle_reconcile_poll},
+    {"x.harp-refdev.params", handle_dev_params},
+    {"x.harp-refdev.meters", handle_dev_meters},
+    {"x.harp-refdev.txn", handle_dev_txn}, /* §9.6 reject meters — golden-free observability */
+    {"x.harp-refdev.gc", handle_dev_gc},   /* §10.3 force retention+GC — golden-free, drains the store */
+    {"x.harp-refdev.notify-changed", handle_notify_changed},
+    {"x.harp-refdev.restart", handle_restart},
+};
+
 static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
     /* dirty-flag work the render thread deferred (queued sets/ramps applied) */
     if (atomic_exchange_explicit(&g_touch_pending, 0, memory_order_acquire)) {
@@ -2001,141 +2137,12 @@ static void handle_ctl(device *d, const uint8_t *buf, size_t len) {
         send_error(d, e.rid, e.method, "denied", "core.hello required first");
         return;
     }
-    if (strcmp(e.method, "core.hello") == 0)
-        handle_hello(d, &e);
-    else if (strcmp(e.method, "core.identify") == 0) {
-        harp_cbuf m;
-        harp_cbuf_init(&m);
-        rsp_head(&m, e.rid, e.method, true);
-        encode_identity(d, &m);
-        send_ctl(d, &m);
-        harp_cbuf_free(&m);
-    } else if (strcmp(e.method, "core.ping") == 0) {
-        harp_cbuf m;
-        harp_cbuf_init(&m);
-        rsp_head(&m, e.rid, e.method, e.has_body);
-        if (e.has_body) harp_cbuf_put(&m, e.body, e.body_len);
-        send_ctl(d, &m);
-        harp_cbuf_free(&m);
-    } else if (strcmp(e.method, "core.bye") == 0) {
-        harp_cbuf m;
-        harp_cbuf_init(&m);
-        rsp_head(&m, e.rid, e.method, false);
-        send_ctl(d, &m);
-        harp_cbuf_free(&m);
-        d->closing = true;
-    } else if (strcmp(e.method, "time.ping") == 0) {
-        /* §7.2 host-device time correlation: {0 => (epoch,msc) at receipt,
-         * 1 => (epoch,msc) at transmit}. msc is the device's monotonic
-         * microsecond clock (the refdev has no analog sample clock in
-         * host-paced mode; free-running MSC rides the stream header, §8.2).
-         * The host brackets this with its own send/recv stamps and solves
-         * the offset NTP-style; transmit-receipt = device turnaround. */
-        struct timespec t0;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        uint64_t recv_us = (uint64_t)t0.tv_sec * 1000000 + (uint64_t)t0.tv_nsec / 1000;
-        uint32_t epoch = d->audio.epoch;
-        harp_cbuf m;
-        harp_cbuf_init(&m);
-        rsp_head(&m, e.rid, e.method, true);
-        harp_cbor_map(&m, 2);
-        harp_cbor_uint(&m, 0);
-        harp_cbor_array(&m, 2);
-        harp_cbor_uint(&m, epoch);
-        harp_cbor_uint(&m, recv_us);
-        harp_cbor_uint(&m, 1);
-        harp_cbor_array(&m, 2);
-        harp_cbor_uint(&m, epoch);
-        struct timespec t1;
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        harp_cbor_uint(&m, (uint64_t)t1.tv_sec * 1000000 + (uint64_t)t1.tv_nsec / 1000);
-        send_ctl(d, &m);
-        harp_cbuf_free(&m);
-    } else if (strcmp(e.method, "state.refs") == 0)
-        handle_state_refs(d, &e);
-    else if (strcmp(e.method, "state.snapshot") == 0)
-        handle_state_snapshot(d, &e);
-    else if (strcmp(e.method, "state.have") == 0)
-        handle_state_have(d, &e);
-    else if (strcmp(e.method, "state.want") == 0)
-        handle_state_want(d, &e);
-    else if (strcmp(e.method, "state.send") == 0)
-        handle_state_send(d, &e);
-    else if (strcmp(e.method, "state.refset") == 0)
-        handle_state_refset(d, &e);
-    else if (strcmp(e.method, "evt.params") == 0)
-        handle_evt_params(d, &e);
-    else if (strcmp(e.method, "evt.format") == 0)
-        handle_evt_format(d, &e);
-    else if (strcmp(e.method, "evt.parse") == 0)
-        handle_evt_parse(d, &e);
-    else if (strcmp(e.method, "audio.start") == 0)
-        handle_audio_start(d, &e);
-    else if (strcmp(e.method, "audio.stop") == 0)
-        handle_audio_stop(d, &e);
-    else if (strcmp(e.method, "audio.trim") == 0)
-        handle_audio_trim(d, &e);
-    else if (strcmp(e.method, "diag.counters") == 0)
-        handle_diag_counters(d, &e);
-    else if (strcmp(e.method, "diag.bundle") == 0)
-        handle_diag_bundle(d, &e); /* §14.4: device-section embedded verbatim host-side */
-    else if (strcmp(e.method, "diag.loopback.start") == 0)
-        handle_diag_loopback_start(d, &e); /* §14.3 round-trip: arm the digital loop */
-    else if (strcmp(e.method, "diag.loopback.stop") == 0)
-        handle_diag_loopback_stop(d, &e);
-    else if (strcmp(e.method, "x.harp-refdev.knob") == 0)
-        handle_knob(d, &e);
-    else if (strcmp(e.method, "x.harp.reconcile.offer") == 0)
-        handle_reconcile_offer(d, &e);
-    else if (strcmp(e.method, "x.harp.reconcile.poll") == 0)
-        handle_reconcile_poll(d, &e);
-    else if (strcmp(e.method, "x.harp-refdev.params") == 0)
-        handle_dev_params(d, &e);
-    else if (strcmp(e.method, "x.harp-refdev.meters") == 0)
-        handle_dev_meters(d, &e);
-    else if (strcmp(e.method, "x.harp-refdev.txn") == 0)
-        handle_dev_txn(d, &e); /* §9.6 reject meters — golden-free observability */
-    else if (strcmp(e.method, "x.harp-refdev.gc") == 0)
-        handle_dev_gc(d, &e); /* §10.3 force retention+GC — golden-free, drains the store */
-    else if (strcmp(e.method, "x.harp-refdev.notify-changed") == 0) {
-        /* §5.5 conformance seam: the refdev has no spontaneous identity mutation, so a test
-         * drives the core.changed sender from here. body {0 => tstr topic}, default "identity".
-         * The ntf is emitted BEFORE this response so the host routes it during the request wait. */
-        char topic[32] = "identity";
-        if (e.has_body) {
-            harp_cdec b;
-            harp_cdec_init(&b, e.body, e.body_len);
-            uint64_t n, key;
-            const char *s;
-            size_t sl;
-            if (harp_cdec_map(&b, &n) && n >= 1 && harp_cdec_uint(&b, &key) && key == 0 &&
-                harp_cdec_text(&b, &s, &sl)) {
-                size_t cl = sl < sizeof topic - 1 ? sl : sizeof topic - 1;
-                memcpy(topic, s, cl);
-                topic[cl] = 0;
-            }
+    for (size_t i = 0; i < sizeof CTL_HANDLERS / sizeof CTL_HANDLERS[0]; i++)
+        if (strcmp(e.method, CTL_HANDLERS[i].method) == 0) {
+            CTL_HANDLERS[i].fn(d, &e);
+            return;
         }
-        ntf_core_changed(d, topic);
-        harp_cbuf m;
-        harp_cbuf_init(&m);
-        rsp_head(&m, e.rid, e.method, false);
-        send_ctl(d, &m);
-        harp_cbuf_free(&m);
-    }
-    else if (strcmp(e.method, "x.harp-refdev.restart") == 0) {
-        /* dev-loop helper: exit cleanly so systemd (Restart=always) respawns
-         * the daemon from the (possibly updated) binary on disk — the
-         * fw.commit pattern in miniature, no root needed for deploys */
-        harp_cbuf m;
-        harp_cbuf_init(&m);
-        rsp_head(&m, e.rid, e.method, false);
-        send_ctl(d, &m);
-        harp_cbuf_free(&m);
-        fprintf(stderr, "harp-deviced: restart requested; exiting for respawn\n");
-        audio_stop(d);
-        exit(0);
-    } else
-        send_error(d, e.rid, e.method, "unsupported", NULL);
+    send_error(d, e.rid, e.method, "unsupported", NULL);
 }
 
 static void handle_obj(device *d, const uint8_t *buf, size_t len) {
