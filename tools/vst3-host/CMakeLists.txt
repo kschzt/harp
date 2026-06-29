@@ -457,6 +457,41 @@ if(LIBUSB_FOUND)
   set_tests_properties(registry PROPERTIES LABELS unit)
   message(STATUS "registry-tests: runtime registry keying/refcount unit test")
 
+  # runtime-units-tests (audit #2): the shell runtime's host-side FUNCTIONAL core —
+  # the param/ramp/note/mod event QUEUE logic + §9.4 per-part channel targeting, the
+  # NoteVoiceMap (host noteId -> §9.5 voice key), and setStateBundle malformed-bundle
+  # REJECTION — all exercised on a constructed HarpRuntime with NO start()/device, the
+  # same hermetic zero-hardware seam registry-tests uses (queue* push to the owner ring,
+  # the test drains it). harp_voice_pick is already in harp-engine-logic-tests; not here.
+  # Same source set + 3-OS reach as registry-tests above.
+  add_executable(runtime-units-tests
+    ${HARP_ROOT}/tests/runtime_units_tests.cpp
+    ${HARP_ROOT}/shell/runtime.cpp
+    ${HARP_ROOT}/shell/runtime_registry.cpp
+    ${HARP_ROOT}/host/usb_io.c
+    ${HARP_ROOT}/host/sock_io.c
+    ${HARP_ROOT}/host/rtp.c
+    ${HARP_ROOT}/host/freerun.c
+    ${HARP_ROOT}/host/client.c
+    ${HARP_ROOT}/core/src/cbor.c
+    ${HARP_ROOT}/core/src/sha256.c
+    ${HARP_ROOT}/core/src/frame.c
+    ${HARP_ROOT}/core/src/object.c
+    ${HARP_ROOT}/core/src/store.c
+    ${HARP_ROOT}/core/src/envelope.c
+    ${HARP_ROOT}/core/src/link.c
+    ${HARP_ROOT}/core/src/audio.c
+    ${HARP_PLAT_SRC})
+  target_include_directories(runtime-units-tests PRIVATE
+    ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
+    ${LIBUSB_INCLUDE_DIRS})
+  target_compile_definitions(runtime-units-tests PRIVATE HAVE_LIBUSB)
+  target_link_directories(runtime-units-tests PRIVATE ${LIBUSB_LIBRARY_DIRS})
+  target_link_libraries(runtime-units-tests ${LIBUSB_LIBRARIES} ${HARP_PLAT_LIBS} harp_asrc harp_mdns)
+  add_test(NAME runtime_units COMMAND runtime-units-tests)
+  set_tests_properties(runtime_units PROPERTIES LABELS unit)
+  message(STATUS "runtime-units-tests: shell runtime queue/channel/NoteVoiceMap/bundle unit test")
+
   # SMTG emits the bundle under VST3/<config>/ ($<CONFIG> = multi-config safe).
   set(HARP_SHELL_BUNDLE ${CMAKE_BINARY_DIR}/VST3/$<CONFIG>/harp-shell.vst3)
   if(APPLE)
