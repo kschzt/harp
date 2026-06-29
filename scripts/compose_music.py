@@ -190,9 +190,9 @@ def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetso
     _render(name, seconds, bar, bass, arp, mel, counter, pad, arp_ep, envs)
 
 if __name__ == '__main__':
-    # Movement XXVI — G DORIAN, lush and OPEN: built on the minor-11 tonic (Gm11 — root, b3, 5, b7,
-    # 9, 11 all sounding, a wide stacked-fourths haze) with the dorian major-IV C glinting through.
-    # After the noir tension and flamenco edge, a gentler, more spacious dark — less a cliff than a
-    # wide grey sea at dusk. The phrased lead drifts over the open voicings, unhurried.
-    P = [(43, 'm11'), (48, 'majadd9'), (53, 'maj7'), (43, 'm11')]   # G dorian: Gm11 Cadd9 Fmaj7 Gm11
-    compose('movement-xxvi-g-dorian-lush', 43, 'dorian', P, bpm=60, reps=2, seed=127)
+    # Movement XXVII — G MELODIC MINOR noir lyric: the minor-MAJOR tonic Gm(maj9) (that raised 7th
+    # F# glinting against the minor 3rd) with a bright major-IV C7 — the jazz-minor / film-noir glow,
+    # bittersweet rather than black. Slow (56bpm), spare, the phrased lead singing its question and
+    # answer over a thin haze. Late-night, last-call music.
+    P = [(43, 'mmaj9'), (48, '7'), (45, 'm7'), (50, '7')]   # G melodic minor: Gm(maj9) C7 Am7 D7
+    compose('movement-xxvii-g-melodicminor-noir', 43, 'melodic_minor', P, bpm=56, reps=2, seed=131)
