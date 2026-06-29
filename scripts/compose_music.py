@@ -96,13 +96,13 @@ def gen_counter(prog, sc, seed=11):          # ANSWERS the lead — call-and-res
 def gen_pad(prog):                          # ATMOSPHERIC pad: the chord root sustained ONE per bar —
     return [bass_root(root) + 12 for root, ct in prog]   # a mid drone an 8ve over the bass, long release
 
-def section_env(nsec, lo=0.6, hi=1.0):     # TERRACED dynamics: a plateau per section, MIDDLE loudest
-    half = (nsec - 1) / 2.0 if nsec > 1 else 1.0
-    pts = []
+def section_env(nsec, lo=0.6, hi=1.0, peak=0.62):  # TERRACED dynamics — BUILD to a climax ~2/3 in, resolve
+    span = max(peak, 1.0 - peak); pts = []          # (for A-B-A the peak lands on B; for A-B-C-A, on C)
     for i in range(nsec):
-        w = round(lo + (hi - lo) * (1.0 - abs(i - (nsec - 1) / 2.0) / half), 3)  # peak at the middle
+        c = (i + 0.5) / nsec                          # this section's centre fraction
+        w = round(hi - (hi - lo) * abs(c - peak) / span, 3)
         a, b = i / nsec, (i + 1) / nsec
-        pts += [[round(a + 0.03, 3), w], [round(b - 0.03, 3), w]]   # flat across the section, short ramps between
+        pts += [[round(a + 0.03, 3), w], [round(b - 0.03, 3), w]]   # flat across the section, ramps between
     return [[0.0, pts[0][1]]] + pts + [[1.0, pts[-1][1]]]
 
 def melody_section_env(nsec):              # the lead: silent INTRO, then follow the section dynamics
@@ -183,11 +183,12 @@ def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetso
     _render(name, seconds, bar, bass, arp, mel, counter, pad, arp_ep, envs)
 
 if __name__ == '__main__':
-    # Movement XVIII — A-B-A with a real KEY MODULATION (not just a mode shift): A is C AEOLIAN, B
-    # lifts the whole tonal centre UP A MINOR THIRD to Eb AEOLIAN — the ground itself moves, a dark
-    # ascension — then A sinks back home to C. Same mode throughout so the ear hears the key change
-    # cleanly. The frame's coda resolves to the home C tonic. The biggest harmonic gesture yet.
-    A = [(48, 'm9'), (44, 'maj7'), (46, 'majadd9'), (48, 'm9')]   # C aeolian: Cm9 Abmaj7 Bbadd9 Cm9
-    B = [(51, 'm9'), (47, 'maj7'), (49, 'majadd9'), (51, 'm9')]   # Eb aeolian (up m3): Ebm9 Bmaj7 Dbadd9 Ebm9
-    compose_form('movement-xviii-aba-modulate', 48,
-                 [(48, 'aeolian', A), (51, 'aeolian', B), (48, 'aeolian', A)], bpm=58, reps_each=1, seed=83)
+    # Movement XIX — a four-part A-B-C-A JOURNEY (the longest form yet) that BUILDS to a modulating
+    # climax: A is D AEOLIAN (dark home), B lifts to D DORIAN (the major-IV brightening), C ascends
+    # up a minor third to F AEOLIAN (a new tonal area — the peak, loudest via the build-to-2/3 arc),
+    # then A returns home to D and the coda resolves. Departure, ascent, climax, and homecoming.
+    A = [(50, 'm9'), (46, 'maj7'), (48, 'majadd9'), (50, 'm9')]   # D aeolian: Dm9 Bbmaj7 Cadd9 Dm9
+    B = [(50, 'm9'), (55, 'majadd9'), (48, 'maj7'), (50, 'm9')]   # D dorian: Dm9 Gadd9 Cmaj7 Dm9 (major IV)
+    C = [(53, 'm9'), (49, 'maj7'), (51, 'majadd9'), (53, 'm9')]   # F aeolian (up m3): Fm9 Dbmaj7 Ebadd9 Fm9
+    compose_form('movement-xix-abca-journey', 50,
+                 [('aeolian', A), ('dorian', B), (53, 'aeolian', C), ('aeolian', A)], bpm=62, reps_each=1, seed=89)
