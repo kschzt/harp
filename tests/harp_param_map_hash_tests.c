@@ -40,17 +40,7 @@
 
 #include "device.h" /* dev_param, NPARAMS, encode_param_array_from */
 
-static int g_fail = 0, g_pass = 0;
-
-#define CHECK(cond)                                                       \
-    do {                                                                  \
-        if (cond) {                                                       \
-            g_pass++;                                                     \
-        } else {                                                          \
-            g_fail++;                                                     \
-            fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-        }                                                                 \
-    } while (0)
+#include "check.h"
 
 /* Real enum labels (count == steps), mirroring device/engine.c. Stepped params
  * MUST carry non-NULL labels or encode_one_param derefs labels[s]. */
@@ -156,6 +146,5 @@ static void test_param_map_hash_change_detection(void) {
 
 int main(void) {
     test_param_map_hash_change_detection();
-    printf("%d passed, %d failed\n", g_pass, g_fail);
-    return g_fail ? 1 : 0;
+    return check_report(NULL);
 }

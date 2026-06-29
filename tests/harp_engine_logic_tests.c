@@ -24,16 +24,7 @@
 #include "usb_select.h"
 #include "voice_alloc.h"
 
-static int g_fail = 0, g_pass = 0;
-#define CHECK(cond)                                                            \
-    do {                                                                       \
-        if (cond) {                                                            \
-            g_pass++;                                                          \
-        } else {                                                               \
-            g_fail++;                                                          \
-            fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);    \
-        }                                                                      \
-    } while (0)
+#include "check.h"
 
 /* §9.5 voice allocation: first FREE slot in index order, else steal the oldest
  * (smallest alloc_seq). */
@@ -273,6 +264,5 @@ int main(void) {
     test_usb_select();
     test_peer_ratelimit();
     test_rtp_loss_gap();
-    printf("harp-engine-logic-tests: %d passed, %d failed\n", g_pass, g_fail);
-    return g_fail ? 1 : 0;
+    return check_report("harp-engine-logic-tests");
 }

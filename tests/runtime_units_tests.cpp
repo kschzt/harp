@@ -26,16 +26,7 @@
 #include "harp/cbor.h"        /* build CBOR bundles for the malformed-bundle tests */
 #include "harp/store.h"       /* harp_ref + harp_ref_encode — the positive-control ref */
 
-static int g_pass = 0, g_fail = 0;
-#define CHECK(cond)                                                            \
-    do {                                                                       \
-        if (cond) {                                                            \
-            g_pass++;                                                          \
-        } else {                                                               \
-            g_fail++;                                                          \
-            fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);    \
-        }                                                                      \
-    } while (0)
+#include "check.h"
 
 /* The §9.4 wire constants are private #defines in runtime.cpp; the host-free test uses
  * the literal strings the wire format pins (a divergence here IS a regression). */
@@ -294,6 +285,5 @@ int main() {
     test_note_voice_map();
     test_setstatebundle_rejection();
 
-    printf("harp-runtime-units-tests: %d passed, %d failed\n", g_pass, g_fail);
-    return g_fail ? 1 : 0;
+    return check_report("harp-runtime-units-tests");
 }

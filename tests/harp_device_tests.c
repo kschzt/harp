@@ -28,17 +28,7 @@
 
 #include "device.h" /* NPARTS, NPARAMS, refdev_{encode,parse}_params_blob */
 
-static int g_fail = 0, g_pass = 0;
-
-#define CHECK(cond)                                                       \
-    do {                                                                  \
-        if (cond) {                                                       \
-            g_pass++;                                                     \
-        } else {                                                          \
-            g_fail++;                                                     \
-            fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-        }                                                                 \
-    } while (0)
+#include "check.h"
 
 /* The codec maps paramId<->grid-column via g_params[].id. We assert against
  * the real table (linked from state_stubs.c, mirroring engine.c's ids 1..12 —
@@ -269,6 +259,5 @@ static void test_params_blob_codec(void) {
 
 int main(void) {
     test_params_blob_codec();
-    printf("%d passed, %d failed\n", g_pass, g_fail);
-    return g_fail ? 1 : 0;
+    return check_report(NULL);
 }

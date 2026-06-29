@@ -13,12 +13,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-static int g_pass = 0, g_fail = 0;
-#define CHECK(c)                                                          \
-    do {                                                                  \
-        if (c) g_pass++;                                                  \
-        else { g_fail++; fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } \
-    } while (0)
+#include "check.h"
 
 /* ---- fault-injection seam: a scripted fake endpoint read/write ----
  * A socketpair can only ever produce healthy bytes or a dead fd (-EBADF); it cannot
@@ -160,6 +155,5 @@ int main(void) {
     close(host_to_dev);
     close(dev_ep_in);
     close(host_from_dev);
-    printf("harp-ffs-link-tests: %d passed, %d failed\n", g_pass, g_fail);
-    return g_fail ? 1 : 0;
+    return check_report("harp-ffs-link-tests");
 }
