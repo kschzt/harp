@@ -57,7 +57,7 @@ def gen_arp(prog, reg_lo=52, reg_hi=74):     # VOICE-LED: chord tones placed in 
 
 RHYTHMS = [[1, 1, 0, 1], [1, 0, 1, 1], [1, 1, 1, 0], [0, 1, 1, 1], [1, 0, 1, 0]]  # 0 = rest
 
-def gen_melody(prog, sc, seed=7):            # motif + arc + RHYTHM (rests = phrasing), 4/bar
+def gen_melody(prog, sc, seed=7):            # motif + register arc + RHYTHM + PHRASE contour (Q&A), 4/bar
     random.seed(seed); out = []; n = len(prog); motif = [0, 2, 3, 1]
     for i, (root, ct) in enumerate(prog):
         tones = [root + t for t in CH[ct]]
@@ -65,15 +65,20 @@ def gen_melody(prog, sc, seed=7):            # motif + arc + RHYTHM (rests = phr
         arc = int(round(5 * (1 - abs(frac - 0.66) / 0.66)))   # register peaks ~2/3 through
         cur = snap(random.choice(tones[:3]) + 7 + arc, sc)    # mid-high — audible, not buried
         mask = RHYTHMS[i % len(RHYTHMS)]                       # rotate rhythmic cells = phrasing
-        mi = 0
+        rising = (i % 2 == 0)    # PHRASE: antecedent bars rise (a question), consequent fall (an answer)
+        mi = 0; last = None
         for beat in range(4):
             if mask[beat] == 0:
                 out.append(-1)                                # REST — the melody breathes
             else:
                 if mi > 0:
-                    d = motif[mi % len(motif)]; d = d if random.random() > 0.35 else -d
+                    d = abs(motif[mi % len(motif)])
+                    d = d if rising else -d                    # bias the contour by phrase direction
+                    if random.random() < 0.25: d = -d         # an occasional surprise turn
                     cur = snap(cur + d, sc)
-                out.append(cur); mi += 1
+                out.append(cur); mi += 1; last = len(out) - 1
+        if not rising and last is not None:                   # CONSEQUENT cadence: land on a chord tone
+            out[last] = min((snap(root + t + 7 + arc, sc) for t in CH[ct]), key=lambda x: abs(x - out[last]))
     return out
 
 def gen_counter(prog, sc, seed=11):          # ANSWERS the lead — call-and-response. Lower
@@ -183,12 +188,9 @@ def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetso
     _render(name, seconds, bar, bass, arp, mel, counter, pad, arp_ep, envs)
 
 if __name__ == '__main__':
-    # Movement XIX — a four-part A-B-C-A JOURNEY (the longest form yet) that BUILDS to a modulating
-    # climax: A is D AEOLIAN (dark home), B lifts to D DORIAN (the major-IV brightening), C ascends
-    # up a minor third to F AEOLIAN (a new tonal area — the peak, loudest via the build-to-2/3 arc),
-    # then A returns home to D and the coda resolves. Departure, ascent, climax, and homecoming.
-    A = [(50, 'm9'), (46, 'maj7'), (48, 'majadd9'), (50, 'm9')]   # D aeolian: Dm9 Bbmaj7 Cadd9 Dm9
-    B = [(50, 'm9'), (55, 'majadd9'), (48, 'maj7'), (50, 'm9')]   # D dorian: Dm9 Gadd9 Cmaj7 Dm9 (major IV)
-    C = [(53, 'm9'), (49, 'maj7'), (51, 'majadd9'), (53, 'm9')]   # F aeolian (up m3): Fm9 Dbmaj7 Ebadd9 Fm9
-    compose_form('movement-xix-abca-journey', 50,
-                 [('aeolian', A), ('dorian', B), (53, 'aeolian', C), ('aeolian', A)], bpm=62, reps_each=1, seed=89)
+    # Movement XX — B AEOLIAN, a single-mode piece written for the LEAD to sing: the new phrase
+    # contour gives it a question-and-answer shape (antecedent bars rise, consequent bars fall and
+    # resolve onto a chord tone), breathing over the i-bVI-bVII-iv loop with the pad as a low haze.
+    # Less a structure than a melody — the most lyrical of the set.
+    P = [(47, 'm9'), (43, 'maj7'), (45, 'majadd9'), (52, 'm7')]   # B aeolian: Bm9 Gmaj7 Aadd9 Em7
+    compose('movement-xx-b-aeolian-lyric', 47, 'aeolian', P, bpm=60, reps=2, seed=97)
