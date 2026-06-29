@@ -24,7 +24,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/usb/functionfs.h>
+#include <poll.h>
+#include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -129,31 +132,73 @@ static int write_descriptors(int ep0) {
     return 0;
 }
 
-/* Bind the gadget to the first available UDC (after descriptors are in). */
-static void bind_udc(const char *gadget_path) {
-    char udc[128] = "";
-    FILE *f = popen("ls /sys/class/udc 2>/dev/null | head -1", "r");
-    if (f) {
-        if (fgets(udc, sizeof udc, f)) udc[strcspn(udc, "\n")] = 0;
-        pclose(f);
-    }
-    if (!udc[0]) {
-        fprintf(stderr, "harp-ffs: no UDC available (is dwc2 in peripheral mode?)\n");
-        return;
-    }
+/* The UDC this gadget is bound to (discovered in bind_udc); reused by the §4.3 self-heal
+ * soft-reconnect to drop+raise the pull-up, and to read the UDC state. */
+static char g_udc[128] = "";
+
+/* Write a UDC name (or "" to unbind) into <gadget>/UDC. Returns true on success. */
+static bool write_udc(const char *gadget_path, const char *val) {
     char path[256];
     snprintf(path, sizeof path, "%s/UDC", gadget_path);
     FILE *u = fopen(path, "w");
     if (!u) {
         fprintf(stderr, "harp-ffs: cannot open %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    bool ok = fprintf(u, "%s\n", val) >= 0 && fflush(u) == 0;
+    if (fclose(u) != 0) ok = false;
+    return ok;
+}
+
+/* Bind the gadget to the first available UDC (after descriptors are in). */
+static void bind_udc(const char *gadget_path) {
+    FILE *f = popen("ls /sys/class/udc 2>/dev/null | head -1", "r");
+    if (f) {
+        if (fgets(g_udc, sizeof g_udc, f)) g_udc[strcspn(g_udc, "\n")] = 0;
+        pclose(f);
+    }
+    if (!g_udc[0]) {
+        fprintf(stderr, "harp-ffs: no UDC available (is dwc2 in peripheral mode?)\n");
         return;
     }
-    if (fprintf(u, "%s\n", udc) < 0 || fflush(u) != 0)
-        fprintf(stderr, "harp-ffs: UDC bind failed (already bound?): %s\n",
-                strerror(errno));
+    if (write_udc(gadget_path, g_udc))
+        fprintf(stderr, "harp-ffs: bound to UDC %s\n", g_udc);
     else
-        fprintf(stderr, "harp-ffs: bound to UDC %s\n", udc);
-    fclose(u);
+        fprintf(stderr, "harp-ffs: UDC bind failed (already bound?): %s\n", strerror(errno));
+}
+
+/* True if the UDC reports a host has fully configured us (SET_CONFIGURATION done). This is the
+ * "a host is present and expects us to work" signal: in the wedge it stays 'configured' even
+ * though the FunctionFS function never got re-ENABLEd, which is exactly what distinguishes a
+ * stuck claim from an unplugged/idle bus (where the state is 'not attached'/'addressed'). */
+static bool host_configured(void) {
+    if (!g_udc[0]) return false;
+    char path[200];
+    snprintf(path, sizeof path, "/sys/class/udc/%s/state", g_udc);
+    FILE *s = fopen(path, "r");
+    if (!s) return false;
+    char st[32] = "";
+    if (!fgets(st, sizeof st, s)) st[0] = 0;
+    fclose(s);
+    return strncmp(st, "configured", 10) == 0;
+}
+
+/* §4.3 self-heal (USB never-silent): force a host re-enumeration by re-binding the UDC
+ * (unbind -> rebind = drop+raise the D+ pull-up). The host sees a disconnect/reconnect and
+ * MUST re-issue SET_CONFIGURATION, which re-ENABLEs the FunctionFS function. This is the in-
+ * process equivalent of the daemon restart that's known to recover the gadget, but without
+ * dropping the process/state. Used when a host keeps us 'configured' yet never re-ENABLEs the
+ * function — the macOS-through-a-USB-hub wedge, where the hub holds the device 'configured'
+ * across a session close so the host skips SET_CONFIGURATION on re-claim and we'd sit silent. */
+static void soft_reconnect(const char *gadget_path) {
+    if (!g_udc[0]) return;
+    fprintf(stderr, "harp-ffs: self-heal — host configured but no re-ENABLE; soft-reconnect "
+                    "(UDC re-bind) to force re-enumeration\n");
+    if (!write_udc(gadget_path, "")) /* unbind: device disappears from the bus */
+        fprintf(stderr, "harp-ffs: self-heal unbind failed: %s\n", strerror(errno));
+    usleep(150 * 1000); /* let the host observe the disconnect before we re-advertise */
+    if (!write_udc(gadget_path, g_udc)) /* rebind: device reappears -> host re-enumerates */
+        fprintf(stderr, "harp-ffs: self-heal rebind failed: %s\n", strerror(errno));
 }
 
 /* ---- buffered endpoint io: ffs_io + the framing read/write live in ffs_link.c
@@ -193,19 +238,49 @@ int harp_ffs_serve(const char *ffs_dir, const char *gadget_path,
     fprintf(stderr, "harp-ffs: descriptors written\n");
     bind_udc(gadget_path);
 
+    /* §4.3 self-heal state (USB never-silent). Once a host has enabled us at least once, the
+     * outer wait for the next ENABLE is bounded: if the grace elapses with the host still
+     * 'configured' but no re-ENABLE, soft-reconnect to force re-enumeration so we never sit
+     * silent. HARP_FFS_REBIND_MS tunes the grace (0 disables). `rebound` caps it to ONE
+     * soft-reconnect per stuck-claim episode (any ep0 event clears it), so a genuinely idle or
+     * unplugged host is not re-enumerated in a tight loop, and the first enumeration (before any
+     * ENABLE) is never disturbed. */
+    int rebind_ms = 4000;
+    const char *rebind_env = getenv("HARP_FFS_REBIND_MS");
+    if (rebind_env) rebind_ms = atoi(rebind_env);
+    bool ever_enabled = false, rebound = false;
+
     for (;;) {
         struct usb_functionfs_event ev;
+        if (rebind_ms > 0 && ever_enabled) {
+            struct pollfd pfd = {.fd = ep0, .events = POLLIN};
+            int pr = poll(&pfd, 1, rebind_ms);
+            if (pr == 0) { /* grace elapsed with no ep0 event */
+                if (!rebound && host_configured()) {
+                    soft_reconnect(gadget_path);
+                    rebound = true; /* one per episode; the next ep0 event clears it */
+                }
+                continue;
+            }
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                fprintf(stderr, "harp-ffs: ep0 poll failed: %s\n", strerror(errno));
+                return 1;
+            }
+        }
         ssize_t r = read(ep0, &ev, sizeof ev);
         if (r < (ssize_t)sizeof ev) {
             if (r < 0 && errno == EINTR) continue;
             fprintf(stderr, "harp-ffs: ep0 read failed: %s\n", strerror(errno));
             return 1;
         }
+        rebound = false; /* an ep0 event arrived — this stuck-claim episode is over */
         switch (ev.type) {
             case FUNCTIONFS_BIND:
                 fprintf(stderr, "harp-ffs: bound\n");
                 break;
             case FUNCTIONFS_ENABLE: {
+                ever_enabled = true;
                 fprintf(stderr, "harp-ffs: host enabled interface; session up\n");
                 ffs_io fio;
                 snprintf(path, sizeof path, "%s/ep1", ffs_dir);
