@@ -85,9 +85,16 @@ struct TimedEv {
     uint8_t channel = 0;
 };
 
-class TimedRing {
+/* SPSC ring of fixed-capacity POD items. Capacity must be a power of two. Overflow REFUSES (push
+ * returns false; the caller retries — automation resends anyway). The relaxed/acquire/release
+ * ordering is the load-bearing lock-free contract, so it lives here ONCE — the param and event
+ * rings can't drift (ring-tests stresses both producer/consumer). */
+template <typename T, size_t kCap>
+class SpscRing {
+    static_assert((kCap & (kCap - 1)) == 0, "SpscRing capacity must be a power of two");
+
 public:
-    bool push(const TimedEv &e) {
+    bool push(const T &e) { /* producer: audio thread */
         size_t h = head_.load(std::memory_order_relaxed);
         size_t t = tail_.load(std::memory_order_acquire);
         if (h - t >= kCap) return false;
@@ -95,7 +102,7 @@ public:
         head_.store(h + 1, std::memory_order_release);
         return true;
     }
-    bool pop(TimedEv &out) {
+    bool pop(T &out) { /* consumer: feeder thread */
         size_t t = tail_.load(std::memory_order_relaxed);
         if (t == head_.load(std::memory_order_acquire)) return false;
         out = buf_[t & (kCap - 1)];
@@ -108,31 +115,11 @@ public:
     }
 
 private:
-    static constexpr size_t kCap = 1024;
-    TimedEv buf_[kCap];
+    T buf_[kCap];
     std::atomic<size_t> head_{0}, tail_{0};
 };
 
-class ParamRing {
-public:
-    bool push(ParamChange c) { /* producer: audio thread */
-        size_t h = head_.load(std::memory_order_relaxed);
-        size_t t = tail_.load(std::memory_order_acquire);
-        if (h - t >= kCap) return false;
-        buf_[h & (kCap - 1)] = c;
-        head_.store(h + 1, std::memory_order_release);
-        return true;
-    }
-    bool pop(ParamChange &out) { /* consumer: feeder thread */
-        size_t t = tail_.load(std::memory_order_relaxed);
-        if (t == head_.load(std::memory_order_acquire)) return false;
-        out = buf_[t & (kCap - 1)];
-        tail_.store(t + 1, std::memory_order_release);
-        return true;
-    }
-
-private:
-    static constexpr size_t kCap = 256;
-    ParamChange buf_[kCap];
-    std::atomic<size_t> head_{0}, tail_{0};
-};
+/* Timestamped outbound events (params/ramps/notes) — one ring so cross-type ordering is kept. */
+using TimedRing = SpscRing<TimedEv, 1024>;
+/* Param changes (audio thread -> feeder); device front-panel echoes ride one of these back. */
+using ParamRing = SpscRing<ParamChange, 256>;
