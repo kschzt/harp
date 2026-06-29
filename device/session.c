@@ -408,6 +408,20 @@ static void rsp_head(harp_cbuf *m, uint64_t rid, const char *method, bool has_bo
     harp_env_head(m, HARP_MSG_RESPONSE, rid, method, has_body);
 }
 
+/* Decode a CBOR text string into a fixed buffer, bounds-checked: copies + null-terminates dest
+ * (cap counts the terminator slot) ONLY if the string fits. Returns true iff a string was present
+ * AND fit — an over-long value is rejected and dest left untouched, exactly like the inline
+ * `harp_cdec_text(...) && sl < sizeof buf` guard the request handlers used to repeat. Centralises
+ * the buffer-overflow-safe copy so the bounds check lives in one place. */
+static bool decode_text_into(harp_cdec *b, char *dest, size_t cap) {
+    const char *s;
+    size_t sl;
+    if (!harp_cdec_text(b, &s, &sl) || sl >= cap) return false;
+    memcpy(dest, s, sl);
+    dest[sl] = 0;
+    return true;
+}
+
 static void handle_hello(device *d, const harp_env *e) {
     uint64_t peer_major = 0;
     if (e->has_body) {
@@ -503,13 +517,8 @@ static void handle_state_refs(device *d, const harp_env *e) {
         harp_cdec b;
         harp_cdec_init(&b, e->body, e->body_len);
         uint64_t n, key;
-        const char *s;
-        size_t sl;
-        if (harp_cdec_map(&b, &n) && n >= 1 && harp_cdec_uint(&b, &key) && key == 0 &&
-            harp_cdec_text(&b, &s, &sl) && sl < sizeof filter) {
-            memcpy(filter, s, sl);
-            filter[sl] = 0;
-        }
+        if (harp_cdec_map(&b, &n) && n >= 1 && harp_cdec_uint(&b, &key) && key == 0)
+            decode_text_into(&b, filter, sizeof filter);
     }
     harp_cbuf m;
     harp_cbuf_init(&m);
@@ -549,17 +558,9 @@ static void handle_state_snapshot(device *d, const harp_env *e) {
             for (uint64_t i = 0; i < n; i++) {
                 uint64_t key;
                 if (!harp_cdec_uint(&b, &key)) break;
-                const char *s;
-                size_t sl;
-                if (key == 0 && harp_cdec_text(&b, &s, &sl) && sl < sizeof refname) {
-                    memcpy(refname, s, sl);
-                    refname[sl] = 0;
-                } else if (key == 1 && harp_cdec_text(&b, &s, &sl) && sl < sizeof msg) {
-                    memcpy(msg, s, sl);
-                    msg[sl] = 0;
-                } else if (key > 1) {
-                    harp_cdec_skip(&b);
-                }
+                if (key == 0) decode_text_into(&b, refname, sizeof refname);
+                else if (key == 1) decode_text_into(&b, msg, sizeof msg);
+                else if (key > 1) harp_cdec_skip(&b);
             }
         }
     }
@@ -800,15 +801,9 @@ static void handle_state_refset(device *d, const harp_env *e) {
                 uint64_t key;
                 if (!harp_cdec_uint(&b, &key)) break;
                 switch (key) {
-                    case 0: {
-                        const char *s;
-                        size_t sl;
-                        if (harp_cdec_text(&b, &s, &sl) && sl < sizeof refname) {
-                            memcpy(refname, s, sl);
-                            refname[sl] = 0;
-                        }
+                    case 0:
+                        decode_text_into(&b, refname, sizeof refname);
                         break;
-                    }
                     case 1:
                         if (harp_cdec_peek_null(&b)) {
                             harp_cdec_null(&b);
