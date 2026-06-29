@@ -190,9 +190,9 @@ def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetso
     _render(name, seconds, bar, bass, arp, mel, counter, pad, arp_ep, envs)
 
 if __name__ == '__main__':
-    # Movement XXV — A PHRYGIAN DOMINANT flamenco, the most exotic dark: here the A7b9 is the TONIC
-    # (not a passing dominant) — that flat-9 (Bb) sitting over a major-3rd (C#) is the raw edge of
-    # Andalusian cante hondo, the bII Bbmaj7 its black Spanish shadow. A dramatic, declamatory dark,
-    # the phrased lead like a voice keening over the gypsy cadence. A different colour of night.
-    P = [(45, '7b9'), (46, 'maj7'), (50, 'm'), (45, '7b9')]   # A phrygian-dom: A7b9 Bbmaj7 Dm A7b9
-    compose('movement-xxv-a-phrygiandom-flamenco', 45, 'phrygian_dominant', P, bpm=60, reps=2, seed=113)
+    # Movement XXVI — G DORIAN, lush and OPEN: built on the minor-11 tonic (Gm11 — root, b3, 5, b7,
+    # 9, 11 all sounding, a wide stacked-fourths haze) with the dorian major-IV C glinting through.
+    # After the noir tension and flamenco edge, a gentler, more spacious dark — less a cliff than a
+    # wide grey sea at dusk. The phrased lead drifts over the open voicings, unhurried.
+    P = [(43, 'm11'), (48, 'majadd9'), (53, 'maj7'), (43, 'm11')]   # G dorian: Gm11 Cadd9 Fmaj7 Gm11
+    compose('movement-xxvi-g-dorian-lush', 43, 'dorian', P, bpm=60, reps=2, seed=127)
