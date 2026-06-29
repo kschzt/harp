@@ -1,9 +1,13 @@
 dangerousTypeCast
-invalidPointerCast
 uninitMemberVar
 uninitMemberVarNoCtor
 uninitMemberVarPrivate
-unknownMacro
+unknownMacro:shell/fx_plugin.cpp
+unknownMacro:shell/plugin.cpp
+invalidPointerCast:device/harp-deviced.c
+invalidPointerCast:host/rtp_udp.c
+invalidPointerCast:shell/eth_transport.h
+invalidPointerCast:shell/runtime.cpp
 identicalConditionAfterEarlyExit:shell/eth_transport.h
 preprocessorErrorDirective:shell/shell_config.h
 missingInclude

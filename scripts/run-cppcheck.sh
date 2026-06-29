@@ -33,7 +33,7 @@ echo "── cppcheck: C++ sources (shell, vst3-host) ──"
 # shellcheck disable=SC2086
 cppcheck $COMMON --std=c++17 --language=c++ -U HARP_SHELL_CONFIG_HEADER \
   -I core/include -I host -I shell \
-  shell tools/vst3-host/main.cpp
+  shell tools/vst3-host
 rc_cpp=$?
 
 if [ "$rc_c" -eq 0 ] && [ "$rc_cpp" -eq 0 ]; then
