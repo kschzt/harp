@@ -12,6 +12,8 @@ import json, subprocess, random
 CH = {'m9':[0,3,7,10,14], 'm7':[0,3,7,10], 'm':[0,3,7], 'madd9':[0,3,7,14],
       'maj9':[0,4,7,11,14], 'maj7':[0,4,7,11], 'majadd9':[0,4,7,14],
       'mmaj9':[0,3,7,11,14], 'mmaj7':[0,3,7,11],          # minor-MAJOR 7 — the noir/melodic-minor tonic
+      'm11':[0,3,7,10,14,17], 'm6':[0,3,7,9],             # lush minor-11 / bittersweet minor-6
+      '7b9':[0,4,7,10,13], 'dim7':[0,3,6,9],              # noir dominant-b9 / fully-diminished passing
       'sus2':[0,2,7], '7':[0,4,7,10], '9':[0,4,7,10,14], 'm7b5':[0,3,6,10]}
 MODE = {'aeolian':[0,2,3,5,7,8,10], 'dorian':[0,2,3,5,7,9,10], 'phrygian':[0,1,3,5,7,8,10],
         'harmonic_minor':[0,2,3,5,7,8,11], 'melodic_minor':[0,2,3,5,7,9,11],
@@ -188,9 +190,9 @@ def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetso
     _render(name, seconds, bar, bass, arp, mel, counter, pad, arp_ep, envs)
 
 if __name__ == '__main__':
-    # Movement XX — B AEOLIAN, a single-mode piece written for the LEAD to sing: the new phrase
-    # contour gives it a question-and-answer shape (antecedent bars rise, consequent bars fall and
-    # resolve onto a chord tone), breathing over the i-bVI-bVII-iv loop with the pad as a low haze.
-    # Less a structure than a melody — the most lyrical of the set.
-    P = [(47, 'm9'), (43, 'maj7'), (45, 'majadd9'), (52, 'm7')]   # B aeolian: Bm9 Gmaj7 Aadd9 Em7
-    compose('movement-xx-b-aeolian-lyric', 47, 'aeolian', P, bpm=60, reps=2, seed=97)
+    # Movement XXI — D HARMONIC MINOR noir, leaning on the new richer chords: the iv is a bittersweet
+    # G MINOR-6 (the natural-6 E glinting through the dark), the V is the classic A7b9 — that flat-9
+    # (Bb) over a major-3rd dominant is the sound of every noir cliffhanger — resolving hard to the
+    # minor-major tonic. Slow (56bpm), the phrased lead crying over it. The most cinematic-dark yet.
+    P = [(50, 'mmaj9'), (43, 'm6'), (45, '7b9'), (50, 'mmaj9')]   # Dm(maj9) Gm6 A7b9 Dm(maj9)
+    compose('movement-xxi-d-harmonicminor-noir', 50, 'harmonic_minor', P, bpm=56, reps=2, seed=101)
