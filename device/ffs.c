@@ -247,7 +247,18 @@ int harp_ffs_serve(const char *ffs_dir, const char *gadget_path,
      * ENABLE) is never disturbed. */
     int rebind_ms = 4000;
     const char *rebind_env = getenv("HARP_FFS_REBIND_MS");
-    if (rebind_env) rebind_ms = atoi(rebind_env);
+    if (rebind_env && rebind_env[0]) {
+        /* Validate, don't atoi(): a typo'd env (e.g. "4s") would atoi to 0 and SILENTLY disable
+         * the never-silent self-heal — the opposite of what the operator wants. Accept only a full
+         * integer in [0, 600000] (0 explicitly disables); otherwise keep the default and warn. */
+        char *end = NULL;
+        long v = strtol(rebind_env, &end, 10);
+        if (end != rebind_env && *end == '\0' && v >= 0 && v <= 600000)
+            rebind_ms = (int)v;
+        else
+            fprintf(stderr, "harp-ffs: ignoring invalid HARP_FFS_REBIND_MS='%s' (keeping %dms)\n",
+                    rebind_env, rebind_ms);
+    }
     bool ever_enabled = false, rebound = false;
 
     for (;;) {

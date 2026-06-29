@@ -376,7 +376,7 @@ void audio_stop(device *d) {
      * tearing down the render thread so no echo races a half-stopped stream. */
     meter_pump_stop(d);
     if (!atomic_load_explicit(&d->audio.thread_live, memory_order_relaxed)) return;
-    d->audio.running = false;
+    atomic_store_explicit(&d->audio.running, false, memory_order_relaxed); /* _Atomic: keep every access atomic (matches session.c) */
     /* The audio thread may be parked in a blocking endpoint read (mode 1 pacing).
      * On POSIX, recv()/read() are pthread cancellation points, so pthread_cancel
      * interrupts the park and the loop unwinds at once. On Windows/winpthreads a

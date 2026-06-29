@@ -1712,7 +1712,8 @@ bool HarpRuntime::start(uint32_t sampleRate) {
             for (const char *p = e; *p;) {
                 char *end = nullptr;
                 unsigned long v = strtoul(p, &end, 10);
-                if (end == p) break; /* no digits: stop at the garbage */
+                if (end == p) break;        /* no digits: stop at the garbage */
+                if (v > 0xFFFFFFFFUL) break; /* >32-bit would silently truncate to a wrong slot — reject */
                 slots.push_back((uint32_t)v);
                 p = (*end == ',') ? end + 1 : end;
             }
@@ -2969,7 +2970,13 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
      * per push wedges the device — so headless takes the same archive-protected Push the
      * pre-recall baseline did. An unborn device is always a clean first push. */
     int timeout_ms = 30000;
-    if (const char *env = getenv("HARP_RECONCILE_TIMEOUT_MS")) timeout_ms = atoi(env);
+    if (const char *env = getenv("HARP_RECONCILE_TIMEOUT_MS")) {
+        int v = atoi(env);
+        /* clamp to [0, 120000]: 0 = headless (skip the offer, push now); the upper bound keeps
+         * the signed `waited` poll loop below (waited += POLL_MS) from overflowing to UB on a
+         * pathologically large value. A negative/garbage env is treated as 0 (headless), not a hang. */
+        timeout_ms = v < 0 ? 0 : (v > 120000 ? 120000 : v);
+    }
     int choice = 0; /* default Push — unborn, headless (timeout 0), and the no-pick path */
     if (!live.unborn && timeout_ms > 0) {
         char expect12[16], live12[16], hex[2 * HARP_HASH_LEN + 1];
@@ -4111,10 +4118,25 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
              * "project state apply failed (will retry on reconnect)") and carries on; this path must
              * match it. Propagating false made the VST3 host's component->setState fail FATALLY for a
              * recoverable hiccup — the intermittent `staged-connected` Windows flake. A genuinely
-             * malformed bundle still returns false EARLY (above), so setState's error contract holds. */
-            log_msg("recall: staged-while-connected auto-push deferred (transient ctl error) — staged; re-asserts on reconnect");
-            recordLog(HARP_LOG_WARN, "recall",
-                      "staged-while-connected auto-push deferred (transient); staged, will re-assert on reconnect");
+             * malformed bundle still returns false EARLY (above), so setState's error contract holds.
+             *
+             * Distinguish WHY it failed (the connect-time re-assert at helloAndIdentity does the same):
+             * pushStateLocked sets readOnlyDefault_/engineRefused_ when the device REFUSED the project
+             * (§13.4 incompatible engine) — a PERMANENT hold, not a transient hiccup. Log it as a
+             * read-only hold so the session log isn't misleading; a real transport timeout (no flag
+             * set) is the transient/deferred case. Either way the bundle is staged and setState is
+             * non-fatal (a held project must not crash the host any more than a deferred one). */
+            if (readOnlyDefault_.load(std::memory_order_relaxed) ||
+                roExplicit_.load(std::memory_order_relaxed) ||
+                engineRefused_.load(std::memory_order_relaxed)) {
+                log_msg("recall: staged-while-connected held read-only (device refused / mismatch) — not auto-applied");
+                recordLog(HARP_LOG_WARN, "recall",
+                          "staged-while-connected held read-only (device refused / mismatch) — not auto-applied");
+            } else {
+                log_msg("recall: staged-while-connected auto-push deferred (transient ctl error) — staged; re-asserts on reconnect");
+                recordLog(HARP_LOG_WARN, "recall",
+                          "staged-while-connected auto-push deferred (transient); staged, will re-assert on reconnect");
+            }
         }
         return true;
     }
