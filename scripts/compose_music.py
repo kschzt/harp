@@ -190,9 +190,12 @@ def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetso
     _render(name, seconds, bar, bass, arp, mel, counter, pad, arp_ep, envs)
 
 if __name__ == '__main__':
-    # Movement XXIII — A HARMONIC MINOR, built on the dark-romantic vii°7 cadence: the leading-tone
-    # G#dim7 (a fully-diminished chord, all minor thirds, maximally unstable) pulls hard down onto
-    # the minor-major tonic Am(maj9) — the sound of a held breath released. Slow (58bpm), the phrased
-    # lead arcing over it. A piece about tension and its resolution, again and again.
-    P = [(45, 'mmaj9'), (50, 'm7'), (44, 'dim7'), (45, 'mmaj9')]   # Am(maj9) Dm7 G#dim7 Am(maj9) — i iv vii°7 i
-    compose('movement-xxiii-a-harmonicminor-dim', 45, 'harmonic_minor', P, bpm=58, reps=2, seed=107)
+    # Movement XXIV — an A-B-C-A ASCENT (the mirror of XXII's descent): each section LIFTS a whole
+    # step (D dorian -> E dorian -> F# dorian) before settling home to D — a feeling of rising,
+    # reaching, the dorian major-IV keeping a thread of light through the dark. The build-to-C arc
+    # makes the highest point (F#) the brightest crest. A touch quicker (66bpm) — it has momentum.
+    A = [(50, 'm9'), (55, 'majadd9'), (48, 'maj7'), (50, 'm9')]   # D dorian: Dm9 Gadd9 Cmaj7 Dm9
+    B = [(52, 'm9'), (57, 'majadd9'), (50, 'maj7'), (52, 'm9')]   # E dorian (up a step): Em9 Aadd9 Dmaj7 Em9
+    C = [(54, 'm9'), (59, 'majadd9'), (52, 'maj7'), (54, 'm9')]   # F# dorian (up again): F#m9 Badd9 Emaj7 F#m9
+    compose_form('movement-xxiv-abca-ascent', 50,
+                 [('dorian', A), (52, 'dorian', B), (54, 'dorian', C), ('dorian', A)], bpm=66, reps_each=1, seed=109)
