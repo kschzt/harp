@@ -31,16 +31,7 @@
 #include "runtime.h"   /* HarpRuntime::bundleWantedSerial (public static) */
 #include "harp/cbor.h" /* build a minimal §15.3 bundle for the eth-serial selection test */
 
-static int g_fail = 0, g_pass = 0;
-#define CHECK(cond)                                                        \
-    do {                                                                   \
-        if (cond) {                                                        \
-            g_pass++;                                                      \
-        } else {                                                           \
-            g_fail++;                                                      \
-            fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-        }                                                                  \
-    } while (0)
+#include "check.h"
 
 /* runtime_acquire(): always a fresh, PRIVATE runtime — no table, no refcount, no
  * sharing. Two acquires must NOT alias (both LIVE here, so distinct addresses is
@@ -158,6 +149,5 @@ int main() {
     test_admission_ledger();
     test_eth_bundle_not_usb_target();
 
-    printf("%d passed, %d failed\n", g_pass, g_fail);
-    return g_fail ? 1 : 0;
+    return check_report(NULL);
 }
