@@ -1,0 +1,138 @@
+name: soak
+
+# Nightly flake-hunt + deep fuzz. Complements the eth-asan ASan/UBSan nightly: this one
+# (1) explores the §16 parsers far deeper than the per-PR fuzz SMOKE (minutes per engine vs
+# 30k runs), and (2) repeats the full §8.7 eth conformance suite to surface INTERMITTENT
+# flakes a single PR run hides — the cloud-side complement to the hardware-fleet soak (which
+# stays a bench tool; this needs no hardware). Manual runs via workflow_dispatch can tune the
+# durations. Does not gate PRs.
+on:
+  schedule:
+    - cron: '37 9 * * *' # nightly, offset from eth-asan (07:17)
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: 'seconds per fuzz engine (default 600)'
+        required: false
+        default: '600'
+      eth_iterations:
+        description: 'eth-suite repeats for flake detection (default 6)'
+        required: false
+        default: '6'
+      hw_usb_n:
+        description: 'usb-stress iterations per vector on the Pi rig (default 10)'
+        required: false
+        default: '10'
+
+permissions:
+  contents: read
+
+jobs:
+  deep-fuzz:
+    if: github.repository == 'kschzt/harp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [cbor, envelope, object, link, audio, state, evt]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: build fuzz tree (clang, ASan, libFuzzer)
+        run: |
+          CC=clang cmake -B build-fuzz -DHARP_FUZZ=ON
+          cmake --build build-fuzz -j --target fuzz-${{ matrix.target }} gen-corpus
+      - name: deep fuzz ${{ matrix.target }}
+        run: |
+          mkdir -p corpus && ./build-fuzz/gen-corpus corpus
+          ./build-fuzz/fuzz-${{ matrix.target }} \
+            -max_total_time=${{ github.event.inputs.fuzz_seconds || '600' }} \
+            -max_len=4096 corpus
+      - name: upload crash corpus on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: |
+            crash-*
+            ./*crash*
+          if-no-files-found: ignore
+
+  eth-flake:
+    if: github.repository == 'kschzt/harp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: deps + SDKs
+        run: |
+          sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libsamplerate0-dev
+          git clone --depth 1 --recursive \
+            https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
+          git clone --depth 1 --branch 1.2.8 \
+            https://github.com/free-audio/clap.git external/clap
+      - name: build device + shell
+        run: |
+          cmake -B build -S .
+          cmake --build build --target harp-deviced harp-probe harp-eth-latefr-test harp-eth-fence-test -j
+          cmake -B build-vst -S tools/vst3-host
+          cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host -j
+      - name: eth conformance suite x N (intermittent-flake detection)
+        run: |
+          N=${{ github.event.inputs.eth_iterations || '6' }}
+          for i in $(seq 1 "$N"); do
+            echo "──────── eth-suite iteration $i/$N ────────"
+            scripts/eth-suite.sh || { echo "eth-suite FAILED on iteration $i/$N"; exit 1; }
+          done
+          echo "eth-suite: $N/$N iterations clean"
+
+  hw-soak:
+    # REAL HARDWARE soak on the self-hosted rig (PI4B-0002 over USB) — the fleet-soak spirit,
+    # nightly. The cloud jobs above can't drive a Pi; this runs the FULL usb-stress/duress
+    # battery (the never-wedge / never-silent guarantee, hammered far harder than the trimmed
+    # N=2 leg hw.yml runs on every merge) plus recall round-trips. Shares the harp-hw concurrency
+    # group with hw.yml so the single exclusive Pi is never driven by two runs at once.
+    if: github.repository == 'kschzt/harp'
+    runs-on: [self-hosted, harp-hw]
+    timeout-minutes: 45
+    concurrency:
+      group: harp-hw
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: VST3 SDK (cached on the runner at ~/vst3sdk)
+        run: |
+          mkdir -p external
+          if [ -d "$HOME/vst3sdk/.git" ]; then ln -sfn "$HOME/vst3sdk" external/vst3sdk
+          else git clone --depth 1 --recursive https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk; fi
+      - name: CLAP SDK (cached on the runner at ~/clap)
+        run: |
+          mkdir -p external
+          if [ -d "$HOME/clap/.git" ]; then ln -sfn "$HOME/clap" external/clap
+          else git clone --depth 1 --branch 1.2.8 https://github.com/free-audio/clap.git external/clap; fi
+      - name: build core + device tools, shell
+        run: |
+          cmake -B build && cmake --build build -j
+          cmake -B build-vst -S tools/vst3-host
+          cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host -j
+          cmake --build build-vst --target install-linux
+      - name: deploy harp-deviced under test to PI4B-0002
+        run: |
+          rsync -a --delete --exclude build --exclude .git --exclude external \
+            ./ ci@harptest.local:harp/
+          ssh ci@harptest.local \
+            'cmake -B ~/harp/build ~/harp && cmake --build ~/harp/build -j4 --target harp-deviced \
+             && sudo -n systemctl restart harp-deviced-usb'
+      - name: extended USB stress/duress soak (full battery, ${{ github.event.inputs.hw_usb_n || '10' }}x/vector)
+        env:
+          TARGET_SER: PI4B-0002
+          TARGET_SSH: ci@harptest.local
+          N: ${{ github.event.inputs.hw_usb_n || '10' }}
+          VECTORS: crash killd stopstr
+        run: scripts/usb-stress.sh
+      - name: recall round-trip soak (save/scramble/restore through PI4B-0002, x3)
+        run: |
+          for i in 1 2 3; do
+            echo "──────── recall round-trip $i/3 ────────"
+            scripts/recall-roundtrip.sh || { echo "recall round-trip FAILED on $i/3"; exit 1; }
+          done

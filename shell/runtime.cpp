@@ -2645,6 +2645,9 @@ void HarpRuntime::demuxUnionFrame(const float *pl, size_t ns, uint16_t S) {
                 tmp[2 * j] = pl[(i + j) * S + 0];
                 tmp[2 * j + 1] = pl[(i + j) * S + 1];
             }
+            /* the loop above fills tmp[0 .. 2*chunk), exactly the range written here; cppcheck
+             * can't prove the variable-length loop covers it (false positive). */
+            /* cppcheck-suppress uninitvar */
             audioRing_.write(tmp, chunk * 2);
             i += chunk;
         }

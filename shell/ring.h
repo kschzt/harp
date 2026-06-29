@@ -16,6 +16,10 @@ public:
         buf_ = new float[cap_]();
     }
     ~FloatRing() { delete[] buf_; }
+    /* owns a heap buffer + atomic cursors -> non-copyable by construction (the atomics already
+     * delete the implicit copy); make it explicit so the rule-of-3 is unambiguous (no double-free). */
+    FloatRing(const FloatRing &) = delete;
+    FloatRing &operator=(const FloatRing &) = delete;
 
     /* consumer-side (and observer) form: acquire on head publishes the
      * producer's buffer writes */

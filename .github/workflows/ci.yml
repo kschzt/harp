@@ -278,3 +278,18 @@ jobs:
       - name: protocol abuse vs sanitized daemon (T9-lite)
         run: DEVICED=build-fuzz/harp-deviced PROBE=build-fuzz/harp-probe
              ./scripts/abuse-test.sh
+
+  static-analysis:
+    # cppcheck (warning + portability) over the production C/C++ sources against a documented
+    # by-design baseline (scripts/cppcheck-suppressions.txt). Catches a NEW real issue (uninit
+    # use, null deref, buffer overflow, ...) on every push without a build — the cloud-side
+    # complement to the ASan/UBSan nightly. No SDK/build needed; cppcheck parses with the include
+    # dirs. Fast (~1 min). Fails only on a finding OUTSIDE the baseline.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
+      - name: cppcheck (warning + portability, baselined)
+        run: bash scripts/run-cppcheck.sh
