@@ -2941,6 +2941,16 @@ bool HarpRuntime::fetchClosureLocked(const harp_hash &root) {
 /* Push staged target to the device: the §11.4 Push with archive-before-push.
  * Caller holds ctlMutex_. */
 bool HarpRuntime::pushStateLocked(const harp_hash &target) {
+    /* test-only fault injection: HARP_TEST_PUSH_FAIL simulates ONE transient ctl push failure
+     * (the kind a loaded Windows runner produces when a request/response is delayed past the
+     * live-session recv bound). One-shot so a later re-assert proceeds normally. The
+     * staged-connected test uses this to PROVE that a failed staged-while-connected auto-push is
+     * non-fatal — i.e. that the Windows `component setState failed` -> rc=1 flake is fixed. */
+    if (getenv("HARP_TEST_PUSH_FAIL")) {
+        static std::atomic<bool> injected{false};
+        bool expected = false;
+        if (injected.compare_exchange_strong(expected, true)) return false;
+    }
     harp_ref live;
     if (!refsLocked(&live)) return false;
     if (!live.unborn && !live.dirty && harp_hash_eq(&live.hash, &target)) {
@@ -4091,7 +4101,22 @@ bool HarpRuntime::setStateBundle(const uint8_t *data, size_t len) {
             return true;
         }
         std::lock_guard<std::mutex> lk(ctlMutex_);
-        return pushStateLocked(target);
+        if (!pushStateLocked(target)) {
+            /* The bundle is STAGED (recorded above) — only the IMMEDIATE auto-push failed, and a
+             * failed push here is recoverable, not data loss: a transient ctl error (a request/
+             * response delayed past the live-session recv bound while the just-started audio stream
+             * loads the link — intermittent on a loaded Windows runner) leaves the staged project
+             * intact, and "Live wins" re-asserts it on the next reconnect/operation. The connect-time
+             * re-assert already treats the SAME pushStateLocked failure as recoverable (helloAndIdentity:
+             * "project state apply failed (will retry on reconnect)") and carries on; this path must
+             * match it. Propagating false made the VST3 host's component->setState fail FATALLY for a
+             * recoverable hiccup — the intermittent `staged-connected` Windows flake. A genuinely
+             * malformed bundle still returns false EARLY (above), so setState's error contract holds. */
+            log_msg("recall: staged-while-connected auto-push deferred (transient ctl error) — staged; re-asserts on reconnect");
+            recordLog(HARP_LOG_WARN, "recall",
+                      "staged-while-connected auto-push deferred (transient); staged, will re-assert on reconnect");
+        }
+        return true;
     }
     log_msg("recall bundle staged (device offline); will apply on connect");
     return true;

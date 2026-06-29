@@ -18,3 +18,7 @@ recall-eth-state/
 recall-eth.state
 recall-eth.params
 offedit-eth-state/
+staged-connected-*/
+core-state/
+admission-eth-state/
+credit-eth-state/
