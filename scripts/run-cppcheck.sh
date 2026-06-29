@@ -27,8 +27,11 @@ cppcheck $COMMON --std=c11 --language=c \
 rc_c=$?
 
 echo "── cppcheck: C++ sources (shell, vst3-host) ──"
+# -U HARP_SHELL_CONFIG_HEADER: analyse the DEFAULT (refdev) config so cppcheck does not explore
+# the downstream-override branch whose `#include HARP_SHELL_CONFIG_HEADER` (shell_config.h) it
+# can't resolve standalone (a CMake -D injects a real path in a product build).
 # shellcheck disable=SC2086
-cppcheck $COMMON --std=c++17 --language=c++ \
+cppcheck $COMMON --std=c++17 --language=c++ -U HARP_SHELL_CONFIG_HEADER \
   -I core/include -I host -I shell \
   shell tools/vst3-host/main.cpp
 rc_cpp=$?

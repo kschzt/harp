@@ -5,6 +5,7 @@ uninitMemberVarNoCtor
 uninitMemberVarPrivate
 unknownMacro
 identicalConditionAfterEarlyExit:shell/eth_transport.h
+preprocessorErrorDirective:shell/shell_config.h
 missingInclude
 missingIncludeSystem
 checkersReport
