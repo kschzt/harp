@@ -98,4 +98,22 @@ grep -q "held read-only" "$HOSTLOG" \
 kill -9 "$DP" 2>/dev/null; DP=""
 echo "   ✓ control: staged-while-connected onto its own unit ($SAVED_SERIAL) was NOT held read-only"
 
-echo "STAGED-CONNECTED PASS (§11.4 HIGH #8: --load-state-after-connect onto a mismatched/different-serial unit held READ-ONLY [not auto-applied]; same-unit staging applies)"
+# ── 3) TRANSIENT (Windows-flake regression guard): stage onto the SAME unit but FORCE the
+#       auto-push to hit ONE transient ctl error (HARP_TEST_PUSH_FAIL). A failed auto-push of a
+#       staged-while-connected bundle is RECOVERABLE — "Live wins" re-asserts on reconnect, exactly
+#       as the connect-time re-assert tolerates it — so the host MUST NOT die. Before the fix the
+#       runtime propagated the push failure as false -> the VST3 host's component->setState returned
+#       kResultFalse -> "component setState failed" -> rc=1: the intermittent `staged-connected`
+#       failure that only surfaced under a loaded Windows CI runner. This reproduces it on demand.
+start_dev "$SAVED_SERIAL" trans
+export HARP_TEST_PUSH_FAIL=1
+run_host "$SAVED_SERIAL" transient --load-state-after-connect "$STATE"   # run_host already asserts rc==0
+unset HARP_TEST_PUSH_FAIL
+grep -q "auto-push deferred (transient" "$HOSTLOG" \
+  || { cat "$HOSTLOG"; fail "transient: a forced push failure did NOT take the non-fatal deferred path (the Windows-flake fix is missing)"; }
+grep -q "held read-only" "$HOSTLOG" \
+  && { cat "$HOSTLOG"; fail "transient: a transient push failure wrongly held read-only (must defer, not hold)"; }
+kill -9 "$DP" 2>/dev/null; DP=""
+echo "   ✓ transient: a forced transient auto-push failure was NON-FATAL (host survived rc=0, bundle staged) — Windows flake guarded"
+
+echo "STAGED-CONNECTED PASS (§11.4 HIGH #8: --load-state-after-connect onto a mismatched/different-serial unit held READ-ONLY [not auto-applied]; same-unit staging applies; a transient push failure is non-fatal)"
