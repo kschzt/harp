@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 # HARP static-analysis lane — cppcheck (warning + portability) over the production C and C++
-# sources, against a documented by-design baseline (scripts/cppcheck-suppressions.txt). Exits
-# non-zero on ANY finding outside the baseline, so a new real issue fails CI. Run it locally
-# exactly as CI does:  bash scripts/run-cppcheck.sh
+# sources, against a by-design baseline (scripts/cppcheck-suppressions.txt). Exits non-zero on
+# ANY finding outside the baseline, so a new real issue fails CI. Run it locally exactly as CI
+# does:  bash scripts/run-cppcheck.sh
+#
+# The high-signal checks stay ACTIVE (uninitvar, nullPointer, bufferOverflow, ...). The baseline
+# file is IDs-only (no comments — older cppcheck rejects "# ..." lines as "no id"); the rationale
+# per suppressed id:
+#   dangerousTypeCast        C-style casts at C / socket / VST3-SDK boundaries (C-interop code)
+#   invalidPointerCast       §8.7 audio wire reinterprets byte buffers as the float sample stream
+#   uninitMemberVar*         lock-free SPSC rings + per-block POD state, written-before-read (§15.1)
+#   unknownMacro             VST3 SDK macros (BEGIN_FACTORY_DEF, OBJ_METHODS) are opaque to cppcheck
+#   identicalConditionAfterEarlyExit:shell/eth_transport.h  double-checked locking (mutex not modeled)
+#   missingInclude/System, checkersReport  cppcheck environment limits, not code
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
