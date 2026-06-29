@@ -190,9 +190,12 @@ def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetso
     _render(name, seconds, bar, bass, arp, mel, counter, pad, arp_ep, envs)
 
 if __name__ == '__main__':
-    # Movement XXI — D HARMONIC MINOR noir, leaning on the new richer chords: the iv is a bittersweet
-    # G MINOR-6 (the natural-6 E glinting through the dark), the V is the classic A7b9 — that flat-9
-    # (Bb) over a major-3rd dominant is the sound of every noir cliffhanger — resolving hard to the
-    # minor-major tonic. Slow (56bpm), the phrased lead crying over it. The most cinematic-dark yet.
-    P = [(50, 'mmaj9'), (43, 'm6'), (45, '7b9'), (50, 'mmaj9')]   # Dm(maj9) Gm6 A7b9 Dm(maj9)
-    compose('movement-xxi-d-harmonicminor-noir', 50, 'harmonic_minor', P, bpm=56, reps=2, seed=101)
+    # Movement XXII — an A-B-C-A DESCENT: each section sinks a whole step (E aeolian -> D aeolian ->
+    # C aeolian) before climbing home to E — a feeling of falling deeper, the build-to-C dynamics
+    # making the lowest point (C) also the loudest, a heavy dark trough rather than a bright crest.
+    # The bittersweet minor-6 iv glints through each level. Then the homecoming lifts back to E.
+    A = [(52, 'madd9'), (48, 'maj7'), (45, 'm6'), (52, 'madd9')]  # E aeolian: Em(add9) Cmaj7 Am6 Em(add9)
+    B = [(50, 'madd9'), (46, 'maj7'), (43, 'm6'), (50, 'madd9')]  # D aeolian (down a step): Dm(add9) Bbmaj7 Gm6
+    C = [(48, 'm9'), (44, 'maj7'), (41, 'm6'), (46, 'majadd9')]   # C aeolian (down again): Cm9 Abmaj7 Fm6 Bbadd9
+    compose_form('movement-xxii-abca-descent', 52,
+                 [('aeolian', A), (50, 'aeolian', B), (48, 'aeolian', C), ('aeolian', A)], bpm=60, reps_each=1, seed=103)
