@@ -1,0 +1,33 @@
+# HARP cppcheck baseline — BY-DESIGN patterns, not bugs. Keep this list minimal and
+# commented; a NEW real finding OUTSIDE these must fail the static-analysis lane
+# (scripts/run-cppcheck.sh runs with --error-exitcode). Format: errorId[:file].
+#
+# The high-signal checks stay ACTIVE: uninitvar (local uninitialized use), nullPointer,
+# bufferOverflow, and the rest of warning/portability. Only the pervasive by-design idioms
+# below — C/socket/SDK-boundary casts, the §8.7 audio byte<->float wire, lock-free POD member
+# init, and SDK macros cppcheck can't expand — are baselined.
+
+# C-style casts at C / socket / VST3-SDK boundaries are intentional (this is C-interop code).
+dangerousTypeCast
+
+# §8.7 audio wire: byte buffers are reinterpreted as the contiguous float sample stream — the
+# whole transport is built around this layout (alignment-safe at these sites).
+invalidPointerCast
+
+# Lock-free SPSC rings + per-block POD state are written-before-read / default-constructed; the
+# audio-thread contract (§15.1) forbids per-block zeroing on the hot path.
+uninitMemberVar
+uninitMemberVarNoCtor
+uninitMemberVarPrivate
+
+# VST3 SDK macros (BEGIN_FACTORY_DEF, OBJ_METHODS, ...) are opaque to cppcheck's preprocessor.
+unknownMacro
+
+# Double-checked locking: the re-check under acceptMu_ is intentional (another thread may have
+# won the accept while we waited for the lock); cppcheck does not model the mutex.
+identicalConditionAfterEarlyExit:shell/eth_transport.h
+
+# Environment limits (cppcheck can't resolve every system/SDK header in this build), not code.
+missingInclude
+missingIncludeSystem
+checkersReport

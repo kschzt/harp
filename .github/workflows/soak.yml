@@ -1,0 +1,83 @@
+name: soak
+
+# Nightly flake-hunt + deep fuzz. Complements the eth-asan ASan/UBSan nightly: this one
+# (1) explores the §16 parsers far deeper than the per-PR fuzz SMOKE (minutes per engine vs
+# 30k runs), and (2) repeats the full §8.7 eth conformance suite to surface INTERMITTENT
+# flakes a single PR run hides — the cloud-side complement to the hardware-fleet soak (which
+# stays a bench tool; this needs no hardware). Manual runs via workflow_dispatch can tune the
+# durations. Does not gate PRs.
+on:
+  schedule:
+    - cron: '37 9 * * *' # nightly, offset from eth-asan (07:17)
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: 'seconds per fuzz engine (default 600)'
+        required: false
+        default: '600'
+      eth_iterations:
+        description: 'eth-suite repeats for flake detection (default 6)'
+        required: false
+        default: '6'
+
+permissions:
+  contents: read
+
+jobs:
+  deep-fuzz:
+    if: github.repository == 'kschzt/harp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [cbor, envelope, object, link, audio, state, evt]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: build fuzz tree (clang, ASan, libFuzzer)
+        run: |
+          CC=clang cmake -B build-fuzz -DHARP_FUZZ=ON
+          cmake --build build-fuzz -j --target fuzz-${{ matrix.target }} gen-corpus
+      - name: deep fuzz ${{ matrix.target }}
+        run: |
+          mkdir -p corpus && ./build-fuzz/gen-corpus corpus
+          ./build-fuzz/fuzz-${{ matrix.target }} \
+            -max_total_time=${{ github.event.inputs.fuzz_seconds || '600' }} \
+            -max_len=4096 corpus
+      - name: upload crash corpus on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: |
+            crash-*
+            ./*crash*
+          if-no-files-found: ignore
+
+  eth-flake:
+    if: github.repository == 'kschzt/harp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: deps + SDKs
+        run: |
+          sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libsamplerate0-dev
+          git clone --depth 1 --recursive \
+            https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
+          git clone --depth 1 --branch 1.2.8 \
+            https://github.com/free-audio/clap.git external/clap
+      - name: build device + shell
+        run: |
+          cmake -B build -S .
+          cmake --build build --target harp-deviced harp-probe harp-eth-latefr-test harp-eth-fence-test -j
+          cmake -B build-vst -S tools/vst3-host
+          cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host -j
+      - name: eth conformance suite x N (intermittent-flake detection)
+        run: |
+          N=${{ github.event.inputs.eth_iterations || '6' }}
+          for i in $(seq 1 "$N"); do
+            echo "──────── eth-suite iteration $i/$N ────────"
+            scripts/eth-suite.sh || { echo "eth-suite FAILED on iteration $i/$N"; exit 1; }
+          done
+          echo "eth-suite: $N/$N iterations clean"
