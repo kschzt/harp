@@ -190,12 +190,9 @@ def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetso
     _render(name, seconds, bar, bass, arp, mel, counter, pad, arp_ep, envs)
 
 if __name__ == '__main__':
-    # Movement XXIV — an A-B-C-A ASCENT (the mirror of XXII's descent): each section LIFTS a whole
-    # step (D dorian -> E dorian -> F# dorian) before settling home to D — a feeling of rising,
-    # reaching, the dorian major-IV keeping a thread of light through the dark. The build-to-C arc
-    # makes the highest point (F#) the brightest crest. A touch quicker (66bpm) — it has momentum.
-    A = [(50, 'm9'), (55, 'majadd9'), (48, 'maj7'), (50, 'm9')]   # D dorian: Dm9 Gadd9 Cmaj7 Dm9
-    B = [(52, 'm9'), (57, 'majadd9'), (50, 'maj7'), (52, 'm9')]   # E dorian (up a step): Em9 Aadd9 Dmaj7 Em9
-    C = [(54, 'm9'), (59, 'majadd9'), (52, 'maj7'), (54, 'm9')]   # F# dorian (up again): F#m9 Badd9 Emaj7 F#m9
-    compose_form('movement-xxiv-abca-ascent', 50,
-                 [('dorian', A), (52, 'dorian', B), (54, 'dorian', C), ('dorian', A)], bpm=66, reps_each=1, seed=109)
+    # Movement XXV — A PHRYGIAN DOMINANT flamenco, the most exotic dark: here the A7b9 is the TONIC
+    # (not a passing dominant) — that flat-9 (Bb) sitting over a major-3rd (C#) is the raw edge of
+    # Andalusian cante hondo, the bII Bbmaj7 its black Spanish shadow. A dramatic, declamatory dark,
+    # the phrased lead like a voice keening over the gypsy cadence. A different colour of night.
+    P = [(45, '7b9'), (46, 'maj7'), (50, 'm'), (45, '7b9')]   # A phrygian-dom: A7b9 Bbmaj7 Dm A7b9
+    compose('movement-xxv-a-phrygiandom-flamenco', 45, 'phrygian_dominant', P, bpm=60, reps=2, seed=113)
