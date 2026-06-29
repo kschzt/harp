@@ -190,9 +190,9 @@ def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetso
     _render(name, seconds, bar, bass, arp, mel, counter, pad, arp_ep, envs)
 
 if __name__ == '__main__':
-    # Movement XXVII — G MELODIC MINOR noir lyric: the minor-MAJOR tonic Gm(maj9) (that raised 7th
-    # F# glinting against the minor 3rd) with a bright major-IV C7 — the jazz-minor / film-noir glow,
-    # bittersweet rather than black. Slow (56bpm), spare, the phrased lead singing its question and
-    # answer over a thin haze. Late-night, last-call music.
-    P = [(43, 'mmaj9'), (48, '7'), (45, 'm7'), (50, '7')]   # G melodic minor: Gm(maj9) C7 Am7 D7
-    compose('movement-xxvii-g-melodicminor-noir', 43, 'melodic_minor', P, bpm=56, reps=2, seed=131)
+    # Movement XXVIII — D AEOLIAN, a DAWN: the slowest (52bpm) and sparest, a quiet settling home
+    # after the long night — i-bVI-bVII-i, the pad a held grey light, the lead barely there, the
+    # frame's coda resolving to the tonic and letting it ring. Not a climax, a release; the dark
+    # not banished but easing toward morning. A close.
+    P = [(50, 'm9'), (46, 'maj7'), (53, 'majadd9'), (50, 'm9')]   # D aeolian: Dm9 Bbmaj7 Fadd9 Dm9
+    compose('movement-xxviii-d-aeolian-dawn', 50, 'aeolian', P, bpm=52, reps=2, seed=137)
