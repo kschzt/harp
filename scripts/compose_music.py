@@ -168,8 +168,9 @@ def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetso
     # concatenated; the form-arc env spans the whole piece (so B, the middle, is the peak).
     beat = 60.0 / bpm; bar = 4 * beat
     bass = []; arp = []; mel = []; counter = []; pad = []; nbars = 0
-    for si, (mode, prog) in enumerate(sections):
-        chords = prog * reps_each; sc = scale_range(key, mode)
+    for si, sec in enumerate(sections):
+        skey, mode, prog = sec if len(sec) == 3 else (key, sec[0], sec[1])  # per-section KEY = MODULATION
+        chords = prog * reps_each; sc = scale_range(skey, mode)
         bass += gen_bass(chords); arp += gen_arp(chords); pad += gen_pad(chords)
         mel += gen_melody(chords, sc, seed + si); counter += gen_counter(chords, sc, seed + si + 4)
         nbars += len(chords)
@@ -177,15 +178,16 @@ def compose_form(name, key, sections, bpm=60, reps_each=1, seed=7, arp_ep='jetso
     seconds = round((nbars + 2) * bar + 2.0, 1)
     nsec = len(sections); se = reframe(section_env(nsec), nbars)   # terraced dynamics, shifted into the frame
     envs = {'bass': se, 'arp': se, 'counter': se, 'pad': se, 'melody': reframe(melody_section_env(nsec), nbars)}
-    print(f"{name}: form [{'-'.join(m for m, _ in sections)}] on key {key}, {nbars}+2 bars @ {bpm}bpm = {seconds}s")
+    tags = '-'.join((f"{s[0]}:{s[1]}" if len(s) == 3 else s[0]) for s in sections)
+    print(f"{name}: form [{tags}] on key {key}, {nbars}+2 bars @ {bpm}bpm = {seconds}s")
     _render(name, seconds, bar, bass, arp, mel, counter, pad, arp_ep, envs)
 
 if __name__ == '__main__':
-    # Movement XVII — A-B-A on a single D tonic, now FRAMED: a pad-only intro breathes in, then A
-    # is D DORIAN (the bright major-IV G), B raises the 7th C->C# into D MELODIC MINOR (the tonic
-    # turns minor-MAJOR noir, the jazz-minor glow), A returns, and a resolving CODA settles on the
-    # tonic with the pad alone. A proper opening and ending bracket the journey for the first time.
-    A = [(50, 'm9'), (55, 'majadd9'), (48, 'maj7'), (50, 'm9')]   # D dorian: Dm9 Gadd9 Cmaj7 Dm9 (major IV)
-    B = [(50, 'mmaj9'), (55, '7'), (52, 'm7'), (50, 'mmaj9')]     # D melodic minor: Dm(maj9) G7 Em7 (C#)
-    compose_form('movement-xvii-aba-framed', 50, [('dorian', A), ('melodic_minor', B), ('dorian', A)],
-                 bpm=60, reps_each=1, seed=79)
+    # Movement XVIII — A-B-A with a real KEY MODULATION (not just a mode shift): A is C AEOLIAN, B
+    # lifts the whole tonal centre UP A MINOR THIRD to Eb AEOLIAN — the ground itself moves, a dark
+    # ascension — then A sinks back home to C. Same mode throughout so the ear hears the key change
+    # cleanly. The frame's coda resolves to the home C tonic. The biggest harmonic gesture yet.
+    A = [(48, 'm9'), (44, 'maj7'), (46, 'majadd9'), (48, 'm9')]   # C aeolian: Cm9 Abmaj7 Bbadd9 Cm9
+    B = [(51, 'm9'), (47, 'maj7'), (49, 'majadd9'), (51, 'm9')]   # Eb aeolian (up m3): Ebm9 Bmaj7 Dbadd9 Ebm9
+    compose_form('movement-xviii-aba-modulate', 48,
+                 [(48, 'aeolian', A), (51, 'aeolian', B), (48, 'aeolian', A)], bpm=58, reps_each=1, seed=83)
