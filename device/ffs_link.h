@@ -10,6 +10,7 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h> /* ssize_t for the rd/wr seam */
 
 /* §14.2 usb_errors: abnormal FunctionFS transport errors — read/write failures that are
  * neither EINTR nor the clean -ESHUTDOWN disable. Lives here (not in the device struct)
@@ -25,6 +26,13 @@ typedef struct {
     int ep_out; /* host -> device: we read  */
     uint8_t rbuf[FFS_READ_CHUNK];
     size_t rlen, rpos;
+    /* Syscall seam: the endpoint read/write, indirected so a unit test can inject the
+     * FunctionFS error classes the socketpair can't reach — a -EINTR (retry), the clean
+     * -ESHUTDOWN disable (must NOT count §14.2), an abnormal STALL/EPIPE (must count), and
+     * partial kernel reads (reassembly). ffs_io_init defaults these to read(2)/write(2),
+     * so ffs.c and the real gadget are byte-for-byte unchanged. */
+    ssize_t (*rd)(int, void *, size_t);
+    ssize_t (*wr)(int, const void *, size_t);
 } ffs_io;
 
 /* Wire the buffered framing onto two endpoint fds (real FunctionFS endpoints, or a

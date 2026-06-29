@@ -22,7 +22,7 @@ static bool ffs_read_exact(harp_io *io, void *buf, size_t n) {
             n -= take;
             continue;
         }
-        ssize_t r = read(f->ep_out, f->rbuf, sizeof f->rbuf);
+        ssize_t r = f->rd(f->ep_out, f->rbuf, sizeof f->rbuf);
         if (r < 0) {
             if (errno == EINTR) continue;
             if (errno != ESHUTDOWN) /* §14.2: count abnormal errors, not the clean disable */
@@ -41,7 +41,7 @@ static bool ffs_write_all(harp_io *io, const void *buf, size_t n) {
     const uint8_t *p = buf;
     size_t total = n;
     while (n) {
-        ssize_t r = write(f->ep_in, p, n);
+        ssize_t r = f->wr(f->ep_in, p, n);
         if (r < 0) {
             if (errno == EINTR) continue;
             if (errno != ESHUTDOWN) /* §14.2: count abnormal errors, not the clean disable */
@@ -61,7 +61,7 @@ static bool ffs_write_all(harp_io *io, const void *buf, size_t n) {
      * write is a harmless no-op over the socketpair the unit test uses. */
     if (total && (total % 512) == 0) {
         ssize_t r;
-        do { r = write(f->ep_in, "", 0); } while (r < 0 && errno == EINTR);
+        do { r = f->wr(f->ep_in, "", 0); } while (r < 0 && errno == EINTR);
         if (r < 0 && errno != ESHUTDOWN) /* message already delivered; ZLP failure is non-fatal */
             atomic_fetch_add_explicit(&g_usb_errors, 1, memory_order_relaxed);
     }
@@ -74,5 +74,7 @@ harp_io *ffs_io_init(ffs_io *f, int ep_in, int ep_out) {
     f->io.write_all = ffs_write_all;
     f->ep_in = ep_in;
     f->ep_out = ep_out;
+    f->rd = read; /* seam defaults to the real syscalls (ffs.c path unchanged); */
+    f->wr = write; /* a test overrides these to inject endpoint errors. */
     return &f->io;
 }
