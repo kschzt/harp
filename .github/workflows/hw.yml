@@ -111,3 +111,19 @@ jobs:
         # asserts byte-identical audio + zero event loss — the real third-party
         # DAW gate, complementing the SDK/pluginval validators.
         run: scripts/reaper-e2e.sh
+
+      - name: USB stress/duress regression guard (PI4B-0002 — DAW-crash + daemon-SIGKILL)
+        # Trimmed usb-stress.sh: hammer the FunctionFS gadget with the two highest-signal
+        # vectors — a host SIGKILL mid-stream (a DAW crash) and a daemon SIGKILL mid-stream —
+        # and assert NO uninterruptible kernel D-state and that the gadget always returns to
+        # service (fresh claim / at most one daemon restart; never a reboot). Guards the
+        # never-wedge fix (#102) against re-wedge on the real USB-teardown path the socketpair
+        # unit test cannot reach. The full N=10 battery is a manual/nightly bench tool; CI runs
+        # the cheap N=2 check (~2 min). systemctl-kill + /proc-stat D-detection keep it within
+        # ci@'s systemctl-only sudo.
+        env:
+          TARGET_SER: PI4B-0002
+          TARGET_SSH: ci@harptest.local
+          N: '2'
+          VECTORS: crash killd
+        run: timeout 300 bash scripts/usb-stress.sh
