@@ -213,18 +213,27 @@ if(NOT WIN32)
   target_include_directories(harp-eth-latefr-test PRIVATE host)
   target_link_libraries(harp-eth-latefr-test harpcore
     ${HARP_MATH_LIB} ${HARP_PLAT_LIBS} Threads::Threads)
+endif()
 
-  # harp-eth-fence-test: §8.3.1 event-fence INTEGRATION — audio.start(key 7) host-paced
-  # OFFLINE bounce; sends a FENCED pacing frame then a NOTE on the EVT stream so the
-  # render blocks on + clears the fence; asserts g_fence_waits moves and g_fence_timeouts
-  # stays 0 (the offline barrier never times out), and prints a determinism hash the
-  # driving script compares run-to-run. POSIX-only (raw connect-back socket), same as
-  # latefr above; needs NO libsamplerate.
+# harp-eth-fence-test: §8.3.1 event-fence INTEGRATION — audio.start(key 7) host-paced
+# bounce; sends a FENCED pacing frame and either releases it with a NOTE (offline: the
+# unbounded barrier, fence_timeouts stays 0) or starves it (realtime, HARP_FENCE_FORCE_RT:
+# the BOUNDED wait fires and fence_timeouts increments — no wedge). Asserts g_fence_waits
+# moves and prints a determinism hash the driving script compares run-to-run. Needs NO
+# libsamplerate. UNLIKE latefr it is Windows-buildable: the raw connect-back server socket
+# is wrapped in winsock2 (the MinGW device already speaks Winsock), so the Windows eth lane
+# runs the REAL-TIME bounded-fence assertion too. Guard NOT MSVC (same as harp-device-tests):
+# it is built in the MinGW device tree (build-dev), not the MSVC shell tree (no ctest entry).
+if(NOT MSVC)
+  find_package(Threads REQUIRED)
   add_executable(harp-eth-fence-test tools/eth-fence-test.c
     host/client.c host/sock_io.c ${HARP_PLAT_SRC})
   target_include_directories(harp-eth-fence-test PRIVATE host)
   target_link_libraries(harp-eth-fence-test harpcore
     ${HARP_MATH_LIB} ${HARP_PLAT_LIBS} Threads::Threads)
+  if(WIN32)
+    target_link_libraries(harp-eth-fence-test ws2_32) # Winsock for the connect-back socket
+  endif()
 endif()
 
 # harp-device-tests: unit tests for the params-blob codec (§10 / P3 closer
