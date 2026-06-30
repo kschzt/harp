@@ -264,6 +264,37 @@ public:
         return fxSilentWetTripped_.load(std::memory_order_relaxed);
     }
 
+    /* §8.7 eth RTP audio NEVER-SILENT guard (RME "loud, not logged") — the symmetric
+     * partner of the §8.8 FX guard for the OTHER audio direction. A connected free-running
+     * Ethernet stream ALWAYS emits RTP packets while it is live: even a musical rest / a
+     * 100%-dry passage / genuine silence-in is carried as silence-CONTENT packets, so the
+     * transport's silentMs (time since the last packet, eth_transport.h) stays low. Only a
+     * REAL stall — the device gone, the RTP socket dead, the ASRC starved of input, the
+     * stream died — stops the packets and lets silentMs grow. rtpStallTrip() is the
+     * detection seam the reader() loop runs on every receive poll (both the bit-exact and
+     * the ASRC arm): given the floats received this poll (0 = none) and the transport's
+     * silentMs, it fires LOUDLY when NO packet has arrived for a full window
+     * (rtpSilentWindowMs_, ≈1 s) while the stream should be live — an ERROR log (RuntimeLog
+     * ring + stderr) + a host-readable counter (rtpSilentFaults(), diag x.harp.rtp_silent) +
+     * a sticky tripped flag the offline/headless bounce returns non-zero on (plugin.cpp). It
+     * NEVER false-positives on legitimate silence (a rest keeps packets flowing → silentMs
+     * low → no trip) nor on startup (no packet yet → silentMs 0). Returns true exactly when
+     * it trips, ONE count per stall episode (the latch clears when packets resume), so the
+     * reader then records the §12.1 STREAMING→DETACHED transition and lets the supervisor
+     * reconnect. Reader-thread only (sole caller); the exposed counter/flag are atomic for
+     * the control-thread accessors + getDiagBundle. */
+    bool rtpStallTrip(unsigned floats, unsigned silentMs);
+    /* Host-readable §8.7 guard count (also emitted as diag host-counter x.harp.rtp_silent).
+     * One increment per RTP-silent stall EPISODE, not per poll. */
+    uint64_t rtpSilentFaults() const {
+        return rtpSilentFaults_.load(std::memory_order_relaxed);
+    }
+    /* Sticky: the §8.7 guard has tripped this session. The offline/headless bounce returns
+     * non-zero on it (plugin.cpp); a live session keeps running (log + counter only). */
+    bool rtpSilentTripped() const {
+        return rtpSilentTripped_.load(std::memory_order_relaxed);
+    }
+
     /* The multitimbral part (§9.4, key 5) the OWNER instance drives: notes
      * already carry their channel in the UMP word (the shell stamps it per-
      * event), but parameter sets/ramps had no channel — so on a multi-part
@@ -1160,6 +1191,17 @@ private:
     uint32_t fxSilentWetWindowFrames_ = 48000; /* trip window (frames); recomputed in configure() */
     std::atomic<uint64_t> fxSilentWetFaults_{0};  /* host-readable: x.harp.fx_silent_wet */
     std::atomic<bool> fxSilentWetTripped_{false}; /* sticky; offline path returns non-zero */
+
+    /* §8.7 eth RTP audio never-silent guard state (see rtpStallTrip). The window is in
+     * MILLISECONDS (the stall signal is wall-clock packet-absence, rate-independent — it
+     * matches the existing ">1s silent" transport watchdog this guard makes loud). The
+     * episode latch is touched ONLY by the reader thread (rtpStallTrip's sole caller); the
+     * EXPOSED counter + tripped flag are atomic because getDiagBundle + the
+     * rtpSilentFaults()/rtpSilentTripped() accessors read them on the control thread. */
+    unsigned rtpSilentWindowMs_ = 1000;          /* stall window (ms): no packet this long => stalled */
+    bool rtpSilentEpisode_ = false;              /* latch: this stall episode is already counted */
+    std::atomic<uint64_t> rtpSilentFaults_{0};   /* host-readable: x.harp.rtp_silent */
+    std::atomic<bool> rtpSilentTripped_{false};  /* sticky; offline/headless path returns non-zero */
 
     /* §6.4 latency-profile, cached from the hello identity (key 8) at
      * helloAndIdentity(). Indexed implicitly by rate (matched in expectedLoopback).

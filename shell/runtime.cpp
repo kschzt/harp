@@ -2356,6 +2356,42 @@ void HarpRuntime::observeFxWet(const float *wet, size_t nFrames) {
     }
 }
 
+/* §8.7 eth RTP audio NEVER-SILENT guard — see runtime.h. The detection seam the reader()
+ * eth loop runs on every receive poll (both the bit-exact and the ASRC arm). `floats` =
+ * audio floats received this poll (0 = none/timeout/still-assembling), `silentMs` = the
+ * transport's time since the LAST RTP packet. A live free-running stream always emits
+ * packets — even a musical rest is silence-CONTENT, not packet-absence — so silentMs only
+ * grows past the window on a REAL stall (RTP stopped / ASRC starved of input / device gone).
+ * Trips LOUDLY then: ERROR log + the host-readable x.harp.rtp_silent counter + the sticky
+ * tripped flag the offline/headless bounce fails on. NEVER fires on legitimate silence (a
+ * rest keeps packets flowing → silentMs low) nor on startup (no packet yet → silentMs 0).
+ * Returns true exactly when the stall is detected (the caller records the §12.1 transition,
+ * drops connected_, and breaks so the supervisor reconnects). ONE count per episode: the
+ * latch clears the instant packets resume, so a LATER stall re-fires its own count. */
+bool HarpRuntime::rtpStallTrip(unsigned floats, unsigned silentMs) {
+    if (floats > 0) {
+        /* a packet landed this poll — the stream is live (incl. a silent-content rest);
+         * clear the episode latch so a later stall re-counts. */
+        rtpSilentEpisode_ = false;
+        return false;
+    }
+    if (silentMs <= rtpSilentWindowMs_)
+        return false; /* a brief gap / jitter / still-assembling — not a stall, and startup
+                       * (no packet yet) reads silentMs 0, so it is never a false positive. */
+    if (!rtpSilentEpisode_) {
+        rtpSilentEpisode_ = true; /* one count per stall episode, not per poll */
+        rtpSilentFaults_.fetch_add(1, std::memory_order_relaxed);
+        rtpSilentTripped_.store(true, std::memory_order_relaxed);
+        char msg[224];
+        snprintf(msg, sizeof msg,
+                 "eth RTP audio SILENT for %ums while streaming — no packets (the stream "
+                 "stalled / ASRC starved / device gone): §8.7 trap", silentMs);
+        recordLog(HARP_LOG_ERROR, "audio.eth", msg);
+        log_msg("§8.7 NEVER-SILENT: %s", msg); /* loud stderr copy */
+    }
+    return true;
+}
+
 /* ---------------- feeder thread ---------------- */
 
 void HarpRuntime::feeder() {
@@ -2837,14 +2873,13 @@ void HarpRuntime::reader() {
                 if (!width) width = 2;
                 if (floats >= width)
                     demuxUnionFrame(buf, floats / width, (uint16_t)width);
-                else if (floats == 0 && transport_->silentMs() > 1000) {
-                    log_msg("RTP stream silent >1s; device gone?");
-                    /* §12.1: implicit STREAMING -> DETACHED (transport-error). On
-                     * the reader thread; the rings are reader-safe (history mutex,
-                     * lock-free log) and off the render path. */
+                else if (rtpStallTrip(floats, transport_->silentMs())) {
+                    /* §8.7 never-silent guard tripped (loud log + x.harp.rtp_silent counter
+                     * + sticky flag, inside rtpStallTrip). §12.1: implicit STREAMING ->
+                     * DETACHED (transport-error). On the reader thread; the rings are
+                     * reader-safe (history mutex, lock-free log) and off the render path. */
                     recordTransition(HARP_ST_STREAMING, HARP_ST_DETACHED,
                                      HARP_TR_TRANSPORT_ERROR, "RTP stream silent >1s");
-                    recordLog(HARP_LOG_ERROR, "transport", "RTP stream silent >1s; device gone?");
                     connected_.store(false, std::memory_order_release);
                     break;
                 }
@@ -2940,12 +2975,12 @@ void HarpRuntime::reader() {
                     asrcOverflow_.store(st.overflow_frames, std::memory_order_relaxed);
                     asrcReanchors_.store(st.reanchors, std::memory_order_relaxed);
                     rtpLostSnap_.store(transport_->rtpPacketsLost(), std::memory_order_relaxed); /* §8.7 clock-stats key 8 (rtp_loss) */
-                } else if (floats == 0 && transport_->silentMs() > 1000) {
-                    log_msg("RTP stream silent >1s; device gone?");
-                    /* §12.1: implicit STREAMING -> DETACHED (transport-error), ASRC path. */
+                } else if (rtpStallTrip(floats, transport_->silentMs())) {
+                    /* §8.7 never-silent guard tripped (loud log + x.harp.rtp_silent counter
+                     * + sticky flag, inside rtpStallTrip), ASRC path: the resampler is
+                     * starved of input. §12.1: implicit STREAMING -> DETACHED. */
                     recordTransition(HARP_ST_STREAMING, HARP_ST_DETACHED,
                                      HARP_TR_TRANSPORT_ERROR, "RTP stream silent >1s (ASRC)");
-                    recordLog(HARP_LOG_ERROR, "transport", "RTP stream silent >1s; device gone?");
                     connected_.store(false, std::memory_order_release);
                     break;
                 }
