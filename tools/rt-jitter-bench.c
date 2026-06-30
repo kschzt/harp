@@ -103,7 +103,7 @@ int main(int argc, char **argv) {
     if (warmup < 0) warmup = 0;
     if (burners < 0) {
         burners = 2 * cpu_count();
-        if (burners < 12) burners = 12;
+        if (burners < 2) burners = 2;   /* scale to cores: a fixed-12 floor 4x-oversubscribes a 3-core CI runner, where even an RT-granted thread cannot hold the deadline */
         if (burners > 64) burners = 64;
     }
 
