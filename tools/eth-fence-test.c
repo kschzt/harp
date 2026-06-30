@@ -27,8 +27,10 @@
  *      script runs this tool twice against a fresh daemon and asserts the two hashes
  *      MATCH — a deterministic, fence-held bounce — closing the loop the fence exists for.
  *
- * POSIX-only (raw server socket for the device's connect-back); not built on Windows,
- * exactly like tools/eth-latefr-test.c which this models.
+ * Portable: the raw connect-back server socket (bind/listen/accept) is wrapped in winsock2
+ * on Windows (the device's host-paced connect-back is already Winsock-native), so this builds
+ * under MinGW too and the Windows eth lane runs the REAL-TIME bounded-fence assertion. It is
+ * modeled on tools/eth-latefr-test.c, which stays POSIX-only.
  */
 #include "client.h"
 #include "sock_io.h"
@@ -37,13 +39,27 @@
 #include "harp/cbor.h"
 #include "harp/envelope.h"
 #include "harp/link.h"
+#include "harp/plat.h" /* harp_sleep_ns — portable (nanosleep is POSIX-only) */
 
-#include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <time.h>
-#include <unistd.h>
+
+/* §8.3.1 connect-back uses a raw server socket (bind/listen/accept). sock_io.h already
+ * pulls winsock2/ws2tcpip on Windows; add the POSIX socket headers otherwise, plus a
+ * portable handle type + close, so this tool builds under MinGW for the Windows eth lane
+ * (the device's host-paced connect-back is already Winsock-native — audio_loop.c). */
+#ifdef _WIN32
+typedef SOCKET sockhandle;
+#  define SOCK_INVALID INVALID_SOCKET
+#  define harp_closesock closesocket
+#else
+#  include <netinet/in.h>
+#  include <sys/socket.h>
+#  include <unistd.h>
+typedef int sockhandle;
+#  define SOCK_INVALID (-1)
+#  define harp_closesock close
+#endif
 
 #define NS 256        /* nsamples per pacing frame */
 #define N_PRE 3       /* plain in-order frames before the fenced one */
@@ -58,10 +74,13 @@ static void hash_bytes(const void *p, size_t n) {
     }
 }
 
-static bool read_exact(int fd, void *buf, size_t n) {
+/* recv/send over a raw socket: cast to (char *) + (int) so the Winsock prototypes are
+ * satisfied (POSIX accepts the same). Buffers here are tiny (≤ one 34-ch frame), so the
+ * (int) length never truncates. */
+static bool read_exact(sockhandle fd, void *buf, size_t n) {
     uint8_t *p = buf;
     while (n) {
-        ssize_t r = recv(fd, p, n, 0);
+        int r = recv(fd, (char *)p, (int)n, 0);
         if (r <= 0) return false;
         p += r;
         n -= (size_t)r;
@@ -69,11 +88,11 @@ static bool read_exact(int fd, void *buf, size_t n) {
     return true;
 }
 
-static bool send_all(int fd, const void *buf, size_t n) {
+static bool send_all(sockhandle fd, const void *buf, size_t n) {
     const uint8_t *p = buf;
     size_t off = 0;
     while (off < n) {
-        ssize_t w = send(fd, p + off, n - off, 0);
+        int w = send(fd, (const char *)(p + off), (int)(n - off), 0);
         if (w <= 0) return false;
         off += (size_t)w;
     }
@@ -81,7 +100,7 @@ static bool send_all(int fd, const void *buf, size_t n) {
 }
 
 /* a plain host-paced pacing frame: header only (slots=0 => no input payload) at SSI `ts` */
-static bool send_pacing(int fd, uint64_t ts) {
+static bool send_pacing(sockhandle fd, uint64_t ts) {
     harp_audio_hdr h = {HARP_AUDIO_FVER, HARP_AUDIO_DIR_H2D, 0, 1, ts, NS, HARP_AUDIO_FMT_F32};
     uint8_t hdr[HARP_AUDIO_HDR_LEN];
     harp_audio_hdr_encode(&h, hdr);
@@ -90,7 +109,7 @@ static bool send_pacing(int fd, uint64_t ts) {
 
 /* a FENCED pacing frame: HARP_AUDIO_FENCE set + the 4-byte LE `want` count appended
  * after the header (engine.c:874-891 reads exactly HARP_AUDIO_FENCE_LEN bytes there). */
-static bool send_pacing_fenced(int fd, uint64_t ts, uint32_t want) {
+static bool send_pacing_fenced(sockhandle fd, uint64_t ts, uint32_t want) {
     harp_audio_hdr h = {HARP_AUDIO_FVER, HARP_AUDIO_DIR_H2D | HARP_AUDIO_FENCE, 0, 1, ts, NS,
                         HARP_AUDIO_FMT_F32};
     uint8_t hdr[HARP_AUDIO_HDR_LEN];
@@ -102,7 +121,7 @@ static bool send_pacing_fenced(int fd, uint64_t ts, uint32_t want) {
 }
 
 /* drain one D->H output frame (header + payload) and fold it into the determinism hash */
-static bool drain_output(int fd) {
+static bool drain_output(sockhandle fd) {
     uint8_t hdr[HARP_AUDIO_HDR_LEN];
     if (!read_exact(fd, hdr, HARP_AUDIO_HDR_LEN)) return false;
     harp_audio_hdr h;
@@ -178,6 +197,15 @@ int main(int argc, char **argv) {
      * the device renders the range anyway (bounded — no wedge) and counts the timeout. */
     bool realtime = (argc > 2 && strcmp(argv[2], "realtime") == 0);
 
+#ifdef _WIN32
+    /* sock_io.h: the caller owns WSAStartup before dialing (and before bind/listen below). */
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "fence: WSAStartup failed\n");
+        return 1;
+    }
+#endif
+
     harp_sockhandle s = harp_sock_dial(argv[1]);
     if (s == HARP_SOCK_INVALID) {
         fprintf(stderr, "fence: dial failed\n");
@@ -196,9 +224,9 @@ int main(int argc, char **argv) {
     }
 
     /* listen for the device's host-paced connect-back on an ephemeral loopback port */
-    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    sockhandle srv = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one); /* (char*) for Winsock */
     struct sockaddr_in a;
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
@@ -231,8 +259,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int dev = accept(srv, NULL, NULL);
-    if (dev < 0) {
+    sockhandle dev = accept(srv, NULL, NULL);
+    if (dev == SOCK_INVALID) {
         fprintf(stderr, "fence: accept failed\n");
         return 1;
     }
@@ -273,7 +301,7 @@ int main(int argc, char **argv) {
          * (a few ms), render the range with the late (here, absent) event, and count the
          * timeout — never wedge. drain_output blocks only until that bounded render lands. */
     } else {
-        nanosleep(&(struct timespec){0, 50 * 1000 * 1000}, NULL); /* 50 ms: audio thread parks on the fence */
+        harp_sleep_ns(50ull * 1000 * 1000); /* 50 ms: audio thread parks on the fence (portable) */
         if (!send_note_evt(&client, &tio.io, &link)) {
             fprintf(stderr, "fence: note evt send failed\n");
             return 1;
@@ -303,8 +331,8 @@ int main(int argc, char **argv) {
     harp_cbuf_free(&sreq);
     harp_cbuf_free(&srsp);
 
-    close(dev);
-    close(srv);
+    harp_closesock(dev);
+    harp_closesock(srv);
     harp_sock_close(s);
 
     /* the determinism hash the driving script compares across two runs */

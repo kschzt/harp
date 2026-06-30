@@ -54,7 +54,13 @@ if [ -z "${PROBE:-}" ]; then
   elif [ -x "./build-dev/harp-probe.exe" ]; then PROBE="./build-dev/harp-probe.exe"
   else PROBE="$(find1 . "harp-probe$EXE")"; fi
 fi
-export DEVICED HOSTBIN VHOST CHOST PROBE
+# harp-eth-fence-test: POSIX build/ on Linux/macOS, MinGW build-dev/*.exe on Windows (§8.3.1).
+if [ -z "${FENCE:-}" ]; then
+  if   [ -x "./build/harp-eth-fence-test" ];         then FENCE="./build/harp-eth-fence-test"
+  elif [ -x "./build-dev/harp-eth-fence-test.exe" ]; then FENCE="./build-dev/harp-eth-fence-test.exe"
+  else FENCE="$(find1 . "harp-eth-fence-test$EXE")"; fi
+fi
+export DEVICED HOSTBIN VHOST CHOST PROBE FENCE
 
 have() { [ -n "${1:-}" ] && [ -x "$1" ]; }
 
@@ -109,15 +115,17 @@ else skip latefr "harp-eth-latefr-test not built (POSIX-only host-paced tool)"; 
 # §8.3.1 event-fence integration: harp-eth-fence-test drives the OFFLINE host-paced bounce
 # with a FENCED pacing frame + a deferred NOTE event so the device's fence branch is reached;
 # asserts fence_waits moves, fence_timeouts stays 0 (unbounded offline barrier), and the
-# bounce is run-to-run deterministic. POSIX-only (raw connect-back socket), same as latefr.
-if [ -x ./build/harp-eth-fence-test ]; then run offline-fence scripts/offline-fence-eth.sh
-else skip offline-fence "harp-eth-fence-test not built (POSIX-only host-paced tool)"; fi
+# bounce is run-to-run deterministic. Now Windows-buildable (winsock connect-back socket), so
+# it runs on every OS the moment harp-eth-fence-test is built.
+if have "$FENCE"; then run offline-fence scripts/offline-fence-eth.sh
+else skip offline-fence "harp-eth-fence-test not built"; fi
 
 # §8.3.1 event-fence integration, REAL-TIME side: same tool with HARP_FENCE_FORCE_RT=1 fences
 # beyond the feed and asserts the device BOUNDS the wait + counts fence_timeouts (no wedge) —
 # the production-path guard the unit test could not give (the loop once bypassed the helper).
-if [ -x ./build/harp-eth-fence-test ]; then run realtime-fence scripts/realtime-fence-eth.sh
-else skip realtime-fence "harp-eth-fence-test not built (POSIX-only host-paced tool)"; fi
+# Runs on Windows too now (the §8.3.1 bound is device-side timing, identical across OSes).
+if have "$FENCE"; then run realtime-fence scripts/realtime-fence-eth.sh
+else skip realtime-fence "harp-eth-fence-test not built"; fi
 
 # §9.4 per-part echo demux drives the device front panel over a unix socket; the MinGW
 # device replaces panel.c with a no-op stub, so the multi-instance path is POSIX-only

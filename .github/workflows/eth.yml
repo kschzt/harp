@@ -85,7 +85,11 @@ jobs:
           # harp-device-tests too: the §10/P3 params-blob codec (device/state.c) the
           # MinGW daemon ships — run it here so a MinGW-vs-clang codec divergence can't
           # slip past (Linux/macOS already run it; gap #3/#4).
-          cmake --build build-dev --target harp-deviced harp-probe harp-device-tests
+          # harp-eth-fence-test too — the §8.3.1 REAL-TIME bounded-fence integration tool. It
+          # now builds under MinGW (winsock connect-back socket), so the Windows eth lane proves
+          # the host-paced fence BOUNDS the wait + counts fence_timeouts under a starved input
+          # (offline ran POSIX-only before; gap #fence-windows).
+          cmake --build build-dev --target harp-deviced harp-probe harp-device-tests harp-eth-fence-test
           ./build-dev/harp-deviced.exe --bogus 2>&1 | head -3 || true   # smoke: it starts
           ./build-dev/harp-device-tests.exe   # device_codec on the production MinGW binary
       - name: fetch libusb (prebuilt MSVC binaries)
