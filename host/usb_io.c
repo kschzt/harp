@@ -33,6 +33,7 @@
 
 #include "usb_io.h"
 #include "usb_select.h" /* pure §15.2 device-match predicate (host-unit-tested) */
+#include "rt_sched.h"   /* harp_thread_set_realtime + HARP_RT_PERIOD_US_DEFAULT (extracted; no libusb) */
 
 #include <libusb.h>
 #include <stdio.h>
@@ -42,14 +43,7 @@
 #include "sync_compat.h"
 #include "harp/plat.h" /* harp_now_ns (monotonic) for the rtstats timing capture */
 #ifdef __APPLE__
-#include <pthread/qos.h>
-#include <mach/mach.h>
-#include <mach/thread_policy.h>
-#include <mach/mach_time.h>
-#elif defined(__linux__)
-#include <pthread.h>
-#include <sched.h>
-#include <errno.h>
+#include <pthread/qos.h> /* QOS_CLASS_USER_INTERACTIVE: the event thread's fallback band */
 #endif
 
 #define USB_READ_CHUNK 16384
@@ -58,10 +52,9 @@
 #define USB_AOUT_SLOTS 8
 #define USB_LINK_WRITE_GIVE_UP_MS 30000
 
-/* §8.3 pacing block at 48 k = 256/48000 s; the default real-time period for the
- * completion-reaping thread (one block cadence). Overridable per device with
- * HARP_USB_RT_PERIOD_US, e.g. for a device that runs a smaller render block. */
-#define USB_RT_PERIOD_US_DEFAULT 5333.0
+/* The default real-time period (one §8.3 pacing block @ 48 k) lives in rt_sched.h
+ * as HARP_RT_PERIOD_US_DEFAULT; a device with a smaller render block overrides it
+ * per session via HARP_USB_RT_PERIOD_US (read in harp_usb_open below). */
 
 /* rtstats capture cap: one µs sample per audio transfer. 262144 ≈ 23 min of
  * 256-sample frames, so an ordinary render never truncates; ~1 MiB per array,
@@ -200,75 +193,11 @@ static void mark_dead_locked(usb_io *u, const char *what, int rc) {
     harp_cond_broadcast(&u->cv);
 }
 
-/* ---------------- real-time scheduling for the completion thread ----------------
- *
- * Promote the CALLING thread to the host's real-time class so libusb completion
- * reaping — every audio byte the device returns, every event-send ack, every
- * OUT-slot recycle passes through this thread — is never descheduled by ordinary
- * time-share work under host CPU load. This is the USB twin of what CoreAudio's
- * own I/O thread runs at (THREAD_TIME_CONSTRAINT). A mere high QoS band
- * (USER_INTERACTIVE) is STILL time-share: under contention it gets preempted,
- * which empties the FunctionFS bulk-OUT endpoint and starves the host's D->H
- * reaping faster than the small device jitter buffer can cover -> cliff-onset
- * dropouts. The fix is DETERMINISM, not a fatter buffer: `period_us` is the audio
- * block cadence, so the kernel sizes a sub-millisecond CPU reservation.
- *
- * Degrades gracefully: if the RT request is denied (a sandbox without the
- * privilege, or an unknown platform) the thread keeps whatever scheduling it had
- * and we log ONCE — the stream still runs, just at the old determinism. Returns
- * true iff real-time was granted. Exported (usb_io.h) so the host-paced runtime's
- * own feed-path threads (the D->H reader, the pacing feeder) can adopt the SAME
- * class — RME-grade means EVERY thread on the realtime path is hard real-time. */
-bool harp_thread_set_realtime(double period_us) {
-    static int logged_fail = 0; /* one diagnostic line, not per-thread spam */
-    /* Single global off-switch (A/B "before" arm + safety valve): HARP_USB_RT=0
-     * keeps EVERY realtime-path thread on its prior time-share scheduling. */
-    const char *rt = getenv("HARP_USB_RT");
-    if (rt && rt[0] == '0') return false;
-    if (period_us <= 0) period_us = USB_RT_PERIOD_US_DEFAULT;
-    double period_ns = period_us * 1000.0;
-#if defined(__APPLE__)
-    mach_timebase_info_data_t tb;
-    if (mach_timebase_info(&tb) != KERN_SUCCESS || tb.numer == 0) return false;
-    double ticks_per_ns = (double)tb.denom / (double)tb.numer; /* ns -> mach abs ticks */
-    thread_time_constraint_policy_data_t pol;
-    pol.period      = (uint32_t)(period_ns * ticks_per_ns);
-    /* CPU budget per period: generous headroom over the few-µs actual reap so the
-     * kernel never demotes us for a brief burst of completions (a reservation, not
-     * a target — a thread blocked in handle_events consumes none of it). */
-    pol.computation = (uint32_t)(period_ns * 0.20 * ticks_per_ns);
-    pol.constraint  = (uint32_t)(period_ns * 0.90 * ticks_per_ns); /* finish within ~90% of the block */
-    pol.preemptible = 1; /* yield to even-higher-priority work; we still outrank all time-share */
-    kern_return_t kr = thread_policy_set(mach_thread_self(),
-                                         THREAD_TIME_CONSTRAINT_POLICY,
-                                         (thread_policy_t)&pol,
-                                         THREAD_TIME_CONSTRAINT_POLICY_COUNT);
-    if (kr == KERN_SUCCESS) return true;
-    if (!logged_fail++)
-        fprintf(stderr, "harp-usb: THREAD_TIME_CONSTRAINT denied (kr=%d) — staying on QoS time-share\n",
-                (int)kr);
-    return false;
-#elif defined(__linux__)
-    struct sched_param sp;
-    int lo = sched_get_priority_min(SCHED_FIFO), hi = sched_get_priority_max(SCHED_FIFO);
-    /* high, but a notch below the very top so kernel/IRQ threads still preempt us */
-    sp.sched_priority = lo + (hi - lo) * 3 / 4;
-    int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
-    if (rc == 0) return true;
-    if (!logged_fail++)
-        fprintf(stderr,
-                "harp-usb: SCHED_FIFO denied (%s) — staying on default scheduling "
-                "(grant CAP_SYS_NICE / RLIMIT_RTPRIO for RT)\n",
-                strerror(rc));
-    (void)period_ns;
-    return false;
-#else
-    (void)period_ns;
-    if (!logged_fail++)
-        fprintf(stderr, "harp-usb: no real-time scheduling on this platform — time-share\n");
-    return false;
-#endif
-}
+/* harp_thread_set_realtime() — the THREAD_TIME_CONSTRAINT / SCHED_FIFO promotion
+ * that pins this completion-reaping thread (and the shell's feed/pump/reader
+ * threads) to the host real-time class — now lives in host/rt_sched.c so it is
+ * reachable WITHOUT libusb (and gateable with no hardware). Declared in
+ * rt_sched.h, included above. */
 
 /* ---------------- HARP_USB_RTSTATS capture ---------------- */
 
@@ -772,7 +701,7 @@ static harp_io *usb_open_core(usb_io *u, const char *want, bool want_vp,
         u->rt_enable = !(rt && rt[0] == '0');
         const char *pe = getenv("HARP_USB_RT_PERIOD_US");
         double us = pe ? atof(pe) : 0.0;
-        u->rt_period_ns = (us > 0 ? us : USB_RT_PERIOD_US_DEFAULT) * 1000.0;
+        u->rt_period_ns = (us > 0 ? us : HARP_RT_PERIOD_US_DEFAULT) * 1000.0;
     }
     if (getenv("HARP_USB_RTSTATS")) u->st = stats_alloc(); /* NULL = capture off */
     u->link_fifo.buf = malloc(LINK_FIFO_SZ);

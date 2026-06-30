@@ -1,0 +1,48 @@
+name: perf-gate
+# Performance regression gate for the §4.3 USB real-time feed thread (#133).
+#
+# #133 promoted the host USB feed/IO threads to the host real-time class
+# (macOS THREAD_TIME_CONSTRAINT / Linux SCHED_FIFO) and measured cliff dropouts
+# 3->0 and producer-cadence out_gap P99.9 21.7->11.1 ms on a dev rig under CPU
+# load — but those numbers were reproducible NOWHERE. This gate reproduces the
+# SCHEDULING claim behind them on a stock runner with NO USB hardware:
+# scripts/rt-jitter-gate.sh promotes a periodic thread with the SAME production
+# call (harp_thread_set_realtime) and asserts its wakeup-lateness tail under
+# synthetic contention stays bounded (RT on) AND blows past the gate when RT is
+# removed (HARP_USB_RT=0) — so the gate provably has teeth.
+on: [push, pull_request]
+
+jobs:
+  # macOS: exercises the THREAD_TIME_CONSTRAINT path. RT is grantable to an
+  # unprivileged process here (it is what CoreAudio's own I/O thread uses), so the
+  # gate needs no special privilege.
+  rt-gate-macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: build the hardware-free RT jitter bench
+        run: |
+          cmake -B build
+          cmake --build build --target harp-rt-jitter-bench -j3
+      - name: gate the USB real-time feed thread (out_gap/jitter under load)
+        run: bash scripts/rt-jitter-gate.sh ./build/harp-rt-jitter-bench
+
+  # Linux: exercises the SCHED_FIFO path. A GitHub-hosted ubuntu runner's default
+  # user has RLIMIT_RTPRIO 0, so SCHED_FIFO is denied without privilege; the runner
+  # grants passwordless sudo, and SCHED_FIFO works as root (CAP_SYS_NICE). Running
+  # the whole gate under sudo lets the RT-on arm get real-time while the RT-off arm
+  # still drops to time-share via HARP_USB_RT=0 (set inside the script).
+  rt-gate-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: build the hardware-free RT jitter bench
+        run: |
+          cmake -B build
+          cmake --build build --target harp-rt-jitter-bench -j
+      - name: gate the USB real-time feed thread (out_gap/jitter under load)
+        # -E preserves the environment; the script's RT-off arm sets HARP_USB_RT=0
+        # for the bench child itself, so only the baseline arm drops to time-share.
+        run: sudo -E bash scripts/rt-jitter-gate.sh ./build/harp-rt-jitter-bench

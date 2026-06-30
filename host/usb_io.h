@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #include "harp/link.h"
+#include "rt_sched.h" /* harp_thread_set_realtime — used by the USB completion thread (def in rt_sched.c) */
 
 /* Scan the bus for a HARP device (vendor-specific interface class
  * 0xFF/0x48/0x01, per §4.3/§6.1 class-triple probe), claim the interface,
@@ -91,15 +92,7 @@ size_t harp_usb_link_pending(harp_io *io);
  * dial; ms=0 restores blocking for the live framed link. The shell brackets hello with 2000/0. */
 void harp_usb_set_ctl_timeout(harp_io *io, unsigned ms);
 
-/* Promote the CALLING thread to the host's real-time scheduling class (macOS
- * THREAD_TIME_CONSTRAINT, Linux SCHED_FIFO) sized to `period_us` (the audio block
- * cadence; <=0 uses the 256-sample @ 48k default). The USB completion thread does
- * this for itself; a host-paced runtime should call it from EVERY thread on the
- * realtime audio path (the D->H reader, the pacing feeder) so none can be
- * descheduled by ordinary load — that is what keeps a LOW-latency USB stream
- * dropout-free without growing any buffer. Degrades gracefully (keeps the
- * caller's prior scheduling, logs once) where RT is unavailable; returns true iff
- * real-time was granted. */
-bool harp_thread_set_realtime(double period_us);
+/* harp_thread_set_realtime() is declared in rt_sched.h (included above) — the RT
+ * promotion the USB completion thread and the shell's realtime-path threads share. */
 
 #endif

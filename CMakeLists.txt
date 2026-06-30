@@ -163,7 +163,9 @@ if(NOT LIBUSB_FOUND)
   endif()
 endif()
 if(LIBUSB_FOUND)
-  target_sources(harp-probe PRIVATE host/usb_io.c)
+  # rt_sched.c holds harp_thread_set_realtime(), which usb_io.c calls (it was
+  # extracted out of usb_io.c so it builds with NO libusb — see harp-rt-jitter-bench).
+  target_sources(harp-probe PRIVATE host/usb_io.c host/rt_sched.c)
   target_compile_definitions(harp-probe PRIVATE HAVE_LIBUSB)
   target_include_directories(harp-probe PRIVATE ${LIBUSB_INCLUDE_DIRS})
   if(LIBUSB_LIBRARY_DIRS)
@@ -177,6 +179,20 @@ if(LIBUSB_FOUND)
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
               "${HARP_LIBUSB_DLL}" "$<TARGET_FILE_DIR:harp-probe>")
   endif()
+endif()
+
+# harp-rt-jitter-bench: the CI performance gate for #133's real-time USB feed
+# thread, with NO hardware and NO libusb. It promotes a periodic thread with the
+# SAME production call the USB completion thread uses (harp_thread_set_realtime,
+# host/rt_sched.c) and measures its wakeup-lateness tail under synthetic CPU
+# contention — the host-side proxy for the USB producer-cadence (out_gap) tail.
+# scripts/rt-jitter-gate.sh drives the RT-on (pass) / HARP_USB_RT=0 (fail) A/B.
+add_executable(harp-rt-jitter-bench tools/rt-jitter-bench.c host/rt_sched.c ${HARP_PLAT_SRC})
+target_include_directories(harp-rt-jitter-bench PRIVATE host core/include)
+target_link_libraries(harp-rt-jitter-bench ${HARP_PLAT_LIBS})
+if(NOT WIN32)
+  find_package(Threads REQUIRED)
+  target_link_libraries(harp-rt-jitter-bench Threads::Threads)
 endif()
 
 enable_testing()
