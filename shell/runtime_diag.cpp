@@ -305,7 +305,7 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
      * §8.7 rtp_loss — the canonical host-section homes per docs/diag-bundle-design.md;
      * clock-stats key 4 mirrors reanchors, key 7 there is reserved for ptp-stats.) */
     harp_cbor_uint(&out, 5);
-    harp_cbor_map(&out, 10);
+    harp_cbor_map(&out, 11);
     harp_cbor_uint(&out, 0);
     harp_cbor_uint(&out, underruns_.load(std::memory_order_relaxed)); /* host_underruns */
     harp_cbor_uint(&out, 1);
@@ -329,6 +329,16 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
      * a full window). A tstr key per the schema's vendor-counter-key (x.*), so it is
      * additive and needs NO diag-bundle version bump. Always emitted (0 = clean), so a
      * host monitor can poll it on any session, FX or instrument. */
+    /* host vendor extension counter (§8.7 eth RTP audio never-silent guard, the symmetric
+     * partner of x.harp.fx_silent_wet): the count of RTP-silent stall episodes (a connected
+     * free-running stream stopped delivering packets for a full ~1 s window — RTP stalled /
+     * ASRC starved / device gone — while it should be live). A tstr key per the schema's
+     * vendor-counter-key (x.*), additive with NO diag-bundle version bump. Always emitted
+     * (0 = clean) so a host monitor can poll it on any eth session. Emitted BEFORE
+     * x.harp.fx_silent_wet: deterministic CBOR sorts map keys by encoded bytes, and the
+     * shorter "x.harp.rtp_silent" (len 17) sorts ahead of "x.harp.fx_silent_wet" (len 20). */
+    harp_cbor_text(&out, "x.harp.rtp_silent");
+    harp_cbor_uint(&out, rtpSilentFaults_.load(std::memory_order_relaxed));
     harp_cbor_text(&out, "x.harp.fx_silent_wet");
     harp_cbor_uint(&out, fxSilentWetFaults_.load(std::memory_order_relaxed));
 

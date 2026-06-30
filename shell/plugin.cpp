@@ -576,6 +576,17 @@ public:
                     }
                 }
         }
+        /* §8.7 eth RTP audio NEVER-SILENT guard (symmetric to the §8.8 FX guard in
+         * fx_plugin.cpp): the runtime's reader watchdog (rtpStallTrip) trips when a
+         * connected free-running stream stopped delivering packets for a full window —
+         * RTP stalled / ASRC starved / device gone — while it should be live. On the
+         * OFFLINE/host-paced bounce that is a HARD failure: fail the render LOUDLY
+         * (non-OK status -> the host/CLI bounce exits non-zero) rather than write a
+         * silent file. A live session keeps running — the ERROR log + the host-readable
+         * x.harp.rtp_silent counter surface it without killing the DAW. USB/non-eth
+         * never trips (the guard is reader-eth-only), so the USB offline golden is
+         * unaffected. */
+        if (offline_ && rt.rtpSilentTripped()) return kResultFalse;
         return kResultOk;
     }
 

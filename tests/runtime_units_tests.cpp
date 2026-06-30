@@ -383,6 +383,116 @@ static void test_fx_never_silent() {
     }
 }
 
+/* 8. §8.7 eth RTP audio NEVER-SILENT guard — the symmetric partner of the §8.8 FX guard,
+ *    for the D->H direction. A connected free-running eth stream ALWAYS emits RTP packets
+ *    while live (even a musical rest is silence-CONTENT, not packet-absence), so the
+ *    transport's silentMs stays low; only a REAL stall (RTP stopped / ASRC starved of
+ *    input / device gone) lets it grow past the window. The runtime's reader watchdog
+ *    (rtpStallTrip) must fire LOUDLY when no packet has arrived for a full window while
+ *    streaming, and must NOT false-positive on a live stream, on a rest, or on brief
+ *    jitter gaps under the window. Exercised directly on the detection seam — the SAME
+ *    call the reader() eth loop makes per receive poll — so it is socket-free and
+ *    hardware-free. silentMs is a parameter, so the ~1 s window is crossed instantly with
+ *    a synthetic value (no real waiting). The default window is 1000 ms (rtpSilentWindowMs_). */
+static void test_rtp_never_silent() {
+    const unsigned kWinMs = 1000; /* rtpSilentWindowMs_ default */
+    const unsigned kStall = kWinMs + 500; /* a silentMs past the window => a real stall */
+    const unsigned kJitter = kWinMs / 2;  /* a brief gap, under the window => NOT a stall */
+
+    /* (a) THE STALL: a live stream (packets flowing) then the packets STOP — silentMs grows
+     *     past the window while we should still be streaming. The guard FIRES (counter +
+     *     sticky tripped + host-readable diag key). This is exactly what a dead RTP socket /
+     *     a starved ASRC / a gone device produces. rtpStallTrip returns true on the trip. */
+    {
+        std::unique_ptr<HarpRuntime> rt = runtime_acquire();
+        rt->configure(8000, 256);
+        CHECK(rt->rtpSilentFaults() == 0);
+        CHECK(!rt->rtpSilentTripped());
+
+        /* the stream is live: packets keep landing (floats > 0, silentMs ~0) */
+        for (int p = 0; p < 16; p++) CHECK(!rt->rtpStallTrip(/*floats=*/512, /*silentMs=*/0));
+        CHECK(!rt->rtpSilentTripped());
+
+        /* packets STOP: recvAudio returns 0 and silentMs crosses the window -> STALL */
+        CHECK(rt->rtpStallTrip(/*floats=*/0, kStall));   /* first cross => trips, returns true */
+        CHECK(rt->rtpSilentTripped());
+        CHECK(rt->rtpSilentFaults() == 1);
+        /* still stalled on subsequent polls: returns true (caller breaks) but counts ONCE */
+        CHECK(rt->rtpStallTrip(/*floats=*/0, kStall + 200));
+        CHECK(rt->rtpSilentFaults() == 1); /* ONE count per stall episode, not per poll */
+
+        /* the host-readable surface: the diag bundle carries the vendor counter key */
+        std::vector<uint8_t> bundle = rt->getDiagBundle();
+        const char *needle = "x.harp.rtp_silent";
+        size_t nl = strlen(needle);
+        bool found = false;
+        for (size_t i = 0; bundle.size() >= nl && i + nl <= bundle.size(); i++)
+            if (memcmp(bundle.data() + i, needle, nl) == 0) { found = true; break; }
+        CHECK(found);
+    }
+
+    /* (b1) NO FALSE POSITIVE — a healthy stream: packets keep arriving (floats > 0, silentMs
+     *      ~0) for far longer than the window -> the guard never fires. */
+    {
+        std::unique_ptr<HarpRuntime> rt = runtime_acquire();
+        rt->configure(8000, 256);
+        for (int p = 0; p < 5000; p++) CHECK(!rt->rtpStallTrip(/*floats=*/512, /*silentMs=*/0));
+        CHECK(!rt->rtpSilentTripped());
+        CHECK(rt->rtpSilentFaults() == 0);
+    }
+
+    /* (b2) NO FALSE POSITIVE — legitimate silence (a musical rest / 100%-dry passage / a
+     *      genuine silence-in): the device free-runs, so it still emits packets, only with
+     *      silent CONTENT. At the transport that is a PACKET (floats > 0, silentMs ~0), so
+     *      the stall signal (packet-absence) never grows. The guard stays quiet. */
+    {
+        std::unique_ptr<HarpRuntime> rt = runtime_acquire();
+        rt->configure(8000, 256);
+        /* a long rest: packets keep flowing (floats > 0), carrying silence — never a stall */
+        for (int p = 0; p < 5000; p++) CHECK(!rt->rtpStallTrip(/*floats=*/512, /*silentMs=*/0));
+        CHECK(!rt->rtpSilentTripped());
+        CHECK(rt->rtpSilentFaults() == 0);
+    }
+
+    /* (b3) NO FALSE POSITIVE — brief network jitter / a multi-packet frame still ASSEMBLING:
+     *      a poll returns 0 floats with silentMs UNDER the window, then a packet resumes. A
+     *      gap shorter than the window is not a stall. The latch never even arms. */
+    {
+        std::unique_ptr<HarpRuntime> rt = runtime_acquire();
+        rt->configure(8000, 256);
+        for (int p = 0; p < 5000; p++) {
+            CHECK(!rt->rtpStallTrip(/*floats=*/512, /*silentMs=*/0));    /* packet */
+            CHECK(!rt->rtpStallTrip(/*floats=*/0, kJitter));            /* brief gap, under window */
+        }
+        CHECK(!rt->rtpSilentTripped());
+        CHECK(rt->rtpSilentFaults() == 0);
+    }
+
+    /* (b4) RE-ARM ACROSS EPISODES: after a stall, packets RESUME (the supervisor reconnected
+     *      and the reader is receiving again) -> the latch clears, so a LATER, distinct stall
+     *      fires its OWN count. Proves the guard is not a one-shot that masks a second fault. */
+    {
+        std::unique_ptr<HarpRuntime> rt = runtime_acquire();
+        rt->configure(8000, 256);
+        CHECK(rt->rtpStallTrip(/*floats=*/0, kStall)); /* episode 1 */
+        CHECK(rt->rtpSilentFaults() == 1);
+        CHECK(!rt->rtpStallTrip(/*floats=*/512, /*silentMs=*/0)); /* packets resume -> latch clears */
+        CHECK(rt->rtpStallTrip(/*floats=*/0, kStall)); /* episode 2 */
+        CHECK(rt->rtpSilentFaults() == 2);
+        CHECK(rt->rtpSilentTripped()); /* sticky stays set */
+    }
+
+    /* (a') a runtime that never sees a stall (the USB / instrument golden path never calls
+     *      rtpStallTrip) stays at zero — the guard is eth-reader-only and adds nothing to
+     *      any other path. */
+    {
+        std::unique_ptr<HarpRuntime> rt = runtime_acquire();
+        rt->configure(8000, 256);
+        CHECK(!rt->rtpSilentTripped());
+        CHECK(rt->rtpSilentFaults() == 0);
+    }
+}
+
 int main() {
     /* Hermetic store: keep the ctor's harp_store_open out of the real cache. POSIX only;
      * on Windows the default store dir is used (harmless — setStateBundle still parses,
@@ -400,6 +510,7 @@ int main() {
     test_note_voice_map();
     test_setstatebundle_rejection();
     test_fx_never_silent();
+    test_rtp_never_silent();
 
     return check_report("harp-runtime-units-tests");
 }
