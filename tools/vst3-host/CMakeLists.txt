@@ -152,6 +152,17 @@ if(LIBUSB_FOUND)
     set(HARP_PLAT_SRC ${HARP_ROOT}/core/src/plat_posix.c)
     set(HARP_PLAT_LIBS "")
   endif()
+  # The SHARED shell-runtime translation units — every shell target (harp-shell,
+  # harp-fx-shell, harp-clap, harp-au, harp-runtime-probe, tsan-host, the unit-test
+  # hosts, the downstream variant) compiles EXACTLY this set; only the per-format
+  # entry point (plugin.cpp / fx_plugin.cpp / harp_clap.cpp / harp_au.mm / a test
+  # main) differs. Listed ONCE here so a new shell TU (e.g. runtime_diag.cpp, split
+  # out of runtime.cpp) is picked up by every target at once — no per-target
+  # duplication to drift (which previously let one build clobber another's binary).
+  set(HARP_SHELL_SRC
+    ${HARP_ROOT}/shell/runtime.cpp
+    ${HARP_ROOT}/shell/runtime_diag.cpp
+    ${HARP_ROOT}/shell/runtime_registry.cpp)
   # VST3 plugin entry point is per-platform (macmain/linuxmain/dllmain).
   if(APPLE)
     set(SHELL_MAIN ${SDK_ROOT}/public.sdk/source/main/macmain.cpp)
@@ -163,8 +174,7 @@ if(LIBUSB_FOUND)
   smtg_add_vst3plugin(harp-shell
     ${SHELL_MAIN}
     ${HARP_ROOT}/shell/plugin.cpp
-    ${HARP_ROOT}/shell/runtime.cpp
-    ${HARP_ROOT}/shell/runtime_registry.cpp
+    ${HARP_SHELL_SRC}
     ${HARP_ROOT}/host/usb_io.c
     ${HARP_ROOT}/host/sock_io.c
     ${HARP_ROOT}/host/rtp.c
@@ -204,8 +214,7 @@ if(LIBUSB_FOUND)
   smtg_add_vst3plugin(harp-fx-shell
     ${SHELL_MAIN}
     ${HARP_ROOT}/shell/fx_plugin.cpp
-    ${HARP_ROOT}/shell/runtime.cpp
-    ${HARP_ROOT}/shell/runtime_registry.cpp
+    ${HARP_SHELL_SRC}
     ${HARP_ROOT}/host/usb_io.c
     ${HARP_ROOT}/host/sock_io.c
     ${HARP_ROOT}/host/rtp.c
@@ -245,8 +254,7 @@ if(LIBUSB_FOUND)
   find_package(Threads REQUIRED)
   add_executable(harp-runtime-probe
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime-probe.cpp
-    ${HARP_ROOT}/shell/runtime.cpp
-    ${HARP_ROOT}/shell/runtime_registry.cpp
+    ${HARP_SHELL_SRC}
     ${HARP_ROOT}/host/usb_io.c
     ${HARP_ROOT}/host/sock_io.c
     ${HARP_ROOT}/host/rtp.c
@@ -273,8 +281,7 @@ if(LIBUSB_FOUND)
   # PARAM_MOD maps straight to §9.5 per-voice modulation (shell/clap/harp_clap.cpp).
   add_library(harp-clap MODULE
     ${HARP_ROOT}/shell/clap/harp_clap.cpp
-    ${HARP_ROOT}/shell/runtime.cpp
-    ${HARP_ROOT}/shell/runtime_registry.cpp
+    ${HARP_SHELL_SRC}
     ${HARP_ROOT}/host/usb_io.c
     ${HARP_ROOT}/host/sock_io.c
     ${HARP_ROOT}/host/rtp.c
@@ -375,8 +382,7 @@ if(LIBUSB_FOUND)
   if(HARP_TSAN)
     add_executable(tsan-host
       ${CMAKE_CURRENT_SOURCE_DIR}/../tsan-host/main.cpp
-      ${HARP_ROOT}/shell/runtime.cpp
-      ${HARP_ROOT}/shell/runtime_registry.cpp
+      ${HARP_SHELL_SRC}
       ${HARP_ROOT}/host/usb_io.c
       ${HARP_ROOT}/host/sock_io.c
       ${HARP_ROOT}/host/rtp.c
@@ -431,8 +437,7 @@ if(LIBUSB_FOUND)
   # dir is used — harmless on CI, and the test never reads the store.)
   add_executable(registry-tests
     ${HARP_ROOT}/tests/registry_tests.cpp
-    ${HARP_ROOT}/shell/runtime.cpp
-    ${HARP_ROOT}/shell/runtime_registry.cpp
+    ${HARP_SHELL_SRC}
     ${HARP_ROOT}/host/usb_io.c
     ${HARP_ROOT}/host/sock_io.c
     ${HARP_ROOT}/host/rtp.c
@@ -466,8 +471,7 @@ if(LIBUSB_FOUND)
   # Same source set + 3-OS reach as registry-tests above.
   add_executable(runtime-units-tests
     ${HARP_ROOT}/tests/runtime_units_tests.cpp
-    ${HARP_ROOT}/shell/runtime.cpp
-    ${HARP_ROOT}/shell/runtime_registry.cpp
+    ${HARP_SHELL_SRC}
     ${HARP_ROOT}/host/usb_io.c
     ${HARP_ROOT}/host/sock_io.c
     ${HARP_ROOT}/host/rtp.c
@@ -561,8 +565,7 @@ if(LIBUSB_FOUND)
   if(HARP_SHELL_VARIANT_NAME AND HARP_SHELL_VARIANT_CONFIG)
     smtg_add_vst3plugin(${HARP_SHELL_VARIANT_NAME}
       ${SHELL_MAIN}
-      ${HARP_ROOT}/shell/plugin.cpp ${HARP_ROOT}/shell/runtime.cpp
-      ${HARP_ROOT}/shell/runtime_registry.cpp
+      ${HARP_ROOT}/shell/plugin.cpp ${HARP_SHELL_SRC}
       ${HARP_ROOT}/host/usb_io.c ${HARP_ROOT}/host/sock_io.c ${HARP_ROOT}/host/rtp.c
       ${HARP_ROOT}/host/freerun.c ${HARP_ROOT}/host/client.c
       ${HARP_ROOT}/core/src/cbor.c ${HARP_ROOT}/core/src/sha256.c
@@ -608,8 +611,7 @@ if(LIBUSB_FOUND)
   if(APPLE)
     add_library(harp-au MODULE
       ${HARP_ROOT}/shell/au/harp_au.mm
-      ${HARP_ROOT}/shell/runtime.cpp
-      ${HARP_ROOT}/shell/runtime_registry.cpp
+      ${HARP_SHELL_SRC}
       ${HARP_ROOT}/host/usb_io.c
       ${HARP_ROOT}/host/sock_io.c
       ${HARP_ROOT}/host/rtp.c
