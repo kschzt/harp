@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47900}"
+PORT="${PORT:-17900}"
 export HARP_RECONCILE_TIMEOUT_MS=0   # headless: no front panel to answer a recall pick
 
 PASS=0; FAIL=0

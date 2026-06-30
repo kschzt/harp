@@ -28,7 +28,7 @@ VHOST="${VHOST:-./build-vst/harp-vst3-host}"
 CHOST="${CHOST:-./build-vst/clap-host}"
 VPLUG="${VPLUG:-$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
 CPLUG="${CPLUG:-$(find build-vst -maxdepth 5 -name harp-clap.clap 2>/dev/null | head -1)}"
-PORT="${PORT:-47990}"
+PORT="${PORT:-17990}"
 export HARP_RECONCILE_TIMEOUT_MS=0   # headless: no front panel to answer a recall pick
 
 # The canonical golden render (same musical content as scripts/golden-test.sh): a clean

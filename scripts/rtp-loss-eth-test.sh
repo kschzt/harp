@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47973}"
+PORT="${PORT:-17973}"
 DROP="${DROP:-25}"
 DEVDIR=rtploss-eth-state   # workspace-RELATIVE (Git Bash /tmp->C:\ trips the device mkdir; see eth-tests.sh)
 DEVLOG=/tmp/rtploss-eth-dev.log

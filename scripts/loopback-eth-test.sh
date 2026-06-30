@@ -38,7 +38,7 @@ cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$(find build-vst build -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47989}"
+PORT="${PORT:-17989}"
 SERIAL="${SERIAL:-SIM-0001}"
 IN_SLOT="${IN_SLOT:-10}"   # H->D injection slot (no synth notes ride it)
 OUT_SLOT="${OUT_SLOT:-11}" # D->H echo slot (UNUSED by notes — the echo overwrites it)

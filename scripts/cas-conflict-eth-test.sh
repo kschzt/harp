@@ -15,12 +15,12 @@
 #
 # A fresh --state-dir device boots with a factory live/project snapshot, so cas-test needs
 # no `demo` to populate the live ref. HARP_RECONCILE_TIMEOUT_MS=0 keeps it headless (no panel
-# answers the loopback). Co-existence: unique port (47997), own state-dir, kills only its pid.
+# answers the loopback). Co-existence: unique port (17997), own state-dir, kills only its pid.
 set -u
 cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 PROBE="${PROBE:-./build/harp-probe}"
-PORT="${PORT:-47997}"
+PORT="${PORT:-17997}"
 SERIAL="${SERIAL:-SIM-0001}"
 DEVDIR=cas-conflict-eth-state   # workspace-RELATIVE (Git Bash /tmp -> C:\ trips the MinGW device mkdir)
 DEVLOG=/tmp/cas-conflict-eth-dev.log

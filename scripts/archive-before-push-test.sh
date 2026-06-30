@@ -33,7 +33,7 @@ export HARP_RECONCILE_TIMEOUT_MS=0
 
 DEVICED="${DEVICED:-./build/harp-deviced}"
 PROBE="${PROBE:-./build/harp-probe}"
-PORT="${PORT:-47925}"
+PORT="${PORT:-17925}"
 DEVDIR=archive-before-push-state   # workspace-RELATIVE (MSYS path-arg safety, same as gc-test)
 STOREDIR=archive-before-push-store # the probe's local store — `save` writes the saved project
                                    # here, `restore` reads it back; MUST persist across invocations

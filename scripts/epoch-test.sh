@@ -19,7 +19,7 @@ set -u
 cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 PROBE="${PROBE:-./build/harp-probe}"
-PORT="${PORT:-47922}"
+PORT="${PORT:-17922}"
 DEVDIR=epoch-state   # workspace-RELATIVE
 DEVLOG=/tmp/epoch-dev.log
 fail() { echo "EPOCH FAIL: $1"; exit 1; }

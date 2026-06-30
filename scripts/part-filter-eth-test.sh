@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47963}"
+PORT="${PORT:-17963}"
 SOCK="/tmp/harp-pf-panel.sock"
 LOG=/tmp/pf-host.log
 fail() { echo "PART-FILTER FAIL: $1"; exit 1; }

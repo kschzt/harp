@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47971}"
+PORT="${PORT:-17971}"
 DEVDIR=reconnect-eth-state   # workspace-RELATIVE: an absolute /tmp arg is path-converted by
                              # Git Bash to C:/Users/.../Temp/..., whose drive component trips
                              # the device's recursive mkdir on Windows (see eth-tests.sh)

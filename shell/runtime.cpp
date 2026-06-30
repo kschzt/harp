@@ -3205,12 +3205,27 @@ bool HarpRuntime::getStateBundle(std::vector<uint8_t> &out) {
     for (int i = 0; i < 60 && !connected(); i++) harp_sleep_ns(50000000ull); /* ≤ ~3 s */
     if (!connected()) return false; /* genuinely offline: nothing to save */
     std::lock_guard<std::mutex> lk(ctlMutex_);
+    /* The ctl round-trips below (refsLocked / snapshotLocked / fetchClosureLocked) are each bounded by
+     * the §15.1 live-session SO_RCVTIMEO; on a loaded Windows runner a single response can land just past
+     * it and fail a project SAVE that should have succeeded — the GET-path mirror of the SET/push path's
+     * non-fatal posture (a transient push failure is already logged-and-tolerated, not fatal). Retry the
+     * round-trips a few times on a TRANSPORT-level failure while still connected(), 100 ms apart. An
+     * AUTHORITATIVE empty state (live.unborn) returns false immediately — a real "nothing to save" is
+     * never retried — and a genuine failure still returns false after the attempts, so the save's
+     * caller still sees the error and the engine-mismatch/recall assertions are unchanged. */
     harp_ref live;
-    if (!refsLocked(&live)) return false;
-    harp_hash head = live.hash;
-    if (live.unborn) return false;
-    if (live.dirty && !snapshotLocked(&head)) return false;
-    if (!fetchClosureLocked(head)) return false;
+    harp_hash head;
+    bool got = false;
+    for (int attempt = 0; attempt < 3 && connected(); attempt++) {
+        if (!refsLocked(&live)) { harp_sleep_ns(100000000ull); continue; } /* transient ctl hiccup */
+        if (live.unborn) return false;                  /* authoritative: nothing to save (not transient) */
+        head = live.hash;
+        if (live.dirty && !snapshotLocked(&head)) { harp_sleep_ns(100000000ull); continue; }
+        if (!fetchClosureLocked(head)) { harp_sleep_ns(100000000ull); continue; }
+        got = true;
+        break;
+    }
+    if (!got) return false;
 
     HashList clo;
     clo.add(head);

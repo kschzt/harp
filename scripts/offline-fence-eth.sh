@@ -27,7 +27,7 @@ cd "$(dirname "$0")/.."
 
 DEVICED="${DEVICED:-./build/harp-deviced}"
 FENCE="${FENCE:-./build/harp-eth-fence-test}"
-PORT="${PORT:-47996}"
+PORT="${PORT:-17996}"
 DEVLOG=/tmp/offline-fence-eth-dev.log
 fail() { echo "OFFLINE-FENCE-ETH FAIL: $1"; exit 1; }
 [ -x "$DEVICED" ] || fail "$DEVICED not built"

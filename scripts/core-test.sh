@@ -11,7 +11,7 @@ set -u
 cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 PROBE="${PROBE:-./build/harp-probe}"
-PORT="${PORT:-47922}"
+PORT="${PORT:-17922}"
 DEVDIR=core-state   # workspace-RELATIVE
 DEVLOG=/tmp/core-dev.log
 fail() { echo "CORE FAIL: $1"; exit 1; }

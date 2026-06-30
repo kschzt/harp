@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$(find build-vst build -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47948}"
+PORT="${PORT:-17948}"
 STATEDIR=pmh-eth-state   # workspace-RELATIVE (Windows path-converts an absolute /tmp arg)
 STATEFILE=pmh-eth.state
 DEVLOG=/tmp/pmh-eth-dev.log

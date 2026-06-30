@@ -12,7 +12,7 @@ set -u
 cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 PROBE="${PROBE:-./build/harp-probe}"
-PORT="${PORT:-47924}"
+PORT="${PORT:-17924}"
 DEVDIR=gc-state          # workspace-RELATIVE
 DEVLOG=/tmp/gc-dev.log
 KEEP=32                  # must match HARP_ARCHIVE_KEEP

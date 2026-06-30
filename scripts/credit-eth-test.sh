@@ -21,7 +21,7 @@ DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PROBE="${PROBE:-./build/harp-probe}"
 PLUG="${PLUG:-$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47903}"
+PORT="${PORT:-17903}"
 STATEDIR=credit-eth-state   # workspace-RELATIVE (see recall-eth-test.sh header)
 STATEFILE=credit-eth.state
 fail() { echo "CREDIT-ETH FAIL: $1"; exit 1; }

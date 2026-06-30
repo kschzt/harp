@@ -42,7 +42,7 @@ cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$(find build-vst build -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47987}"
+PORT="${PORT:-17987}"
 SERIAL="${SERIAL:-SIM-0001}"
 DEVDIR=diagbundle-host-eth-state   # workspace-RELATIVE (see header)
 DEVLOG=/tmp/diagbundle-host-eth-dev.log

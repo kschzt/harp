@@ -27,7 +27,7 @@ cd "$(dirname "$0")/.."
 
 DEVICED="${DEVICED:-./build/harp-deviced}"
 PROBE="${PROBE:-./build/harp-probe}"
-PORT="${PORT:-47834}"
+PORT="${PORT:-17834}"
 FORCE_IP="${FORCE_IP:-203.0.113.7}"   # TEST-NET-3 (RFC 5737) — a non-loopback IP the shed path keys on
 DEVDIR=ratelimit-eth-state   # workspace-RELATIVE (see header)
 STORE=ratelimit-eth-store

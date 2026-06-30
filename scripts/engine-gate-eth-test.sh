@@ -11,7 +11,7 @@ set -u
 cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 PROBE="${PROBE:-./build/harp-probe}"
-PORT="${PORT:-47926}"
+PORT="${PORT:-17926}"
 DEVDIR=engine-gate-state   # workspace-RELATIVE (Git Bash /tmp -> C:\ trips the MinGW device mkdir)
 DEVLOG=/tmp/engine-gate-dev.log
 fail() { echo "ENGINE-GATE-ETH FAIL: $1"; exit 1; }

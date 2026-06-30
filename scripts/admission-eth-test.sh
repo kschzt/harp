@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47913}"
+PORT="${PORT:-17913}"
 STATEDIR=admission-eth-state   # workspace-RELATIVE
 DEVLOG=/tmp/admission-eth-dev.log
 HOSTLOG=/tmp/admission-eth-host.log

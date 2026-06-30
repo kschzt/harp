@@ -7,7 +7,7 @@
 set -u
 cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
-PORT="${PORT:-47823}"
+PORT="${PORT:-17823}"
 fail() { echo "HELLO-GATE FAIL: $1"; exit 1; }
 [ -x "$DEVICED" ] || fail "$DEVICED not built"
 command -v python3 >/dev/null 2>&1 || { echo "HELLO-GATE SKIP: python3 not available"; exit 0; }

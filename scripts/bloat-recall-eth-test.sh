@@ -10,7 +10,7 @@ set -u
 cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 PROBE="${PROBE:-./build/harp-probe}"
-PORT="${PORT:-47923}"
+PORT="${PORT:-17923}"
 DEVDIR=bloat-state   # workspace-RELATIVE
 DEVLOG=/tmp/bloat-dev.log
 N="${BLOAT_N:-1500}" # comfortably past the ~1,300-ref ctl-bound threshold

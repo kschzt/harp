@@ -15,7 +15,7 @@ DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PROBE="${PROBE:-./build/harp-probe}"
 PLUG="${PLUG:-$(find build-vst build -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47812}"
+PORT="${PORT:-17812}"
 SERIAL=SIM-SHELL-MDNS
 fail() { echo "SHELL-MDNS FAIL: $1"; exit 1; }
 [ -x "$DEVICED" ] || fail "$DEVICED not built"
