@@ -18,6 +18,20 @@
 #  include <sys/socket.h>
 #endif
 #include "device.h"
+#include "fence_wait.h" /* §8.3.1 fence-wait + count predicates (pure, unit-tested) */
+
+/* §8.3.1 real-time host-paced fence bound: "a few milliseconds". The fence wait is normally
+ * µs (events keep up); this is the safety cap so a host that fences beyond what it feeds cannot
+ * wedge the real-time stream — at the bound we render the range with the late event applied and
+ * count the expiry. The deterministic OFFLINE bounce ignores it (unbounded barrier). */
+#define HARP_FENCE_RT_BOUND_NS 5000000ull /* 5 ms */
+
+/* monotonic now in ns for the real-time fence deadline (CLOCK_MONOTONIC, as elsewhere here) */
+static inline uint64_t fence_mono_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 /* sockets are owned by the daemon main (harp-deviced.c) */
 void audio_rtp_emit(audio_state *a, const float *samples, size_t payload_bytes, uint64_t msc);
@@ -114,19 +128,21 @@ static void host_paced_loop(device *d) {
                     hdr[0], hdr[1]);
             return; /* §4.2 spirit: malformed stream is fatal */
         }
-        /* event fence (§8.3.1): events ride the link endpoint, pacing rides
-         * this one — two pipes, no ordering between them. A fenced frame
-         * names how many evt messages must be consumed before its range may
-         * render; ordering becomes structural instead of probabilistic.
-         * The wait is wire+parse time of in-flight events (typically µs,
-         * absorbed by the host's ring cushion). It is UNBOUNDED (a true barrier):
-         * host-paced delivery is DETERMINISTIC — a faster-than-real-time offline
-         * pull (the §8.3-over-§8.7 bounce) outruns the events, and a timed-out
-         * fence would render before the event landed, making the bounce non-
-         * deterministic run-to-run. Over USB the events always keep up so this
-         * never waits long (the golden is unaffected). A genuinely stalled/dead
-         * host is caught by a->running going false (session teardown closes the
-         * link → the loop's reads return), so this can't wedge forever. */
+        /* event fence (§8.3.1): events ride the link endpoint, pacing rides this
+         * one — two pipes, no ordering between them. A fenced frame names how many
+         * evt messages must be consumed before its range may render; ordering
+         * becomes structural instead of probabilistic. Two regimes, decided by
+         * a->offline (the pure predicates are in fence_wait.h, unit-tested):
+         *   - OFFLINE deterministic bounce (§8.3-over-§8.7 TCP pull): faster than
+         *     real time, no stream to wedge, and it MUST reproduce the EXACT fenced
+         *     event set bit-for-bit — so the fence is an UNBOUNDED barrier (a timed-
+         *     out fence would render before the event landed, breaking determinism).
+         *   - REAL-TIME host-paced (USB; a running wall clock): an unbounded fence
+         *     IS a wedged stream, so §8.3.1 MANDATES a few-ms bound — at the deadline
+         *     we render the range with the late event applied and count the expiry
+         *     (g_fence_timeouts; evt_late is the probe for the late apply). Events
+         *     normally keep up over USB, so the bound almost never fires. Session
+         *     teardown (a->running false) ends either wait. */
         if (h.dirflags & HARP_AUDIO_FENCE) {
             uint8_t fb[HARP_AUDIO_FENCE_LEN];
             size_t fgot = 0;
@@ -146,21 +162,27 @@ static void host_paced_loop(device *d) {
             }
             uint32_t want = (uint32_t)fb[0] | ((uint32_t)fb[1] << 8) |
                             ((uint32_t)fb[2] << 16) | ((uint32_t)fb[3] << 24);
-            if ((int32_t)(want - atomic_load_explicit(&g_evt_consumed,
-                                                      memory_order_acquire)) > 0) {
+            int32_t pending = (int32_t)(want - atomic_load_explicit(
+                                            &g_evt_consumed, memory_order_acquire));
+            if (pending > 0) {
                 CTR_INC(g_fence_waits);
-                struct timespec fts = {0, 50000}; /* 50 µs */
-                /* unbounded barrier (see above): wait for the fenced events or for
-                 * the session to stop — never a fixed timeout that would race. */
-                while ((int32_t)(want - atomic_load_explicit(
-                                            &g_evt_consumed,
-                                            memory_order_acquire)) > 0 &&
-                       atomic_load_explicit(&a->running, memory_order_relaxed))
+                struct timespec fts = {0, 50000}; /* 50 µs poll */
+                uint64_t deadline = fence_mono_ns() + HARP_FENCE_RT_BOUND_NS;
+                /* offline: unbounded barrier (deterministic bounce); real-time: bounded at the
+                 * deadline, then fall through to render the range with the late event (§8.3.1). */
+                while (harp_fence_keep_waiting(
+                           pending,
+                           atomic_load_explicit(&a->running, memory_order_relaxed),
+                           a->offline, fence_mono_ns(), deadline)) {
                     nanosleep(&fts, NULL);
-                if ((int32_t)(want - atomic_load_explicit(
-                                         &g_evt_consumed,
-                                         memory_order_acquire)) > 0)
-                    CTR_INC(g_fence_timeouts); /* aborted via stop with events pending */
+                    pending = (int32_t)(want - atomic_load_explicit(
+                                            &g_evt_consumed, memory_order_acquire));
+                }
+                if (harp_fence_count_timeout(
+                        pending,
+                        atomic_load_explicit(&a->running, memory_order_relaxed),
+                        a->offline))
+                    CTR_INC(g_fence_timeouts); /* real-time deadline expiry — rendered late */
             }
         }
         /* Input payload: normally discarded (this engine has no input channels), so the

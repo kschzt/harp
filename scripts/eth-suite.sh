@@ -113,6 +113,12 @@ else skip latefr "harp-eth-latefr-test not built (POSIX-only host-paced tool)"; 
 if [ -x ./build/harp-eth-fence-test ]; then run offline-fence scripts/offline-fence-eth.sh
 else skip offline-fence "harp-eth-fence-test not built (POSIX-only host-paced tool)"; fi
 
+# §8.3.1 event-fence integration, REAL-TIME side: same tool with HARP_FENCE_FORCE_RT=1 fences
+# beyond the feed and asserts the device BOUNDS the wait + counts fence_timeouts (no wedge) —
+# the production-path guard the unit test could not give (the loop once bypassed the helper).
+if [ -x ./build/harp-eth-fence-test ]; then run realtime-fence scripts/realtime-fence-eth.sh
+else skip realtime-fence "harp-eth-fence-test not built (POSIX-only host-paced tool)"; fi
+
 # §9.4 per-part echo demux drives the device front panel over a unix socket; the MinGW
 # device replaces panel.c with a no-op stub, so the multi-instance path is POSIX-only
 # until the Windows panel transport lands.
