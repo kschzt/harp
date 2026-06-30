@@ -133,6 +133,20 @@ jobs:
           TARGET_SSH: ci@harptest.local
           N: ${{ github.event.inputs.hw_usb_n || '10' }}
           VECTORS: crash killd stopstr
+          # After a brutal vector, assert_recovers does ONE daemon restart then lets the churned
+          # passthrough xHCI quiesce for up to QUIESCE_S before declaring a wedge (a SIGKILLed
+          # daemon balloons re-enum latency to ~6-10s; the old 3×3s probe mislabelled that settle
+          # as a REBOOT-CLASS WEDGE). Genuine wedges still fail loud after the full window.
+          QUIESCE_S: '60'
+          # xHCI-passthrough backstop (Fix C): the only thing that resets a TRULY wedged passthrough
+          # controller is a host-side `virsh destroy harp-rig && virsh start harp-rig` of THIS libvirt
+          # guest (NOT an in-guest reboot, NOT USBDEVFS_RESET; uhubctl is unavailable on this rig).
+          # This runner executes INSIDE that guest, so it cannot virsh-destroy its own VM without
+          # killing itself mid-probe — wiring it inline is impractical. BACKSTOP_CMD is therefore left
+          # UNSET here: a true wedge fails loud and the operator/runbook (memory hw-rig-runner) resets
+          # the passthrough from the libvirt host with `virsh destroy harp-rig && virsh start harp-rig`.
+          # (If a future rig runs the suite from the host, set BACKSTOP_CMD to that virsh reset and the
+          # script will attempt it + one final probe before failing.)
         run: scripts/usb-stress.sh
       - name: recall round-trip soak (save/scramble/restore through PI4B-0002, x3)
         run: |
