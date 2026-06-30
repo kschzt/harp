@@ -98,6 +98,18 @@ else()
   endif()
 endif()
 
+# debt #19: the DEVICE engine-render golden (cloud-gated). Links the refdev engine seam
+# (engine.c render_output / engine_voices_cold / evq_*) DIRECTLY — no shell, no transport, no USB —
+# so the raw synth DSP is pinned in cloud CI, not only on the hw rig. See scripts/engine-golden-test.sh.
+add_executable(harp-engine-golden tools/engine-golden.c device/engine.c ${HARP_PLAT_SRC})
+target_link_libraries(harp-engine-golden harpdevice ${HARP_PLAT_LIBS})
+if(WIN32)
+  target_link_libraries(harp-engine-golden ws2_32)
+else()
+  find_package(Threads REQUIRED)
+  target_link_libraries(harp-engine-golden Threads::Threads)
+endif()
+
 add_executable(harp-probe host/harp-probe.c host/client.c host/mdns.c ${HARP_PLAT_SRC})
 target_link_libraries(harp-probe harpcore ${HARP_MATH_LIB} ${HARP_PLAT_LIBS})
 if(WIN32)

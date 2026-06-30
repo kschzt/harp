@@ -220,6 +220,8 @@ jobs:
         run: cmake -B build && cmake --build build -j
       - name: unit tests (core + device_codec + freerun/rtp ASRC stopband/reanchor)
         run: ctest --test-dir build --output-on-failure
+      - name: engine-render golden (debt #19 — raw device DSP render_output(): determinism + non-silence + pinned hash)
+        run: ./scripts/engine-golden-test.sh
       - name: ring tests under ThreadSanitizer
         run: |
           clang++ -std=c++17 -fsanitize=thread -O1 -g -I shell \
