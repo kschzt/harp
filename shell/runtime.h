@@ -113,6 +113,7 @@ struct AudioSink {
 };
 
 extern "C" {
+#include "harp/anonymize.h" /* §16 device-section PII redactor (shared w/ harp-probe) */
 #include "harp/audio.h"
 #include "harp/cbor.h"
 #include "harp/envelope.h"

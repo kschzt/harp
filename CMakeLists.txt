@@ -44,6 +44,7 @@ endif()
 
 add_library(harpcore STATIC
   core/src/cbor.c
+  core/src/anonymize.c   # §16 device-section anonymizer — single source of truth (shell + probe)
   core/src/sha256.c
   core/src/frame.c
   core/src/object.c

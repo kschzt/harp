@@ -141,6 +141,21 @@ endif()
 
 if(LIBUSB_FOUND)
   set(HARP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+  # The §-conformance C core, compiled DIRECTLY into every shell/test target below
+  # (NOT a shared static lib) so each gets its own tsan/asan/MSVC-c11atomics/PIC
+  # instrumentation — a static lib would erase the per-target flags. This ONE list
+  # is the single source of truth: adding a core source (e.g. anonymize.c) here
+  # reaches all ~9 targets at once, so none can silently miss it and fail to link.
+  set(HARP_CORE_SRC
+    ${HARP_ROOT}/core/src/cbor.c
+    ${HARP_ROOT}/core/src/anonymize.c
+    ${HARP_ROOT}/core/src/sha256.c
+    ${HARP_ROOT}/core/src/frame.c
+    ${HARP_ROOT}/core/src/object.c
+    ${HARP_ROOT}/core/src/store.c
+    ${HARP_ROOT}/core/src/envelope.c
+    ${HARP_ROOT}/core/src/link.c
+    ${HARP_ROOT}/core/src/audio.c)
   # Platform shim (harp/plat.h) compiled into the shell/AU like the core .c files.
   if(WIN32)
     set(HARP_PLAT_SRC ${HARP_ROOT}/core/src/plat_win.c)
@@ -170,14 +185,7 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/host/rtp.c
     ${HARP_ROOT}/host/freerun.c
     ${HARP_ROOT}/host/client.c
-    ${HARP_ROOT}/core/src/cbor.c
-    ${HARP_ROOT}/core/src/sha256.c
-    ${HARP_ROOT}/core/src/frame.c
-    ${HARP_ROOT}/core/src/object.c
-    ${HARP_ROOT}/core/src/store.c
-    ${HARP_ROOT}/core/src/envelope.c
-    ${HARP_ROOT}/core/src/link.c
-    ${HARP_ROOT}/core/src/audio.c
+    ${HARP_CORE_SRC}
     ${HARP_PLAT_SRC}
   )
   target_include_directories(harp-shell PRIVATE
@@ -211,14 +219,7 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/host/rtp.c
     ${HARP_ROOT}/host/freerun.c
     ${HARP_ROOT}/host/client.c
-    ${HARP_ROOT}/core/src/cbor.c
-    ${HARP_ROOT}/core/src/sha256.c
-    ${HARP_ROOT}/core/src/frame.c
-    ${HARP_ROOT}/core/src/object.c
-    ${HARP_ROOT}/core/src/store.c
-    ${HARP_ROOT}/core/src/envelope.c
-    ${HARP_ROOT}/core/src/link.c
-    ${HARP_ROOT}/core/src/audio.c
+    ${HARP_CORE_SRC}
     ${HARP_PLAT_SRC}
   )
   target_include_directories(harp-fx-shell PRIVATE
@@ -252,14 +253,7 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/host/rtp.c
     ${HARP_ROOT}/host/freerun.c
     ${HARP_ROOT}/host/client.c
-    ${HARP_ROOT}/core/src/cbor.c
-    ${HARP_ROOT}/core/src/sha256.c
-    ${HARP_ROOT}/core/src/frame.c
-    ${HARP_ROOT}/core/src/object.c
-    ${HARP_ROOT}/core/src/store.c
-    ${HARP_ROOT}/core/src/envelope.c
-    ${HARP_ROOT}/core/src/link.c
-    ${HARP_ROOT}/core/src/audio.c
+    ${HARP_CORE_SRC}
     ${HARP_PLAT_SRC})
   target_include_directories(harp-runtime-probe PRIVATE
     ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell ${LIBUSB_INCLUDE_DIRS})
@@ -280,14 +274,7 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/host/rtp.c
     ${HARP_ROOT}/host/freerun.c
     ${HARP_ROOT}/host/client.c
-    ${HARP_ROOT}/core/src/cbor.c
-    ${HARP_ROOT}/core/src/sha256.c
-    ${HARP_ROOT}/core/src/frame.c
-    ${HARP_ROOT}/core/src/object.c
-    ${HARP_ROOT}/core/src/store.c
-    ${HARP_ROOT}/core/src/envelope.c
-    ${HARP_ROOT}/core/src/link.c
-    ${HARP_ROOT}/core/src/audio.c
+    ${HARP_CORE_SRC}
     ${HARP_PLAT_SRC})
   target_include_directories(harp-clap PRIVATE
     ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
@@ -382,14 +369,7 @@ if(LIBUSB_FOUND)
       ${HARP_ROOT}/host/rtp.c
       ${HARP_ROOT}/host/freerun.c
       ${HARP_ROOT}/host/client.c
-      ${HARP_ROOT}/core/src/cbor.c
-      ${HARP_ROOT}/core/src/sha256.c
-      ${HARP_ROOT}/core/src/frame.c
-      ${HARP_ROOT}/core/src/object.c
-      ${HARP_ROOT}/core/src/store.c
-      ${HARP_ROOT}/core/src/envelope.c
-      ${HARP_ROOT}/core/src/link.c
-      ${HARP_ROOT}/core/src/audio.c
+      ${HARP_CORE_SRC}
       ${HARP_PLAT_SRC})
     target_include_directories(tsan-host PRIVATE
       ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
@@ -438,14 +418,7 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/host/rtp.c
     ${HARP_ROOT}/host/freerun.c
     ${HARP_ROOT}/host/client.c
-    ${HARP_ROOT}/core/src/cbor.c
-    ${HARP_ROOT}/core/src/sha256.c
-    ${HARP_ROOT}/core/src/frame.c
-    ${HARP_ROOT}/core/src/object.c
-    ${HARP_ROOT}/core/src/store.c
-    ${HARP_ROOT}/core/src/envelope.c
-    ${HARP_ROOT}/core/src/link.c
-    ${HARP_ROOT}/core/src/audio.c
+    ${HARP_CORE_SRC}
     ${HARP_PLAT_SRC})
   target_include_directories(registry-tests PRIVATE
     ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
@@ -473,14 +446,7 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/host/rtp.c
     ${HARP_ROOT}/host/freerun.c
     ${HARP_ROOT}/host/client.c
-    ${HARP_ROOT}/core/src/cbor.c
-    ${HARP_ROOT}/core/src/sha256.c
-    ${HARP_ROOT}/core/src/frame.c
-    ${HARP_ROOT}/core/src/object.c
-    ${HARP_ROOT}/core/src/store.c
-    ${HARP_ROOT}/core/src/envelope.c
-    ${HARP_ROOT}/core/src/link.c
-    ${HARP_ROOT}/core/src/audio.c
+    ${HARP_CORE_SRC}
     ${HARP_PLAT_SRC})
   target_include_directories(runtime-units-tests PRIVATE
     ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
@@ -565,10 +531,7 @@ if(LIBUSB_FOUND)
       ${HARP_ROOT}/shell/runtime_registry.cpp
       ${HARP_ROOT}/host/usb_io.c ${HARP_ROOT}/host/sock_io.c ${HARP_ROOT}/host/rtp.c
       ${HARP_ROOT}/host/freerun.c ${HARP_ROOT}/host/client.c
-      ${HARP_ROOT}/core/src/cbor.c ${HARP_ROOT}/core/src/sha256.c
-      ${HARP_ROOT}/core/src/frame.c ${HARP_ROOT}/core/src/object.c
-      ${HARP_ROOT}/core/src/store.c ${HARP_ROOT}/core/src/envelope.c
-      ${HARP_ROOT}/core/src/link.c ${HARP_ROOT}/core/src/audio.c
+      ${HARP_CORE_SRC}
       ${HARP_PLAT_SRC})
     target_include_directories(${HARP_SHELL_VARIANT_NAME} PRIVATE
       ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell
@@ -615,14 +578,7 @@ if(LIBUSB_FOUND)
       ${HARP_ROOT}/host/rtp.c
       ${HARP_ROOT}/host/freerun.c
       ${HARP_ROOT}/host/client.c
-      ${HARP_ROOT}/core/src/cbor.c
-      ${HARP_ROOT}/core/src/sha256.c
-      ${HARP_ROOT}/core/src/frame.c
-      ${HARP_ROOT}/core/src/object.c
-      ${HARP_ROOT}/core/src/store.c
-      ${HARP_ROOT}/core/src/envelope.c
-      ${HARP_ROOT}/core/src/link.c
-      ${HARP_ROOT}/core/src/audio.c
+      ${HARP_CORE_SRC}
       ${HARP_PLAT_SRC})
     target_include_directories(harp-au PRIVATE
       ${HARP_ROOT}/core/include ${HARP_ROOT}/host ${HARP_ROOT}/shell

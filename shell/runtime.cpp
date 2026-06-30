@@ -3343,10 +3343,10 @@ bool HarpRuntime::getStateBundle(std::vector<uint8_t> &out) {
 /* §14.4 diag-bundle / §16 anonymization. DECODE the device-section map
  * { 0 => identity, 1 => counters } and RE-ENCODE it into `out`, clearing the
  * identity PII leaves to "" IN PLACE while preserving everything else byte-for-
- * meaning. This MIRRORS host/harp-probe.c:anonymize_device_section (the
- * authoritative §16 leaf list) so the host's two diag-bundle producers (the
- * out-of-process harp-probe and the in-shell runtime) clear the SAME leaves
- * identically. Cleared: identity key 2 (serial); vendor (key 0)/product (key 1)
+ * meaning. This now DELEGATES to the shared core helper
+ * harp_anonymize_device_section (core/src/anonymize.c) — the ONE §16 leaf list,
+ * shared with harp-probe so the two host-side diag-bundle producers can never
+ * diverge. Cleared: identity key 2 (serial); vendor (key 0)/product (key 1)
  * sub-map key 1 (name); identity key 9 (build-id); channel-map (key 7) per-entry
  * keys 2/3/4 (name/group/path). PRESERVED verbatim: vid/pid, firmware, engine
  * (incl. engine-id + param-map-hash), protocol, latency-profile, boot count,
@@ -3355,83 +3355,7 @@ bool HarpRuntime::getStateBundle(std::vector<uint8_t> &out) {
  * edit are copied via harp_cdec_span (byte-for-byte). Returns false on a
  * malformed section so the caller can fall back. */
 static bool anon_device_section(harp_cbuf *out, const uint8_t *sec, size_t len) {
-    harp_cdec d;
-    harp_cdec_init(&d, sec, len);
-    uint64_t nsec;
-    if (!harp_cdec_map(&d, &nsec)) return false;
-    harp_cbor_map(out, nsec);
-    for (uint64_t i = 0; i < nsec; i++) {
-        uint64_t key;
-        if (!harp_cdec_uint(&d, &key)) return false;
-        harp_cbor_uint(out, key);
-        if (key != 0) { /* counters (key 1) + any future member: no PII, verbatim */
-            const uint8_t *span;
-            size_t sl;
-            if (!harp_cdec_span(&d, &span, &sl)) return false;
-            harp_cbuf_put(out, span, sl);
-            continue;
-        }
-        /* key 0 => identity: re-encode, clearing serial + vendor/product names. */
-        uint64_t nid;
-        if (!harp_cdec_map(&d, &nid)) return false;
-        harp_cbor_map(out, nid);
-        for (uint64_t j = 0; j < nid; j++) {
-            uint64_t ik;
-            if (!harp_cdec_uint(&d, &ik)) return false;
-            harp_cbor_uint(out, ik);
-            if (ik == 0 || ik == 1) { /* vendor/product { 0 => id, 1 => name } */
-                uint64_t nsub;
-                if (!harp_cdec_map(&d, &nsub)) return false;
-                harp_cbor_map(out, nsub);
-                for (uint64_t s = 0; s < nsub; s++) {
-                    uint64_t sk;
-                    if (!harp_cdec_uint(&d, &sk)) return false;
-                    harp_cbor_uint(out, sk);
-                    if (sk == 1) {
-                        if (!harp_cdec_skip(&d)) return false; /* drop the name */
-                        harp_cbor_text(out, "");               /* "" in place (§16) */
-                    } else {
-                        const uint8_t *span;
-                        size_t sl;
-                        if (!harp_cdec_span(&d, &span, &sl)) return false;
-                        harp_cbuf_put(out, span, sl);
-                    }
-                }
-            } else if (ik == 2 || ik == 9) { /* serial / build-id -> "" (§16) */
-                if (!harp_cdec_skip(&d)) return false;
-                harp_cbor_text(out, "");
-            } else if (ik == 7) { /* channel-map: clear per-entry name/group/path */
-                uint64_t nent;
-                if (!harp_cdec_array(&d, &nent)) return false;
-                harp_cbor_array(out, nent);
-                for (uint64_t en = 0; en < nent; en++) {
-                    uint64_t nek;
-                    if (!harp_cdec_map(&d, &nek)) return false;
-                    harp_cbor_map(out, nek);
-                    for (uint64_t ek = 0; ek < nek; ek++) {
-                        uint64_t ekey;
-                        if (!harp_cdec_uint(&d, &ekey)) return false;
-                        harp_cbor_uint(out, ekey);
-                        if (ekey == 2 || ekey == 3 || ekey == 4) {
-                            if (!harp_cdec_skip(&d)) return false; /* name/group/path */
-                            harp_cbor_text(out, "");               /* "" in place */
-                        } else {
-                            const uint8_t *span;
-                            size_t sl;
-                            if (!harp_cdec_span(&d, &span, &sl)) return false;
-                            harp_cbuf_put(out, span, sl);
-                        }
-                    }
-                }
-            } else { /* fw/engine/protocol/latency/boot/ump-map/parts: verbatim */
-                const uint8_t *span;
-                size_t sl;
-                if (!harp_cdec_span(&d, &span, &sl)) return false;
-                harp_cbuf_put(out, span, sl);
-            }
-        }
-    }
-    return !d.err;
+    return harp_anonymize_device_section(out, sec, len);
 }
 
 /* §14.4 host-context-C: clock-stats (top key 11). ALWAYS emitted. Deterministic

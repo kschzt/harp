@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "harp/anonymize.h"
 #include "harp/audio.h"
 #include "harp/cbor.h"
 #include "harp/envelope.h"
@@ -922,8 +923,163 @@ static void test_hash_read(void) {
     harp_cbuf_free(&notbytes);
 }
 
+/* §16 / §14.4 device-section anonymizer (core/src/anonymize.c) — the SINGLE redactor both
+ * host-side diag-bundle producers (harp-probe + the in-shell HarpRuntime) now delegate to.
+ * Builds a device-section { 0 => identity, 1 => counters } with EVERY PII leaf populated,
+ * anonymizes it, and proves the redaction is exact AND lossless: the cleared leaves are now
+ * "" and EVERYTHING else is byte-identical. The oracle is a second device-section built by
+ * the SAME canonical encoders but with the PII leaves already "" — an independent expectation
+ * (not the anonymizer's own output), so a missed leaf OR a perturbed non-PII byte makes the
+ * memcmp fail. */
+static void build_dsec(harp_cbuf *b, const char *vendor, const char *product, const char *serial,
+                       const char *build_id, const char *n0, const char *g0, const char *p0,
+                       const char *n1, const char *g1, const char *p1) {
+    harp_cbuf_reset(b);
+    harp_cbor_map(b, 2); /* device-section: { 0 => identity, 1 => counters } */
+
+    harp_cbor_uint(b, 0);
+    harp_cbor_map(b, 8); /* identity: keys 0,1,2,3,4,6,7,9 */
+    harp_cbor_uint(b, 0); /* vendor { 0 => vid, 1 => name } */
+    harp_cbor_map(b, 2);
+    harp_cbor_uint(b, 0);
+    harp_cbor_uint(b, 0x1234);
+    harp_cbor_uint(b, 1);
+    harp_cbor_text(b, vendor);
+    harp_cbor_uint(b, 1); /* product { 0 => pid, 1 => name } */
+    harp_cbor_map(b, 2);
+    harp_cbor_uint(b, 0);
+    harp_cbor_uint(b, 0x5678);
+    harp_cbor_uint(b, 1);
+    harp_cbor_text(b, product);
+    harp_cbor_uint(b, 2); /* serial (PII) */
+    harp_cbor_text(b, serial);
+    harp_cbor_uint(b, 3); /* firmware (preserved) */
+    harp_cbor_text(b, "1.2.3");
+    harp_cbor_uint(b, 4); /* engine-id (preserved) */
+    harp_cbor_text(b, "criticality");
+    harp_cbor_uint(b, 6); /* param-map-hash bytes (preserved) */
+    {
+        uint8_t pmh[4] = {0xde, 0xad, 0xbe, 0xef};
+        harp_cbor_bytes(b, pmh, 4);
+    }
+    harp_cbor_uint(b, 7); /* channel-map: array of entry maps */
+    harp_cbor_array(b, 2);
+    harp_cbor_map(b, 6); /* entry 0: keys 0,1,2,3,4,5 */
+    harp_cbor_uint(b, 0);
+    harp_cbor_uint(b, 0); /* slot (preserved) */
+    harp_cbor_uint(b, 1);
+    harp_cbor_uint(b, 1); /* direction (preserved) */
+    harp_cbor_uint(b, 2);
+    harp_cbor_text(b, n0); /* name (PII) */
+    harp_cbor_uint(b, 3);
+    harp_cbor_text(b, g0); /* group (PII) */
+    harp_cbor_uint(b, 4);
+    harp_cbor_text(b, p0); /* path (PII) */
+    harp_cbor_uint(b, 5);
+    harp_cbor_bool(b, true); /* host-paced flag (preserved) */
+    harp_cbor_map(b, 6);     /* entry 1 */
+    harp_cbor_uint(b, 0);
+    harp_cbor_uint(b, 1);
+    harp_cbor_uint(b, 1);
+    harp_cbor_uint(b, 0);
+    harp_cbor_uint(b, 2);
+    harp_cbor_text(b, n1);
+    harp_cbor_uint(b, 3);
+    harp_cbor_text(b, g1);
+    harp_cbor_uint(b, 4);
+    harp_cbor_text(b, p1);
+    harp_cbor_uint(b, 5);
+    harp_cbor_bool(b, false);
+    harp_cbor_uint(b, 9); /* build-id (PII — may embed host/date) */
+    harp_cbor_text(b, build_id);
+
+    harp_cbor_uint(b, 1);   /* device-section key 1 => counters (no PII, preserved whole) */
+    harp_cbor_map(b, 3);
+    harp_cbor_uint(b, 0);
+    harp_cbor_uint(b, 42);
+    harp_cbor_uint(b, 1);
+    harp_cbor_uint(b, 7);
+    harp_cbor_uint(b, 2);
+    harp_cbor_uint(b, 0);
+}
+
+static void test_anonymize(void) {
+    harp_cbuf in, want, out;
+    harp_cbuf_init(&in);
+    harp_cbuf_init(&want);
+    harp_cbuf_init(&out);
+
+    build_dsec(&in, "Acme Audio", "Harp Reference", "SN-PII-0001", "buildhost-2026-06-30",
+               "Main Out", "groupA", "/dev/snd/x", "Aux Send", "groupB", "/dev/snd/y");
+    /* the expected anonymized form: the SAME section with the 6 PII leaf classes -> "" */
+    build_dsec(&want, "", "", "", "", "", "", "", "", "", "");
+
+    CHECK(harp_anonymize_device_section(&out, in.buf, in.len));
+    /* the whole-section oracle: cleared leaves empty AND every other byte preserved */
+    CHECK(out.len == want.len && memcmp(out.buf, want.buf, out.len) == 0);
+    /* sanity: the anonymizer actually changed the input (it is not a no-op copy) */
+    CHECK(out.len != in.len || memcmp(out.buf, in.buf, out.len) != 0);
+
+    /* Independent decode walk: assert EACH PII leaf is now empty and the vid/pid survived,
+     * so a single-leaf regression is reported precisely (not just "buffers differ"). */
+    harp_cdec d;
+    uint64_t nsec, k, nid;
+    const char *txt;
+    size_t tl;
+    harp_cdec_init(&d, out.buf, out.len);
+    CHECK(harp_cdec_map(&d, &nsec) && nsec == 2);
+    CHECK(harp_cdec_uint(&d, &k) && k == 0); /* identity */
+    CHECK(harp_cdec_map(&d, &nid) && nid == 8);
+    for (uint64_t i = 0; i < nid; i++) {
+        uint64_t ik;
+        CHECK(harp_cdec_uint(&d, &ik));
+        if (ik == 0 || ik == 1) { /* vendor/product: vid/pid kept, name cleared */
+            uint64_t ns, sk, idv;
+            CHECK(harp_cdec_map(&d, &ns) && ns == 2);
+            CHECK(harp_cdec_uint(&d, &sk) && sk == 0);
+            CHECK(harp_cdec_uint(&d, &idv) && idv == (ik == 0 ? 0x1234u : 0x5678u));
+            CHECK(harp_cdec_uint(&d, &sk) && sk == 1);
+            CHECK(harp_cdec_text(&d, &txt, &tl) && tl == 0);
+        } else if (ik == 2 || ik == 9) { /* serial / build-id cleared */
+            CHECK(harp_cdec_text(&d, &txt, &tl) && tl == 0);
+        } else if (ik == 7) { /* channel-map: per-entry name/group/path cleared */
+            uint64_t na;
+            CHECK(harp_cdec_array(&d, &na) && na == 2);
+            for (uint64_t e = 0; e < na; e++) {
+                uint64_t ne;
+                CHECK(harp_cdec_map(&d, &ne) && ne == 6);
+                for (uint64_t m = 0; m < ne; m++) {
+                    uint64_t ek;
+                    CHECK(harp_cdec_uint(&d, &ek));
+                    if (ek == 2 || ek == 3 || ek == 4)
+                        CHECK(harp_cdec_text(&d, &txt, &tl) && tl == 0);
+                    else
+                        CHECK(harp_cdec_skip(&d)); /* slot/dir/host-paced (memcmp covers value) */
+                }
+            }
+        } else {
+            CHECK(harp_cdec_skip(&d)); /* firmware/engine/pmh (memcmp covers value) */
+        }
+    }
+    CHECK(harp_cdec_uint(&d, &k) && k == 1); /* counters preserved as a 3-entry map */
+    uint64_t nc;
+    CHECK(harp_cdec_map(&d, &nc) && nc == 3);
+    CHECK(!d.err);
+
+    /* a malformed (truncated) section returns false so the caller can fall back */
+    harp_cbuf bad;
+    harp_cbuf_init(&bad);
+    CHECK(!harp_anonymize_device_section(&bad, in.buf, 1));
+    harp_cbuf_free(&bad);
+
+    harp_cbuf_free(&in);
+    harp_cbuf_free(&want);
+    harp_cbuf_free(&out);
+}
+
 int main(void) {
     test_sha256();
+    test_anonymize();
     test_link_fragmentation();
     test_link_interleave();
     test_link_stream_caps();
