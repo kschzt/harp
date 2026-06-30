@@ -293,3 +293,28 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cppcheck
       - name: cppcheck (warning + portability, baselined)
         run: bash scripts/run-cppcheck.sh
+
+  coverage:
+    # Quantified test-coverage metric (gcovr) over the unit-tested C core — the chair's named
+    # "no quantified metric" gap. Instruments the build, runs the ctest suite (a clean exit flushes
+    # the .gcda), and prints line/branch coverage. The floor catches a coverage REGRESSION; device
+    # DSP/session paths reached only by the script suite (whose daemon is SIGKILLed, so it would not
+    # flush .gcda) are deliberately out of this unit-level metric.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: install gcovr + libsamplerate
+        run: sudo apt-get update && sudo apt-get install -y gcovr libsamplerate0-dev
+      - name: build (coverage-instrumented)
+        run: |
+          cmake -B build-cov -DCMAKE_C_FLAGS="--coverage -O0 -g" -DCMAKE_CXX_FLAGS="--coverage -O0 -g"
+          cmake --build build-cov -j
+      - name: run the unit-test suite (clean exit flushes .gcda)
+        run: ctest --test-dir build-cov --output-on-failure
+      - name: coverage metric (gcovr summary over core/host/device)
+        run: |
+          gcovr --root . \
+            --filter 'core/src/' --filter 'host/' --filter 'device/' \
+            --exclude '.*test.*' --exclude '.*external.*' --exclude '.*vst3sdk.*' \
+            --print-summary --fail-under-line 30
