@@ -67,6 +67,10 @@ jobs:
       - name: deps + SDKs
         run: |
           sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libsamplerate0-dev
+          # cbor2: the §8.7 rtp-loss / rtp-reorder loss-count assertions decode the diag bundle with
+          # python3+cbor2 and HARD-fail on CI if it is absent (they must not silently skip a MUST).
+          # eth.yml installs it; the soak runs the same suite ×N, so it needs it too.
+          python3 -m pip install cbor2 || python3 -m pip install --break-system-packages cbor2
           git clone --depth 1 --recursive \
             https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
           git clone --depth 1 --branch 1.2.8 \
