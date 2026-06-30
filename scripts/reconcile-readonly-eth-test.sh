@@ -38,13 +38,17 @@ trap '[ -n "$DP" ] && kill -9 "$DP" 2>/dev/null; [ -n "$HP" ] && kill -9 "$HP" 2
 wait_listen() { for _ in $(seq 1 25); do grep -q "listening on $PORT" "$DEVLOG" 2>/dev/null && return 0; sleep 0.2; done; return 1; }
 panel() { python3 -c "
 import socket,sys
-s=socket.socket(socket.AF_UNIX); s.connect('$SOCK')
+s=socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect('$SOCK')
 s.sendall((sys.argv[1]+'\n').encode()); sys.stdout.write(s.recv(4096).decode())" "$1" 2>/dev/null; }
 
 rm -rf "$DEVDIR" "$PHOST"; : > "$DEVLOG"; rm -f "$STATE" "$SOCK"; mkdir -p "$PHOST"
 echo "── start device (serial $SERIAL, --panel-sock) on $PORT over the §8.7 loopback"
 "$DEVICED" --serial "$SERIAL" --port "$PORT" --state-dir "$DEVDIR" --panel-sock "$SOCK" >>"$DEVLOG" 2>&1 & DP=$!
 wait_listen || { cat "$DEVLOG"; fail "device didn't start on $PORT"; }
+# the panel-socket thread is created asynchronously AFTER the "listening" line, so the first
+# panel() must wait for the socket file to exist — otherwise its connect races the thread and
+# fails on a loaded macOS runner (the flake this closes; the settimeout above bounds a stuck connect).
+for _ in $(seq 1 25); do [ -S "$SOCK" ] && break; sleep 0.2; done
 
 # 0) stage a project bundle (borns the device + sets hasBundle_ on the load run below).
 : > "$HOSTLOG"

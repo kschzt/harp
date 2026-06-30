@@ -544,7 +544,23 @@ int main(int argc, char **argv) {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons((uint16_t)port);
-    if (bind(sfd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(sfd, 4) != 0) {
+    /* Bounded bind-retry on EADDRINUSE — rapid-restart robustness. A supervisor cycling the
+     * daemon, or a just-killed predecessor whose listening socket the kernel has not finished
+     * reaping, can briefly hold the port even with SO_REUSEADDR (that flag forgives a TIME_WAIT
+     * socket, not a still-live one). Poll up to ~2 s so a clean restart binds the moment the port
+     * frees; a genuine conflict (another daemon truly holding it) still fails, just after the window.
+     * Normal start binds on the first attempt, so this adds no latency unless the port is contended. */
+    int bound = 0;
+    for (int attempt = 0; attempt < 40; attempt++) { /* 40 × 50 ms ≈ 2 s */
+        if (bind(sfd, (struct sockaddr *)&addr, sizeof addr) == 0) { bound = 1; break; }
+#ifdef _WIN32
+        if (WSAGetLastError() != WSAEADDRINUSE) break;
+#else
+        if (errno != EADDRINUSE) break;
+#endif
+        harp_sleep_ns(50000000ull); /* 50 ms */
+    }
+    if (!bound || listen(sfd, 4) != 0) {
         fprintf(stderr, "harp-deviced: cannot listen on port %d: %s\n", port,
                 strerror(errno));
         return 1;
