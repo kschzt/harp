@@ -18,7 +18,7 @@ DEVICED="${DEVICED:-./build/harp-deviced}"
 # so prefer CHOST and fall back to the local build path when run standalone.
 CHOST="${CHOST:-./build-vst/clap-host}"
 PLUG="${PLUG:-$(find build-vst build -maxdepth 5 -name harp-clap.clap 2>/dev/null | head -1)}"
-PORT="${PORT:-47949}"
+PORT="${PORT:-17949}"
 fail() { echo "MULTIOUT-CLAP FAIL: $1"; [ -n "${DP:-}" ] && kill "$DP" 2>/dev/null; exit 1; }
 [ -x "$DEVICED" ] || fail "$DEVICED not built"
 [ -x "$CHOST" ] || fail "$CHOST (clap-host) not built"

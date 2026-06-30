@@ -27,7 +27,7 @@ cd "$(dirname "$0")/.."
 
 DEVICED="${DEVICED:-./build/harp-deviced}"
 PROBE="${PROBE:-./build/harp-probe}"
-PORT="${PORT:-47983}"
+PORT="${PORT:-17983}"
 SERIAL="${SERIAL:-SIM-0001}"
 VNAME="${VNAME:-HARP Reference Project}"   # device vendor NAME (§16: cleared under --anonymize; vendor_id is retained)
 FULLID="${FULLID:-Part 1 L}"   # FULL-identity token: channel-map (key 7) entry NAME (entry key 2)

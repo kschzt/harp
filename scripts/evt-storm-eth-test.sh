@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$(find build-vst build -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47974}"
+PORT="${PORT:-17974}"
 SERIAL="${SERIAL:-SIM-0001}"
 DEVDIR=evtstorm-eth-state   # workspace-RELATIVE (see header)
 DEVLOG=/tmp/evtstorm-eth-dev.log

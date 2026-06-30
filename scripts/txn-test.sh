@@ -11,7 +11,7 @@ set -u
 cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 PROBE="${PROBE:-./build/harp-probe}"
-PORT="${PORT:-47921}"
+PORT="${PORT:-17921}"
 DEVDIR=txn-state   # workspace-RELATIVE
 DEVLOG=/tmp/txn-dev.log
 fail() { echo "TXN FAIL: $1"; exit 1; }

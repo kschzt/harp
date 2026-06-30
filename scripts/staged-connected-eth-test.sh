@@ -26,7 +26,7 @@ cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$(find build-vst build -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47992}"
+PORT="${PORT:-17992}"
 SAVED_SERIAL="${SAVED_SERIAL:-SIM-0001}"
 ALT_SERIAL="${ALT_SERIAL:-SIM-ALT-0002}"
 DEVLOG=/tmp/staged-connected-eth-dev.log

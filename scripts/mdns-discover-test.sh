@@ -14,7 +14,7 @@ set -u
 cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 PROBE="${PROBE:-./build/harp-probe}"
-PORT="${PORT:-47809}"
+PORT="${PORT:-17809}"
 STATEDIR=mdns-disc-state   # workspace-RELATIVE
 SERIAL=SIM-MDNS
 fail() { echo "MDNS-DISC FAIL: $1"; exit 1; }

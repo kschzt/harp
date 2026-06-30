@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$(find build-vst build -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47940}"
+PORT="${PORT:-17940}"
 FLOOR="${FLOOR:-0.005}"   # a clearly-sounding bus (observed ~0.034)
 fail() { echo "MULTIOUT-ISO FAIL: $1"; [ -n "${DP:-}" ] && kill "$DP" 2>/dev/null; exit 1; }
 [ -x "$DEVICED" ] || fail "$DEVICED not built"

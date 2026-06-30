@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 
 DEVICED=${DEVICED:-build/harp-deviced}
 PROBE=${PROBE:-build/harp-probe}
-PORT=${PORT:-47833}
+PORT=${PORT:-17833}
 export ASAN_OPTIONS="detect_leaks=0${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
 STATE=conn-flood-state    # workspace-RELATIVE: Git Bash /tmp->C:\ trips the MinGW device's --state-dir
 STORE=conn-flood-store    # mkdir (and harp-probe's -s store) on Windows (see eth-tests.sh). A shell

@@ -22,7 +22,7 @@ DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PROBE="${PROBE:-./build/harp-probe}"
 PLUG="${PLUG:-$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47902}"
+PORT="${PORT:-17902}"
 # State dir + file are passed as ARGS to the native device/host exes; keep them
 # workspace-RELATIVE so MSYS doesn't path-convert an absolute /tmp arg into a
 # C:\...\ drive path the MinGW device's recursive mkdir can't create on Windows

@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 DEVICED="${DEVICED:-./build/harp-deviced}"
 LATEFR="${LATEFR:-./build/harp-eth-latefr-test}"
-PORT="${PORT:-47994}"
+PORT="${PORT:-17994}"
 DEVDIR=latefr-eth-state   # workspace-RELATIVE (see eth-tests.sh header)
 DEVLOG=/tmp/latefr-eth-dev.log
 fail() { echo "LATEFR-ETH FAIL: $1"; exit 1; }

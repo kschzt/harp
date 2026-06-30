@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 DEVICED=${DEVICED:-build/harp-deviced}
 PROBE=${PROBE:-build/harp-probe}
-PORT=${PORT:-47821}
+PORT=${PORT:-17821}
 # ASan builds: this test is about crashes/UB under hostile input, not
 # CLI-tool exit leaks (Linux ASan turns leak detection on by default and
 # would fail the probe's demo for unrelated reasons)

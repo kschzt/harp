@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47977}"
+PORT="${PORT:-17977}"
 REORDER="${REORDER:-20}"
 DEVDIR=rtpreorder-eth-state
 DEVLOG=/tmp/rtpreorder-eth-dev.log

@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 
 DEVICED="${DEVICED:-build/harp-deviced}"
 PROBE="${PROBE:-build/harp-probe}"
-PORT="${PORT:-47811}"
+PORT="${PORT:-17811}"
 SOCK="/tmp/recrelay-panel.sock"
 STATE="/tmp/recrelay-dev"
 HOST="/tmp/recrelay-host"

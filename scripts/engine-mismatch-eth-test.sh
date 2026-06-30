@@ -33,7 +33,7 @@ cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$(find build-vst build -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47991}"
+PORT="${PORT:-17991}"
 SERIAL="${SERIAL:-SIM-0001}"
 DEVDIR=engine-mismatch-eth-state   # workspace-RELATIVE (see header)
 DEVLOG=/tmp/engine-mismatch-eth-dev.log

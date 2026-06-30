@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN:-./build-vst/harp-vst3-host}"
 PLUG="${PLUG:-$(find build-vst build-asan build -maxdepth 5 -name harp-shell.vst3 -type d 2>/dev/null | head -1)}"
-PORT="${PORT:-47975}"
+PORT="${PORT:-17975}"
 CORRUPT="${CORRUPT:-8}"
 DEVDIR=corrupt-eth-state   # workspace-RELATIVE (Git Bash /tmp->C:\ trips the device mkdir; see eth-tests.sh)
 DEVLOG=/tmp/corrupt-eth-dev.log

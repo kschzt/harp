@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
 HOSTBIN="${HOSTBIN_AU:-./build-vst/au-host}"
 AUCOMP="${AUCOMP:-$HOME/Library/Audio/Plug-Ins/Components/harp-au.component}"
-PORT="${PORT:-47950}"
+PORT="${PORT:-17950}"
 fail() { echo "MULTIOUT-AU FAIL: $1"; [ -n "${DP:-}" ] && kill "$DP" 2>/dev/null; exit 1; }
 [ -x "$DEVICED" ] || fail "$DEVICED not built"
 if [ ! -x "$HOSTBIN" ] || [ ! -d "$AUCOMP" ]; then
