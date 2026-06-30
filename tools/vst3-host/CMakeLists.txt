@@ -155,7 +155,12 @@ if(LIBUSB_FOUND)
     ${HARP_ROOT}/core/src/store.c
     ${HARP_ROOT}/core/src/envelope.c
     ${HARP_ROOT}/core/src/link.c
-    ${HARP_ROOT}/core/src/audio.c)
+    ${HARP_ROOT}/core/src/audio.c
+    # host/rt_sched.c: harp_thread_set_realtime(), called by runtime.cpp's feed/
+    # pump/reader threads AND by usb_io.c. Extracted from usb_io.c so it links
+    # even in a USB-less build; listed here so all ~9 shell targets get the one
+    # definition (usb_io.c no longer carries it).
+    ${HARP_ROOT}/host/rt_sched.c)
   # Platform shim (harp/plat.h) compiled into the shell/AU like the core .c files.
   if(WIN32)
     set(HARP_PLAT_SRC ${HARP_ROOT}/core/src/plat_win.c)
