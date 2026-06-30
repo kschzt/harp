@@ -1279,6 +1279,11 @@ static void handle_audio_start(device *d, const harp_env *e) {
      * faster-than-real-time with no stream to wedge. The engine fence reads d->audio.offline, NOT the
      * transport, so a future offline bounce over any carrier is bounded correctly. */
     d->audio.offline = (hp_port > 0);
+    /* TEST HOOK (§8.3.1 real-time fence integration): force the REAL-TIME bounded fence path
+     * even on the TCP test carrier, so eth-fence-test can exercise the deadline+count branch a
+     * USB host-paced stream would. Off in production; the fence reads a->offline, not the
+     * transport, so this faithfully selects the bounded regime regardless of carrier. */
+    if (getenv("HARP_FENCE_FORCE_RT")) d->audio.offline = 0;
     if (rtp_fd >= 0) {          /* fresh RTP stream identity */
         d->audio.rtp_ssrc = 0x48415250u; /* "HARP" */
         d->audio.rtp_seq = 0;

@@ -169,9 +169,14 @@ static uint64_t counter(harp_client *c, const char *name) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: eth-fence-test HOST:PORT\n");
+        fprintf(stderr, "usage: eth-fence-test HOST:PORT [realtime]\n");
         return 2;
     }
+    /* realtime = exercise the §8.3.1 REAL-TIME bounded fence (deadline + count) instead of the
+     * offline unbounded barrier. The daemon must run with HARP_FENCE_FORCE_RT=1 so its host-paced
+     * stream is offline=false. We fence beyond the feed (never release it with an event) and assert
+     * the device renders the range anyway (bounded — no wedge) and counts the timeout. */
+    bool realtime = (argc > 2 && strcmp(argv[2], "realtime") == 0);
 
     harp_sockhandle s = harp_sock_dial(argv[1]);
     if (s == HARP_SOCK_INVALID) {
@@ -263,12 +268,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "fence: fenced pacing send failed\n");
         return 1;
     }
-    nanosleep(&(struct timespec){0, 50 * 1000 * 1000}, NULL); /* 50 ms: audio thread parks on the fence */
-    if (!send_note_evt(&client, &tio.io, &link)) {
-        fprintf(stderr, "fence: note evt send failed\n");
-        return 1;
+    if (realtime) {
+        /* REAL-TIME: do NOT release the fence with an event. The device MUST bound the wait
+         * (a few ms), render the range with the late (here, absent) event, and count the
+         * timeout — never wedge. drain_output blocks only until that bounded render lands. */
+    } else {
+        nanosleep(&(struct timespec){0, 50 * 1000 * 1000}, NULL); /* 50 ms: audio thread parks on the fence */
+        if (!send_note_evt(&client, &tio.io, &link)) {
+            fprintf(stderr, "fence: note evt send failed\n");
+            return 1;
+        }
     }
-    if (!drain_output(dev)) { /* blocks here until the fence releases + the range renders */
+    if (!drain_output(dev)) { /* offline: blocks until the event releases; realtime: until the bound */
         fprintf(stderr, "fence: fenced-frame output never arrived (fence wedged?)\n");
         return 1;
     }
@@ -304,6 +315,20 @@ int main(int argc, char **argv) {
                 "the fence branch was never reached\n",
                 (unsigned long long)w_before, (unsigned long long)w_after);
         return 1;
+    }
+    if (realtime) {
+        /* the range DID render (drain_output above succeeded — no wedge) AND the bound fired */
+        if (t_after <= t_before) {
+            fprintf(stderr, "FENCE FAIL: real-time fence_timeouts did not move (%llu -> %llu) — "
+                    "the bounded path did not fire (unbounded fence would WEDGE a real-time stream)\n",
+                    (unsigned long long)t_before, (unsigned long long)t_after);
+            return 1;
+        }
+        printf("FENCE PASS: real-time event fence bounded + counted, no wedge "
+               "(fence_waits %llu -> %llu, fence_timeouts %llu -> %llu)\n",
+               (unsigned long long)w_before, (unsigned long long)w_after,
+               (unsigned long long)t_before, (unsigned long long)t_after);
+        return 0;
     }
     if (t_after != t_before) {
         fprintf(stderr, "FENCE FAIL: fence_timeouts moved (%llu -> %llu) — the OFFLINE "
