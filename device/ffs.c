@@ -161,6 +161,15 @@ static void bind_udc(const char *gadget_path) {
         fprintf(stderr, "harp-ffs: no UDC available (is dwc2 in peripheral mode?)\n");
         return;
     }
+    /* Drop the pull-up before (re)binding so every start re-enumerates clean. A predecessor
+     * that was SIGKILLed (no on_term) leaves the UDC still bound; a bare write_udc(g_udc) then
+     * returns EBUSY ("already bound") and the host keeps its stale claim. Unbinding first
+     * (then a short settle so the host observes the disconnect) clears that stale binding and
+     * guarantees a fresh disconnect+enumerate on this start. This is the in-process twin of the
+     * daemon's on_term unbind (harp-deviced.c on_term). No-op on a fresh boot: the UDC is already
+     * empty, so the unbind just writes "" to an unbound gadget. */
+    write_udc(gadget_path, ""); /* clear any stale binding left by a SIGKILLed predecessor */
+    usleep(150 * 1000);         /* let the host observe the disconnect before we re-advertise */
     if (write_udc(gadget_path, g_udc))
         fprintf(stderr, "harp-ffs: bound to UDC %s\n", g_udc);
     else
