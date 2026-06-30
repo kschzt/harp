@@ -18,7 +18,7 @@ jobs:
       - name: build shell + tools
         run: |
           cmake -B build-vst -S tools/vst3-host
-          cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host ring-tests registry-tests runtime-units-tests -j3
+          cmake --build build-vst --target harp-vst3-host harp-shell harp-fx-shell harp-clap clap-host ring-tests registry-tests runtime-units-tests -j3
       - name: shell unit tests (rings + registry via ctest -L unit)
         run: ctest --test-dir build-vst -L unit --output-on-failure
       - name: root tree — core + engine-logic + device-codec + freerun/rtp tests (gap #3/#4; Apple-clang/arm64)
@@ -115,7 +115,7 @@ jobs:
           # load). Full instantiate + process + audio is covered by the hw runner
           # (real Pi over USB) and local Windows runs; hosted runners have no device.
           cmake -B build-vst -S tools/vst3-host -G "Visual Studio 17 2022" -A x64
-          cmake --build build-vst --config Release --target harp-vst3-host harp-shell harp-clap ring-tests registry-tests runtime-units-tests
+          cmake --build build-vst --config Release --target harp-vst3-host harp-shell harp-fx-shell harp-clap ring-tests registry-tests runtime-units-tests
           ctest --test-dir build-vst -C Release -L unit --output-on-failure
           # CLAP: a green build + LoadLibrary does NOT prove clap_entry is in the
           # DLL export table (MSVC needs __declspec(dllexport) via CLAP_EXPORT) —
@@ -188,7 +188,7 @@ jobs:
       - name: build shell + tools, unit tests (rings + registry + mpe-zone via ctest -L unit)
         run: |
           cmake -B build-vst -S tools/vst3-host
-          cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host ring-tests registry-tests runtime-units-tests -j
+          cmake --build build-vst --target harp-vst3-host harp-shell harp-fx-shell harp-clap clap-host ring-tests registry-tests runtime-units-tests -j
           ctest --test-dir build-vst -L unit --output-on-failure
       - name: pluginval (plugin-contract abuse, strictness 10)
         run: |

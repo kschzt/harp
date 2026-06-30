@@ -135,6 +135,9 @@ public:
         rate_ = sampleRate;
         maxDawBlock_ = maxDawBlock;
         targetFrames_ = targetFramesFor(maxDawBlock);
+        /* §8.8 never-silent window ≈ 1 s of audio (matches the existing ">1s silent"
+         * transport watchdog), floored so a tiny/zero rate can't disable the guard. */
+        fxSilentWetWindowFrames_ = sampleRate > 4096 ? sampleRate : 4096;
     }
 
     /* The reported latency (= ring target + event headroom) is a PURE function
@@ -230,6 +233,35 @@ public:
      * underruns in lockstep anyway). No-op + returns 0 when not armed. Returns
      * frames actually written. */
     size_t writeFxInput(const float *interleaved, size_t nFrames);
+
+    /* §8.8 audio.fx NEVER-SILENT guard (RME "loud, not logged"). An armed effect is
+     * host-paced (H→D track in, D→H wet); if that input path ever breaks (the device
+     * ends up free-running, ignores the host-paced in-slots, or otherwise consumes no
+     * input) the device reverberates SILENCE and the wet is dead — "the §8.8 trap".
+     * Today only the soak notices. observeFxWet() is the detection seam the FX shell's
+     * pull side runs each block (called from pullAudio/pullAudioBlocking when fxArmed):
+     * it correlates the recent INPUT energy (tracked in writeFxInput) against the WET
+     * energy here. When the host has fed non-silent input continuously for a full
+     * window (fxSilentWetWindowFrames_ ≈ 1 s) yet the wet stayed silent the whole time,
+     * it raises the guard LOUDLY — an ERROR log (RuntimeLog ring + stderr) + a host-
+     * readable counter (fxSilentWetFaults(), diag host-counter x.harp.fx_silent_wet) +
+     * a sticky tripped flag the offline/host path returns non-zero on. It NEVER fires on
+     * legitimately-silent input (the input-energy gate) nor on a reverb tail decaying
+     * during a pause (the silent run resets the instant input stops), so genuine silence
+     * is not a false positive. nFrames is interleaved stereo L/R, exactly as pullAudio
+     * delivers; a no-op when not armed. Audio-thread only (sole caller), in lockstep
+     * with writeFxInput. */
+    void observeFxWet(const float *interleavedLR, size_t nFrames);
+    /* Host-readable §8.8 guard count (also emitted as diag host-counter
+     * x.harp.fx_silent_wet). One increment per silent-wet EPISODE, not per block. */
+    uint64_t fxSilentWetFaults() const {
+        return fxSilentWetFaults_.load(std::memory_order_relaxed);
+    }
+    /* Sticky: the §8.8 guard has tripped this session. The offline/host bounce returns
+     * non-zero on it (fx_plugin.cpp); a live insert keeps running (log + counter only). */
+    bool fxSilentWetTripped() const {
+        return fxSilentWetTripped_.load(std::memory_order_relaxed);
+    }
 
     /* The multitimbral part (§9.4, key 5) the OWNER instance drives: notes
      * already carry their channel in the UMP word (the shell stamps it per-
@@ -1110,6 +1142,23 @@ private:
      * never touched off the FX path, so the instrument render is unaffected). */
     std::vector<uint32_t> fxInSlots_;
     FloatRing fxInRing_{1 << 15};
+
+    /* §8.8 never-silent guard state (see observeFxWet / writeFxInput). The
+     * accumulators are touched ONLY by the audio/process thread (writeFxInput +
+     * observeFxWet run there, in lockstep per block), so they need no atomics; the
+     * EXPOSED counter + tripped flag are atomic because getDiagBundle and the
+     * fxSilentWetFaults()/fxSilentWetTripped() accessors read them on the control
+     * thread. The window is recomputed by configure() (~1 s). The state is reset on a
+     * session-generation change (reconnect) inside observeFxWet, so a fresh stream's
+     * priming silence never counts against a prior run without touching session
+     * lifecycle. */
+    uint64_t fxInRunFrames_ = 0;        /* consecutive frames of NON-silent input pushed */
+    uint64_t fxWetSilentRunFrames_ = 0; /* consecutive frames of SILENT wet, while input live */
+    bool fxSilentWetEpisode_ = false;   /* latch: this silent-wet episode is already counted */
+    uint64_t fxWatchdogGen_ = 0;        /* the sessionGen_ this watchdog state belongs to */
+    uint32_t fxSilentWetWindowFrames_ = 48000; /* trip window (frames); recomputed in configure() */
+    std::atomic<uint64_t> fxSilentWetFaults_{0};  /* host-readable: x.harp.fx_silent_wet */
+    std::atomic<bool> fxSilentWetTripped_{false}; /* sticky; offline path returns non-zero */
 
     /* §6.4 latency-profile, cached from the hello identity (key 8) at
      * helloAndIdentity(). Indexed implicitly by rate (matched in expectedLoopback).
