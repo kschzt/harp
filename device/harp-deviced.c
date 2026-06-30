@@ -29,6 +29,7 @@
 #  include <netdb.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
+#  include <poll.h> /* graceful (coverage) accept wait — poll() bounds the wait portably */
 #  include <pthread.h> /* POSIX pthreads (Windows gets the shim via device.h) */
 #  include <signal.h>
 #  include <sys/socket.h>
@@ -38,6 +39,7 @@
 #  define HARP_CLOSESOCK(fd) close(fd)
 #endif
 #include <errno.h>
+#include <signal.h> /* sig_atomic_t for the clean-shutdown flag (the POSIX block re-includes it) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +52,17 @@
 
 /* THE device. One per daemon; modules share it via device.h. */
 device g_dev;
+
+/* Clean-shutdown / coverage seam. When HARP_CLEAN_EXIT is set in the environment (the CI coverage
+ * lane only — scripts/device-coverage-drive.sh), SIGTERM/SIGINT ask the eth (--port) accept loop to
+ * RETURN from main() rather than take the immediate _exit(0) in the signal handler, so a --coverage
+ * build runs its normal atexit teardown and FLUSHES the per-TU .gcda (a _exit() in a signal handler
+ * does not, so a SIGKILLed/SIGTERMed daemon otherwise yields ZERO device-line coverage). Production
+ * leaves HARP_CLEAN_EXIT unset, so device shutdown is byte-for-byte the existing immediate-exit path
+ * off the coverage lane. Set/observed only on the POSIX --port path (the FFS gadget still unbinds the
+ * UDC + _exit()s; Windows CI stops the daemon via TerminateProcess; the coverage build is Linux). */
+static int g_graceful_shutdown = 0;             /* HARP_CLEAN_EXIT set -> accept loop returns cleanly */
+static volatile sig_atomic_t g_accept_stop = 0; /* set by on_term to break the eth accept loop */
 
 /* On a clean shutdown, unbind the gadget UDC so the USB host sees a real disconnect.
  * A bare daemon restart leaves the UDC bound, so the host — especially the CI rig's
@@ -70,8 +83,13 @@ static void on_term(int sig) {
             (void)w;
             close(fd);
         }
+        _exit(0); /* FFS gadget: async-signal-safe unbind done; exit now (UDC unbind is HW-critical) */
     }
-    _exit(0);
+    if (g_graceful_shutdown) {
+        g_accept_stop = 1; /* eth --port + HARP_CLEAN_EXIT: let the accept loop return -> gcov flush */
+        return;
+    }
+    _exit(0); /* default (production): immediate exit, unchanged */
 }
 
 /* §4.4.3: advertise this device as `_harp._tcp` so hosts discover it without a hardcoded
@@ -459,6 +477,12 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     signal(SIGTERM, on_term); /* clean shutdown unbinds the UDC (FFS mode) -> host re-enumerates */
     signal(SIGINT, on_term);
+    /* Coverage lane only: ask the eth accept loop to return from main() on SIGTERM/SIGINT so a
+     * --coverage build flushes its .gcda (see g_graceful_shutdown). Empty/unset => off (production). */
+    {
+        const char *ce = getenv("HARP_CLEAN_EXIT");
+        g_graceful_shutdown = (ce && ce[0]) ? 1 : 0;
+    }
 #endif
 
     device *d = &g_dev;
@@ -582,10 +606,32 @@ int main(int argc, char **argv) {
      * close is not a DoS, since each is accepted, handled, and closed immediately. For a
      * single-threaded daemon the per-connection TIME bound is what prevents the hang.) */
     for (;;) {
+#ifndef _WIN32
+        /* Coverage lane only: when HARP_CLEAN_EXIT is set, wait on the listen socket with poll() (a
+         * 200 ms tick) instead of a parked accept(), so the signal handler need only set g_accept_stop
+         * and the loop returns from main() within one tick — flushing .gcda. poll() is portable
+         * (macOS + Linux); SO_RCVTIMEO does NOT bound accept() on Darwin, and shutdown()/close() to
+         * unblock a parked accept() is not portable either. Off (a plain blocking accept, zero added
+         * wakeups) in production. Guarded out of the Windows build (graceful mode is never armed there
+         * — on_term is POSIX-only — and MinGW has WSAPoll, not poll()). */
+        if (g_graceful_shutdown) {
+            struct pollfd pfd;
+            pfd.fd = sfd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            int pr = poll(&pfd, 1, 200);
+            if (g_accept_stop) break;        /* clean shutdown requested -> return from main */
+            if (pr <= 0) continue;           /* timeout or EINTR: loop back, re-check the stop flag */
+        }
+#endif
         harp_sockhandle cfd = accept(sfd, NULL, NULL);
         if (cfd == HARP_SOCK_INVALID) {
+            if (g_accept_stop) break; /* coverage lane: clean shutdown requested -> return from main */
 #ifndef _WIN32
             if (errno == EINTR) continue;
+            /* a poll-readable connection that was reset before accept() (rare) -> keep serving */
+            if (g_graceful_shutdown && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                                        errno == ECONNABORTED)) continue;
 #endif
             break;
         }
@@ -641,5 +687,7 @@ int main(int argc, char **argv) {
         HARP_CLOSESOCK(cfd);
         fprintf(stderr, "harp-deviced: session ended; awaiting reattach\n");
     }
+    HARP_CLOSESOCK(sfd); /* release the listen socket on a clean accept-loop exit (coverage lane) */
+    if (g_accept_stop) fprintf(stderr, "harp-deviced: clean shutdown (HARP_CLEAN_EXIT) — flushing\n");
     return 0;
 }
