@@ -8,7 +8,7 @@
 set -u
 cd "$(dirname "$0")/.."
 DEVICED="${DEVICED:-./build/harp-deviced}"
-PORT="${PORT:-48099}"
+PORT="${PORT:-18099}"   # below every OS ephemeral floor (<32768) — see the eth-suite port renumber (#122)
 SOCK="/tmp/web-panel-$$.sock"
 DEVLOG=/tmp/web-panel-dev.log
 PANLOG=/tmp/web-panel-panel.log
@@ -18,7 +18,7 @@ command -v python3 >/dev/null 2>&1 || { echo "WEB-PANEL SKIP: no python3"; exit 
 command -v curl    >/dev/null 2>&1 || { echo "WEB-PANEL SKIP: no curl"; exit 0; }
 
 rm -f "$SOCK"; rm -rf /tmp/web-panel-state
-"$DEVICED" --port 48098 --state-dir /tmp/web-panel-state --panel-sock "$SOCK" >"$DEVLOG" 2>&1 & DP=$!
+"$DEVICED" --port 18098 --state-dir /tmp/web-panel-state --panel-sock "$SOCK" >"$DEVLOG" 2>&1 & DP=$!
 PP=""
 trap '[ -n "$DP" ] && kill -9 "$DP" 2>/dev/null; [ -n "$PP" ] && kill -9 "$PP" 2>/dev/null; rm -f "$SOCK"' EXIT
 for _ in $(seq 1 25); do [ -S "$SOCK" ] && break; sleep 0.2; done
