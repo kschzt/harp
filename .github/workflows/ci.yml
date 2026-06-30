@@ -297,11 +297,13 @@ jobs:
         run: bash scripts/run-cppcheck.sh
 
   coverage:
-    # Quantified test-coverage metric (gcovr) over the unit-tested C core — the chair's named
-    # "no quantified metric" gap. Instruments the build, runs the ctest suite (a clean exit flushes
-    # the .gcda), and prints line/branch coverage. The floor catches a coverage REGRESSION; device
-    # DSP/session paths reached only by the script suite (whose daemon is SIGKILLed, so it would not
-    # flush .gcda) are deliberately out of this unit-level metric.
+    # Quantified test-coverage metric (gcovr) over the two surfaces CI is responsible for — the
+    # panel's named "no quantified metric" gap. Instruments the build, then flushes .gcda from a
+    # CLEAN exit on BOTH levels: (1) the ctest UNIT suite covers core/src/ (protocol library);
+    # (2) a dedicated clean-exit harp-deviced drive (device-coverage-drive.sh) covers the device
+    # DAEMON (session/state/audio_loop/engine + harp-deviced + panel) — the eth-suite SIGKILLs its
+    # daemon so it never flushes, which is why these read ~0% before. Both carry a real line/branch
+    # number and a regression floor; the USB/FFS transport (ffs.c, no cloud path) stays HW-gated.
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -318,17 +320,49 @@ jobs:
         # perturb its thread timing under coverage. It adds no unique lines here — freerun.c is covered
         # by the single-threaded `freerun` test — so dropping it from the COVERAGE run masks nothing.
         run: ctest --test-dir build-cov --output-on-failure -E freerun_mt
-      - name: coverage metric (gcovr) — gate the unit-tested protocol core; report overall
-        # The quantified metric the panel asked for. The GATE is core/src/ — the protocol library the
-        # unit suite is responsible for (~85% lines: cbor/store/object/frame/audio/envelope/link). The
-        # device daemon, engine, and socket I/O are exercised by the eth-suite + the engine-render
-        # golden (#119) + HW, not the gcov-instrumented unit build (its SIGKILLed daemon never flushes
-        # .gcda), so they read ~0% here and would only make the gate a meaningless aggregate — they are
-        # reported separately, informationally. The plat shim has no unit test by design.
+      - name: device-daemon clean-exit coverage drive (flushes device/.gcda the SIGKILLed suite can't)
+        # The eth conformance suite SIGKILLs its daemon, so gcov never flushes the device .gcda and
+        # device/{session,state,audio_loop,engine}.c + harp-deviced.c + panel.c read ~0% in this
+        # instrumented unit build — which is why the gate below could only ever cover core/src/. This
+        # drives a CLEAN-EXIT harp-deviced (HARP_CLEAN_EXIT=1 makes SIGTERM RETURN from main() so the
+        # atexit __gcov dump runs) through a representative slice — hello/identity, recall save/restore/
+        # CAS/txn, §9 events, host-paced + free-running RTP audio, the bounded event fence, the front
+        # panel, and the raw engine render — so device/ carries a REAL line/branch number, not a
+        # behavioural-only pass/fail. The probe protocol asserts are deterministic (a failure is a real
+        # regression); the audio fidelity is gated in eth.yml, not re-asserted here. ALL binaries were
+        # built by the coverage build above; the .gcda ACCUMULATES on top of the unit run.
+        run: ./scripts/device-coverage-drive.sh
+      - name: coverage metric (gcovr) — gate the unit-tested core AND the driven device daemon
+        # The quantified metric the panel asked for, now over BOTH responsible surfaces:
+        #  • core/src/  — the protocol library the UNIT suite covers (~85% lines:
+        #                 cbor/store/object/frame/audio/envelope/link). Gate: --fail-under-line 78.
+        #  • device/    — the device daemon (session/state/audio_loop/engine + harp-deviced + panel),
+        #                 now driven to a clean exit by the step above so its .gcda actually flushes
+        #                 (~71% lines on the dev box). Gate: --fail-under-line 64 (a regression floor
+        #                 with headroom for gcc-vs-clang + Linux/platform-#ifdef variance, same ~7-pt
+        #                 margin as the core gate's 78-vs-85; PRINTED below so a green run can tighten
+        #                 it — capture-then-pin, like the engine-golden hashes).
+        # SCOPE (honest): the gate gates LINE coverage (branch counting differs across gcc/clang, so it
+        # is REPORTED, not gated — same as the core gate). device/ffs.c (the USB/FunctionFS gadget
+        # transport) is EXCLUDED from the device gate: it needs real USB hardware, has no cloud path,
+        # and is covered on the hw rig (hw.yml) — including it would read ~0% and make the gate a
+        # meaningless aggregate. ffs_link.c (framed-link codec) stays in: it is unit-tested cross-OS.
+        # The plat shim (core) has no unit test by design.
         run: |
-          echo "── GATE: core protocol unit coverage (core/src/, the unit-test target):"
+          echo "── GATE 1/2: core protocol unit coverage (core/src/, the unit-test target):"
           gcovr --root . --filter 'core/src/' --exclude '.*plat_.*' \
             --print-summary --fail-under-line 78
-          echo "── INFORMATIONAL: overall core/host/device (device + socket I/O are eth-suite/HW-tested, not unit-tested):"
+          echo ""
+          echo "════════════════════════════════════════════════════════════════════════════"
+          echo "── GATE 2/2: DEVICE DAEMON coverage (device/, clean-exit-driven; ffs.c = HW-gated):"
+          echo "════════════════════════════════════════════════════════════════════════════"
+          gcovr --root . --filter 'device/' \
+            --exclude '.*test.*' --exclude '.*ffs\.c$' \
+            --print-summary --fail-under-line 64
+          echo ""
+          echo "── INFORMATIONAL: per-file device/ breakdown (panel.c = sidecar-driven; ffs.c = USB/HW):"
+          gcovr --root . --filter 'device/' --exclude '.*test.*' --txt 2>/dev/null | \
+            grep -E '^device/.*\.(c|h)' || true
+          echo "── INFORMATIONAL: overall core/host/device (host socket I/O is eth-suite/HW-tested):"
           gcovr --root . --filter 'core/src/' --filter 'host/' --filter 'device/' \
             --exclude '.*test.*' --exclude '.*external.*' --exclude '.*vst3sdk.*' --print-summary
