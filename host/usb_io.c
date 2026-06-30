@@ -40,8 +40,16 @@
 #include <string.h>
 
 #include "sync_compat.h"
+#include "harp/plat.h" /* harp_now_ns (monotonic) for the rtstats timing capture */
 #ifdef __APPLE__
 #include <pthread/qos.h>
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
+#include <mach/mach_time.h>
+#elif defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#include <errno.h>
 #endif
 
 #define USB_READ_CHUNK 16384
@@ -49,6 +57,16 @@
 #define USB_LINK_IN_XFERS 2
 #define USB_AOUT_SLOTS 8
 #define USB_LINK_WRITE_GIVE_UP_MS 30000
+
+/* §8.3 pacing block at 48 k = 256/48000 s; the default real-time period for the
+ * completion-reaping thread (one block cadence). Overridable per device with
+ * HARP_USB_RT_PERIOD_US, e.g. for a device that runs a smaller render block. */
+#define USB_RT_PERIOD_US_DEFAULT 5333.0
+
+/* rtstats capture cap: one µs sample per audio transfer. 262144 ≈ 23 min of
+ * 256-sample frames, so an ordinary render never truncates; ~1 MiB per array,
+ * allocated only when HARP_USB_RTSTATS is set. */
+#define USB_RT_STAT_CAP (1u << 18)
 
 /* FIFO sizes (bytes, power of two). Audio: stereo f32 at 48 k is 384 KiB/s;
  * half a second absorbs any scheduling excursion that matters. */
@@ -102,7 +120,29 @@ typedef struct {
     struct libusb_transfer *xfer;
     uint8_t buf[USB_READ_CHUNK];
     int busy; /* under u->mu */
+    uint64_t submit_ns; /* rtstats: harp_now_ns at submit, read at completion */
 } aout_slot;
+
+/* ---- HARP_USB_RTSTATS capture (allocated only when enabled) ----
+ * Per-audio-transfer timing so a streaming campaign can characterize the
+ * scheduling-jitter tail and pin starvation as thread-late vs queue-empty:
+ *   out_lat : audio bulk-OUT submit -> completion-callback latency (the wire +
+ *             reaping turnaround for one pacing frame).
+ *   out_gap : interval between consecutive OUT submissions = the PRODUCER's
+ *             cadence; a fat tail here is the feed thread being preempted
+ *             (thread-late) rather than the wire stalling.
+ *   in_gap  : interval between consecutive audio bulk-IN completions = the rate
+ *             the device's render frames actually LAND on the host; a fat tail
+ *             here is the dropout window (reaping-late or device-late).
+ *   depth   : OUT transfers already in flight at each submit (queue occupancy) —
+ *             0/1 means the endpoint is producer-gated, not ring-limited. */
+typedef struct {
+    uint32_t *out_lat, *out_gap, *in_gap; /* µs samples */
+    size_t out_n, outgap_n, in_n;
+    uint64_t last_out_submit_ns, last_in_ns;
+    uint64_t depth_hist[USB_AOUT_SLOTS + 1];
+    uint64_t truncated; /* samples dropped past the cap (should stay 0) */
+} rt_stats;
 /* §14.3: the slot MUST hold a full H->D loopback frame (the bug this fixes). hdr(20)+fence(4)+kBlock(256)*4 = 1048 B. */
 _Static_assert(sizeof(((aout_slot *)0)->buf) >= 1048, "USB audio-OUT slot too small for a §14.3 H->D loopback frame");
 
@@ -139,6 +179,12 @@ struct usb_io {
     int sync_audio;    /* HARP_USB_SYNC_AUDIO: diagnostic fallback — audio
                           reads bypass the async machinery (sync bulk),
                           e.g. to bisect transport issues on a new OS */
+    int rt_enable;     /* HARP_USB_RT (default on): promote the event thread to
+                          hard real-time (THREAD_TIME_CONSTRAINT / SCHED_FIFO).
+                          Set HARP_USB_RT=0 to keep the old USER_INTERACTIVE QoS
+                          (the A/B "before" arm + a safety valve). */
+    double rt_period_ns; /* RT period = audio block cadence (HARP_USB_RT_PERIOD_US) */
+    rt_stats *st;        /* HARP_USB_RTSTATS capture, or NULL when disabled */
     byte_fifo link_fifo, audio_fifo;
     uint64_t fifo_drops; /* overflow bytes dropped — never silent */
 
@@ -152,6 +198,139 @@ static void mark_dead_locked(usb_io *u, const char *what, int rc) {
         fprintf(stderr, "harp-usb: %s failed: %s\n", what, libusb_error_name(rc));
     u->dead = 1;
     harp_cond_broadcast(&u->cv);
+}
+
+/* ---------------- real-time scheduling for the completion thread ----------------
+ *
+ * Promote the CALLING thread to the host's real-time class so libusb completion
+ * reaping — every audio byte the device returns, every event-send ack, every
+ * OUT-slot recycle passes through this thread — is never descheduled by ordinary
+ * time-share work under host CPU load. This is the USB twin of what CoreAudio's
+ * own I/O thread runs at (THREAD_TIME_CONSTRAINT). A mere high QoS band
+ * (USER_INTERACTIVE) is STILL time-share: under contention it gets preempted,
+ * which empties the FunctionFS bulk-OUT endpoint and starves the host's D->H
+ * reaping faster than the small device jitter buffer can cover -> cliff-onset
+ * dropouts. The fix is DETERMINISM, not a fatter buffer: `period_us` is the audio
+ * block cadence, so the kernel sizes a sub-millisecond CPU reservation.
+ *
+ * Degrades gracefully: if the RT request is denied (a sandbox without the
+ * privilege, or an unknown platform) the thread keeps whatever scheduling it had
+ * and we log ONCE — the stream still runs, just at the old determinism. Returns
+ * true iff real-time was granted. Exported (usb_io.h) so the host-paced runtime's
+ * own feed-path threads (the D->H reader, the pacing feeder) can adopt the SAME
+ * class — RME-grade means EVERY thread on the realtime path is hard real-time. */
+bool harp_thread_set_realtime(double period_us) {
+    static int logged_fail = 0; /* one diagnostic line, not per-thread spam */
+    /* Single global off-switch (A/B "before" arm + safety valve): HARP_USB_RT=0
+     * keeps EVERY realtime-path thread on its prior time-share scheduling. */
+    const char *rt = getenv("HARP_USB_RT");
+    if (rt && rt[0] == '0') return false;
+    if (period_us <= 0) period_us = USB_RT_PERIOD_US_DEFAULT;
+    double period_ns = period_us * 1000.0;
+#if defined(__APPLE__)
+    mach_timebase_info_data_t tb;
+    if (mach_timebase_info(&tb) != KERN_SUCCESS || tb.numer == 0) return false;
+    double ticks_per_ns = (double)tb.denom / (double)tb.numer; /* ns -> mach abs ticks */
+    thread_time_constraint_policy_data_t pol;
+    pol.period      = (uint32_t)(period_ns * ticks_per_ns);
+    /* CPU budget per period: generous headroom over the few-µs actual reap so the
+     * kernel never demotes us for a brief burst of completions (a reservation, not
+     * a target — a thread blocked in handle_events consumes none of it). */
+    pol.computation = (uint32_t)(period_ns * 0.20 * ticks_per_ns);
+    pol.constraint  = (uint32_t)(period_ns * 0.90 * ticks_per_ns); /* finish within ~90% of the block */
+    pol.preemptible = 1; /* yield to even-higher-priority work; we still outrank all time-share */
+    kern_return_t kr = thread_policy_set(mach_thread_self(),
+                                         THREAD_TIME_CONSTRAINT_POLICY,
+                                         (thread_policy_t)&pol,
+                                         THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    if (kr == KERN_SUCCESS) return true;
+    if (!logged_fail++)
+        fprintf(stderr, "harp-usb: THREAD_TIME_CONSTRAINT denied (kr=%d) — staying on QoS time-share\n",
+                (int)kr);
+    return false;
+#elif defined(__linux__)
+    struct sched_param sp;
+    int lo = sched_get_priority_min(SCHED_FIFO), hi = sched_get_priority_max(SCHED_FIFO);
+    /* high, but a notch below the very top so kernel/IRQ threads still preempt us */
+    sp.sched_priority = lo + (hi - lo) * 3 / 4;
+    int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+    if (rc == 0) return true;
+    if (!logged_fail++)
+        fprintf(stderr,
+                "harp-usb: SCHED_FIFO denied (%s) — staying on default scheduling "
+                "(grant CAP_SYS_NICE / RLIMIT_RTPRIO for RT)\n",
+                strerror(rc));
+    (void)period_ns;
+    return false;
+#else
+    (void)period_ns;
+    if (!logged_fail++)
+        fprintf(stderr, "harp-usb: no real-time scheduling on this platform — time-share\n");
+    return false;
+#endif
+}
+
+/* ---------------- HARP_USB_RTSTATS capture ---------------- */
+
+static rt_stats *stats_alloc(void) {
+    rt_stats *s = calloc(1, sizeof *s);
+    if (!s) return NULL;
+    s->out_lat = malloc(USB_RT_STAT_CAP * sizeof *s->out_lat);
+    s->out_gap = malloc(USB_RT_STAT_CAP * sizeof *s->out_gap);
+    s->in_gap  = malloc(USB_RT_STAT_CAP * sizeof *s->in_gap);
+    if (!s->out_lat || !s->out_gap || !s->in_gap) {
+        free(s->out_lat); free(s->out_gap); free(s->in_gap); free(s);
+        return NULL;
+    }
+    return s;
+}
+
+static void stats_free(rt_stats *s) {
+    if (!s) return;
+    free(s->out_lat); free(s->out_gap); free(s->in_gap);
+    free(s);
+}
+
+/* caller holds u->mu (the callbacks already do) */
+static void st_push(rt_stats *s, uint32_t *arr, size_t *n, uint32_t v) {
+    if (*n < USB_RT_STAT_CAP) arr[(*n)++] = v;
+    else s->truncated++;
+}
+
+static int cmp_u32(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+
+static void st_report(const char *name, uint32_t *a, size_t n) {
+    if (!n) { fprintf(stderr, "  %-8s (no samples)\n", name); return; }
+    qsort(a, n, sizeof *a, cmp_u32);
+    double mean = 0;
+    for (size_t i = 0; i < n; i++) mean += a[i];
+    mean /= (double)n;
+    size_t i50 = (size_t)(n * 0.50), i99 = (size_t)(n * 0.99), i999 = (size_t)(n * 0.999);
+    if (i50 >= n) i50 = n - 1;
+    if (i99 >= n) i99 = n - 1;
+    if (i999 >= n) i999 = n - 1;
+    fprintf(stderr, "  %-8s n=%-6zu mean=%7.1f  P50=%-6u P99=%-6u P99.9=%-6u max=%-6u  (µs)\n",
+            name, n, mean, a[i50], a[i99], a[i999], a[n - 1]);
+}
+
+static void stats_dump(usb_io *u) {
+    rt_stats *s = u->st;
+    if (!s) return;
+    fprintf(stderr, "harp-usb: RTSTATS for %s (rt=%s)\n", u->dev_serial,
+            u->rt_enable ? "on" : "off");
+    st_report("out_lat", s->out_lat, s->out_n);   /* OUT submit -> completion */
+    st_report("out_gap", s->out_gap, s->outgap_n); /* producer cadence (thread-late probe) */
+    st_report("in_gap", s->in_gap, s->in_n);       /* D->H landing cadence (dropout-window probe) */
+    fprintf(stderr, "  OUT in-flight depth at submit:");
+    for (int d = 0; d <= USB_AOUT_SLOTS; d++)
+        if (s->depth_hist[d]) fprintf(stderr, " [%d]=%llu", d, (unsigned long long)s->depth_hist[d]);
+    fprintf(stderr, "\n");
+    if (s->truncated)
+        fprintf(stderr, "  (rtstats truncated %llu samples past cap)\n",
+                (unsigned long long)s->truncated);
 }
 
 /* ---------------- completions (run on the event thread) ---------------- */
@@ -172,6 +351,13 @@ static void LIBUSB_CALL in_cb(struct libusb_transfer *x) {
             fifo_push(f, t->buf, (size_t)x->actual_length);
             if (fifo_used(f) - before < (size_t)x->actual_length)
                 u->fifo_drops += x->actual_length - (fifo_used(f) - before);
+            if (u->st && t->is_audio) { /* D->H landing cadence (the dropout window) */
+                uint64_t now = harp_now_ns();
+                if (u->st->last_in_ns)
+                    st_push(u->st, u->st->in_gap, &u->st->in_n,
+                            (uint32_t)((now - u->st->last_in_ns) / 1000));
+                u->st->last_in_ns = now;
+            }
             harp_cond_broadcast(&u->cv);
         }
         if (!u->closing && !u->dead) { /* keep the read pending, always */
@@ -206,6 +392,11 @@ static void LIBUSB_CALL aout_cb(struct libusb_transfer *x) {
     harp_mutex_lock(&u->mu);
     u->inflight--;
     s->busy = 0;
+    if (u->st && s->submit_ns) { /* OUT submit -> completion turnaround */
+        st_push(u->st, u->st->out_lat, &u->st->out_n,
+                (uint32_t)((harp_now_ns() - s->submit_ns) / 1000));
+        s->submit_ns = 0;
+    }
     if (x->status != LIBUSB_TRANSFER_COMPLETED &&
         x->status != LIBUSB_TRANSFER_CANCELLED)
         mark_dead_locked(u, "audio bulk out",
@@ -235,11 +426,16 @@ static void LIBUSB_CALL lout_cb(struct libusb_transfer *x) {
 
 static HARP_THREAD_RET ev_main(void *arg) {
     usb_io *u = arg;
+    /* completion reaping is on the realtime path: every audio byte and every
+     * event acknowledgment passes through this thread. Set the USER_INTERACTIVE
+     * QoS first — it is both the macOS fallback when RT is denied and what
+     * HARP_USB_RT=0 keeps for the A/B "before" arm — then promote to hard
+     * real-time (THREAD_TIME_CONSTRAINT / SCHED_FIFO) so host CPU contention
+     * can't deschedule us and empty the endpoint (the cliff-onset dropout). */
 #ifdef __APPLE__
-    /* completion reaping is on the realtime path: every audio byte and
-     * every event acknowledgment passes through this thread */
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
+    if (u->rt_enable) harp_thread_set_realtime(u->rt_period_ns / 1000.0);
     while (harp_flag_load_acq(&u->ev_running)) {
         struct timeval tv = {0, 20000}; /* 20 ms tick to observe shutdown */
         libusb_handle_events_timeout_completed(u->ctx, &tv, NULL);
@@ -383,6 +579,18 @@ bool harp_usb_audio_write(harp_io *io, const void *buf, int len, unsigned timeou
             harp_mutex_unlock(&u->mu);
             return false;
         }
+    }
+    if (u->st) { /* producer cadence + queue occupancy, sampled at submit */
+        uint64_t now = harp_now_ns();
+        int depth = 0;
+        for (int i = 0; i < USB_AOUT_SLOTS; i++)
+            if (u->aout[i].busy) depth++; /* OUT transfers already in flight */
+        u->st->depth_hist[depth]++;
+        if (u->st->last_out_submit_ns)
+            st_push(u->st, u->st->out_gap, &u->st->outgap_n,
+                    (uint32_t)((now - u->st->last_out_submit_ns) / 1000));
+        u->st->last_out_submit_ns = now;
+        s->submit_ns = now;
     }
     memcpy(s->buf, buf, (size_t)len);
     libusb_fill_bulk_transfer(s->xfer, u->h, u->ep_audio_out, s->buf, len, aout_cb, s,
@@ -558,6 +766,15 @@ static harp_io *usb_open_core(usb_io *u, const char *want, bool want_vp,
     harp_cond_init(&u->cv);
     u->debug = getenv("HARP_USB_DEBUG") != NULL;
     u->sync_audio = getenv("HARP_USB_SYNC_AUDIO") != NULL;
+    /* RT on by default; HARP_USB_RT=0 keeps the old USER_INTERACTIVE QoS. */
+    {
+        const char *rt = getenv("HARP_USB_RT");
+        u->rt_enable = !(rt && rt[0] == '0');
+        const char *pe = getenv("HARP_USB_RT_PERIOD_US");
+        double us = pe ? atof(pe) : 0.0;
+        u->rt_period_ns = (us > 0 ? us : USB_RT_PERIOD_US_DEFAULT) * 1000.0;
+    }
+    if (getenv("HARP_USB_RTSTATS")) u->st = stats_alloc(); /* NULL = capture off */
     u->link_fifo.buf = malloc(LINK_FIFO_SZ);
     u->link_fifo.cap = LINK_FIFO_SZ;
     u->audio_fifo.buf = malloc(AUDIO_FIFO_SZ);
@@ -652,6 +869,7 @@ static harp_io *usb_open_core(usb_io *u, const char *want, bool want_vp,
         fprintf(stderr, "harp-usb: no HARP device on the bus (class FF/48/01 scan)\n");
 fail:
 fail_no_list:
+    stats_free(u->st);
     free(u->link_fifo.buf);
     free(u->audio_fifo.buf);
     if (u->owns_ctx) libusb_exit(u->ctx);
@@ -689,6 +907,11 @@ void harp_usb_close(harp_io *io) {
     if (u->fifo_drops)
         fprintf(stderr, "harp-usb: %llu FIFO bytes dropped this session\n",
                 (unsigned long long)u->fifo_drops);
+    if (u->st) {
+        stats_dump(u);
+        stats_free(u->st);
+        u->st = NULL;
+    }
     if (u->h) {
         libusb_release_interface(u->h, u->iface);
         libusb_close(u->h);

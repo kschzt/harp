@@ -1650,6 +1650,13 @@ void HarpRuntime::supervisor() {
 #ifdef __APPLE__
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
+    /* + hard real-time: this thread runs the host-paced PACING FEEDER (the
+     * audioWrite loop). Under host CPU contention a time-share QoS thread is
+     * preempted for tens of ms, so the FunctionFS OUT endpoint empties and the
+     * device underruns (cliff-onset USB dropout). Measured: producer cadence
+     * (usb_io out_gap) tailed to 50-85 ms at USER_INTERACTIVE; RT pins it. The
+     * helper degrades gracefully where RT is unavailable. See host/usb_io.c. */
+    harp_thread_set_realtime(0);
     bool everConnected = connected_.load(std::memory_order_acquire);
     while (running_.load(std::memory_order_acquire)) {
         /* §8.3-over-§8.7 mid-stream toggle: a host flipped offline<->live on a LIVE
@@ -2562,6 +2569,12 @@ void HarpRuntime::eventPump() {
 #ifdef __APPLE__
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
+    /* + hard real-time: events ride the link endpoint while pacing rides the
+     * audio endpoint; if this thread stalls under load the §8.3.1 fence the
+     * feeder stamps outraces the event stream and the device counts
+     * fence_timeouts (the late-apply that shows as the dropout's edge). Keep it
+     * on the same RT class as the feeder so the two pipes stay in lockstep. */
+    harp_thread_set_realtime(0);
     harp_cbuf msgbuf, batch;
     harp_cbuf_init(&msgbuf);
     harp_cbuf_init(&batch);
@@ -2710,6 +2723,11 @@ void HarpRuntime::reader() {
 #ifdef __APPLE__
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
+    /* + hard real-time: this thread drains the D->H render frames (USB audio_fifo
+     * or RTP) into audioRing_ that the DAW audio thread pulls. If it is preempted
+     * past the small (low-latency) ring depth, the DAW sees a gap even when the
+     * bytes already landed in the FIFO — so it must be RT too. See host/usb_io.c. */
+    harp_thread_set_realtime(0);
     if (freeRunning_) {
         /* §8.7 Ethernet: receive the device's RTP stream and write it 1:1 into
          * audioRing_ (bit-exact — no resampling). The DAW audio thread consumes
