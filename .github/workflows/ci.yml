@@ -316,11 +316,17 @@ jobs:
         # perturb its thread timing under coverage. It adds no unique lines here — freerun.c is covered
         # by the single-threaded `freerun` test — so dropping it from the COVERAGE run masks nothing.
         run: ctest --test-dir build-cov --output-on-failure -E freerun_mt
-      - name: coverage metric (gcovr summary over core/host/device)
-        # First cut: report the quantified metric (the panel's named gap). The regression floor
-        # (--fail-under-line) is added in a follow-up once this run reveals the baseline %.
+      - name: coverage metric (gcovr) — gate the unit-tested protocol core; report overall
+        # The quantified metric the panel asked for. The GATE is core/src/ — the protocol library the
+        # unit suite is responsible for (~85% lines: cbor/store/object/frame/audio/envelope/link). The
+        # device daemon, engine, and socket I/O are exercised by the eth-suite + the engine-render
+        # golden (#119) + HW, not the gcov-instrumented unit build (its SIGKILLed daemon never flushes
+        # .gcda), so they read ~0% here and would only make the gate a meaningless aggregate — they are
+        # reported separately, informationally. The plat shim has no unit test by design.
         run: |
-          gcovr --root . \
-            --filter 'core/src/' --filter 'host/' --filter 'device/' \
-            --exclude '.*test.*' --exclude '.*external.*' --exclude '.*vst3sdk.*' \
-            --print-summary
+          echo "── GATE: core protocol unit coverage (core/src/, the unit-test target):"
+          gcovr --root . --filter 'core/src/' --exclude '.*plat_.*' \
+            --print-summary --fail-under-line 78
+          echo "── INFORMATIONAL: overall core/host/device (device + socket I/O are eth-suite/HW-tested, not unit-tested):"
+          gcovr --root . --filter 'core/src/' --filter 'host/' --filter 'device/' \
+            --exclude '.*test.*' --exclude '.*external.*' --exclude '.*vst3sdk.*' --print-summary
