@@ -282,6 +282,15 @@ public:
             else outL[s] = 0.5f * (l + r); /* mono host: sum */
         }
         data.outputs[0].silenceFlags = 0;
+        /* §8.8 NEVER-SILENT guard: the runtime's wet-side watchdog (observeFxWet, run
+         * inside pullAudio/pullAudioBlocking) trips when this armed FX has been fed live
+         * input but the device returned silence for a full window — the H->D input path
+         * is dead ("the §8.8 trap"). On the OFFLINE/host-paced bounce that is a HARD
+         * failure: fail the render LOUDLY (non-OK process status -> the host/CLI bounce
+         * exits non-zero, e.g. harp-vst3-host --fx-instances die()s) rather than write a
+         * silent file. A live insert keeps running — the ERROR log + the host-readable
+         * x.harp.fx_silent_wet counter surface it without killing the DAW. */
+        if (offline_ && rt.fxSilentWetTripped()) return kResultFalse;
         return kResultOk;
     }
 

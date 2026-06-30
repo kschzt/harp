@@ -158,6 +158,12 @@ host-counters = {
   ? 8 => uint,        ; rtp_loss              (RTP seq gaps, §8.7), free-running net only
   ? 9 => uint,        ; admission_failures    (§8.4 admission-control rejections)
     * vendor-counter-key => uint / int   ; host/vendor x.* extension counters
+    ; shipped host vendor counter:
+    ;   "x.harp.fx_silent_wet" => uint   ; §8.8 audio.fx NEVER-SILENT guard — armed-FX
+    ;     silent-wet faults (the H->D input path was live but the device's wet stayed
+    ;     silent a full ~1 s window: the device is free-running / not host-paced).
+    ;     Additive (tstr x.* key), so no diag-bundle version bump. Always present (0 =
+    ;     clean) so a host monitor can poll it on any session, FX or instrument.
 }
 
 ; --- session state-machine history (§12.1) ---

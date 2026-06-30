@@ -26,6 +26,11 @@ extern "C" {
 #define CREDIT_GRANT (16u << 20)
 #define BUNDLE_MAGIC "harpb"
 
+/* §8.8 never-silent guard: |sample| at or below this counts as silence. Above the
+ * float denormal floor but far below any real audio, so the all-zeros wet of a broken
+ * input path reads silent while a working reverb's wet reads live. */
+static constexpr float kFxSilenceEps = 1e-6f;
+
 static void log_msg(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -2132,6 +2137,7 @@ size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
     size_t want = nFrames * 2;
     size_t got = audioRing_.read(dst, want);
     ssiRead_.fetch_add(nFrames, std::memory_order_relaxed);
+    size_t shortBy = 0;
     if (got < want) {
         memset(dst + got, 0, (want - got) * sizeof(float));
         /* §8.8: only the 1:1 synth path owes droppable pad debt. For an armed FX
@@ -2145,9 +2151,12 @@ size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
             underruns_.fetch_add(1, std::memory_order_relaxed);
             padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
         }
-        return (want - got) / 2;
+        shortBy = (want - got) / 2;
     }
-    return 0;
+    /* §8.8 never-silent guard: observe the wet just delivered (read-only). Gated on
+     * fxArmed, so the instrument path is byte-identical (the golden gate). */
+    if (fxArmed()) observeFxWet(dst, nFrames);
+    return shortBy;
 }
 
 /* Per-part pull: drain THIS sink's demuxed stereo ring. Structurally identical
@@ -2210,11 +2219,13 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
             padDebtFloats_ += want - got;
             underruns_.fetch_add(1, std::memory_order_relaxed);
             padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
+            if (fxArmed()) observeFxWet(dst, nFrames); /* §8.8 never-silent guard (offline) */
             return (want - got) / 2;
         }
         harp_sleep_ns(500000ull); /* 0.5 ms */
         waited++;
     }
+    if (fxArmed()) observeFxWet(dst, nFrames); /* §8.8 never-silent guard (offline) */
     return 0;
 }
 
@@ -2269,7 +2280,73 @@ size_t HarpRuntime::pullAudioBlocking(AudioSink *sink, float *dst, size_t nFrame
 size_t HarpRuntime::writeFxInput(const float *interleaved, size_t nFrames) {
     if (fxInSlots_.empty() || !interleaved || nFrames == 0) return 0;
     size_t cols = fxInSlots_.size();
+    /* §8.8 never-silent guard: track how long the host has been pushing NON-silent
+     * input. A run of non-silent blocks means the input path is live and the device
+     * MUST return wet; a single silent block breaks the run (a pause is not the trap,
+     * so a decaying reverb tail going quiet during a pause is never a false positive).
+     * Audio-thread only (sole producer), in lockstep with observeFxWet's wet side. */
+    bool energy = false;
+    for (size_t i = 0, n = nFrames * cols; i < n; i++)
+        if (interleaved[i] > kFxSilenceEps || interleaved[i] < -kFxSilenceEps) {
+            energy = true;
+            break;
+        }
+    fxInRunFrames_ = energy ? fxInRunFrames_ + nFrames : 0;
     return fxInRing_.write(interleaved, nFrames * cols) / cols;
+}
+
+/* §8.8 audio.fx NEVER-SILENT guard — see runtime.h. Runs on the audio/process thread
+ * from the FX pull side each block (pullAudio / pullAudioBlocking when fxArmed). It
+ * correlates the input-energy run (writeFxInput) against the wet energy delivered here
+ * and trips LOUDLY when input has been live for a full window yet the wet stayed silent
+ * the whole time — the broken-input-path ("§8.8 trap") signature. READ-ONLY w.r.t. the
+ * wet buffer, so the FX render (and the instrument golden, which never arms) is
+ * byte-unchanged. */
+void HarpRuntime::observeFxWet(const float *wet, size_t nFrames) {
+    if (!fxArmed() || !wet || nFrames == 0) return;
+    /* Reset on a (re)negotiation: a new stream's wet starts from priming silence, which
+     * must not count against the previous run. sessionGen_ bumps at sessionUp. */
+    uint64_t gen = sessionGen_.load(std::memory_order_relaxed);
+    if (gen != fxWatchdogGen_) {
+        fxWatchdogGen_ = gen;
+        fxInRunFrames_ = 0;
+        fxWetSilentRunFrames_ = 0;
+        fxSilentWetEpisode_ = false;
+    }
+    bool wetEnergy = false;
+    for (size_t i = 0, n = nFrames * 2; i < n; i++)
+        if (wet[i] > kFxSilenceEps || wet[i] < -kFxSilenceEps) {
+            wetEnergy = true;
+            break;
+        }
+    if (wetEnergy) {
+        /* the wet is alive — clear the silent run AND the episode latch, so a LATER
+         * break (a mid-session input-path failure) re-fires its own count. */
+        fxWetSilentRunFrames_ = 0;
+        fxSilentWetEpisode_ = false;
+        return;
+    }
+    /* the wet is silent THIS block. ONLY the trap — continuously-fed input with a dead
+     * wet — accumulates; the instant input stops (fxInRunFrames_ == 0) the run resets,
+     * so a reverb tail decaying to silence during a pause is never a false positive. */
+    if (fxInRunFrames_ == 0) {
+        fxWetSilentRunFrames_ = 0;
+        return;
+    }
+    fxWetSilentRunFrames_ += nFrames;
+    if (!fxSilentWetEpisode_ && fxInRunFrames_ >= fxSilentWetWindowFrames_ &&
+        fxWetSilentRunFrames_ >= fxSilentWetWindowFrames_) {
+        fxSilentWetEpisode_ = true; /* one count per silent episode, not per block */
+        fxSilentWetFaults_.fetch_add(1, std::memory_order_relaxed);
+        fxSilentWetTripped_.store(true, std::memory_order_relaxed);
+        char msg[224];
+        snprintf(msg, sizeof msg,
+                 "armed FX wet SILENT for %llu frames while input was live — the H->D "
+                 "input path is dead (device free-running / not host-paced?): §8.8 trap",
+                 (unsigned long long)fxWetSilentRunFrames_);
+        recordLog(HARP_LOG_ERROR, "audio.fx", msg);
+        log_msg("§8.8 NEVER-SILENT: %s", msg); /* loud stderr copy */
+    }
 }
 
 /* ---------------- feeder thread ---------------- */
@@ -3622,7 +3699,7 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
      * §8.7 rtp_loss — the canonical host-section homes per docs/diag-bundle-design.md;
      * clock-stats key 4 mirrors reanchors, key 7 there is reserved for ptp-stats.) */
     harp_cbor_uint(&out, 5);
-    harp_cbor_map(&out, 9);
+    harp_cbor_map(&out, 10);
     harp_cbor_uint(&out, 0);
     harp_cbor_uint(&out, underruns_.load(std::memory_order_relaxed)); /* host_underruns */
     harp_cbor_uint(&out, 1);
@@ -3641,6 +3718,13 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
     harp_cbor_uint(&out, asrcReanchors_.load(std::memory_order_relaxed)); /* §8.3 stream_reanchors */
     harp_cbor_uint(&out, 8);
     harp_cbor_uint(&out, rtpLostSnap_.load(std::memory_order_relaxed)); /* §8.7 rtp_loss (RTP seq gaps) */
+    /* host vendor extension counter (§8.8 audio.fx never-silent guard): the count of
+     * armed-FX silent-wet faults (the H→D input path was live but the wet stayed silent
+     * a full window). A tstr key per the schema's vendor-counter-key (x.*), so it is
+     * additive and needs NO diag-bundle version bump. Always emitted (0 = clean), so a
+     * host monitor can poll it on any session, FX or instrument. */
+    harp_cbor_text(&out, "x.harp.fx_silent_wet");
+    harp_cbor_uint(&out, fxSilentWetFaults_.load(std::memory_order_relaxed));
 
     /* KEY 6: session-history — the §12.1 state-machine transition ring. Each
      * record is { 0 => [epoch, msc], 1 => from-state, 2 => to-state, 3 =>

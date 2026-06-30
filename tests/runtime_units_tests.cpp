@@ -268,6 +268,121 @@ static void test_setstatebundle_rejection() {
     }
 }
 
+/* 7. §8.8 audio.fx NEVER-SILENT guard. An armed FX is host-paced (H->D track in, D->H
+ *    wet); if the input path breaks, the device returns SILENCE (the "§8.8 trap") and
+ *    today only the soak notices. The runtime's watchdog correlates the input-energy run
+ *    (writeFxInput) against the wet-energy (observeFxWet) and must fire LOUDLY when input
+ *    is live but the wet stays silent for a full window, while NOT false-positiving on a
+ *    working wet, on legitimately-silent input, or on a reverb tail decaying during a
+ *    pause. Exercised directly on the runtime's detection seam — the SAME two calls the
+ *    FX shell's process() makes — so it is hardware-free. A small test rate makes the
+ *    ~1 s window cheap to reach (configure() floors the window to 4096 frames). */
+static void test_fx_never_silent() {
+    const uint32_t kRate = 8000; /* window = 8000 frames (1 s @ 8k) */
+    const size_t kBlk = 256;
+    const size_t kWin = kRate;                       /* fxSilentWetWindowFrames_ */
+    const size_t kTripBlocks = (2 * kWin / kBlk) + 8; /* > window for BOTH runs */
+    const size_t kSafeBlocks = (3 * kWin / kBlk);     /* well past the window, must NOT trip */
+
+    /* (a) THE TRAP: armed FX, host feeding non-silent input, wet SILENT every block ->
+     *     after the window the guard FIRES (counter + tripped + host-readable diag key).
+     *     This is exactly what a free-running / non-host-paced FX device produces. */
+    {
+        std::unique_ptr<HarpRuntime> rt = runtime_acquire();
+        rt->configure(kRate, (uint32_t)kBlk);
+        rt->setFxInputSlots({0}); /* arm: the reverb's single mono input column */
+        CHECK(rt->fxArmed());
+        CHECK(rt->fxSilentWetFaults() == 0);
+        CHECK(!rt->fxSilentWetTripped());
+
+        std::vector<float> in(kBlk, 0.25f);     /* non-silent track input (mono column) */
+        std::vector<float> wet(2 * kBlk, 0.0f); /* the device returns SILENCE */
+        for (size_t b = 0; b < kTripBlocks; b++) {
+            rt->writeFxInput(in.data(), kBlk);
+            rt->observeFxWet(wet.data(), kBlk);
+        }
+        CHECK(rt->fxSilentWetTripped());
+        CHECK(rt->fxSilentWetFaults() == 1); /* ONE count per silent episode, not per block */
+
+        /* the host-readable surface: the diag bundle carries the vendor counter key */
+        std::vector<uint8_t> bundle = rt->getDiagBundle();
+        const char *needle = "x.harp.fx_silent_wet";
+        size_t nl = strlen(needle);
+        bool found = false;
+        for (size_t i = 0; bundle.size() >= nl && i + nl <= bundle.size(); i++)
+            if (memcmp(bundle.data() + i, needle, nl) == 0) { found = true; break; }
+        CHECK(found);
+    }
+
+    /* (b1) NO FALSE POSITIVE — a working device: non-silent input AND non-silent wet ->
+     *      the guard never fires (the wet-alive path clears the run every block). */
+    {
+        std::unique_ptr<HarpRuntime> rt = runtime_acquire();
+        rt->configure(kRate, (uint32_t)kBlk);
+        rt->setFxInputSlots({0});
+        std::vector<float> in(kBlk, 0.25f);
+        std::vector<float> wet(2 * kBlk, 0.1f); /* device returns a real wet */
+        for (size_t b = 0; b < kSafeBlocks; b++) {
+            rt->writeFxInput(in.data(), kBlk);
+            rt->observeFxWet(wet.data(), kBlk);
+        }
+        CHECK(!rt->fxSilentWetTripped());
+        CHECK(rt->fxSilentWetFaults() == 0);
+    }
+
+    /* (b2) NO FALSE POSITIVE — legitimate silence: the host feeds SILENT input (a paused
+     *      track / a 100%-dry passage) and the wet is silent too. NOT the trap — the
+     *      input-energy gate keeps the guard quiet. */
+    {
+        std::unique_ptr<HarpRuntime> rt = runtime_acquire();
+        rt->configure(kRate, (uint32_t)kBlk);
+        rt->setFxInputSlots({0});
+        std::vector<float> in(kBlk, 0.0f);
+        std::vector<float> wet(2 * kBlk, 0.0f);
+        for (size_t b = 0; b < kSafeBlocks; b++) {
+            rt->writeFxInput(in.data(), kBlk);
+            rt->observeFxWet(wet.data(), kBlk);
+        }
+        CHECK(!rt->fxSilentWetTripped());
+        CHECK(rt->fxSilentWetFaults() == 0);
+    }
+
+    /* (b3) NO FALSE POSITIVE — a reverb TAIL during a pause: input plays a short burst,
+     *      then STOPS; the wet rings out and eventually goes silent for far longer than
+     *      the window. The run resets the instant input stops, so the long silent-wet
+     *      stretch AFTER input ends never trips. */
+    {
+        std::unique_ptr<HarpRuntime> rt = runtime_acquire();
+        rt->configure(kRate, (uint32_t)kBlk);
+        rt->setFxInputSlots({0});
+        std::vector<float> live(kBlk, 0.25f), silentIn(kBlk, 0.0f);
+        std::vector<float> wetLive(2 * kBlk, 0.1f), wetSilent(2 * kBlk, 0.0f);
+        for (int b = 0; b < 8; b++) { /* short burst, well under the window */
+            rt->writeFxInput(live.data(), kBlk);
+            rt->observeFxWet(wetLive.data(), kBlk);
+        }
+        for (size_t b = 0; b < kSafeBlocks; b++) { /* input gone; wet silent forever */
+            rt->writeFxInput(silentIn.data(), kBlk);
+            rt->observeFxWet(wetSilent.data(), kBlk);
+        }
+        CHECK(!rt->fxSilentWetTripped());
+        CHECK(rt->fxSilentWetFaults() == 0);
+    }
+
+    /* (a') the instrument shell never arms fxInSlots_, so observeFxWet is inert there —
+     *      a never-armed runtime fed silent "wet" must NEVER trip (the golden-path
+     *      guarantee that the guard is FX-only). */
+    {
+        std::unique_ptr<HarpRuntime> rt = runtime_acquire();
+        rt->configure(kRate, (uint32_t)kBlk);
+        CHECK(!rt->fxArmed());
+        std::vector<float> wet(2 * kBlk, 0.0f);
+        for (size_t b = 0; b < kTripBlocks; b++) rt->observeFxWet(wet.data(), kBlk);
+        CHECK(!rt->fxSilentWetTripped());
+        CHECK(rt->fxSilentWetFaults() == 0);
+    }
+}
+
 int main() {
     /* Hermetic store: keep the ctor's harp_store_open out of the real cache. POSIX only;
      * on Windows the default store dir is used (harmless — setStateBundle still parses,
@@ -284,6 +399,7 @@ int main() {
     test_mod_queue();
     test_note_voice_map();
     test_setstatebundle_rejection();
+    test_fx_never_silent();
 
     return check_report("harp-runtime-units-tests");
 }
