@@ -45,7 +45,7 @@ jobs:
     # never run on a fork of this repo that happens to have the workflow
     if: github.repository == 'kschzt/harp'
     runs-on: [self-hosted, harp-hw]
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -132,6 +132,33 @@ jobs:
           N: '2'
           VECTORS: crash killd
         run: timeout 300 bash scripts/usb-stress.sh
+
+      - name: SCHED_FIFO fence-under-load gate (§8.3.1 zero fence_timeouts under load, PI4B-0002)
+        # Prove the device's SCHED_FIFO promotion (device/session.c::harp_device_thread_set_realtime)
+        # holds §8.3.1 host-paced fence_timeouts at ZERO under CPU contention — the on-target twin of
+        # the host RT promotion (#133/#139). Runs ON THE PI (native arm64): builds the fence tool, then
+        # fence-load-rt.sh runs a time-share `before` arm (HARP_DEVICE_RT=0) vs a SCHED_FIFO `after` arm
+        # under CPU burners and asserts the SCHED_FIFO arm hits fence_timeouts=0 + audio_underruns=0 (no
+        # audio_overruns / frame_errors regression either). The ci user carries RLIMIT_RTPRIO (limits.d)
+        # so the non-root daemon self-promotes without sudo — the production-audio RT model
+        # (harp-deviced-usb runs as root and always gets RT). We THEN assert the after-arm daemon log
+        # shows SCHED_FIFO was actually GRANTED (not "denied"): if RT can't be granted the gate degrades
+        # HONESTLY to RED, never a hollow green. ControlMaster=no forces a fresh ssh PAM session so the
+        # rtprio limit applies. Modest FRAMES/BURNERS keep it ~2-3 min. Uses the daemon already built on
+        # the board by the deploy step; the TCP fence daemon (port 17998, own state-dir) does not touch
+        # the USB gadget.
+        env:
+          TARGET_SSH: ci@harptest.local
+          FRAMES: '1500'
+          BURNERS: '8'
+        run: |
+          ssh -o ControlMaster=no -o ControlPath=none "$TARGET_SSH" "
+            set -e
+            cd ~/harp
+            cmake --build build -j4 --target harp-eth-fence-test
+            FRAMES=$FRAMES BURNERS=$BURNERS DEVLOG=/tmp/hw-fence-load-dev.log scripts/fence-load-rt.sh
+            grep -q 'SCHED_FIFO prio .* (real-time)' /tmp/hw-fence-load-dev.log || { echo 'hw fence gate: SCHED_FIFO could not be granted on the rig (RLIMIT_RTPRIO missing?) — refusing a hollow green'; exit 1; }
+          "
 
   # ─────────────────────────────────────────────────────────────────────────────
   # DORMANT: real two-host Ethernet §8.7 conformance against the rig Pi.
