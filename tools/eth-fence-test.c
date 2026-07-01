@@ -42,6 +42,7 @@
 #include "harp/plat.h" /* harp_sleep_ns — portable (nanosleep is POSIX-only) */
 
 #include <stdio.h>
+#include <stdlib.h> /* strtol — the `load[:N]` frame-count arg */
 #include <string.h>
 
 /* §8.3.1 connect-back uses a raw server socket (bind/listen/accept). sock_io.h already
@@ -188,7 +189,7 @@ static uint64_t counter(harp_client *c, const char *name) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: eth-fence-test HOST:PORT [realtime]\n");
+        fprintf(stderr, "usage: eth-fence-test HOST:PORT [realtime|load[:N]]\n");
         return 2;
     }
     /* realtime = exercise the §8.3.1 REAL-TIME bounded fence (deadline + count) instead of the
@@ -196,6 +197,23 @@ int main(int argc, char **argv) {
      * stream is offline=false. We fence beyond the feed (never release it with an event) and assert
      * the device renders the range anyway (bounded — no wedge) and counts the timeout. */
     bool realtime = (argc > 2 && strcmp(argv[2], "realtime") == 0);
+    /* load[:N] = the SCHED_FIFO regression driver (device/session.c harp_device_thread_set_realtime).
+     * Like `realtime` the daemon runs HARP_FENCE_FORCE_RT=1 (bounded real-time fence over the TCP
+     * carrier, faithful to a USB host-paced stream — the fence reads a->offline, not the transport).
+     * But UNLIKE `realtime` every fenced frame IS released by an in-order event: for frame k we send
+     * a fenced frame want=k+1 then the k+1'th note event, N times. The fence should therefore never
+     * time out — the event is fed on time. It DOES time out only when the device's event-consume
+     * thread is descheduled past the few-ms bound under CPU contention (the benign fence_timeout this
+     * fix targets). Run the daemon under load with HARP_DEVICE_RT=0 (time-share, the "before" arm) vs
+     * default (SCHED_FIFO, the fix) and compare the printed fence_timeouts delta: the fix drives it to
+     * literal zero while audio_underruns stay 0. This mode MEASURES + prints; it never asserts on the
+     * timeout count (that is the A/B the driving script/operator compares). N defaults to 4000. */
+    bool load = (argc > 2 && strncmp(argv[2], "load", 4) == 0);
+    long load_n = 4000;
+    if (load && argv[2][4] == ':') {
+        long v = strtol(argv[2] + 5, NULL, 10);
+        if (v > 0) load_n = v;
+    }
 
 #ifdef _WIN32
     /* sock_io.h: the caller owns WSAStartup before dialing (and before bind/listen below). */
@@ -267,6 +285,73 @@ int main(int argc, char **argv) {
 
     uint64_t w_before = counter(&client, "x.harp-refdev.fence_waits");
     uint64_t t_before = counter(&client, "x.harp-refdev.fence_timeouts");
+
+    if (load) {
+        /* SCHED_FIFO regression driver: stream `load_n` fenced frames, each RELEASED by an
+         * in-order event, so a correctly-scheduled device never times out. For frame k: send
+         * the fenced frame want=k+1 FIRST (so the audio thread can park on the fence), then the
+         * (k+1)'th note event (bumping g_evt_consumed toward want). drain_output blocks until
+         * the device renders the range — released by the event within the bound, or, if the
+         * device's event-consume thread was descheduled past it, by the bound itself (counted).
+         * The daemon's g_evt_consumed starts at 0 on a fresh stream, so want == the running
+         * event total. Back-to-back is a harsher, faster proxy for the realtime cadence; it
+         * paces to the device's own render rate (drain_output gates each iteration). */
+        uint64_t au_before = counter(&client, "audio_underruns");
+        uint64_t ao_before = counter(&client, "audio_overruns");
+        uint64_t al_before = counter(&client, "audio_late_frames");
+        uint64_t fe_before = counter(&client, "frame_errors");
+        uint64_t el_before = counter(&client, "evt_late");
+        uint64_t ssi = 0;
+        for (long k = 0; k < load_n; k++) {
+            if (!send_pacing_fenced(dev, ssi, (uint32_t)(k + 1))) {
+                fprintf(stderr, "fence: load fenced send failed at k=%ld\n", k);
+                return 1;
+            }
+            if (!send_note_evt(&client, &tio.io, &link)) {
+                fprintf(stderr, "fence: load note evt send failed at k=%ld\n", k);
+                return 1;
+            }
+            if (!drain_output(dev)) {
+                fprintf(stderr, "fence: load fenced output never arrived at k=%ld (wedge?)\n", k);
+                return 1;
+            }
+            ssi += NS;
+        }
+        uint64_t w_after = counter(&client, "x.harp-refdev.fence_waits");
+        uint64_t t_after = counter(&client, "x.harp-refdev.fence_timeouts");
+        uint64_t au_after = counter(&client, "audio_underruns");
+        uint64_t ao_after = counter(&client, "audio_overruns");
+        uint64_t al_after = counter(&client, "audio_late_frames");
+        uint64_t fe_after = counter(&client, "frame_errors");
+        uint64_t el_after = counter(&client, "evt_late");
+
+        harp_cbuf sreq, srsp;
+        harp_cbuf_init(&sreq);
+        harp_cbuf_init(&srsp);
+        harp_client_req_head(&client, &sreq, "audio.stop", false);
+        harp_env se;
+        harp_client_request(&client, &sreq, &srsp, &se);
+        harp_cbuf_free(&sreq);
+        harp_cbuf_free(&srsp);
+        harp_closesock(dev);
+        harp_closesock(srv);
+        harp_sock_close(s);
+
+        /* machine-parseable A/B line: the driving script/operator compares two arms (device
+         * HARP_DEVICE_RT=0 "before" vs default SCHED_FIFO "after"). fence_timeouts is the target. */
+        printf("fence-load: frames=%ld fence_waits=+%llu fence_timeouts=+%llu "
+               "audio_underruns=+%llu audio_overruns=+%llu audio_late_frames=+%llu "
+               "frame_errors=+%llu evt_late=+%llu\n",
+               load_n,
+               (unsigned long long)(w_after - w_before),
+               (unsigned long long)(t_after - t_before),
+               (unsigned long long)(au_after - au_before),
+               (unsigned long long)(ao_after - ao_before),
+               (unsigned long long)(al_after - al_before),
+               (unsigned long long)(fe_after - fe_before),
+               (unsigned long long)(el_after - el_before));
+        return 0;
+    }
 
     /* N_PRE plain in-order frames, draining each output -> render cursor = N_PRE*NS. */
     uint64_t ssi = 0;

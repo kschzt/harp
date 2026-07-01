@@ -8,6 +8,9 @@
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
+#ifdef __linux__
+#include <sched.h> /* §8.3.1 SCHED_FIFO: the device real-time promotion (Linux gadget only) */
+#endif
 #include <stdio.h>
 #include <stdlib.h> /* getenv/strtoull: the §4.2.1b HARP_FORCE_CREDIT_GRANT test seam */
 #include <string.h>
@@ -2169,9 +2172,62 @@ static void handle_obj(device *d, const uint8_t *buf, size_t len) {
     if (d->granted < CREDIT_GRANT / 2) grant_credit(d);
 }
 
+/* ---------------- §8.3.1 device real-time scheduling ----------------
+ *
+ * The host-paced event fence (§8.3.1, device/fence_wait.h) blocks a fenced pacing-frame
+ * range until its named EVT-stream events are CONSUMED: g_evt_consumed is bumped here in
+ * the session / event-consume loop, and the audio pacing thread (audio_loop.c) waits on
+ * it up to a few-ms bound, else it renders the range with the late event and counts a
+ * fence_timeout. Both threads had NO real-time scheduling, so under CPU contention a
+ * NORMAL-priority event-consume thread can be descheduled past that bound even when the
+ * host fed the event IN ORDER — a benign but nonzero fence_timeout. The host's realtime
+ * audio-path threads already run on the RT class (host/rt_sched.c, #133/#139); the device
+ * had none. Lift the calling thread onto Linux SCHED_FIFO so the event-apply always
+ * reaches the fenced frame inside the bound — the RME-bar device twin of the host promotion.
+ *
+ * Priority: a notch below the top (lo + (hi-lo)*3/4, matching host/rt_sched.c) so kernel /
+ * IRQ / USB-gadget threads still preempt us — we outrank ordinary time-share, not the
+ * kernel. NOT masking: this closes the race so an in-order event is applied on time; a
+ * GENUINELY late or dropped event still misses the bound and is still counted (the tight
+ * §8.3.1 bound is unchanged). */
+bool harp_device_thread_set_realtime(const char *who) {
+    static _Atomic int rt_logged_fail = 0; /* one diagnostic line, not per-thread spam */
+    /* HARP_DEVICE_RT=0: the A/B "before" arm + a safety valve — keep EVERY device thread on
+     * its prior time-share scheduling (mirrors the host's HARP_USB_RT=0 off-switch). */
+    const char *gate = getenv("HARP_DEVICE_RT");
+    if (gate && gate[0] == '0') return false;
+#ifdef __linux__
+    struct sched_param sp;
+    int lo = sched_get_priority_min(SCHED_FIFO), hi = sched_get_priority_max(SCHED_FIFO);
+    sp.sched_priority = lo + (hi - lo) * 3 / 4; /* high, but below kernel/IRQ threads */
+    int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+    if (rc == 0) {
+        harp_devlog(HARP_LOG_INFO, "rt", "harp-deviced: %s thread -> SCHED_FIFO prio %d (real-time)\n",
+                    who ? who : "?", sp.sched_priority);
+        return true;
+    }
+    /* graceful degrade: keep the caller's prior scheduling, never fatal, log once */
+    if (!atomic_fetch_add_explicit(&rt_logged_fail, 1, memory_order_relaxed))
+        harp_devlog(HARP_LOG_WARN, "rt",
+                    "harp-deviced: SCHED_FIFO denied (%s) — %s stays on default scheduling "
+                    "(grant CAP_SYS_NICE / RLIMIT_RTPRIO for zero §8.3.1 fence_timeouts under load)\n",
+                    strerror(rc), who ? who : "?");
+    return false;
+#else
+    (void)who;
+    (void)rt_logged_fail;
+    return false; /* no device audio path off Linux (the simulator) — time-share is fine */
+#endif
+}
+
 /* ---------------- session / main ---------------- */
 
 void harp_deviced_run_session(device *d, harp_io *io) {
+    /* §8.3.1: the event-consume loop below bumps g_evt_consumed the moment each EVT message
+     * is fully processed, which is what releases the audio thread's fenced pacing frame. Run
+     * it on the real-time class so CPU contention can never park it past the fence bound (the
+     * audio thread self-promotes too, at audio_thread). Once per session; graceful degrade. */
+    harp_device_thread_set_realtime("session/event-consume");
     pthread_mutex_lock(&d->send_mu);
     d->io = io;
     pthread_mutex_unlock(&d->send_mu);

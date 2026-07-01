@@ -569,6 +569,22 @@ void send_error(device *d, uint64_t rid, const char *method, const char *code,
                 const char *detail);
 void harp_deviced_run_session(device *d, harp_io *io);
 
+/* §8.3.1 real-time scheduling (device side, session.c). Lift the CALLING thread onto
+ * Linux SCHED_FIFO so the two threads on the real-time host-paced path — the session /
+ * event-consume loop (which bumps g_evt_consumed) and the audio pacing thread (which
+ * waits on it up to the few-ms fence bound) — are never descheduled by ordinary load.
+ * That closes the host-event-vs-pacing-frame race that leaves an in-order-but-late
+ * event applied past the bound (a benign but nonzero fence_timeout under CPU
+ * contention): the DEVICE twin of the host's harp_thread_set_realtime (host/rt_sched.c,
+ * promoted for #133/#139). Priority is a notch below the top (kernel/IRQ/USB-gadget
+ * threads still preempt us). Degrades gracefully (keeps the caller's prior scheduling,
+ * logs ONCE) where RT is denied — no CAP_SYS_NICE / RLIMIT_RTPRIO — so the stream still
+ * runs, just at the old determinism. Gate HARP_DEVICE_RT=0 keeps every device thread on
+ * time-share (the A/B "before" arm + safety valve). Non-Linux (the macOS/Windows
+ * simulator, no real audio path) is a no-op. `who` tags the one-line log. Returns true
+ * iff real-time was actually granted. */
+bool harp_device_thread_set_realtime(const char *who);
+
 /* ---------------- panel.c ---------------- */
 struct panel_args {
     device *d;

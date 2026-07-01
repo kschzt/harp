@@ -279,6 +279,13 @@ static void host_paced_loop(device *d) {
 void *audio_thread(void *arg) {
     device *d = arg;
     audio_state *a = &d->audio;
+    /* §8.3.1: this is the real-time audio path — host-paced pacing/fence (mode 1) and
+     * free-running RTP (mode 0). Promote it to SCHED_FIFO so it is never descheduled by
+     * ordinary load: in host-paced mode it re-checks g_evt_consumed against the fenced
+     * frame every 50 µs and must see an in-order event land before the few-ms bound (the
+     * session thread promotes itself too); in free-running mode it must hit its emit
+     * cadence. Once per stream; graceful degrade + log-once if RT can't be granted. */
+    harp_device_thread_set_realtime("audio");
     /* §8.3-over-§8.7: host-paced deterministic render over TCP (offline bounce).
      * Connect back to the host's audio-listen port (key 7) HERE, on the audio
      * thread — NOT in handle_audio_start, which advances the §8.3.1 event fence on
