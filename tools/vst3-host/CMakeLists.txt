@@ -185,16 +185,18 @@ if(LIBUSB_FOUND)
   # main) differs. Listed ONCE here (parallel to HARP_CORE_SRC above) so a new shell
   # TUs — runtime_diag.cpp (the §14.4 diag-bundle assembly), runtime_recall.cpp
   # (the §11.4 recall/reconcile + §15.3 state-bundle codec), runtime_session.cpp
-  # (the §5/§12 hello/identity + device-selection + connect/reconnect lifecycle), and
-  # runtime_events.cpp (the §9 event plane: encode/queue/drain) split out of
-  # runtime.cpp — are picked up by every target at once, with no per-target list
-  # to drift (which previously let one build clobber another's binary).
+  # (the §5/§12 hello/identity + device-selection + connect/reconnect lifecycle),
+  # runtime_events.cpp (the §9 event plane: encode/queue/drain), and runtime_audio.cpp
+  # (the §8.2/§8.3/§8.7 audio engine: audioStart/reneg + feeder/reader/eventPump +
+  # ASRC) split out of runtime.cpp — are picked up by every target at once, with no
+  # per-target list to drift (which previously let one build clobber another's binary).
   set(HARP_SHELL_SRC
     ${HARP_ROOT}/shell/runtime.cpp
     ${HARP_ROOT}/shell/runtime_diag.cpp
     ${HARP_ROOT}/shell/runtime_recall.cpp
     ${HARP_ROOT}/shell/runtime_session.cpp
     ${HARP_ROOT}/shell/runtime_events.cpp
+    ${HARP_ROOT}/shell/runtime_audio.cpp
     ${HARP_ROOT}/shell/runtime_registry.cpp)
   # VST3 plugin entry point is per-platform (macmain/linuxmain/dllmain).
   if(APPLE)
