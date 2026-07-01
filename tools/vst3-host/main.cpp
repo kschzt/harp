@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "render_check.h"
+#include "rt_sched.h" /* harp_thread_set_realtime — hard-RT the wall-clock render thread (#133 helper) */
 
 #include <csignal>
 
@@ -247,9 +248,18 @@ static int run_multi_instance(VST3::Hosting::Module::Ptr &module, const VST3::Ho
     std::vector<float> capture; /* bus 0 main mix */
     capture.reserve(total * (size_t)out_ch);
 
+    /* Real-time render/pacing thread. Keep USER_INTERACTIVE (macOS) as the RT-denied
+     * fallback and the HARP_USB_RT=0 A/B "before" arm, then promote to the host's
+     * hard real-time class (THREAD_TIME_CONSTRAINT / SCHED_FIFO) via the SAME #133
+     * helper the shell's USB feed/pump/reader threads use. Without it, parallel
+     * --realtime hosts (the song-soak spawns one per device) preempt each other ->
+     * the host-paced block+events land late -> device §8.3.1 fence_timeouts. A real
+     * DAW paces on CoreAudio's RT thread, so this CLI stand-in must too. period = one
+     * audio block; degrades gracefully (keeps the QoS above) if RT is denied. */
 #ifdef __APPLE__
     if (realtime) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
+    if (realtime) harp_thread_set_realtime((double)block / (double)rate * 1e6);
     auto rt0 = std::chrono::steady_clock::now();
     while (done < total) {
         if (g_stop) break; /* SIGTERM/SIGINT -> leave the loop into the normal teardown (clean USB close) */
@@ -545,9 +555,14 @@ static int run_fx_instances(VST3::Hosting::Module::Ptr &module, const VST3::Host
     capture.reserve(total * (size_t)out_ch);
     double phase = 0;
 
+    /* Real-time render/pacing thread — promote to the host hard-RT class (the #133
+     * helper) so parallel --realtime FX hosts don't preempt each other into late
+     * host-paced blocks -> device §8.3.1 fence_timeouts. The QoS below is the
+     * RT-denied / HARP_USB_RT=0 fallback; period = one audio block. */
 #ifdef __APPLE__
     if (realtime) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
+    if (realtime) harp_thread_set_realtime((double)block / (double)rate * 1e6);
     auto rt0 = std::chrono::steady_clock::now();
     while (done < total) {
         if (g_stop) break; /* SIGTERM/SIGINT -> leave the loop into the normal teardown (clean USB close) */
@@ -1237,6 +1252,12 @@ int main(int argc, char **argv) {
     if (realtime) /* compete like a DAW audio thread, not a background job */
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
+    /* ...but a QoS band is still time-share: under parallel --realtime contention it
+     * gets preempted -> late host-paced block+events -> device §8.3.1 fence_timeouts.
+     * Promote to the host hard-RT class (THREAD_TIME_CONSTRAINT / SCHED_FIFO) via the
+     * #133 helper, exactly as CoreAudio runs a DAW's render thread. period = one audio
+     * block; the QoS above stays as the RT-denied / HARP_USB_RT=0 fallback. */
+    if (realtime) harp_thread_set_realtime((double)block / (double)rate * 1e6);
     auto rt0 = std::chrono::steady_clock::now();
     while (done < total) {
         if (g_stop) break; /* SIGTERM/SIGINT -> leave the loop into the normal teardown (clean USB close) */

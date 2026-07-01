@@ -40,6 +40,12 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../external/vst3sdk vst3sdk EXCL
 
 set(SDK_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vst3sdk)
 add_executable(harp-vst3-host main.cpp
+  # host/rt_sched.c: harp_thread_set_realtime() — the #133 THREAD_TIME_CONSTRAINT /
+  # SCHED_FIFO promotion the shell's USB threads use. libusb-free (that is why it was
+  # extracted from usb_io.c), so it links cleanly into this SDK-only host and lets the
+  # wall-clock render/pacing loop run hard-real-time (no fence_timeouts under parallel
+  # --realtime contention).
+  ${SDK_ROOT}/../../host/rt_sched.c
   ${SDK_ROOT}/public.sdk/source/common/memorystream.cpp
   ${SDK_ROOT}/public.sdk/source/vst/hosting/plugprovider.cpp)
 if(APPLE)
@@ -55,7 +61,7 @@ target_link_libraries(harp-vst3-host PRIVATE sdk_hosting sdk_common base plugint
 if(APPLE)
   target_link_libraries(harp-vst3-host PRIVATE "-framework CoreFoundation" "-framework Foundation")
 endif()
-target_include_directories(harp-vst3-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vst3sdk ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_include_directories(harp-vst3-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vst3sdk ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../host)
 
 # ---- ring unit + stress tests (no SDK, no hardware) ----
 add_executable(ring-tests ring_tests.cpp)
