@@ -183,14 +183,16 @@ if(LIBUSB_FOUND)
   # hosts, the downstream variant) compiles EXACTLY this set; only the per-format
   # entry point (plugin.cpp / fx_plugin.cpp / harp_clap.cpp / harp_au.mm / a test
   # main) differs. Listed ONCE here (parallel to HARP_CORE_SRC above) so a new shell
-  # TUs — runtime_diag.cpp (the §14.4 diag-bundle assembly) and runtime_recall.cpp
-  # (the §11.4 recall/reconcile + §15.3 state-bundle codec) split out of runtime.cpp —
-  # are picked up by every target at once, with no per-target list to drift (which
-  # previously let one build clobber another's binary).
+  # TUs — runtime_diag.cpp (the §14.4 diag-bundle assembly), runtime_recall.cpp
+  # (the §11.4 recall/reconcile + §15.3 state-bundle codec), and runtime_session.cpp
+  # (the §5/§12 hello/identity + device-selection + connect/reconnect lifecycle) split
+  # out of runtime.cpp — are picked up by every target at once, with no per-target list
+  # to drift (which previously let one build clobber another's binary).
   set(HARP_SHELL_SRC
     ${HARP_ROOT}/shell/runtime.cpp
     ${HARP_ROOT}/shell/runtime_diag.cpp
     ${HARP_ROOT}/shell/runtime_recall.cpp
+    ${HARP_ROOT}/shell/runtime_session.cpp
     ${HARP_ROOT}/shell/runtime_registry.cpp)
   # VST3 plugin entry point is per-platform (macmain/linuxmain/dllmain).
   if(APPLE)
