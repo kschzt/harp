@@ -19,6 +19,7 @@
 #endif
 #include "device.h"
 #include "fence_wait.h" /* §8.3.1 fence-wait + count predicates (pure, unit-tested) */
+#include "log_ring.h" /* §4.2 stream `log` ring — route the audio loop's log lines (§14.4) */
 
 /* §8.3.1 real-time host-paced fence bound: "a few milliseconds". The fence wait is normally
  * µs (events keep up); this is the safety cap so a host that fences beyond what it feeds cannot
@@ -112,9 +113,9 @@ static void host_paced_loop(device *d) {
             ssize_t r = hp_read(a, rbuf, sizeof rbuf);
             if (r <= 0) { /* endpoint died, or a stop unwound the recv (running=false) */
 #ifdef _WIN32
-                fprintf(stderr, "harp-deviced: pacing read ended (%s)\n", r == 0 ? "EOF" : "recv error");
+                harp_devlog(HARP_LOG_INFO, "audio", "harp-deviced: pacing read ended (%s)\n", r == 0 ? "EOF" : "recv error");
 #else
-                fprintf(stderr, "harp-deviced: pacing read ended: %s\n", r == 0 ? "EOF" : strerror(errno));
+                harp_devlog(HARP_LOG_INFO, "audio", "harp-deviced: pacing read ended: %s\n", r == 0 ? "EOF" : strerror(errno));
 #endif
                 return;
             }
@@ -124,7 +125,7 @@ static void host_paced_loop(device *d) {
         harp_audio_hdr h;
         if (!harp_audio_hdr_decode(hdr, &h) || !(h.dirflags & HARP_AUDIO_DIR_H2D)) {
             CTR_INC(d->frame_errors);
-            fprintf(stderr, "harp-deviced: malformed pacing frame (%02x %02x ...)\n",
+            harp_devlog(HARP_LOG_ERROR, "audio", "harp-deviced: malformed pacing frame (%02x %02x ...)\n",
                     hdr[0], hdr[1]);
             return; /* §4.2 spirit: malformed stream is fatal */
         }
@@ -289,7 +290,7 @@ void *audio_thread(void *arg) {
     if (a->host_paced_port > 0) {
         int s = audio_open_tcp_paced(d->rtp_peer_ip, a->host_paced_port);
         if (s < 0) {
-            fprintf(stderr, "harp-deviced: host-paced TCP connect-back to :%d failed\n",
+            harp_devlog(HARP_LOG_ERROR, "audio", "harp-deviced: host-paced TCP connect-back to :%d failed\n",
                     a->host_paced_port);
             return NULL;
         }
@@ -303,11 +304,11 @@ void *audio_thread(void *arg) {
         { DWORD tmo = 200; setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof tmo); }
 #endif
     }
-    fprintf(stderr, "harp-deviced: audio thread up: mode=%u fd=%d out_fd=%d\n", a->mode,
+    harp_devlog(HARP_LOG_INFO, "audio", "harp-deviced: audio thread up: mode=%u fd=%d out_fd=%d\n", a->mode,
             a->fd, a->out_fd);
     if (a->mode == 1) {
         host_paced_loop(d);
-        fprintf(stderr, "harp-deviced: host-paced loop exited\n");
+        harp_devlog(HARP_LOG_INFO, "audio", "harp-deviced: host-paced loop exited\n");
         return NULL;
     }
     /* voice starts from zero at audio.start (T15); notes/arp are reset by
@@ -440,6 +441,6 @@ void audio_stop(device *d) {
         free(d->audio.fx_in);
         d->audio.fx_in = NULL;
     }
-    fprintf(stderr, "harp-deviced: audio stream stopped (%llu reanchors)\n",
+    harp_devlog(HARP_LOG_INFO, "audio", "harp-deviced: audio stream stopped (%llu reanchors)\n",
             (unsigned long long)d->audio.reanchors);
 }

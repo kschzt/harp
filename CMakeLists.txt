@@ -70,6 +70,7 @@ add_library(harpdevice STATIC
   device/state.c        # engine <-> content-addressed objects
   device/session.c      # protocol handlers + session loop
   device/audio_loop.c   # the §8.7/§8.3 render+emit loop (render_output seam)
+  device/log_ring.c     # §4.2 stream `log` device log ring (§14.4 diag-bundle key 2)
 )
 target_include_directories(harpdevice PUBLIC device host)
 target_link_libraries(harpdevice PUBLIC harpcore ${HARP_MATH_LIB})
@@ -200,6 +201,23 @@ add_executable(harp-tests tests/harp_tests.c)
 target_link_libraries(harp-tests harpcore ${HARP_MATH_LIB})
 add_test(NAME core COMMAND harp-tests)
 set_tests_properties(core PROPERTIES LABELS unit)
+
+# harp-logring-tests: the §4.2 stream `log` device log ring (device/log_ring.c,
+# §14.4 diag-bundle device-section key 2). Links the REAL ring implementation +
+# harpcore's CBOR encoder/decoder to assert (a) log lines land as well-formed
+# §14.4 log-records, and (b) the >= 64 KiB bound with OLDEST-dropped eviction plus
+# the §4.2.1 per-bundle ctl budget. log_ring.c pulls pthread; winpthreads provides
+# it under the MinGW device build, so this runs on Linux, macOS, AND MinGW Windows
+# (3-OS). NOT-MSVC (the ring isn't MSVC-built in this tree — same rationale as
+# harp-device-tests: absent under MSVC so ctest never targets an unbuilt exe).
+if(NOT MSVC)
+  find_package(Threads REQUIRED)
+  add_executable(harp-logring-tests tests/harp_logring_tests.c device/log_ring.c)
+  target_include_directories(harp-logring-tests PRIVATE device core/include)
+  target_link_libraries(harp-logring-tests harpcore Threads::Threads)
+  add_test(NAME logring COMMAND harp-logring-tests)
+  set_tests_properties(logring PROPERTIES LABELS unit)
+endif()
 
 # harp-engine-logic-tests: the determinism-critical PURE policies factored out of
 # engine.c (device/voice_alloc.h §9.5 allocation, device/arp_select.h §9.7 arp

@@ -21,6 +21,14 @@
 # This is the CI assertion the schema mandates: CDDL alone cannot prove the §16 pass ran
 # (a "" and a real string are both tstr).
 #
+# §4.2 / §14.4 device LOG STREAM (device-section key 2): the daemon routes its own log
+# lines through a bounded (>= 64 KiB) ring (device/log_ring.c) and drains a recent window
+# into device-section key 2 as [* log-record]. The daemon's startup line logs the serial +
+# the --state-dir PATH, so the PLAIN bundle carries that path token (proving a real device
+# log line landed) plus the machine-greppable log TAG "daemon"; the --anonymize pass clears
+# each log-record msg (key 3) to "" (§16 log free-text), so the PATH token DISAPPEARS while
+# the TAG (key 2, reveal-whether-not-what) is RETAINED.
+#
 # Co-existence: unique port + kills ONLY its own device by pid; hard perl-alarm watchdog.
 set -u
 cd "$(dirname "$0")/.."
@@ -37,7 +45,13 @@ FULLID="${FULLID:-Part 1 L}"   # FULL-identity token: channel-map (key 7) entry 
                             # it is not a substring of any retained field (caps/counters/engine/fw/
                             # build-id/serial/vendor/product). The §16 pass CLEARS channel-map
                             # name/group/path leaves, so this token DISAPPEARS under --anonymize.
+LOGTAG="${LOGTAG:-daemon}"   # §4.2/§14.4 device log-record TAG (key 2): the daemon lifecycle tag.
+                            # RETAINED under --anonymize (machine-greppable, reveals whether not what);
+                            # unique to the log stream — not a substring of any retained field.
 DEVDIR=diagbundle-eth-state   # workspace-RELATIVE (Git Bash /tmp->C:\ trips the device mkdir; see eth-tests.sh)
+                            # ALSO the §4.2/§14.4 log MSG token: the daemon startup line logs the
+                            # --state-dir PATH, unique to a device log-record msg (key 3) — cleared to
+                            # "" under --anonymize (§16 log free-text).
 DEVLOG=/tmp/diagbundle-eth-dev.log
 PROBELOG=/tmp/diagbundle-eth-probe.log
 BUNDLE=/tmp/db.cbor
@@ -70,6 +84,13 @@ grep -aq "$VNAME" "$BUNDLE" || fail "bundle missing vendor name '$VNAME' (identi
 grep -aq "$FULLID" "$BUNDLE" || fail "bundle missing full-identity channel-map token '$FULLID' (device-section not embedded verbatim?)"
 echo "   plain bundle OK: 'harpd' + 'usb_errors' + serial + vendor-name + device-assembled marker + full-identity '$FULLID' all present ($(wc -c <"$BUNDLE") bytes)"
 
+# §4.2/§14.4 device LOG STREAM (device-section key 2): the daemon routed its own startup log
+# line through the >= 64 KiB ring and drained it into the bundle. Assert the machine-greppable
+# log TAG landed AND the startup-log --state-dir PATH token landed (unique to a log-record msg).
+grep -aq "$LOGTAG" "$BUNDLE" || fail "bundle missing device log tag '$LOGTAG' — device-section key 2 log stream not emitted (§4.2/§14.4)?"
+grep -aq "$DEVDIR" "$BUNDLE" || fail "bundle missing device log msg path token '$DEVDIR' — daemon startup log line not captured in the ring?"
+echo "   device log stream OK: tag '$LOGTAG' + startup-log path token '$DEVDIR' embedded at device-section key 2"
+
 echo "── harp-probe diag-bundle --anonymize -> $ANONBUNDLE (§16 serial-clearing pass)"
 perl -e 'alarm 15; exec @ARGV' "$PROBE" -d "127.0.0.1:$PORT" diag-bundle --anonymize "$ANONBUNDLE" >"$PROBELOG" 2>&1 \
     || { cat "$PROBELOG"; fail "diag-bundle --anonymize command failed (rc=$?)"; }
@@ -84,7 +105,11 @@ grep -aq "$FULLID"    "$ANONBUNDLE" && fail "anonymized bundle STILL contains ch
 grep -aq "harpd"      "$ANONBUNDLE" || fail "anonymized bundle lost magic 'harpd' — structure not preserved"
 grep -aq "usb_errors" "$ANONBUNDLE" || fail "anonymized bundle lost counter 'usb_errors' — counters wrongly stripped"
 grep -aq "device-assembled" "$ANONBUNDLE" || fail "anonymized bundle lost the device-assembled marker — seam exception path not taken"
-echo "   anonymized bundle OK: serial + vendor-name + channel-map name '$FULLID' ABSENT; 'harpd' + 'usb_errors' + device-assembled marker still present ($(wc -c <"$ANONBUNDLE") bytes)"
+# §16 device LOG STREAM: the anon pass clears each log-record msg (key 3) to "", so the daemon
+# startup-log --state-dir PATH token DISAPPEARS; the log TAG (key 2) is RETAINED (whether-not-what).
+grep -aq "$DEVDIR" "$ANONBUNDLE" && fail "anonymized bundle STILL contains device log msg path token '$DEVDIR' — §16 did not clear log-record msg (key 3)"
+grep -aq "$LOGTAG" "$ANONBUNDLE" || fail "anonymized bundle lost device log tag '$LOGTAG' — the log tag (key 2) must be RETAINED (§16: reveal whether, not what)"
+echo "   anonymized bundle OK: serial + vendor-name + channel-map name '$FULLID' + device-log path '$DEVDIR' ABSENT; 'harpd' + 'usb_errors' + device-assembled marker + log tag '$LOGTAG' still present ($(wc -c <"$ANONBUNDLE") bytes)"
 
 kill -9 "$DP" 2>/dev/null; DP=""
-echo "DIAG-BUNDLE PASS (device-assembled embed + verbatim counters; §16 clears serial + vendor-name + channel-map name/group/path, structure preserved)"
+echo "DIAG-BUNDLE PASS (device-assembled embed + verbatim counters; §4.2/§14.4 device log stream at key 2; §16 clears serial + vendor-name + channel-map name/group/path + log msg, retains log tag, structure preserved)"

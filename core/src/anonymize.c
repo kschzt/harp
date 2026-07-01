@@ -15,8 +15,37 @@ bool harp_anonymize_device_section(harp_cbuf *out, const uint8_t *sec, size_t le
         uint64_t key;
         if (!harp_cdec_uint(&d, &key)) return false;
         harp_cbor_uint(out, key);
+        if (key == 2) {
+            /* device logs ([* log-record], §4.2/§14.4): re-encode each record clearing
+             * key 3 (msg free-text — a device log line may carry a serial/host/path token,
+             * §16) to "" IN PLACE; RETAIN key 0 (msc), key 1 (level), key 2 (tag —
+             * machine-greppable, reveals whether not what), and any further key. */
+            uint64_t nrec;
+            if (!harp_cdec_array(&d, &nrec)) return false;
+            harp_cbor_array(out, nrec);
+            for (uint64_t r = 0; r < nrec; r++) {
+                uint64_t nk;
+                if (!harp_cdec_map(&d, &nk)) return false;
+                harp_cbor_map(out, nk);
+                for (uint64_t f = 0; f < nk; f++) {
+                    uint64_t fk;
+                    if (!harp_cdec_uint(&d, &fk)) return false;
+                    harp_cbor_uint(out, fk);
+                    if (fk == 3) {
+                        if (!harp_cdec_skip(&d)) return false; /* drop the msg free-text */
+                        harp_cbor_text(out, "");               /* "" in place (§16) */
+                    } else {
+                        const uint8_t *span;
+                        size_t sl;
+                        if (!harp_cdec_span(&d, &span, &sl)) return false;
+                        harp_cbuf_put(out, span, sl);
+                    }
+                }
+            }
+            continue;
+        }
         if (key != 0) {
-            /* counters (key 1) + any future device-section member: no PII, verbatim. */
+            /* counters (key 1) + any future non-log device-section member: no PII, verbatim. */
             const uint8_t *span;
             size_t sl;
             if (!harp_cdec_span(&d, &span, &sl)) return false;

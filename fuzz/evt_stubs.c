@@ -61,6 +61,22 @@ int harp_ffs_audio_in_fd(void) { return -1; }
 int harp_ffs_audio_out_fd(void) { return -1; }
 #endif
 
+/* §4.2/§14.4 device log ring (device/log_ring.c). session.c's whole-TU compile references
+ * these, but the fuzzer never needs a real ring. harp_devlog is a benign no-op (logging is
+ * incidental to the parse path — a no-op is correct, not missing, behavior); harp_devlog_emit_cbor
+ * is only reached from handle_diag_bundle, off the §9.2 evt-parse grammar, so it is an
+ * abort-stub like the other never-reached handlers below. */
+void harp_devlog(int level, const char *tag, const char *fmt, ...) {
+    (void)level;
+    (void)tag;
+    (void)fmt;
+}
+void harp_devlog_emit_cbor(harp_cbuf *m, size_t max_payload) {
+    (void)m;
+    (void)max_payload;
+    abort();
+}
+
 /* ── REACHED on the fuzz path: no-op so the parser runs without a real engine/queue ── */
 void evq_push(dev_event ev) { (void)ev; }
 bool evq_push_batch(const dev_event *evs, size_t count) {

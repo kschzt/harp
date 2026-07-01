@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "device.h"
+#include "log_ring.h" /* §4.2 stream `log` ring — route the panel API log lines (§14.4) */
 
 /* ---------------- panel API (device frontend boundary) ----------------
  *
@@ -360,11 +361,11 @@ void *panel_main(void *arg) {
     addr.sun_family = AF_UNIX;
     snprintf(addr.sun_path, sizeof addr.sun_path, "%s", a->path);
     if (bind(sfd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(sfd, 4) != 0) {
-        fprintf(stderr, "harp-deviced: panel api: cannot listen on %s\n", a->path);
+        harp_devlog(HARP_LOG_ERROR, "panel", "harp-deviced: panel api: cannot listen on %s\n", a->path);
         return NULL;
     }
     chmod(a->path, 0666); /* sidecar runs unprivileged */
-    fprintf(stderr, "harp-deviced: panel api on %s\n", a->path);
+    harp_devlog(HARP_LOG_INFO, "panel", "harp-deviced: panel api on %s\n", a->path);
 
     /* Single-threaded poll() multiplexing: several frontends (the web sidecar AND
      * the Electra MIDI sidecar, say) connect at once, but every command is still
