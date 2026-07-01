@@ -96,7 +96,10 @@ jobs:
     # battery (the never-wedge / never-silent guarantee, hammered far harder than the trimmed
     # N=2 leg hw.yml runs on every merge) plus recall round-trips. Shares the harp-hw concurrency
     # group with hw.yml so the single exclusive Pi is never driven by two runs at once.
-    if: github.repository == 'kschzt/harp'
+    # SKIP while the self-hosted rig is offline — gated on repo var HARP_RIG_ONLINE == '1' (see
+    # hw.yml; rig down 2026-07-01). The cloud deep-fuzz + eth-flake jobs above keep running nightly.
+    # RE-ENABLE: `gh variable set HARP_RIG_ONLINE --body 1` once PI4B-0002 is back.
+    if: github.repository == 'kschzt/harp' && vars.HARP_RIG_ONLINE == '1'
     runs-on: [self-hosted, harp-hw]
     timeout-minutes: 45
     concurrency:

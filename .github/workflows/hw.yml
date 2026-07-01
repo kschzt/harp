@@ -42,8 +42,13 @@ permissions:
 
 jobs:
   hardware:
-    # never run on a fork of this repo that happens to have the workflow
-    if: github.repository == 'kschzt/harp'
+    # never run on a fork; and SKIP while the self-hosted rig is offline.
+    # Gate: runs only when repo var HARP_RIG_ONLINE == '1'. The rig (twwwth / harp-runner VM) is
+    # DOWN as of 2026-07-01 (a USB xHCI passthrough reset hung the libvirt host; needs a hands-on
+    # power-cycle at the closet). Until then this job SKIPS (neutral) instead of queuing/false-red.
+    # RE-ENABLE when PI4B-0002 is back: `gh variable set HARP_RIG_ONLINE --body 1` (then `virsh
+    # start harp-runner` on the host). TODO: remove this gate once the rig is stable again.
+    if: github.repository == 'kschzt/harp' && vars.HARP_RIG_ONLINE == '1'
     runs-on: [self-hosted, harp-hw]
     timeout-minutes: 25
     steps:
