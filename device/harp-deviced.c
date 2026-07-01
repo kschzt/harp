@@ -45,6 +45,7 @@
 #include <string.h>
 
 #include "device.h"
+#include "log_ring.h" /* §4.2 stream `log` ring — route the daemon's own log lines (§14.4) */
 #include "rtp.h"
 #include "sock_io.h" /* harp_sock_io: recv/send accept path (Winsock SOCKETs reject _read/_write) */
 #include "harp/plat.h" /* harp_now_ns: the §16 pre-hello read deadline */
@@ -132,7 +133,7 @@ int harp_ffs_serve(const char *ffs_dir, const char *gadget_path,
 static void ffs_session_cb(void *ud, harp_io *io) {
     ((device *)ud)->ctl_sock = HARP_SOCK_INVALID; /* §16: USB/FFS has no eth control socket */
     harp_deviced_run_session(ud, io);
-    fprintf(stderr, "harp-deviced: usb session ended; awaiting reattach\n");
+    harp_devlog(HARP_LOG_INFO, "daemon", "harp-deviced: usb session ended; awaiting reattach\n");
 }
 #endif
 
@@ -347,7 +348,7 @@ void audio_rtp_close(audio_state *a) {
  * the device side of the network audio plane. Blocks until killed. */
 static int run_rtp_out(device *d, const char *hostport) {
     const char *colon = strrchr(hostport, ':');
-    if (!colon || colon == hostport) { fprintf(stderr, "--rtp-out needs HOST:PORT\n"); return 2; }
+    if (!colon || colon == hostport) { harp_devlog(HARP_LOG_ERROR, "daemon", "--rtp-out needs HOST:PORT\n"); return 2; }
     char host[256];
     size_t hl = (size_t)(colon - hostport);
     if (hl >= sizeof host) return 2;
@@ -363,12 +364,12 @@ static int run_rtp_out(device *d, const char *hostport) {
         struct addrinfo hints = {0}, *res = NULL;
         hints.ai_family = AF_INET; hints.ai_socktype = SOCK_DGRAM;
         if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
-            fprintf(stderr, "--rtp-out: cannot resolve %s\n", host); return 1;
+            harp_devlog(HARP_LOG_ERROR, "daemon", "--rtp-out: cannot resolve %s\n", host); return 1;
         }
         a.sin_addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
         freeaddrinfo(res);
     }
-    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) { fprintf(stderr, "--rtp-out: connect failed\n"); return 1; }
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) { harp_devlog(HARP_LOG_ERROR, "daemon", "--rtp-out: connect failed\n"); return 1; }
 
     audio_state *au = &d->audio;
     au->fd = au->out_fd = -1;             /* no framed transport — RTP only       */
@@ -376,7 +377,7 @@ static int run_rtp_out(device *d, const char *hostport) {
     au->mode = 0; au->rate = 48000; au->nsamples = 256; au->epoch = 1;
     au->out_slots[0] = 0; au->n_out_slots = 1;   /* mono: main-mix slot 0         */
     atomic_store_explicit(&au->running, true, memory_order_relaxed);
-    fprintf(stderr, "harp-deviced: §8.7 RTP emit -> %s:%d (48k mono, free-running)\n", host, rport);
+    harp_devlog(HARP_LOG_INFO, "daemon", "harp-deviced: §8.7 RTP emit -> %s:%d (48k mono, free-running)\n", host, rport);
     audio_thread(d);                       /* render+emit in this thread until killed */
     return 0;
 }
@@ -460,7 +461,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--engine-name") == 0 && i + 1 < argc)
             engine_name = argv[++i]; /* identity engine name (PARAMS_MEDIA / recall format unaffected) */
         else {
-            fprintf(stderr,
+            harp_devlog(HARP_LOG_ERROR, "daemon",
                     "usage: harp-deviced [--state-dir DIR] [--serial S] [--product NAME] [--engine-name NAME] "
                     "[--panel-sock PATH] [--tone HZ] [--no-rate-lock] [--rt-floor N] [--rt-nsamples N] [--in-lat N] [--out-lat N] [--engine-ver X.Y.Z] "
                     "[--port P | --ffs FFS_DIR [--gadget CONFIGFS_PATH]]\n");
@@ -470,7 +471,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     { WSADATA wsa;
       if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-          fprintf(stderr, "harp-deviced: WSAStartup failed\n");
+          harp_devlog(HARP_LOG_ERROR, "daemon", "harp-deviced: WSAStartup failed\n");
           return 1;
       } }
 #else
@@ -505,7 +506,7 @@ int main(int argc, char **argv) {
     d->engine_name = engine_name; /* identity engine name; NULL => ENGINE_ID (media-type unaffected) */
     snprintf(d->serial, sizeof d->serial, "%s", serial);
     if (harp_store_open(&d->store, state_dir) != 0) {
-        fprintf(stderr, "harp-deviced: cannot open state dir %s\n", state_dir);
+        harp_devlog(HARP_LOG_ERROR, "daemon", "harp-deviced: cannot open state dir %s\n", state_dir);
         return 1;
     }
     d->boot_count = bump_boot_count(state_dir);
@@ -537,10 +538,10 @@ int main(int argc, char **argv) {
         if (live.unborn) {
             harp_hash snap;
             if (do_snapshot(d, "factory state", &snap, NULL) == 0)
-                fprintf(stderr, "harp-deviced: initialized factory state\n");
+                harp_devlog(HARP_LOG_INFO, "daemon", "harp-deviced: initialized factory state\n");
         } else if (!live.dirty) {
             if (engine_load_snapshot(d, &live.hash) == 0)
-                fprintf(stderr, "harp-deviced: restored live/project (gen %llu)\n",
+                harp_devlog(HARP_LOG_INFO, "daemon", "harp-deviced: restored live/project (gen %llu)\n",
                         (unsigned long long)live.generation);
         }
     }
@@ -551,12 +552,12 @@ int main(int argc, char **argv) {
     if (ffs_dir) {
 #ifdef __linux__
         snprintf(g_udc_path, sizeof g_udc_path, "%s/UDC", gadget); /* arm the shutdown unbind */
-        fprintf(stderr, "harp-deviced: serial %s, state %s, USB gadget via %s (boot %llu)\n",
+        harp_devlog(HARP_LOG_INFO, "daemon", "harp-deviced: serial %s, state %s, USB gadget via %s (boot %llu)\n",
                 d->serial, state_dir, ffs_dir, (unsigned long long)d->boot_count);
         return harp_ffs_serve(ffs_dir, gadget, ffs_session_cb, d);
 #else
         (void)gadget;
-        fprintf(stderr, "harp-deviced: --ffs requires Linux\n");
+        harp_devlog(HARP_LOG_ERROR, "daemon", "harp-deviced: --ffs requires Linux\n");
         return 2;
 #endif
     }
@@ -585,11 +586,11 @@ int main(int argc, char **argv) {
         harp_sleep_ns(50000000ull); /* 50 ms */
     }
     if (!bound || listen(sfd, 4) != 0) {
-        fprintf(stderr, "harp-deviced: cannot listen on port %d: %s\n", port,
+        harp_devlog(HARP_LOG_ERROR, "daemon", "harp-deviced: cannot listen on port %d: %s\n", port,
                 strerror(errno));
         return 1;
     }
-    fprintf(stderr, "harp-deviced: serial %s, state %s, listening on %d (boot %llu)\n",
+    harp_devlog(HARP_LOG_INFO, "daemon", "harp-deviced: serial %s, state %s, listening on %d (boot %llu)\n",
             d->serial, state_dir, port, (unsigned long long)d->boot_count);
 #ifndef _WIN32
     if (mdns) mdns_advertise(port, d->product); /* §4.4.3: advertise _harp._tcp (instance name = --product, default "HARP refdev") */
@@ -685,9 +686,9 @@ int main(int argc, char **argv) {
         d->ctl_sock = HARP_SOCK_INVALID; /* §16: session over — disarm the pre-hello timeout */
         d->rtp_peer_ip = 0; /* session over — forget the peer */
         HARP_CLOSESOCK(cfd);
-        fprintf(stderr, "harp-deviced: session ended; awaiting reattach\n");
+        harp_devlog(HARP_LOG_INFO, "daemon", "harp-deviced: session ended; awaiting reattach\n");
     }
     HARP_CLOSESOCK(sfd); /* release the listen socket on a clean accept-loop exit (coverage lane) */
-    if (g_accept_stop) fprintf(stderr, "harp-deviced: clean shutdown (HARP_CLEAN_EXIT) — flushing\n");
+    if (g_accept_stop) harp_devlog(HARP_LOG_INFO, "daemon", "harp-deviced: clean shutdown (HARP_CLEAN_EXIT) — flushing\n");
     return 0;
 }

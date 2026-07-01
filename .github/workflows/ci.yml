@@ -35,7 +35,7 @@ jobs:
         # or `-L unit` reports them "Not Run". freerun_mt is the TSan SPSC race test.
         run: |
           cmake -B build
-          cmake --build build --target harp-engine-logic-tests harp-tests harp-device-tests harp-ffs-link-tests harp-freerun-tests harp-rtp-tests harp-freerun-mt-tests harp-param-map-hash-tests -j3
+          cmake --build build --target harp-engine-logic-tests harp-tests harp-logring-tests harp-device-tests harp-ffs-link-tests harp-freerun-tests harp-rtp-tests harp-freerun-mt-tests harp-param-map-hash-tests -j3
           ctest --test-dir build -L unit --output-on-failure
       - name: AU shell + auval (Apple's own validation gate)
         run: |

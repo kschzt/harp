@@ -33,6 +33,7 @@
 
 #include "harp/link.h"
 #include "ffs_link.h" /* §4.3 endpoint framing I/O (ffs_io, ffs_io_init) — unit-tested */
+#include "log_ring.h" /* §4.2 stream `log` ring — route the USB-gadget log lines (§14.4) */
 
 /* ---- descriptors ---- */
 
@@ -142,7 +143,7 @@ static bool write_udc(const char *gadget_path, const char *val) {
     snprintf(path, sizeof path, "%s/UDC", gadget_path);
     FILE *u = fopen(path, "w");
     if (!u) {
-        fprintf(stderr, "harp-ffs: cannot open %s: %s\n", path, strerror(errno));
+        harp_devlog(HARP_LOG_ERROR, "ffs", "harp-ffs: cannot open %s: %s\n", path, strerror(errno));
         return false;
     }
     bool ok = fprintf(u, "%s\n", val) >= 0 && fflush(u) == 0;
@@ -158,7 +159,7 @@ static void bind_udc(const char *gadget_path) {
         pclose(f);
     }
     if (!g_udc[0]) {
-        fprintf(stderr, "harp-ffs: no UDC available (is dwc2 in peripheral mode?)\n");
+        harp_devlog(HARP_LOG_ERROR, "ffs", "harp-ffs: no UDC available (is dwc2 in peripheral mode?)\n");
         return;
     }
     /* Drop the pull-up before (re)binding so every start re-enumerates clean. A predecessor
@@ -171,9 +172,9 @@ static void bind_udc(const char *gadget_path) {
     write_udc(gadget_path, ""); /* clear any stale binding left by a SIGKILLed predecessor */
     usleep(150 * 1000);         /* let the host observe the disconnect before we re-advertise */
     if (write_udc(gadget_path, g_udc))
-        fprintf(stderr, "harp-ffs: bound to UDC %s\n", g_udc);
+        harp_devlog(HARP_LOG_INFO, "ffs", "harp-ffs: bound to UDC %s\n", g_udc);
     else
-        fprintf(stderr, "harp-ffs: UDC bind failed (already bound?): %s\n", strerror(errno));
+        harp_devlog(HARP_LOG_ERROR, "ffs", "harp-ffs: UDC bind failed (already bound?): %s\n", strerror(errno));
 }
 
 /* True if the UDC reports a host has fully configured us (SET_CONFIGURATION done). This is the
@@ -201,13 +202,13 @@ static bool host_configured(void) {
  * across a session close so the host skips SET_CONFIGURATION on re-claim and we'd sit silent. */
 static void soft_reconnect(const char *gadget_path) {
     if (!g_udc[0]) return;
-    fprintf(stderr, "harp-ffs: self-heal — host configured but no re-ENABLE; soft-reconnect "
+    harp_devlog(HARP_LOG_WARN, "ffs", "harp-ffs: self-heal — host configured but no re-ENABLE; soft-reconnect "
                     "(UDC re-bind) to force re-enumeration\n");
     if (!write_udc(gadget_path, "")) /* unbind: device disappears from the bus */
-        fprintf(stderr, "harp-ffs: self-heal unbind failed: %s\n", strerror(errno));
+        harp_devlog(HARP_LOG_ERROR, "ffs", "harp-ffs: self-heal unbind failed: %s\n", strerror(errno));
     usleep(150 * 1000); /* let the host observe the disconnect before we re-advertise */
     if (!write_udc(gadget_path, g_udc)) /* rebind: device reappears -> host re-enumerates */
-        fprintf(stderr, "harp-ffs: self-heal rebind failed: %s\n", strerror(errno));
+        harp_devlog(HARP_LOG_ERROR, "ffs", "harp-ffs: self-heal rebind failed: %s\n", strerror(errno));
 }
 
 /* ---- buffered endpoint io: ffs_io + the framing read/write live in ffs_link.c
@@ -237,14 +238,14 @@ int harp_ffs_serve(const char *ffs_dir, const char *gadget_path,
     snprintf(path, sizeof path, "%s/ep0", ffs_dir);
     int ep0 = open(path, O_RDWR);
     if (ep0 < 0) {
-        fprintf(stderr, "harp-ffs: cannot open %s: %s\n", path, strerror(errno));
+        harp_devlog(HARP_LOG_ERROR, "ffs", "harp-ffs: cannot open %s: %s\n", path, strerror(errno));
         return 1;
     }
     if (write_descriptors(ep0) != 0) {
-        fprintf(stderr, "harp-ffs: descriptor write failed: %s\n", strerror(errno));
+        harp_devlog(HARP_LOG_ERROR, "ffs", "harp-ffs: descriptor write failed: %s\n", strerror(errno));
         return 1;
     }
-    fprintf(stderr, "harp-ffs: descriptors written\n");
+    harp_devlog(HARP_LOG_INFO, "ffs", "harp-ffs: descriptors written\n");
     bind_udc(gadget_path);
 
     /* §4.3 self-heal state (USB never-silent). Once a host has enabled us at least once, the
@@ -265,7 +266,7 @@ int harp_ffs_serve(const char *ffs_dir, const char *gadget_path,
         if (end != rebind_env && *end == '\0' && v >= 0 && v <= 600000)
             rebind_ms = (int)v;
         else
-            fprintf(stderr, "harp-ffs: ignoring invalid HARP_FFS_REBIND_MS='%s' (keeping %dms)\n",
+            harp_devlog(HARP_LOG_WARN, "ffs", "harp-ffs: ignoring invalid HARP_FFS_REBIND_MS='%s' (keeping %dms)\n",
                     rebind_env, rebind_ms);
     }
     bool ever_enabled = false, rebound = false;
@@ -284,24 +285,24 @@ int harp_ffs_serve(const char *ffs_dir, const char *gadget_path,
             }
             if (pr < 0) {
                 if (errno == EINTR) continue;
-                fprintf(stderr, "harp-ffs: ep0 poll failed: %s\n", strerror(errno));
+                harp_devlog(HARP_LOG_ERROR, "ffs", "harp-ffs: ep0 poll failed: %s\n", strerror(errno));
                 return 1;
             }
         }
         ssize_t r = read(ep0, &ev, sizeof ev);
         if (r < (ssize_t)sizeof ev) {
             if (r < 0 && errno == EINTR) continue;
-            fprintf(stderr, "harp-ffs: ep0 read failed: %s\n", strerror(errno));
+            harp_devlog(HARP_LOG_ERROR, "ffs", "harp-ffs: ep0 read failed: %s\n", strerror(errno));
             return 1;
         }
         rebound = false; /* an ep0 event arrived — this stuck-claim episode is over */
         switch (ev.type) {
             case FUNCTIONFS_BIND:
-                fprintf(stderr, "harp-ffs: bound\n");
+                harp_devlog(HARP_LOG_INFO, "ffs", "harp-ffs: bound\n");
                 break;
             case FUNCTIONFS_ENABLE: {
                 ever_enabled = true;
-                fprintf(stderr, "harp-ffs: host enabled interface; session up\n");
+                harp_devlog(HARP_LOG_INFO, "ffs", "harp-ffs: host enabled interface; session up\n");
                 ffs_io fio;
                 snprintf(path, sizeof path, "%s/ep1", ffs_dir);
                 int ep_in = open(path, O_RDWR);
@@ -313,7 +314,7 @@ int harp_ffs_serve(const char *ffs_dir, const char *gadget_path,
                 snprintf(path, sizeof path, "%s/ep4", ffs_dir);
                 g_audio_out_fd = open(path, O_RDWR);
                 if (fio.ep_in < 0 || fio.ep_out < 0) {
-                    fprintf(stderr, "harp-ffs: endpoint open failed: %s\n",
+                    harp_devlog(HARP_LOG_ERROR, "ffs", "harp-ffs: endpoint open failed: %s\n",
                             strerror(errno));
                     if (fio.ep_in >= 0) close(fio.ep_in);
                     if (fio.ep_out >= 0) close(fio.ep_out);
@@ -335,11 +336,11 @@ int harp_ffs_serve(const char *ffs_dir, const char *gadget_path,
                 g_audio_in_fd = g_audio_out_fd = -1;
                 close(fio.ep_in);
                 close(fio.ep_out);
-                fprintf(stderr, "harp-ffs: endpoints closed; waiting for enable\n");
+                harp_devlog(HARP_LOG_WARN, "ffs", "harp-ffs: endpoints closed; waiting for enable\n");
                 break;
             }
             case FUNCTIONFS_DISABLE:
-                fprintf(stderr, "harp-ffs: host disabled interface\n");
+                harp_devlog(HARP_LOG_WARN, "ffs", "harp-ffs: host disabled interface\n");
                 break;
             case FUNCTIONFS_SETUP:
                 ack_setup(ep0, &ev.u.setup);

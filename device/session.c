@@ -19,6 +19,7 @@
 
 #include "device.h"
 #include "evq_mod.h" /* harp_evt_epoch_stale (§7.1 shared stale-epoch predicate) */
+#include "log_ring.h" /* §4.2 stream `log` ring — diag.bundle device-section key 2 (§14.4) */
 #include "harp/plat.h" /* harp_now_ns: §16 DoS pre-hello deadline */
 
 #ifdef __linux__
@@ -777,10 +778,10 @@ static void maybe_gc(device *d, const char *refname) {
         int rc = harp_store_gc(&d->store, HARP_GC_MAX_SWEEP, &reclaimed);
         pthread_mutex_unlock(&d->state_mu);
         if (rc != 0) /* fail-closed: an incomplete closure or OOM left the store untouched */
-            fprintf(stderr, "harp-deviced: §10.3 GC aborted (pruned %zu %srefs) — store not swept\n",
+            harp_devlog(HARP_LOG_WARN, "session", "harp-deviced: §10.3 GC aborted (pruned %zu %srefs) — store not swept\n",
                     pruned, prefix);
         else
-            fprintf(stderr, "harp-deviced: §10.3 GC pruned %zu %srefs, reclaimed %zu objects\n", pruned,
+            harp_devlog(HARP_LOG_INFO, "session", "harp-deviced: §10.3 GC pruned %zu %srefs, reclaimed %zu objects\n", pruned,
                     prefix, reclaimed);
         return;
     }
@@ -1020,21 +1021,28 @@ static void handle_diag_counters(device *d, const harp_env *e) {
 
 /* diag.bundle (§14.4): the DEVICE-SECTION the host embeds VERBATIM at bundle key 4.
  * Integer-keyed map { 0 => identity (encode_identity — byte-identical to hello),
- *                     1 => counters (emit_counters — byte-identical to diag.counters) }.
- * device-section keys 2 (device logs) and 3 (audio-config) are OPTIONAL and omitted
- * for now: the refdev has no drainable §4.2 log ring yet, and audio-config is a later
- * enrichment. The byte-identical round-trip of THIS map is the device conformance gate
- * (host stores it verbatim under key 4 in the non-anonymized path). See
- * docs/diag-bundle-design.md. §16 anonymization stays HOST-side (host re-encodes). */
+ *                     1 => counters (emit_counters — byte-identical to diag.counters),
+ *                     2 => device logs ([* log-record] drained from the §4.2 `log` ring) }.
+ * Keys 0/1 are UNCHANGED bytes (the counters-verbatim conformance gate holds); key 2 is
+ * the ADDITIVE §4.2/§14.4 log stream — the recent window of the device's own log lines
+ * (device/log_ring.c), bounded to HARP_LOGRING_BUNDLE_MAX so the whole device-section rides
+ * one `ctl` message under the §4.2.1 64 KiB bound. device-section key 3 (audio-config) is a
+ * later enrichment. The byte-identical round-trip of THIS map is the device conformance gate
+ * (host stores it verbatim under key 4 in the non-anonymized path). §16 anonymization stays
+ * HOST-side: harp_anonymize_device_section re-encodes device-section, clearing log-record key
+ * 3 (msg) — a device log line may carry serial/host/path free-text (§16). See
+ * docs/diag-bundle-design.md. */
 static void handle_diag_bundle(device *d, const harp_env *e) {
     harp_cbuf m;
     harp_cbuf_init(&m);
     rsp_head(&m, e->rid, e->method, true);
-    harp_cbor_map(&m, 2); /* device-section: 0 identity, 1 counters */
+    harp_cbor_map(&m, 3); /* device-section: 0 identity, 1 counters, 2 device logs */
     harp_cbor_uint(&m, 0);
     encode_identity(d, &m);
     harp_cbor_uint(&m, 1);
     emit_counters(d, &m);
+    harp_cbor_uint(&m, 2);
+    harp_devlog_emit_cbor(&m, HARP_LOGRING_BUNDLE_MAX);
     send_ctl(d, &m);
     harp_cbuf_free(&m);
 }
@@ -1336,7 +1344,7 @@ static void handle_audio_start(device *d, const harp_env *e) {
     }
     atomic_store_explicit(&d->audio.thread_live, true, memory_order_relaxed);
     meter_pump_start(d); /* §9.9: stream the readonly meters while streaming */
-    fprintf(stderr, "harp-deviced: audio stream started (%u Hz, %u-sample blocks, %s%s)\n",
+    harp_devlog(HARP_LOG_INFO, "session", "harp-deviced: audio stream started (%u Hz, %u-sample blocks, %s%s)\n",
             d->audio.rate, d->audio.nsamples, mode ? "host-paced" : "free-running",
             d->audio.rtp_fd >= 0 ? ", RTP/UDP" : "");
 
@@ -2061,7 +2069,7 @@ static void handle_restart(device *d, const harp_env *e) {
     rsp_head(&m, e->rid, e->method, false);
     send_ctl(d, &m);
     harp_cbuf_free(&m);
-    fprintf(stderr, "harp-deviced: restart requested; exiting for respawn\n");
+    harp_devlog(HARP_LOG_INFO, "session", "harp-deviced: restart requested; exiting for respawn\n");
     audio_stop(d);
     exit(0);
 }

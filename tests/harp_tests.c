@@ -1077,9 +1077,100 @@ static void test_anonymize(void) {
     harp_cbuf_free(&out);
 }
 
+/* §16 / §14.4: the device-section carries recent DEVICE logs at key 2 (an array
+ * of §14.4 log-records, drained from the §4.2 `log` ring). A log line's msg
+ * free-text can carry a serial / host / path token, so the host §16 pass MUST
+ * clear log-record key 3 (msg) to "" IN PLACE while RETAINING key 0 (msc),
+ * key 1 (level), and key 2 (tag — machine-greppable, reveals whether not what). */
+static int bytes_contain(const harp_cbuf *b, const char *needle) {
+    size_t nl = strlen(needle);
+    if (nl == 0) return 1;
+    for (size_t i = 0; i + nl <= b->len; i++)
+        if (memcmp(b->buf + i, needle, nl) == 0) return 1;
+    return 0;
+}
+
+static void test_anonymize_device_logs(void) {
+    harp_cbuf in, out;
+    harp_cbuf_init(&in);
+    harp_cbuf_init(&out);
+
+    /* device-section { 0 => identity(minimal), 1 => counters, 2 => [log-record*] } */
+    harp_cbor_map(&in, 3);
+    harp_cbor_uint(&in, 0); /* identity: a minimal map — copied verbatim by the pass */
+    harp_cbor_map(&in, 1);
+    harp_cbor_uint(&in, 3);
+    harp_cbor_text(&in, "1.0.0"); /* firmware (retained) */
+    harp_cbor_uint(&in, 1);       /* counters (no PII, retained whole) */
+    harp_cbor_map(&in, 1);
+    harp_cbor_text(&in, "usb_errors");
+    harp_cbor_uint(&in, 0);
+    harp_cbor_uint(&in, 2); /* device logs (§4.2/§14.4) */
+    harp_cbor_array(&in, 2);
+    harp_cbor_map(&in, 4); /* record 0 */
+    harp_cbor_uint(&in, 0);
+    harp_cbor_uint(&in, 0); /* msc */
+    harp_cbor_uint(&in, 1);
+    harp_cbor_uint(&in, 1); /* level info */
+    harp_cbor_uint(&in, 2);
+    harp_cbor_text(&in, "daemon"); /* tag (retained) */
+    harp_cbor_uint(&in, 3);
+    harp_cbor_text(&in, "serial SIM-PII-0001 state /home/pi/secretdir listening on 1234"); /* msg (PII) */
+    harp_cbor_map(&in, 4);         /* record 1 */
+    harp_cbor_uint(&in, 0);
+    harp_cbor_uint(&in, 99); /* msc */
+    harp_cbor_uint(&in, 1);
+    harp_cbor_uint(&in, 3); /* level error */
+    harp_cbor_uint(&in, 2);
+    harp_cbor_text(&in, "session"); /* tag (retained) */
+    harp_cbor_uint(&in, 3);
+    harp_cbor_text(&in, "host mybox.local user secretname"); /* msg (PII) */
+
+    CHECK(harp_anonymize_device_section(&out, in.buf, in.len));
+
+    /* Raw-byte oracle: the PII tokens are GONE, the retained tags survive. */
+    CHECK(bytes_contain(&in, "SIM-PII-0001"));      /* sanity: present pre-pass */
+    CHECK(!bytes_contain(&out, "SIM-PII-0001"));    /* msg cleared */
+    CHECK(!bytes_contain(&out, "/home/pi/secretdir"));
+    CHECK(!bytes_contain(&out, "mybox.local"));
+    CHECK(!bytes_contain(&out, "secretname"));
+    CHECK(bytes_contain(&out, "daemon"));           /* tag retained */
+    CHECK(bytes_contain(&out, "session"));          /* tag retained */
+    CHECK(bytes_contain(&out, "usb_errors"));       /* counters retained */
+
+    /* Structured decode walk: shape + keys preserved, msg == "", others retained. */
+    harp_cdec d;
+    uint64_t nsec, k, u;
+    const char *s;
+    size_t sl;
+    harp_cdec_init(&d, out.buf, out.len);
+    CHECK(harp_cdec_map(&d, &nsec) && nsec == 3);
+    CHECK(harp_cdec_uint(&d, &k) && k == 0 && harp_cdec_skip(&d)); /* identity (verbatim) */
+    CHECK(harp_cdec_uint(&d, &k) && k == 1 && harp_cdec_skip(&d)); /* counters (verbatim) */
+    CHECK(harp_cdec_uint(&d, &k) && k == 2);
+    uint64_t nrec;
+    CHECK(harp_cdec_array(&d, &nrec) && nrec == 2);
+    const uint64_t want_msc[2] = {0, 99}, want_lvl[2] = {1, 3};
+    const char *want_tag[2] = {"daemon", "session"};
+    for (uint64_t r = 0; r < 2; r++) {
+        uint64_t nk;
+        CHECK(harp_cdec_map(&d, &nk) && nk == 4);
+        CHECK(harp_cdec_uint(&d, &k) && k == 0 && harp_cdec_uint(&d, &u) && u == want_msc[r]);
+        CHECK(harp_cdec_uint(&d, &k) && k == 1 && harp_cdec_uint(&d, &u) && u == want_lvl[r]);
+        CHECK(harp_cdec_uint(&d, &k) && k == 2 && harp_cdec_text(&d, &s, &sl) &&
+              sl == strlen(want_tag[r]) && memcmp(s, want_tag[r], sl) == 0);
+        CHECK(harp_cdec_uint(&d, &k) && k == 3 && harp_cdec_text(&d, &s, &sl) && sl == 0); /* msg "" */
+    }
+    CHECK(!d.err && d.p == d.end);
+
+    harp_cbuf_free(&in);
+    harp_cbuf_free(&out);
+}
+
 int main(void) {
     test_sha256();
     test_anonymize();
+    test_anonymize_device_logs();
     test_link_fragmentation();
     test_link_interleave();
     test_link_stream_caps();
