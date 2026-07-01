@@ -22,18 +22,30 @@ STATEDIR=admission-eth-state   # workspace-RELATIVE
 DEVLOG=/tmp/admission-eth-dev.log
 HOSTLOG=/tmp/admission-eth-host.log
 fail() { echo "ADMISSION FAIL: $1"; exit 1; }
-[ -x "$DEVICED" ] || fail "$DEVICED not built"
+. "$(dirname "$0")/eth-extern-lib.sh"
+[ -x "$DEVICED" ] || eth_extern_active || fail "$DEVICED not built"
 [ -x "$HOSTBIN" ] || fail "$HOSTBIN not built"
 [ -n "$PLUG" ] && [ -d "$PLUG" ] || fail "harp-shell.vst3 bundle not found"
 
+# EXTERNAL-ENDPOINT MODE: target the already-running external deviced instead of spawning one.
+# The §8.4 admission gate is entirely HOST-side (the HARP_ADMISSION_BUDGET seam refuses/admits
+# the audio reservation before audio.start); the device just needs to stream when admitted —
+# so the refuse-vs-admit render divergence holds over the real hop. run_host + the over/under-
+# budget assertions below are shared, untouched.
 DP=""
 trap '[ -n "$DP" ] && kill -9 "$DP" 2>/dev/null' EXIT INT TERM
-rm -rf "$STATEDIR"; : > "$DEVLOG"
-"$DEVICED" --port "$PORT" --state-dir "$STATEDIR" >>"$DEVLOG" 2>&1 & DP=$!
-for _ in $(seq 1 25); do grep -q "listening on $PORT" "$DEVLOG" 2>/dev/null && break; sleep 0.2; done
-grep -q "listening on $PORT" "$DEVLOG" || { cat "$DEVLOG"; fail "device didn't start on $PORT"; }
-export HARP_ETH_DEVICE="127.0.0.1:$PORT"
-export HARP_DEVICE_SERIAL="SIM-0001"
+if eth_extern_active; then
+    eth_extern_banner admission
+    export HARP_ETH_DEVICE="$(eth_extern_ep)"
+    eth_extern_export_serial
+else
+    rm -rf "$STATEDIR"; : > "$DEVLOG"
+    "$DEVICED" --port "$PORT" --state-dir "$STATEDIR" >>"$DEVLOG" 2>&1 & DP=$!
+    for _ in $(seq 1 25); do grep -q "listening on $PORT" "$DEVLOG" 2>/dev/null && break; sleep 0.2; done
+    grep -q "listening on $PORT" "$DEVLOG" || { cat "$DEVLOG"; fail "device didn't start on $PORT"; }
+    export HARP_ETH_DEVICE="127.0.0.1:$PORT"
+    export HARP_DEVICE_SERIAL="SIM-0001"
+fi
 
 # run the host under a given admission budget. $1 = budget. Hash -> stdout; log -> $HOSTLOG.
 run_host() {

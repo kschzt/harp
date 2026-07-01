@@ -23,6 +23,20 @@ PORT="${PORT:-17922}"
 DEVDIR=epoch-state   # workspace-RELATIVE
 DEVLOG=/tmp/epoch-dev.log
 fail() { echo "EPOCH FAIL: $1"; exit 1; }
+. "$(dirname "$0")/eth-extern-lib.sh"
+
+# EXTERNAL-ENDPOINT MODE (§8.7 over a real network hop): the probe drives the sample-rate
+# change against the already-running external deviced directly — no local spawn. Default
+# loopback path below is untouched when HARP_ETH_EXTERN is unset.
+if eth_extern_active; then
+    eth_extern_banner epoch
+    [ -x "$PROBE" ] || fail "$PROBE not built (needed as the external client)"
+    perl -e 'alarm 30; exec @ARGV' "$PROBE" -d "$(eth_extern_ep)" epoch-test \
+      || fail "epoch-test assertions failed against $(eth_extern_ep) (§7.1/§8.6 time.epoch / stale-epoch)"
+    echo "EPOCH PASS (external §7.1/§8.6 over the real link: time.epoch bumped + stale-epoch discarded against $(eth_extern_ep) — cert T4)"
+    exit 0
+fi
+
 [ -x "$DEVICED" ] || fail "$DEVICED not built"
 [ -x "$PROBE" ]   || fail "$PROBE not built"
 

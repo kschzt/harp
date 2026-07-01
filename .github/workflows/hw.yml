@@ -25,6 +25,11 @@ on:
         description: 'RUNS for the P5b late-sink reliability test (blank = default 5). Set high (e.g. 40) to statistically validate the re-neg padDebt fix against the ~1/5 flake.'
         required: false
         default: ''
+      eth_hw:
+        description: 'DORMANT: run the real-Ethernet §8.7 eth-hw job (external-endpoint mode against the rig Pi over a real network hop). Leave OFF until the Pi eth daemon service+port are confirmed on-rig — see the eth-hw TODO.'
+        type: boolean
+        required: false
+        default: false
 
 # One hardware run at a time: the device is exclusive, and a half-finished
 # run can leave the USB bus mid-stream. Queue, never cancel in flight.
@@ -127,3 +132,111 @@ jobs:
           N: '2'
           VECTORS: crash killd
         run: timeout 300 bash scripts/usb-stress.sh
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # DORMANT: real two-host Ethernet §8.7 conformance against the rig Pi.
+  #
+  # Runs scripts/eth-suite.sh in EXTERNAL-ENDPOINT MODE (HARP_ETH_EXTERN=host:port) over a
+  # REAL network hop against a harp-deviced running on PI4B-0002 in ETH (TCP) transport —
+  # closing the "eth CI is loopback-only" hardware gap the maturity capstone flagged. The
+  # external-capable §8.7 tests (bit-exact RTP stream, §14.3 loopback RTT, §14.4/§8.3 diag
+  # counters, §8.4 admission, §5.4/§5.5 control plane, §9.6 txn, §7.1/§8.6 epoch, §11.3 CAS)
+  # run over the real link; everything that structurally needs a harness-owned LOCAL co-process
+  # (SIGKILL fault-injection, deterministic host-paced offline goldens, daemons started with
+  # specific flags) self-skips WITH A LOGGED REASON (see scripts/eth-suite.sh EXTERN_CAP).
+  #
+  # ── GATED OFF until the main session validates it on-rig ──
+  #   * Triggers ONLY when the workflow_dispatch input `eth_hw` is ticked, OR the repo variable
+  #     HARP_ETH_HW_ENABLED is set to '1' (Settings → Secrets and variables → Actions →
+  #     Variables). A normal main push / a plain dispatch (for the USB `hardware` job) does
+  #     NOT run this job. It shares the `harp-hw` concurrency group + the single self-hosted
+  #     runner, so it never overlaps the USB job on the exclusive Pi.
+  #
+  # ══ TODO(main-session, on-rig) — MUST confirm before enabling ══════════════════════════════
+  #   The repo provisioning (scripts/pi-stage2-install.sh) installs only the USB unit
+  #   `harp-deviced-usb.service`; the TCP/ETH unit is `harp-deviced.service` (it `Conflicts=`
+  #   the USB unit — one protocol stack owns the state store at a time) and is NOT created by
+  #   the provisioner, so its exact NAME + PORT on PI4B-0002 are deployment-specific:
+  #     1. Confirm the eth daemon on PI4B-0002: service name (repo assumes `harp-deviced`) and
+  #        the listen PORT. Device default --port is 47800 (device/harp-deviced.c); the
+  #        PI4B-0001 desk deployment runs on 47988 (on-device service flag, not baked) — so
+  #        PI4B-0002's port MUST be confirmed on the box.
+  #     2. Set the job env below: HARP_ETH_PORT (and, if the service name differs, fix the
+  #        `systemctl` line in the bring-up step).
+  #     3. Enable: tick the `eth_hw` dispatch input, or set repo var HARP_ETH_HW_ENABLED=1.
+  #   Once green on the real Pi, this job is the standing real-Ethernet §8.7 gate.
+  eth-hw:
+    if: >-
+      github.repository == 'kschzt/harp' &&
+      ((github.event_name == 'workflow_dispatch' && inputs.eth_hw == true) ||
+       vars.HARP_ETH_HW_ENABLED == '1')
+    runs-on: [self-hosted, harp-hw]
+    timeout-minutes: 25
+    env:
+      HARP_ETH_HOST: harptest.local
+      HARP_ETH_PORT: '47800'          # TODO(main-session): confirm PI4B-0002's eth port (default 47800; deployments vary, e.g. 47988)
+      HARP_ETH_SERIAL: PI4B-0002
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: VST3 SDK (cached on the runner at ~/vst3sdk)
+        run: |
+          mkdir -p external
+          if [ -d "$HOME/vst3sdk/.git" ]; then
+            ln -sfn "$HOME/vst3sdk" external/vst3sdk
+          else
+            git clone --depth 1 --recursive \
+              https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
+          fi
+
+      - name: CLAP SDK (header-only; cached on the runner at ~/clap)
+        run: |
+          mkdir -p external
+          if [ -d "$HOME/clap/.git" ]; then
+            ln -sfn "$HOME/clap" external/clap
+          else
+            git clone --depth 1 --branch 1.2.8 \
+              https://github.com/free-audio/clap.git external/clap
+          fi
+
+      - name: build device + eth test tools (harp-deviced, harp-probe, fence/latefr) on the runner
+        run: cmake -B build && cmake --build build -j --target harp-deviced harp-probe harp-eth-fence-test harp-eth-latefr-test
+
+      - name: build + install the Linux VST3 shell (~/.vst3) + the CLAP shell/host
+        run: |
+          cmake -B build-vst -S tools/vst3-host
+          cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host -j
+          cmake --build build-vst --target install-linux
+
+      - name: bring up the Pi in ETH (TCP) transport for THIS commit
+        # USB and ETH are mutually exclusive (harp-deviced-usb.service Conflicts=
+        # harp-deviced.service), so stop USB and start the TCP daemon built from this commit.
+        # The harp-hw concurrency group already serializes this against the USB `hardware` job.
+        # TODO(main-session): if the eth unit is named/parameterized differently on PI4B-0002,
+        # fix the systemctl line; the direct-launch fallback needs a matching sudoers allowance.
+        run: |
+          rsync -a --delete --exclude build --exclude .git --exclude external \
+            ./ ci@${HARP_ETH_HOST}:harp/
+          ssh ci@${HARP_ETH_HOST} "cmake -B ~/harp/build ~/harp \
+            && cmake --build ~/harp/build -j4 --target harp-deviced \
+            && sudo -n systemctl stop harp-deviced-usb 2>/dev/null || true; \
+            ( sudo -n systemctl restart harp-deviced 2>/dev/null ) \
+            || ( pkill -f 'harp-deviced --port' 2>/dev/null; \
+                 nohup ~/harp/build/harp-deviced --port ${HARP_ETH_PORT} \
+                   --state-dir ~/harp-eth-state --serial ${HARP_ETH_SERIAL} \
+                   >/tmp/harp-deviced-eth.log 2>&1 & sleep 2; \
+                 grep -q \"listening on ${HARP_ETH_PORT}\" /tmp/harp-deviced-eth.log )"
+
+      - name: §8.7 conformance over REAL Ethernet (external-endpoint mode, PI4B-0002)
+        env:
+          HARP_ETH_EXTERN: ${{ env.HARP_ETH_HOST }}:${{ env.HARP_ETH_PORT }}
+          HARP_ETH_EXTERN_SERIAL: ${{ env.HARP_ETH_SERIAL }}
+        run: scripts/eth-suite.sh
+
+      - name: restore the USB daemon (leave the rig as the USB `hardware` job expects)
+        if: always()
+        run: |
+          ssh ci@${HARP_ETH_HOST} \
+            "( sudo -n systemctl stop harp-deviced 2>/dev/null; \
+               pkill -f 'harp-deviced --port' 2>/dev/null ) || true; \
+             sudo -n systemctl start harp-deviced-usb 2>/dev/null || true"

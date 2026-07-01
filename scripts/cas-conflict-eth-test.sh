@@ -26,6 +26,24 @@ DEVDIR=cas-conflict-eth-state   # workspace-RELATIVE (Git Bash /tmp -> C:\ trips
 DEVLOG=/tmp/cas-conflict-eth-dev.log
 OUT=/tmp/cas-conflict-eth.out
 fail() { echo "CAS-CONFLICT-ETH FAIL: $1"; exit 1; }
+. "$(dirname "$0")/eth-extern-lib.sh"
+
+# EXTERNAL-ENDPOINT MODE (§8.7 over a real network hop): the probe drives cas-test against the
+# already-running external deviced directly — no local spawn. cas-test's expects/digests are
+# self-contained (it relies only on the daemon's factory live/project snapshot, which a running
+# daemon boots). Default loopback path below is untouched when HARP_ETH_EXTERN is unset.
+if eth_extern_active; then
+    eth_extern_banner cas-conflict
+    [ -x "$PROBE" ] || fail "$PROBE not built (needed as the external client)"
+    HARP_RECONCILE_TIMEOUT_MS=0 "$PROBE" -d "$(eth_extern_ep)" cas-test >"$OUT" 2>&1 \
+      || { cat "$OUT"; fail "cas-test assertions failed against $(eth_extern_ep)"; }
+    cat "$OUT"
+    grep -q "dirty-ref -> conflict: OK" "$OUT" || { cat "$OUT"; fail "the DIRTY-REF case (e) did not pass — 'dirty-ref -> conflict: OK' absent"; }
+    grep -q "CAS-TEST PASS" "$OUT"            || { cat "$OUT"; fail "cas-test did not report PASS"; }
+    echo "CAS-CONFLICT-ETH PASS (external §11.3 over the real link: stale-expect AND dirty-ref -> conflict against $(eth_extern_ep))"
+    exit 0
+fi
+
 [ -x "$DEVICED" ] || fail "$DEVICED not built"
 [ -x "$PROBE" ]   || fail "$PROBE not built"
 

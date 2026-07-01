@@ -50,9 +50,34 @@ HOSTLOG=/tmp/diagbundle-host-eth-host.log
 BUNDLE=/tmp/db-host.cbor
 BUNDLE_ANON=/tmp/db-host-anon.cbor   # §16: a second capture with --diag-bundle-anon
 fail() { echo "DIAG-BUNDLE-HOST FAIL: $1"; exit 1; }
-[ -x "$DEVICED" ] || fail "$DEVICED not built"
+. "$(dirname "$0")/eth-extern-lib.sh"
+[ -x "$DEVICED" ] || eth_extern_active || fail "$DEVICED not built"
 [ -x "$HOSTBIN" ] || fail "$HOSTBIN not built"
 [ -n "$PLUG" ] && [ -d "$PLUG" ] || fail "harp-shell.vst3 not found"
+
+# EXTERNAL-ENDPOINT MODE: capture the runtime getDiagBundle over a REAL two-host hop — the
+# §8.3 device-section counters (incl. RTP-loss/reanchor) + the §14.4 host sections must travel
+# across the network into the host's bundle. We assert the bundle is well-formed, embeds the
+# device-section counters (key 4), and its net-topology carries the EXTERNAL dial host — but we
+# DO NOT assert the refdev serial (SIM-0001) or the 127.0.0.1 literal, which are loopback/
+# refdev-specific (the full v4 CBOR shape + §16 anon walk stay on the loopback path below).
+if eth_extern_active; then
+    eth_extern_banner diag-bundle-host
+    EP="$(eth_extern_ep)"; eth_extern_export_serial
+    rm -f "$BUNDLE"; : > "$HOSTLOG"
+    HARP_ETH_DEVICE="$EP" perl -e 'alarm 30; exec @ARGV' "$HOSTBIN" "$PLUG" \
+        --seconds 2 --realtime --diag-bundle "$BUNDLE" >"$HOSTLOG" 2>&1
+    rc=$?; [ "$rc" -eq 142 ] && { cat "$HOSTLOG"; fail "host HUNG (watchdog) against $EP"; }
+    [ "$rc" -eq 0 ] || { cat "$HOSTLOG"; fail "host exited rc=$rc against $EP"; }
+    grep -q "connected:" "$HOSTLOG" || { cat "$HOSTLOG"; fail "host never connected to $EP"; }
+    [ -s "$BUNDLE" ] || { cat "$HOSTLOG"; fail "no diag bundle written to $BUNDLE (capture didn't run?)"; }
+    grep -aq "harpd"      "$BUNDLE" || fail "bundle missing magic 'harpd' (top key 0)"
+    grep -aq "usb_errors" "$BUNDLE" || fail "bundle missing device-section counters (key 4 not embedded over the real hop?)"
+    EHOST="$(eth_extern_host)"
+    grep -aq "$EHOST"     "$BUNDLE" || fail "bundle net-topology missing the external host '$EHOST' (key 13.0 — host never resolved the real dial target?)"
+    echo "DIAG-BUNDLE-HOST PASS (external §14.4/§8.3 over the real link: 'harpd' + device-section counters + net-topology host '$EHOST' captured over $EP; $(wc -c <"$BUNDLE") bytes)"
+    exit 0
+fi
 
 DP=""; HP=""
 trap '[ -n "$DP" ] && kill -9 "$DP" 2>/dev/null; [ -n "$HP" ] && kill -9 "$HP" 2>/dev/null' EXIT

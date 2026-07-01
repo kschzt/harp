@@ -15,6 +15,19 @@ PORT="${PORT:-17922}"
 DEVDIR=core-state   # workspace-RELATIVE
 DEVLOG=/tmp/core-dev.log
 fail() { echo "CORE FAIL: $1"; exit 1; }
+. "$(dirname "$0")/eth-extern-lib.sh"
+
+# EXTERNAL-ENDPOINT MODE (§8.7 over a real network hop): harp-probe is a CLIENT, so it dials
+# the already-running external deviced directly — no local spawn. The default loopback path
+# below is untouched when HARP_ETH_EXTERN is unset.
+if eth_extern_active; then
+    eth_extern_banner core
+    [ -x "$PROBE" ] || fail "$PROBE not built (needed as the external client)"
+    "$PROBE" -d "$(eth_extern_ep)" core-test || fail "core-test assertions failed against $(eth_extern_ep)"
+    echo "CORE PASS (external §5.5 over the real link: ping/identify/changed/bye against $(eth_extern_ep))"
+    exit 0
+fi
+
 [ -x "$DEVICED" ] || fail "$DEVICED not built"
 [ -x "$PROBE" ]   || fail "$PROBE not built"
 
