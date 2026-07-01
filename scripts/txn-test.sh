@@ -15,6 +15,18 @@ PORT="${PORT:-17921}"
 DEVDIR=txn-state   # workspace-RELATIVE
 DEVLOG=/tmp/txn-dev.log
 fail() { echo "TXN FAIL: $1"; exit 1; }
+. "$(dirname "$0")/eth-extern-lib.sh"
+
+# EXTERNAL-ENDPOINT MODE (§8.7 over a real network hop): the probe dials the already-running
+# external deviced directly — no local spawn. Default loopback path below is untouched.
+if eth_extern_active; then
+    eth_extern_banner txn
+    [ -x "$PROBE" ] || fail "$PROBE not built (needed as the external client)"
+    "$PROBE" -d "$(eth_extern_ep)" txn-test || fail "txn-test assertions failed against $(eth_extern_ep)"
+    echo "TXN PASS (external §9.6 over the real link: buffer/commit-atomic/abort against $(eth_extern_ep))"
+    exit 0
+fi
+
 [ -x "$DEVICED" ] || fail "$DEVICED not built"
 [ -x "$PROBE" ]   || fail "$PROBE not built"
 

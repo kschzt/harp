@@ -31,6 +31,7 @@ export PYTHONIOENCODING=utf-8
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
+. "$ROOT/scripts/eth-extern-lib.sh"
 
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) OSID=windows; EXE=.exe ;;
@@ -70,12 +71,61 @@ echo "   HOSTBIN=$HOSTBIN"
 echo "   CHOST=$CHOST"
 echo "   PROBE=${PROBE:-<none>}  $(have "$PROBE" && echo '(present)' || echo '(absent — probe tests skip)')"
 
+# ---- EXTERNAL-ENDPOINT MODE gate (capability-based, exactly like the per-OS / probe skips) ---
+# HARP_ETH_EXTERN=host:port => target an already-running EXTERNAL harp-deviced over a real
+# network hop instead of spawning a localhost one (closes the loopback-only gap). The DEFAULT
+# (unset) spawn-local path is 100% unchanged. In external mode only the EXTERNAL-CAPABLE tests
+# run (they dial $HARP_ETH_EXTERN); every other test SKIPS with a LOGGED capability reason —
+# tests that structurally need a harness-owned local co-process (SIGKILL fault-injection,
+# deterministic host-paced offline goldens, or a daemon started with specific flags/config).
+export HARP_ETH_EXTERN HARP_ETH_EXTERN_SERIAL 2>/dev/null || true
+EXTERN_CAP=" eth-tests core txn epoch cas-conflict admission loopback diag-bundle-host hello-gate "
+if eth_extern_active; then
+  echo ""
+  echo "── eth-suite EXTERNAL-ENDPOINT MODE: targeting $(eth_extern_ep) over a REAL §8.7 hop (NOT spawning a localhost deviced)"
+  [ -n "${HARP_ETH_EXTERN_SERIAL:-}" ] && echo "   external device serial pin: HARP_DEVICE_SERIAL=$HARP_ETH_EXTERN_SERIAL" || echo "   (no HARP_ETH_EXTERN_SERIAL pin — the host takes the daemon's reported serial)"
+  echo "   external-capable (run):$EXTERN_CAP"
+fi
+# Why a given test cannot run against a single, fixed, already-running external deviced.
+extern_reason() {
+  case "$1" in
+    main-multi-out) echo "host-side only — does not exercise the external §8.7 endpoint";;
+    offline-golden|offline-fence|realtime-fence|latefr)
+      echo "host-paced OFFLINE bounce needs deterministic LOCAL device-clock control (byte-exact in-process golden / connect-back socket)";;
+    corrupt-cbor|reconnect|conn-flood)
+      echo "fault-injection SIGKILLs/restarts the local deviced — the harness must own its lifecycle";;
+    rtp-loss|rtp-reorder)
+      echo "needs a harness-started --tone daemon + host-side RTP loss/reorder injection (loopback-only seam)";;
+    reported-latency|eth-rtfloor|evt-storm|engine-mismatch|engine-gate)
+      echo "needs a harness-configured deviced (--rt-floor/--rt-nsamples/--in-lat/--engine, often multi-config) — can't reconfigure the external endpoint";;
+    ratelimit) echo "needs --force-peer-ip on a harness-started deviced (§16 shed seam)";;
+    param-map-recall) echo "restarts the deviced with a mutated param-map to force §13.4 drift";;
+    credit) echo "needs HARP_FORCE_CREDIT_GRANT in the DEVICE process env (a harness-started daemon)";;
+    recall|archive-before-push|bloat-recall|gc|offline-edit)
+      echo "mutates/inspects the device store — needs a harness-owned fresh device state-dir";;
+    diag-bundle) echo "device-side harp-probe bundle needs a harness-owned state-dir; diag-bundle-host covers §8.3 counters over the real hop";;
+    part-filter|reconcile-readonly|part-param-iso)
+      echo "drives the device front-panel unix socket — device-LOCAL transport, unreachable over the network hop";;
+    multiout-iso|multiout-perchan|multiout-clap|multiout-au)
+      echo "multi-instance perl-alarm harness needs harness-owned local device instances";;
+    mdns-discover|shell-mdns) echo "needs a LOCAL mDNS responder + a harness-spawned daemon";;
+    *) echo "needs a harness-managed local deviced";;
+  esac
+}
+
 # ---- run / skip bookkeeping (no fail-fast: collect every result so one PR shows ALL
 #      platform failures at once, minimizing branch round-trips) ----
 RESULTS=""
 FAILED=0
 run() {  # run <name> <script...>
   name="$1"; shift
+  # External mode: run only the external-capable tests; skip the rest WITH A LOGGED reason.
+  if eth_extern_active; then
+    case "$EXTERN_CAP" in
+      *" $name "*) : ;;
+      *) skip "$name" "external mode: $(extern_reason "$name")"; return ;;
+    esac
+  fi
   if [ "${DRY_RUN:-0}" = 1 ]; then echo "▶ WOULD RUN $name ($*)"; RESULTS="$RESULTS
 PLAN  $name"; return; fi
   echo "::group::eth-suite: $name"
@@ -214,10 +264,12 @@ else
   skip diag-bundle  "harp-probe not built on $OSID"
 fi
 
+MODE="$OSID"
+eth_extern_active && MODE="$OSID, EXTERNAL $(eth_extern_ep)"
 echo ""
-echo "════════ eth-suite summary ($OSID) ════════$RESULTS"
+echo "════════ eth-suite summary ($MODE) ════════$RESULTS"
 echo "═══════════════════════════════════════════"
-[ "$FAILED" = 0 ] && echo "eth-suite: ALL GREEN on $OSID" || echo "eth-suite: FAILURES on $OSID"
+[ "$FAILED" = 0 ] && echo "eth-suite: ALL GREEN on $MODE" || echo "eth-suite: FAILURES on $MODE"
 
 if [ "${DRY_RUN:-0}" = 1 ]; then exit 0; fi
 exit "$FAILED"
