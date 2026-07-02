@@ -121,6 +121,14 @@ jobs:
             echo "DEVICED=build-dev/harp-deviced.exe"
             echo "HOSTBIN=$(find build-vst -name 'harp-vst3-host.exe' | head -1)"
             echo "CHOST=$(find build-vst -name 'clap-host.exe' | head -1)"
+            # PROBE explicitly, alongside its siblings: the MinGW job builds a TCP-only
+            # harp-probe.exe (no libusb → usb_io.c omitted; the eth suite is TCP, not USB),
+            # which gates the ~16 §11.3/§11.4/§14/§15.5/§16 host-shell conformance tests
+            # (recall, cas-conflict, offline-edit, diag-bundle, credit, epoch, …). Until now
+            # PROBE was resolved only by eth-suite.sh's implicit ./build-dev/harp-probe.exe
+            # fallback; exporting it here guarantees the coverage BY DESIGN (not by a
+            # CWD-relative -x probe that could silently regress to "harp-probe not built").
+            echo "PROBE=$(find build-dev -name 'harp-probe.exe' | head -1)"
           } >> "$GITHUB_ENV"
       # §8.7 HIGH #6: the rtp-loss/rtp-reorder "loss MUST be counted, never silently concealed"
       # assertion decodes the diag bundle with python3+cbor2. The suite runs under Git Bash, whose
