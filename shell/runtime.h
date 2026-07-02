@@ -857,6 +857,15 @@ private:
      * the first real demuxed frame is not eaten paying that bogus debt. Consumer-
      * side (pullAudio) only. */
     void syncSinkEpoch(AudioSink &sink);
+    /* Shared RT-underrun tail for the pullAudio*() family: zero-fill the short read
+     * [got,want), accrue the pad debt (when `padDebt` != null — the owner pull passes
+     * null for an armed FX, whose short read is PDC-late priming silence, not spent
+     * SSIs), and (when `count`) bump the §8.3 underrun/padSamples diag counters.
+     * Returns the short-by frame count (want-got)/2. Behavior-preserving extraction of
+     * the four identical memset+pad-debt+counter epilogues; each caller keeps its own
+     * gating (fxArmed pad-debt suppression on the owner pull, connected_ counter gate on
+     * the non-blocking pulls) by choosing what it passes. */
+    size_t padUnderrun(float *dst, size_t got, size_t want, size_t *padDebt, bool count);
     bool helloAndIdentity();
     /* §12.2/§13.4: recompute the read-only holds vs the live identity; shared by connect +
      * the staged-while-connected setStateBundle path. */
