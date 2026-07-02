@@ -34,6 +34,7 @@
 #include "harp/store.h"
 #include "sock_io.h" /* harp_sockhandle / HARP_SOCK_INVALID / harp_sock_recv_timeout_ms (§16) */
 #include "conn_ratelimit.h" /* §16(b): harp_peer_penalty — per-peer pre-hello rate-limit ring */
+#include "op_ratelimit.h"   /* §16: harp_op_bucket — per-connection expensive-op (snapshot/bundle) rate-limit */
 
 #define PROTO_MAJOR 1
 #define PROTO_MINOR 0
@@ -430,6 +431,10 @@ typedef struct {
        completing client is never penalized. Accept-loop-private (no lock). */
     harp_peer_penalty prehello_penalty[16];
     size_t prehello_penalty_idx;
+    /* §16 DoS: per-CONNECTION token buckets shedding a state.snapshot / diag.bundle flood on THIS
+       session (each op is O(whole-state) — see op_ratelimit.h). Reset per session (run_session) and
+       on core.hello (§5.4). Recv-thread-private (all ctl handlers run on the one recv thread). */
+    harp_op_bucket rl_snapshot, rl_bundle;
 
     audio_state audio;
 
@@ -450,7 +455,8 @@ typedef struct {
     /* counters (§14.2): frame_errors has render + session writers;
      * snapshots_taken has session + panel writers; all read cross-thread */
     _Atomic uint64_t frame_errors, session_resets, snapshots_taken, audio_overruns, evt_stale_epoch,
-        audio_late_frames, obj_drops, evt_txn_rejected, evt_txn_overflow, evt_txn_unknown;
+        audio_late_frames, obj_drops, evt_txn_rejected, evt_txn_overflow, evt_txn_unknown,
+        rate_limited; /* §16: expensive control ops (state.snapshot/diag.bundle) shed under flood */
 } device;
 
 extern device g_dev;

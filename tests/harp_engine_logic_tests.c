@@ -18,6 +18,7 @@
 
 #include "arp_select.h"
 #include "conn_ratelimit.h"
+#include "op_ratelimit.h"
 #include "evq_mod.h"
 #include "fence_wait.h"
 #include "rtp.h"
@@ -238,6 +239,32 @@ static void test_peer_ratelimit(void) {
     CHECK(!harp_peer_penalized(ring, 4, 0, 1500));
 }
 
+static void test_op_ratelimit(void) {
+    /* §16: the per-connection expensive-op token bucket (state.snapshot/diag.bundle). cost 100ms/op,
+     * burst 500ms -> a fresh bucket admits a 5-op burst, then throttles to 1 op / 100ms; credit
+     * accrues at wall-rate up to the burst ceiling. All times below in ns. */
+    const uint64_t COST = 100000000ull, BURST = 500000000ull;
+    harp_op_bucket b = {0};
+    uint64_t t = 1000000000ull; /* a nonzero monotonic base (real harp_now_ns is boot-relative) */
+    /* fresh bucket: a full 5-op burst is admitted back-to-back at the same instant */
+    for (int i = 0; i < 5; i++) CHECK(harp_op_admit(&b, t, COST, BURST));
+    /* the 6th at the same instant is SHED (burst exhausted, no time has passed) */
+    CHECK(!harp_op_admit(&b, t, COST, BURST));
+    CHECK(!harp_op_admit(&b, t, COST, BURST)); /* still shed under a same-instant flood */
+    /* after one cost-interval of real time, exactly one more op is admitted, then shed again */
+    CHECK(harp_op_admit(&b, t + COST, COST, BURST));
+    CHECK(!harp_op_admit(&b, t + COST, COST, BURST));
+    /* credit is CAPPED at the burst: idling 10s does not bank 100 ops — only a 5-op burst returns */
+    b = (harp_op_bucket){0}; harp_op_admit(&b, t, COST, BURST); /* prime last_ns, spend 1 (4 left) */
+    uint64_t t2 = t + 10000000000ull; /* +10s idle */
+    for (int i = 0; i < 5; i++) CHECK(harp_op_admit(&b, t2, COST, BURST)); /* refilled to the 5 ceiling */
+    CHECK(!harp_op_admit(&b, t2, COST, BURST));                            /* not 100 — capped */
+    /* NORMAL cadence (one op every 250ms, above the 100ms sustained rate) is NEVER throttled */
+    harp_op_bucket n = {0};
+    uint64_t tn = t;
+    for (int i = 0; i < 50; i++) { CHECK(harp_op_admit(&n, tn, COST, BURST)); tn += 250000000ull; }
+}
+
 static void test_rtp_loss_gap(void) {
     /* §8.7: a forward packet reports the skip + advances; a reordered/duplicate one reports 0 and
      * does NOT advance, so it cannot rewind the high-water seq and mis-count the next packet. */
@@ -263,6 +290,7 @@ int main(void) {
     test_fence_count_timeout();
     test_usb_select();
     test_peer_ratelimit();
+    test_op_ratelimit();
     test_rtp_loss_gap();
     return check_report("harp-engine-logic-tests");
 }

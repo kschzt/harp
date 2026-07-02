@@ -254,11 +254,12 @@ if have "$PROBE"; then
   run core             scripts/core-test.sh                  # §5.5 core methods: ping/identify/changed/bye
   run conn-flood       scripts/conn-flood-test.sh            # §16 DoS: half-open drop + connect-storm survival
   run ratelimit        scripts/ratelimit-eth-test.sh         # §16(b) shed-on-reflood + no-shed-after-hello (--force-peer-ip)
+  run ratelimit-ops    scripts/rate-limit-ops-eth-test.sh    # §16 DoS: state.snapshot/diag.bundle flood shed (throttle + counter + normal-safe)
   run bloat-recall     scripts/bloat-recall-eth-test.sh      # debt #22: live ref resolves on a many-archive store (recall-breaker)
   run gc               scripts/gc-test.sh                    # debt #22a: §10.3 archive retention + mark-sweep GC (wired device path)
   run offline-edit     scripts/offline-edit-eth-test.sh      # §15.5 edit-while-absent reaches device
   run diag-bundle      scripts/diag-bundle-eth-test.sh       # §14.4 device-side export + §16 anon
-  run diag-counters    scripts/diag-counters-eth-test.sh     # §14.2 ALL-16 diag counters: exact map + types + clean-session bounds
+  run diag-counters    scripts/diag-counters-eth-test.sh     # §14.2 ALL-17 diag counters: exact map + types + clean-session bounds
 else
   skip recall       "harp-probe not built on $OSID"
   skip credit       "harp-probe not built on $OSID"
@@ -268,6 +269,7 @@ else
   skip core         "harp-probe not built on $OSID"
   skip conn-flood   "harp-probe not built on $OSID"
   skip ratelimit    "harp-probe not built on $OSID"
+  skip ratelimit-ops "harp-probe not built on $OSID"
   skip bloat-recall "harp-probe not built on $OSID"
   skip gc           "harp-probe not built on $OSID"
   skip offline-edit "harp-probe not built on $OSID"
