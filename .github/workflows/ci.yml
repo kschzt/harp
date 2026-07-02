@@ -28,14 +28,15 @@ jobs:
         # The root configure is cheap (no SDK clone) and picks up the brew libusb/
         # libsamplerate already installed above.
         #
-        # freerun/rtp/freerun_mt carry LABELS unit so the §8.3 SINAD-on-the-shipped-
-        # converter fixture runs on EVERY OS — but `ctest -L unit` only RUNS a test
-        # whose binary exists. brew libsamplerate above makes SAMPLERATE_FOUND true
-        # (and macOS is NOT WIN32), so all three targets are defined; build them here
-        # or `-L unit` reports them "Not Run". freerun_mt is the TSan SPSC race test.
+        # freerun/rtp/rtp-hf/freerun_mt carry LABELS unit so the §8.3 SINAD-on-the-shipped-
+        # converter fixture (and the HF rms-band converter gate) run on EVERY OS — but
+        # `ctest -L unit` only RUNS a test whose binary exists. brew libsamplerate above
+        # makes SAMPLERATE_FOUND true (and macOS is NOT WIN32), so all targets are defined;
+        # build them here or `-L unit` reports them "Not Run". freerun_mt is the TSan SPSC
+        # race test; rtp-hf is the §8.3 high-frequency converter-quality gate.
         run: |
           cmake -B build
-          cmake --build build --target harp-engine-logic-tests harp-tests harp-logring-tests harp-device-tests harp-ffs-link-tests harp-freerun-tests harp-rtp-tests harp-freerun-mt-tests harp-param-map-hash-tests -j3
+          cmake --build build --target harp-engine-logic-tests harp-tests harp-logring-tests harp-device-tests harp-ffs-link-tests harp-freerun-tests harp-rtp-tests harp-rtp-hf-tests harp-freerun-mt-tests harp-param-map-hash-tests -j3
           ctest --test-dir build -L unit --output-on-failure
       - name: AU shell + auval (Apple's own validation gate)
         run: |

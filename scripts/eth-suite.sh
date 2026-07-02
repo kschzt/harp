@@ -104,9 +104,10 @@ extern_reason() {
     recall|archive-before-push|bloat-recall|gc|offline-edit)
       echo "mutates/inspects the device store — needs a harness-owned fresh device state-dir";;
     diag-bundle) echo "device-side harp-probe bundle needs a harness-owned state-dir; diag-bundle-host covers §8.3 counters over the real hop";;
+    diag-counters) echo "storage-gauge bounds need a harness-owned state-dir; diag-bundle-host covers the §14.2 counters over the real hop";;
     part-filter|reconcile-readonly|part-param-iso)
       echo "drives the device front-panel unix socket — device-LOCAL transport, unreachable over the network hop";;
-    multiout-iso|multiout-perchan|multiout-clap|multiout-au)
+    multiout-iso|multiout-bleed|multiout-perchan|multiout-clap|multiout-au)
       echo "multi-instance perl-alarm harness needs harness-owned local device instances";;
     mdns-discover|shell-mdns) echo "needs a LOCAL mDNS responder + a harness-spawned daemon";;
     *) echo "needs a harness-managed local deviced";;
@@ -190,6 +191,14 @@ else run part-filter    scripts/part-filter-eth-test.sh; fi
 if [ "$OSID" = windows ]; then skip multiout-iso "multiout-iso uses the POSIX perl-alarm harness (Windows multi-out coverage pending)"
 else run multiout-iso   scripts/multiout-iso-test.sh; fi
 
+# MULTI-OUT (M1b): ADJACENT-part zero-bleed. multiout-iso pins isolation only between parts
+# 8 slots apart (ch 3 & 7); this drives a part and asserts the IMMEDIATELY adjacent buses
+# (the next slot pair — where an off-by-one/off-by-two slot bug bleeds) are BIT-EXACT silent,
+# at the LOW/MIDDLE/HIGH ends of the 16-part range, plus a full-scan total-isolation pass and
+# an offline bit-exact silence golden. POSIX-only (the perl-alarm capture harness).
+if [ "$OSID" = windows ]; then skip multiout-bleed "multiout-bleed uses the POSIX perl-alarm harness (Windows multi-out coverage pending)"
+else run multiout-bleed scripts/multiout-bleed-test.sh; fi
+
 # MULTI-OUT (M2): per-channel PARAMS — one main instance edits any part's device params per
 # event (a satellite's MIDI CC on channel N -> part N's param, §9.4 key 5). Routing + isolation
 # via deterministic offline hashes. POSIX-only (the perl-alarm capture harness).
@@ -249,6 +258,7 @@ if have "$PROBE"; then
   run gc               scripts/gc-test.sh                    # debt #22a: §10.3 archive retention + mark-sweep GC (wired device path)
   run offline-edit     scripts/offline-edit-eth-test.sh      # §15.5 edit-while-absent reaches device
   run diag-bundle      scripts/diag-bundle-eth-test.sh       # §14.4 device-side export + §16 anon
+  run diag-counters    scripts/diag-counters-eth-test.sh     # §14.2 ALL-16 diag counters: exact map + types + clean-session bounds
 else
   skip recall       "harp-probe not built on $OSID"
   skip credit       "harp-probe not built on $OSID"
@@ -262,6 +272,7 @@ else
   skip gc           "harp-probe not built on $OSID"
   skip offline-edit "harp-probe not built on $OSID"
   skip diag-bundle  "harp-probe not built on $OSID"
+  skip diag-counters "harp-probe not built on $OSID"
 fi
 
 MODE="$OSID"

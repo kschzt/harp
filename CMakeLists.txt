@@ -341,6 +341,20 @@ if(SAMPLERATE_FOUND)
   add_test(NAME rtp COMMAND harp-rtp-tests)
   set_tests_properties(rtp PROPERTIES LABELS unit) # §8.3 SINAD fixture (shipped BEST converter) — every OS
 
+  # harp-rtp-hf-tests: the §8.3 HIGH-FREQUENCY (18-23 kHz) converter-quality gate — the
+  # audio-quality claim made explicit. The 1 kHz `rtp` fixture ceilings at the ~87 dB sine-fit
+  # estimator floor and CANNOT see the shipped converter's ~120 dB stopband; this streams the
+  # top band jitter-suppressed so the residual IS the converter, and asserts the shipped
+  # HARP_ASRC_QUALITY materially out-performs SRC_SINC_FASTEST near Nyquist (a downgrade fails).
+  add_executable(harp-rtp-hf-tests tests/harp_rtp_hf_tests.c host/rtp.c host/freerun.c)
+  target_include_directories(harp-rtp-hf-tests PRIVATE host ${SAMPLERATE_INCLUDE_DIRS})
+  if(SAMPLERATE_LIBRARY_DIRS)
+    target_link_directories(harp-rtp-hf-tests PRIVATE ${SAMPLERATE_LIBRARY_DIRS})
+  endif()
+  target_link_libraries(harp-rtp-hf-tests ${SAMPLERATE_LIBRARIES} ${HARP_MATH_LIB})
+  add_test(NAME rtp-hf COMMAND harp-rtp-hf-tests)
+  set_tests_properties(rtp-hf PROPERTIES LABELS unit) # §8.3 HF converter discrimination — every OS
+
   # harp-rtp-demo: runnable §8.7 RTP-over-UDP path (loopback or KR260 -> Mac).
   if(NOT WIN32)
     find_package(Threads REQUIRED)
@@ -438,6 +452,25 @@ if(HARP_FUZZ)
   if(NOT APPLE)
     target_compile_options(fuzz-evt PRIVATE -fsanitize=fuzzer)
     target_link_options(fuzz-evt PRIVATE -fsanitize=fuzzer)
+  endif()
+
+  # fuzz-ffs: the §4.3 FunctionFS bulk-endpoint PARSE path (device/ffs_link.c). ffs.c
+  # wires ffs_link's buffered read_exact onto the kernel ep1/ep2 files (Pi-only); this
+  # fuzzes the reassembly layer with no hardware by replaying the input through the
+  # ffs_io.rd seam with arbitrary chunk boundaries, then into harp_link_recv (§4.2). It
+  # reaches the cross-read reassembly that fuzz-link (an exact-size mem_io) never fragments.
+  # Compiles the production ffs_link.c TU directly (no copy) + the device/ include dir for
+  # ffs_link.h; no stubs (ffs_link.c defines g_usb_errors; its read/write defaults are
+  # unused — the seam is overridden). POSIX-only (ffs_link.c uses unistd read/write); the
+  # fuzz tree is only ever built on Linux CI + macOS (standalone replay), never Windows.
+  if(NOT WIN32)
+    add_executable(fuzz-ffs fuzz/fuzz_ffs.c device/ffs_link.c ${FUZZ_DRIVER})
+    target_link_libraries(fuzz-ffs harpcore m)
+    target_include_directories(fuzz-ffs PRIVATE device)
+    if(NOT APPLE)
+      target_compile_options(fuzz-ffs PRIVATE -fsanitize=fuzzer)
+      target_link_options(fuzz-ffs PRIVATE -fsanitize=fuzzer)
+    endif()
   endif()
 
   add_executable(gen-corpus fuzz/gen_corpus.c)
