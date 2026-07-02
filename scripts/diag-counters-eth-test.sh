@@ -80,12 +80,19 @@ echo "   12 safety counters all 0 on a clean session ✓"
 fw="$(val x.harp-refdev.fence_waits)"; is_uint "$fw" || fail "fence_waits not a uint: '$fw'"
 # clock_drift_ppb: SIGNED int (device-side 0; a sensing device could report negative — §14.2).
 cdp="$(val clock_drift_ppb)"; is_int "$cdp" || fail "clock_drift_ppb not a signed int: '$cdp'"
-# storage: real filesystem gauges — total>0, 0<free<=total.
+# storage: real filesystem gauges from statvfs() — total>0, 0<free<=total on POSIX. On Windows the
+# MinGW device has no statvfs (device/session.c deliberately "skips them"), so both gauges are 0:
+# type-check them but don't require positive there (0 is correct-by-design on Windows, not a regression).
 st="$(val storage_bytes_total)"; sf="$(val storage_bytes_free)"
-{ is_uint "$st" && [ "$st" -gt 0 ]; } || fail "storage_bytes_total not a positive uint: '$st'"
-{ is_uint "$sf" && [ "$sf" -gt 0 ]; } || fail "storage_bytes_free not a positive uint: '$sf'"
-[ "$sf" -le "$st" ] || fail "storage_bytes_free ($sf) > storage_bytes_total ($st) — impossible"
-echo "   fence_waits uint, clock_drift_ppb signed-int, storage total>0 & 0<free<=total ✓"
+is_uint "$st" || fail "storage_bytes_total not a uint: '$st'"
+is_uint "$sf" || fail "storage_bytes_free not a uint: '$sf'"
+case "${DEVICED:-}" in
+  *.exe)  echo "   fence_waits uint, clock_drift_ppb signed-int, storage gauges typed (0 on Windows — no statvfs, by design) ✓" ;;
+  *)      [ "$st" -gt 0 ] || fail "storage_bytes_total not positive: '$st'"
+          [ "$sf" -gt 0 ] || fail "storage_bytes_free not positive: '$sf'"
+          [ "$sf" -le "$st" ] || fail "storage_bytes_free ($sf) > storage_bytes_total ($st) — impossible"
+          echo "   fence_waits uint, clock_drift_ppb signed-int, storage total>0 & 0<free<=total ✓" ;;
+esac
 
 kill -9 "$DP" 2>/dev/null; wait "$DP" 2>/dev/null; DP=""
 echo "DIAG-COUNTERS PASS (all 16 §14.2 counters present + exact map size 16; 12 safety counters 0; every value typed + bounded)"
