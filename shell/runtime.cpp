@@ -865,6 +865,20 @@ void HarpRuntime::syncSinkEpoch(AudioSink &sink) {
     }
 }
 
+/* Shared RT-underrun tail for the pullAudio*() family — see the header for the
+ * contract. Keeps the four short-read epilogues (owner/sink × realtime/blocking) in
+ * one place: zero-fill [got,want), accrue pad debt, count the underrun. */
+size_t HarpRuntime::padUnderrun(float *dst, size_t got, size_t want, size_t *padDebt,
+                                bool count) {
+    memset(dst + got, 0, (want - got) * sizeof(float));
+    if (padDebt) *padDebt += want - got;
+    if (count) {
+        underruns_.fetch_add(1, std::memory_order_relaxed);
+        padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
+    }
+    return (want - got) / 2;
+}
+
 size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
     /* Reads the stable audioRing_ for BOTH bindings — USB's reader() demuxes the
      * host-paced frames into it; Ethernet's reader() writes the 1:1 RTP frames
@@ -876,19 +890,15 @@ size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
     ssiRead_.fetch_add(nFrames, std::memory_order_relaxed);
     size_t shortBy = 0;
     if (got < want) {
-        memset(dst + got, 0, (want - got) * sizeof(float));
         /* §8.8: only the 1:1 synth path owes droppable pad debt. For an armed FX
          * (fxArmed) this short read is PRIMING silence while the fixed-latency wet
-         * pipeline fills — the wet is PDC-late, not spent — so DON'T schedule a drop
-         * (settlePadDebt early-returns for the FX too). We still COUNT the underrun:
-         * for the FX these are the expected handful of priming blocks, after which the
-         * ring stays full and there are none. fxInSlots_ is fixed before start(). */
-        if (!fxArmed()) padDebtFloats_ += want - got;
-        if (connected_.load(std::memory_order_acquire)) {
-            underruns_.fetch_add(1, std::memory_order_relaxed);
-            padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
-        }
-        shortBy = (want - got) / 2;
+         * pipeline fills — the wet is PDC-late, not spent — so pass a null accumulator
+         * (no drop scheduled; settlePadDebt early-returns for the FX too). We still
+         * COUNT the underrun when connected_: for the FX these are the expected handful
+         * of priming blocks, after which the ring stays full and there are none.
+         * fxInSlots_ is fixed before start(). */
+        shortBy = padUnderrun(dst, got, want, fxArmed() ? nullptr : &padDebtFloats_,
+                              connected_.load(std::memory_order_acquire));
     }
     /* §8.8 never-silent guard: observe the wet just delivered (read-only). Gated on
      * fxArmed, so the instrument path is byte-identical (the golden gate). */
@@ -913,15 +923,9 @@ size_t HarpRuntime::pullAudio(AudioSink *sink, float *dst, size_t nFrames) {
     settleSinkPadDebt(*sink);
     size_t want = nFrames * 2;
     size_t got = sink->ring.read(dst, want);
-    if (got < want) {
-        memset(dst + got, 0, (want - got) * sizeof(float));
-        sink->padDebt += want - got;
-        if (connected_.load(std::memory_order_acquire)) {
-            underruns_.fetch_add(1, std::memory_order_relaxed);
-            padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
-        }
-        return (want - got) / 2;
-    }
+    if (got < want)
+        return padUnderrun(dst, got, want, &sink->padDebt,
+                           connected_.load(std::memory_order_acquire));
     return 0;
 }
 
@@ -952,12 +956,9 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
         }
         if ((!flipping && !connected_.load(std::memory_order_acquire)) || waited >= timeoutMs) {
             if (!settled) ssiRead_.fetch_add(nFrames, std::memory_order_relaxed); /* advance EXACTLY once per call */
-            memset(dst + got, 0, (want - got) * sizeof(float));
-            padDebtFloats_ += want - got;
-            underruns_.fetch_add(1, std::memory_order_relaxed);
-            padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
+            size_t shortBy = padUnderrun(dst, got, want, &padDebtFloats_, true);
             if (fxArmed()) observeFxWet(dst, nFrames); /* §8.8 never-silent guard (offline) */
-            return (want - got) / 2;
+            return shortBy;
         }
         harp_sleep_ns(500000ull); /* 0.5 ms */
         waited++;
@@ -996,11 +997,7 @@ size_t HarpRuntime::pullAudioBlocking(AudioSink *sink, float *dst, size_t nFrame
             if (got >= want) break;
         }
         if ((!flipping && !connected_.load(std::memory_order_acquire)) || waited >= timeoutMs) {
-            memset(dst + got, 0, (want - got) * sizeof(float));
-            sink->padDebt += want - got;
-            underruns_.fetch_add(1, std::memory_order_relaxed);
-            padSamples_.fetch_add((want - got) / 2, std::memory_order_relaxed);
-            return (want - got) / 2;
+            return padUnderrun(dst, got, want, &sink->padDebt, true);
         }
         harp_sleep_ns(500000ull); /* 0.5 ms */
         waited++;
