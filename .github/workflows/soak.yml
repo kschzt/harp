@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [cbor, envelope, object, link, audio, state, evt]
+        target: [cbor, envelope, object, link, audio, state, evt, ffs]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: build fuzz tree (clang, ASan, libFuzzer)

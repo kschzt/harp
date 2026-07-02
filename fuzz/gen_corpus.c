@@ -172,6 +172,19 @@ int main(int argc, char **argv) {
     harp_link_send(&cap.io, HARP_STREAM_CTL, big.buf, big.len);
     harp_link_send(&cap.io, HARP_STREAM_EVT, params, sizeof params);
     dump(dir, "link-stream", cap.buf, cap.len);
+
+    /* fuzz-ffs seeds: the SAME framed link stream, but prefixed with the leading
+     * "chunk-selector" byte fuzz_ffs.c reads (0 => uncapped kernel read; 1 => 1-byte
+     * dribble that forces maximal ffs_read_exact cross-read reassembly). Two extremes so
+     * the fuzzer starts inside the §4.3 reassembly path at both boundary regimes. */
+    if (cap.len + 1 <= sizeof cap.buf) {
+        uint8_t ffs_seed[1 + sizeof cap.buf];
+        ffs_seed[0] = 0x00; /* uncapped */
+        memcpy(ffs_seed + 1, cap.buf, cap.len);
+        dump(dir, "ffs-link-whole", ffs_seed, cap.len + 1);
+        ffs_seed[0] = 0x01; /* 1-byte-per-read */
+        dump(dir, "ffs-link-dribble", ffs_seed, cap.len + 1);
+    }
     harp_cbuf_free(&big);
 
     /* audio frame header */
