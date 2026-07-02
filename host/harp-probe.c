@@ -1424,6 +1424,14 @@ static void cmd_epoch_test(probe *p) {
     printf("── epoch-test: time.epoch on rate change + stale-epoch discard (§7.1/§8.6)\n");
 
     audio_start_rtp(p, 48000);
+    /* Let the free-running 48 kHz stream render at least one 256-sample block before we
+     * stop it, so its published final MSC is a POSITIVE, block-aligned count (asserted
+     * below). Without this the two audio.start/stop requests run back-to-back and, on a
+     * loaded runner where the device audio thread hasn't ticked once yet, the old stream
+     * closes at MSC 0 — a real race (seen flaky on the Windows CI). The device is wall-clock
+     * paced (256 @ 48k = 5.33 ms/block), so ~9 blocks of margin makes old-msc-final
+     * deterministic without depending on runner speed. */
+    harp_sleep_ns(50ull * 1000000ull); /* 50 ms — portable (nanosleep is POSIX-only) */
     audio_stop_probe(p);
     p->epoch_seen = false;
     audio_start_rtp(p, 44100); /* rate change -> time.epoch (captured by probe_ntf during the request) */
