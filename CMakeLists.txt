@@ -167,6 +167,9 @@ if(LIBUSB_FOUND)
   # rt_sched.c holds harp_thread_set_realtime(), which usb_io.c calls (it was
   # extracted out of usb_io.c so it builds with NO libusb — see harp-rt-jitter-bench).
   target_sources(harp-probe PRIVATE host/usb_io.c host/rt_sched.c)
+  if(WIN32)
+    target_link_libraries(harp-probe avrt) # rt_sched.c: MMCSS "Pro Audio" RT promotion (avrt)
+  endif()
   target_compile_definitions(harp-probe PRIVATE HAVE_LIBUSB)
   target_include_directories(harp-probe PRIVATE ${LIBUSB_INCLUDE_DIRS})
   if(LIBUSB_LIBRARY_DIRS)
@@ -194,6 +197,11 @@ target_link_libraries(harp-rt-jitter-bench ${HARP_PLAT_LIBS})
 if(NOT WIN32)
   find_package(Threads REQUIRED)
   target_link_libraries(harp-rt-jitter-bench Threads::Threads)
+else()
+  # host/rt_sched.c promotes the feed thread via MMCSS "Pro Audio"
+  # (AvSetMmThreadCharacteristicsW / AvSetMmThreadPriority) — those live in avrt
+  # (avrt.lib under MSVC, libavrt.a under MinGW). POSIX builds never see this.
+  target_link_libraries(harp-rt-jitter-bench avrt)
 endif()
 
 enable_testing()
