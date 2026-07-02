@@ -78,5 +78,16 @@ jobs:
         # arm sets HARP_USB_RT=0 for the bench child, so only the baseline drops to
         # ordinary time-share; the ratio between the two arms is the runner-independent
         # invariant that proves RT is actually pinning the thread.
+        #
+        # Windows contention is modelled ONE notch higher than POSIX (the bench runs its
+        # burners at THREAD_PRIORITY_HIGHEST — see tools/rt-jitter-bench.c): a woken
+        # NORMAL-priority thread gets a wait-completion boost, so plain NORMAL load cannot
+        # deschedule it and the two arms are indistinguishable at the 1 ms timer floor.
+        # HIGHEST burners model the real competing audio/system threads a DAW runs — the
+        # load MMCSS "Pro Audio" is built to beat and a time-share thread cannot. BURNERS
+        # is bumped for a deeper HIGHEST-priority ready queue (a bigger RT-off tail) while
+        # the RT-promoted thread (15+) still preempts and holds the floor.
         shell: msys2 {0}
+        env:
+          BURNERS: 16
         run: bash scripts/rt-jitter-gate.sh ./build-rt/harp-rt-jitter-bench.exe
