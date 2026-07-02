@@ -301,8 +301,7 @@ void HarpRuntime::audioRenegotiateLocked() {
     }
 
     /* 3. fence epoch baseline (monotonic counter untouched — no race with queue*) */
-    evtEpochBase_.store(evtQueuedSeq_.load(std::memory_order_acquire),
-                        std::memory_order_release);
+    events_.advanceEpoch();
 
     bool ok = audioStart(rate_);
 
@@ -525,10 +524,10 @@ void HarpRuntime::feeder() {
              * only decrementer, a released source's leftover-event fetch_sub, is
              * retired with the source registry, so hw >= base always holds. The
              * clamp stays as a cheap guard; an under-count is always safe anyway
-             * (the fence is a minimum -> at worst evt_late). */
-            uint32_t hw = evtQueuedSeq_.load(std::memory_order_acquire);
-            uint32_t base = evtEpochBase_.load(std::memory_order_acquire);
-            uint32_t seq = hw > base ? hw - base : 0;
+             * (the fence is a minimum -> at worst evt_late). The (hw-base) saturating
+             * math is owned by EventManager::fenceStamp() — one owner for both this
+             * feeder stamp and the §14.3 loopback probe's identical stamp. */
+            uint32_t seq = events_.fenceStamp();
             ph[HARP_AUDIO_HDR_LEN + 0] = (uint8_t)seq;
             ph[HARP_AUDIO_HDR_LEN + 1] = (uint8_t)(seq >> 8);
             ph[HARP_AUDIO_HDR_LEN + 2] = (uint8_t)(seq >> 16);
@@ -553,12 +552,7 @@ void HarpRuntime::feeder() {
         /* 4. (audio draining lives on the reader thread; sync the count) */
         framesRecv_ = framesRecvAtomic_.load(std::memory_order_acquire);
 
-        uint64_t drops = evDrops_.load(std::memory_order_relaxed);
-        if (drops != evDropsLogged_) {
-            log_msg("WARNING: %llu events dropped (ring overflow)",
-                    (unsigned long long)(drops - evDropsLogged_));
-            evDropsLogged_ = drops;
-        }
+        events_.pollDropLog();
 
         if (!didWork) {
             harp_sleep_ns(1000000ull); /* 1 ms */
@@ -603,10 +597,10 @@ void HarpRuntime::eventPump() {
 
         /* escalated panic: a note-off was lost to overflow — all-notes-off
          * (CC 123) ahead of everything else */
-        if (panicPending_.exchange(false, std::memory_order_acq_rel)) {
+        if (events_.takePanic()) {
             harp_cbuf m;
             harp_cbuf_init(&m);
-            encodeUmpEvent(&m, ump_all_notes_off(), 0); /* CC 123, now */
+            EventManager::encodeUmpEvent(&m, ump_all_notes_off(), 0); /* CC 123, now */
             std::lock_guard<std::mutex> lk(ctlMutex_);
             harp_link_send(transport_->ctlIo(), HARP_STREAM_EVT, m.buf, m.len);
             harp_cbuf_free(&m);
@@ -622,7 +616,7 @@ void HarpRuntime::eventPump() {
          * attached-source merge is retired). The audio thread (queue*) is its sole
          * SPSC producer; the pump is the sole consumer, so no lock is needed. */
         harp_cbuf_reset(&batch);
-        int sent = drainSource(ownerSource_, batch, msgbuf, 64);
+        int sent = events_.drainOwner(batch, msgbuf, 64);
         if (sent) {
             std::lock_guard<std::mutex> lk(ctlMutex_);
             /* A P5b re-negotiation may run (under ctlMutex_, serialized against this

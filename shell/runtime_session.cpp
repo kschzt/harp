@@ -514,13 +514,9 @@ bool HarpRuntime::sessionUp() {
     /* new session = new stream = new SSI time domain (§7.1). Events still queued
      * from the previous session carry STALE timestamps — drain the owner source
      * (no pump is running yet, so consuming here is safe), and the fence sequence
-     * space restarts from zero on both sides. */
-    {
-        TimedEv stale;
-        while (ownerSource_.ring.pop(stale)) {}
-    }
-    evtQueuedSeq_.store(0, std::memory_order_release);
-    evtEpochBase_.store(0, std::memory_order_release); /* fresh fence epoch == 0 */
+     * space restarts from zero on both sides. Both are EventManager-owned now. */
+    events_.drainStaleOwnerRing();
+    events_.resetFence(); /* evtQueuedSeq_ = evtEpochBase_ = 0: fresh fence epoch */
     ssi_ = framesSent_ = framesRecv_ = 0;
     framesRecvAtomic_.store(0, std::memory_order_relaxed);
     ssiRead_.store(0, std::memory_order_relaxed);
@@ -763,7 +759,7 @@ void HarpRuntime::stop() {
      * them still queued is how notes get stuck. Bounded wait. */
     if (running_.load(std::memory_order_acquire) && connected()) {
         for (int i = 0; i < 100; i++) {
-            if (ownerSource_.ring.empty()) break;
+            if (events_.ownerRingEmpty()) break;
             harp_sleep_ns(1000000ull); /* 1 ms */
         }
     }

@@ -127,6 +127,138 @@ extern "C" {
 
 #include "transport.h" /* ShellTransport: the USB/Ethernet binding behind the runtime */
 
+/* EventManager — the §9 event plane as a REAL owned-state component (a genuine
+ * type that OWNS its state, not just a sibling TU of HarpRuntime:: methods over
+ * the shared god-object). It OWNS the SPSC event source ring, the §8.3.1 event
+ * fence sequence, the drop counter, the escalated-panic latch, and the §9.7
+ * transport-change detector — every piece of state the event encode/queue/drain
+ * logic mutates. HarpRuntime holds ONE instance (events_) and DELEGATES its
+ * public event API to it; the feeder / eventPump / re-negotiation / session
+ * touch this plane ONLY through the narrow interface below, never the raw
+ * atomics. Its member declarations were previously ~11 data members embedded in
+ * HarpRuntime; they now live here, behind this interface.
+ *
+ * SPSC OWNERSHIP CONTRACT (unchanged from pre-extraction — now encoded in ONE
+ * owner rather than scattered header comments):
+ *   - ownerSource_.ring: exactly ONE producer (the DAW audio / plugin thread via
+ *     queue*) and ONE consumer (the eventPump via drainOwner). No lock on the path.
+ *   - evtQueuedSeq_ is MONOTONIC — queue* only ever fetch_add's it. evtEpochBase_
+ *     is written only under HarpRuntime::ctlMutex_ (advanceEpoch on a re-neg,
+ *     resetFence at session start). Every READER of the fence (the feeder's pacing
+ *     stamp, the §14.3 loopback probe) goes through fenceStamp(), which now holds
+ *     the saturating (hw - base) that used to be duplicated inline at both sites.
+ *   - the tp* transport-change state is audio-thread-owned (feedTransport only).
+ *   - panicPending_ is produced by queueNote (audio) and consumed by the eventPump
+ *     via takePanic(); evDrops_ by queue* (audio), read by the feeder's pollDropLog
+ *     and by the diag bundle via evDrops().
+ * The §12.2/§11.4 read-only WRITE HOLD stays in HarpRuntime: it gates the public
+ * queue wrappers BEFORE they reach this plane, so EventManager carries no
+ * reconcile/session policy — the event bytes on the wire are byte-identical. */
+class EventManager {
+public:
+    /* MULTI-OUT M2 sentinel: resolve the target part from the source's own channel. */
+    static constexpr uint8_t kChanFromSource = 0xff;
+
+    /* the sole event source (its ring is the SPSC channel; chan is the §9.4 part). */
+    EventSource *ownerSource() { return &ownerSource_; }
+    void setChannel(uint8_t channel) {
+        ownerSource_.chan.store(channel & 0xf, std::memory_order_relaxed);
+    }
+    uint8_t channel() const { return ownerSource_.chan.load(std::memory_order_relaxed); }
+
+    /* ---- audio-thread producers (SPSC producer side; lock-free) ----
+     * Each pushes onto ownerSource_.ring and bumps the fence (evtQueuedSeq_), or
+     * counts a drop on overflow. queueNote escalates a lost note-OFF to panic.
+     * The read-only hold is applied by HarpRuntime's wrappers, NOT here. */
+    void queueParamSet(EventSource *src, uint32_t id, float v, uint64_t ts, uint8_t channel);
+    void queueRamp(EventSource *src, uint32_t id, float target, uint64_t start,
+                   uint64_t end, uint8_t channel);
+    void queueNote(EventSource *src, uint32_t umpWord, uint64_t ts);
+    void queueMod(EventSource *src, uint32_t id, float offset, uint32_t voice, uint64_t ts);
+    void queueTransport(EventSource *src, uint32_t flags, double tempo, double ppq, uint64_t ts);
+    /* §9.7 transport-change synthesizer. `rate` is the negotiated sample rate
+     * (HarpRuntime::rate_), passed in so this plane owns no session config. */
+    void feedTransport(bool playing, bool tempoValid, double tempo, bool posValid,
+                       double ppq, uint32_t blockSamples, uint64_t base, uint32_t rate);
+
+    /* ---- §8.3.1 fence (readers: feeder + loopback; writers: reneg + session) ----
+     * The value a pacing frame stamps: events queued SINCE this stream's
+     * audio.start = monotonic high-water minus the current epoch baseline,
+     * saturating at 0 (a fence is a §8.3.1 MINIMUM, so an under-count is safe).
+     * Consolidated here from the two duplicate inline copies (feeder + §14.3
+     * probe) — byte-identical value, single owner. */
+    uint32_t fenceStamp() const {
+        uint32_t hw = evtQueuedSeq_.load(std::memory_order_acquire);
+        uint32_t base = evtEpochBase_.load(std::memory_order_acquire);
+        return hw > base ? hw - base : 0;
+    }
+    /* re-negotiation (feeder thread, under ctlMutex_): the baseline catches up to
+     * the monotonic counter — the device reset g_evt_consumed, so the host's fence
+     * must restart at 0 without ever resetting the counter (that would race the
+     * lock-free queue* — the B2 fix). */
+    void advanceEpoch() {
+        evtEpochBase_.store(evtQueuedSeq_.load(std::memory_order_acquire),
+                            std::memory_order_release);
+    }
+    /* session start (supervisor thread, no pump running): the sequence space
+     * restarts from zero on both sides for the new SSI domain. */
+    void resetFence() {
+        evtQueuedSeq_.store(0, std::memory_order_release);
+        evtEpochBase_.store(0, std::memory_order_release);
+    }
+    /* session start: drain events left carrying the PREVIOUS stream's stale
+     * timestamps (safe: no pump runs yet, so this is the only ring toucher). */
+    void drainStaleOwnerRing() {
+        TimedEv stale;
+        while (ownerSource_.ring.pop(stale)) {}
+    }
+    /* stop(): have the DAW's final note-offs drained onto the wire yet? */
+    bool ownerRingEmpty() const { return ownerSource_.ring.empty(); }
+
+    /* ---- eventPump consumer side (SPSC consumer; sole caller) ----
+     * Drain up to `budget` events from the owner ring, framing each as an EVT
+     * message onto `batch` (msgbuf is per-event encode scratch). Returns count. */
+    int drainOwner(harp_cbuf &batch, harp_cbuf &msgbuf, int budget);
+    /* Take the escalated all-notes-off panic (a note-off was lost to overflow). */
+    bool takePanic() { return panicPending_.exchange(false, std::memory_order_acq_rel); }
+
+    /* ---- diagnostics ---- */
+    uint64_t evDrops() const { return evDrops_.load(std::memory_order_relaxed); }
+    /* feeder: log the events newly dropped to overflow since the last poll. */
+    void pollDropLog();
+
+    /* ---- pure CBOR encoders (no state) — shared by drainOwner + the panic path ---- */
+    static void encodeParamEvent(harp_cbuf *out, uint32_t id, float v, uint64_t ts,
+                                 uint8_t channel = 0);
+    static void encodeRampEvent(harp_cbuf *out, uint32_t id, float target,
+                                uint64_t start, uint64_t end, uint8_t channel = 0);
+    static void encodeUmpEvent(harp_cbuf *out, uint32_t word, uint64_t ts);
+    static void encodeModEvent(harp_cbuf *out, uint32_t id, float offset,
+                               uint64_t ts, uint32_t voice, uint8_t srcChan = 0);
+    static void encodeTransportEvent(harp_cbuf *out, uint32_t flags, double tempo,
+                                     double ppq, uint64_t ts);
+
+private:
+    /* The one event source. It IS the pre-P5 timedRing_ + chan_: a single instance
+     * (now the only kind) drains exactly this one ring with this one channel — the
+     * byte-identical golden path. queue* is its sole SPSC producer; the eventPump
+     * (drainOwner) is its sole consumer, so no lock is needed. */
+    EventSource ownerSource_{0};
+    /* §8.3.1 event fence. See fenceStamp/advanceEpoch/resetFence above for the
+     * monotonic-counter + epoch-baseline contract. */
+    std::atomic<uint32_t> evtQueuedSeq_{0};
+    std::atomic<uint32_t> evtEpochBase_{0};
+    std::atomic<uint64_t> evDrops_{0};    /* events lost to ring overflow — never silent */
+    uint64_t evDropsLogged_ = 0;          /* feeder-owned: last count pollDropLog reported */
+    std::atomic<bool> panicPending_{false}; /* a note-off was lost: all-off NOW */
+
+    /* §9.7 transport change detection (audio-thread-owned; feedTransport only) */
+    bool tpLastPlaying_ = false;
+    bool tpSent_ = false;
+    double tpLastTempo_ = 0, tpLastEndPpq_ = 0;
+    uint64_t tpSamplesSince_ = 0;
+};
+
 class HarpRuntime {
 public:
     /* Called from setupProcessing: the ring cushion must scale with the
@@ -304,18 +436,16 @@ public:
      * the key => byte-identical wire (golden gate). Set before start() (the
      * event pump reads it per event); a no-op mid-session is harmless since
      * the pump re-reads it per event. */
-    void setChannel(uint8_t channel) {
-        ownerSource_.chan.store(channel & 0xf, std::memory_order_relaxed);
-    }
-    uint8_t channel() const { return ownerSource_.chan.load(std::memory_order_relaxed); }
+    void setChannel(uint8_t channel) { events_.setChannel(channel); }
+    uint8_t channel() const { return events_.channel(); }
 
     /* ---- the event source ----
      * One private runtime per instance, so there is ONE event source: the
-     * runtime's built-in ownerSource_. queue* take it so the instance pushes to
-     * ITS ring (the SPSC producer side); the eventPump drains it onto the wire.
+     * EventManager's built-in ownerSource_. queue* take it so the instance pushes
+     * to ITS ring (the SPSC producer side); the eventPump drains it onto the wire.
      * (The attached-source merge — registerSource/unregisterSource across a
      * shared runtime — is retired with the sharing registry.) */
-    EventSource *ownerSource() { return &ownerSource_; }
+    EventSource *ownerSource() { return events_.ownerSource(); }
 
     /* ---- audio thread (all lock-free) ---- */
     /* Each takes the owner EventSource (its SPSC producer side) via ownerSource(). */
@@ -323,7 +453,7 @@ public:
      * default kChanFromSource (0xff) resolves to the source's own channel at queue time — so
      * every existing caller is byte-identical. A multi-out main passes an explicit channel (a
      * satellite's MIDI channel N -> part N) to drive any part from ONE instance, per event. */
-    static constexpr uint8_t kChanFromSource = 0xff;
+    static constexpr uint8_t kChanFromSource = EventManager::kChanFromSource;
     void queueParamSet(EventSource *src, uint32_t id, float v, uint64_t ts,
                        uint8_t channel = kChanFromSource);
     void queueRamp(EventSource *src, uint32_t id, float target, uint64_t start,
@@ -717,12 +847,8 @@ private:
                            events must never wait behind audio head-of-line.
                            P5: drains the SET of registered sources, stamping
                            each event with its source's channel. */
-    /* drain one source's ring into `batch` as framed EVT messages (up to
-     * `budget` events), returning how many were drained. SPSC consumer side
-     * of that source — only the pump calls it. Encodes params/ramps with the
-     * source's channel; notes carry their own channel in the UMP word;
-     * transport (owner source only) is global. */
-    int drainSource(EventSource &src, harp_cbuf &batch, harp_cbuf &msgbuf, int budget);
+    /* (drainSource moved into EventManager::drainOwner — the SPSC consumer side of
+     * the owner ring; the eventPump calls events_.drainOwner.) */
     void settlePadDebt(); /* drop late arrivals for already-padded SSIs */
     /* the per-sink analogue: drop late arrivals owed to a sink's padded SSIs. */
     void settleSinkPadDebt(AudioSink &sink);
@@ -781,20 +907,9 @@ private:
      * Caller holds ctlMutex_; only ever called from the feeder thread, which owns
      * readerThread_'s lifecycle (same thread as sessionUp/sessionDown). */
     void audioRenegotiateLocked();
-    /* encode one event message into `out` (no I/O) — the feeder batches
-     * many messages into a single framed bulk write per cycle */
-    /* channel = multitimbral part (§9.4, key 5); 0 omits the key so the
-     * single-part wire is byte-identical. The host sends 0 until per-shell
-     * channel routing lands (multitimbral group). */
-    static void encodeParamEvent(harp_cbuf *out, uint32_t id, float v, uint64_t ts,
-                                 uint8_t channel = 0);
-    static void encodeRampEvent(harp_cbuf *out, uint32_t id, float target,
-                                uint64_t start, uint64_t end, uint8_t channel = 0);
-    static void encodeUmpEvent(harp_cbuf *out, uint32_t word, uint64_t ts);
-    static void encodeModEvent(harp_cbuf *out, uint32_t id, float offset,
-                               uint64_t ts, uint32_t voice, uint8_t srcChan = 0);
-    static void encodeTransportEvent(harp_cbuf *out, uint32_t flags, double tempo,
-                                     double ppq, uint64_t ts);
+    /* (the §9 event encoders + the eventPump drain body moved into EventManager —
+     * events_ owns them now; the eventPump calls events_.drainOwner / the static
+     * EventManager::encode* for the panic path.) */
     void pollEcho(); /* drain incoming evt stream */
 
     /* control-plane ops under ctlMutex_ (protocol work lives in the shared
@@ -933,9 +1048,15 @@ private:
     std::atomic<bool> allowDiscovery_{true};
     std::atomic<uint64_t> underruns_{0};
     std::atomic<uint64_t> padSamples_{0}; /* total silence padded — severity, not count */
-    std::atomic<uint64_t> evDrops_{0};    /* events lost to ring overflow — never silent */
-    uint64_t evDropsLogged_ = 0;
-    std::atomic<bool> panicPending_{false}; /* a note-off was lost: all-off NOW */
+
+    /* §9 event plane — a REAL owned-state component (see EventManager above). Owns
+     * the SPSC event source ring, the §8.3.1 fence, the drop counter, the panic
+     * latch, and the §9.7 transport detector. The public event API (queue*,
+     * feedTransport, ownerSource, setChannel) delegates here — the read-only WRITE
+     * HOLD is applied by the delegating wrappers, before the plane. The feeder,
+     * eventPump, re-negotiation and session reach it via its narrow interface
+     * (fenceStamp, advanceEpoch, resetFence, drainOwner, takePanic, pollDropLog). */
+    EventManager events_;
 
     /* §14.4 host-context-B instrumentation rings. SessionHistory is CONTROL-PATH
      * (recorded at the §12.1 transition sites on the supervisor/feeder/reader
@@ -958,41 +1079,15 @@ private:
     static constexpr size_t kDiagHistoryMax = 64;
     static constexpr size_t kDiagLogMax = 64;
 
-    /* §9.7 transport change detection (audio-thread-owned) */
-    bool tpLastPlaying_ = false;
-    bool tpSent_ = false;
-    double tpLastTempo_ = 0, tpLastEndPpq_ = 0;
-    uint64_t tpSamplesSince_ = 0;
+    /* (§9.7 transport change detection — tp* — moved into EventManager, which owns
+     * feedTransport now.) */
 
-    /* event fence sequence (§8.3.1): count of events QUEUED this session
-     * (not yet written — queue time is what a racing pacing frame must
-     * respect). Audio thread increments (queue*); the feeder stamps it into
-     * fenced pacing frames; the device renders a range only after consuming
-     * that many evt messages. With one session-long source there is nothing to
-     * subtract (the retired per-source release used to remove a freed source's
-     * leftover queued-but-unwritten events); the count is the owner's queued
-     * events. Resets with the session, like the SSI domain.
-     *
-     * MONOTONIC across re-negotiations: queue* only ever fetch_add's it — a re-neg
-     * NEVER store(0)'s it (that would race the lock-free queue* on the audio/
-     * control threads — the old B2 race).
-     * The value a pacing frame FENCES with is (evtQueuedSeq_ - evtEpochBase_): the
-     * events queued SINCE the current epoch's audio.start. See evtEpochBase_. */
-    std::atomic<uint32_t> evtQueuedSeq_{0};
-    /* §8.3.1 fence EPOCH baseline: evtQueuedSeq_'s value at the current stream's
-     * audio.start. The device runs evq_reset_for_new_stream() (g_evt_consumed = 0)
-     * at every audio.start, so the host must fence with a count that ALSO restarts
-     * at 0 per stream — but without resetting the monotonic counter. The pacing
-     * frame stamps (evtQueuedSeq_.load() - evtEpochBase_). At the INITIAL audio.start
-     * evtQueuedSeq_ == 0 and evtEpochBase_ == 0, so the fenced value is identical to
-     * the pre-P5b wire (byte-identical golden). At a re-neg the feeder sets
-     * evtEpochBase_ = evtQueuedSeq_.load() (a single store under ctlMutex_, NO race
-     * with queue*); events queued before the re-neg fall below the baseline so they
-     * UNDER-count — per §8.3.1 the fence is a MINIMUM, so an under-count makes the
-     * device render a touch early (at worst evt_late at the boundary), NEVER the
-     * over-count that would wedge every later fenced frame. Written only under
-     * ctlMutex_ (initial sessionUp and the re-neg); read by the feeder's pacing. */
-    std::atomic<uint32_t> evtEpochBase_{0};
+    /* (the §8.3.1 event fence — evtQueuedSeq_ (monotonic queued-count) + evtEpochBase_
+     * (per-stream epoch baseline) — moved into EventManager, which owns them behind
+     * fenceStamp()/advanceEpoch()/resetFence(). The feeder + §14.3 loopback READ the
+     * stamp via events_.fenceStamp(); the re-neg advances the epoch via
+     * events_.advanceEpoch(); sessionUp restarts both via events_.resetFence(). The
+     * monotonic-counter + epoch-baseline contract is documented on those methods.) */
 
     FloatRing audioRing_{1 << 15}; /* 32768 floats = 16384 stereo frames */
     std::atomic<uint64_t> framesRecvAtomic_{0}; /* written by reader, read by feeder */
@@ -1077,13 +1172,8 @@ private:
      * P5b mid-attach limitation — see audioStart). */
     std::vector<uint32_t> unionSlots_;
 
-    /* The one event source. It IS the pre-P5 timedRing_ + chan_: a single instance
-     * (now the only kind) drains exactly this one ring with this one channel — the
-     * byte-identical golden path. The audio thread's queue* is its sole SPSC
-     * producer; the eventPump is its sole consumer, so no lock is needed. (The
-     * attached-source array + sourcesMutex_ merge is retired with the sharing
-     * registry.) */
-    EventSource ownerSource_{0};
+    /* (the one event source — ownerSource_ — moved into EventManager (events_), which
+     * owns the SPSC ring + its §9.4 channel; reach it via events_.ownerSource().) */
 
     ParamRing echoRing_;  /* device front-panel echoes -> outputParameterChanges */
     std::atomic<uint64_t> ssiRead_{0};
