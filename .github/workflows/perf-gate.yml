@@ -46,3 +46,48 @@ jobs:
         # -E preserves the environment; the script's RT-off arm sets HARP_USB_RT=0
         # for the bench child itself, so only the baseline arm drops to time-share.
         run: sudo -E bash scripts/rt-jitter-gate.sh ./build/harp-rt-jitter-bench
+
+  # Windows: exercises the MMCSS "Pro Audio" path (host/rt_sched.c's _WIN32 branch —
+  # AvSetMmThreadCharacteristicsW + AVRT_PRIORITY_CRITICAL). MMCSS is the UNPRIVILEGED
+  # real-time mechanism pro-audio apps use (WASAPI clients / DAWs), so — exactly like
+  # the macOS THREAD_TIME_CONSTRAINT job — the gate needs NO admin/sudo. Built with
+  # MinGW (the same MSYS2 toolchain eth.yml uses for its Windows device/host tools);
+  # avrt (libavrt.a) supplies the MMCSS entry points. If the hosted runner's MMCSS
+  # service is unavailable, rt_sched.c falls back to THREAD_PRIORITY_TIME_CRITICAL —
+  # still real-time relative to the time-share burners, so RT is granted either way
+  # and the scale-free RT-on-vs-off ratio gate (#136) keeps its teeth. HARP_USB_RT=0
+  # (the RT-off arm, set inside the script) must still blow past the gate.
+  rt-gate-windows:
+    runs-on: windows-2022   # pinned like eth.yml: proven-good with this setup-msys2 + MinGW
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
+      - name: build the hardware-free RT jitter bench (MinGW; links avrt)
+        shell: msys2 {0}
+        run: |
+          cmake -B build-rt -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build-rt --target harp-rt-jitter-bench
+      - name: gate the feed thread (MMCSS "Pro Audio" vs time-share under load)
+        # MMCSS/TIME_CRITICAL are unprivileged — no sudo (as macOS). The gate's RT-off
+        # arm sets HARP_USB_RT=0 for the bench child, so only the baseline drops to
+        # ordinary time-share; the ratio between the two arms is the runner-independent
+        # invariant that proves RT is actually pinning the thread.
+        #
+        # Windows contention is modelled ONE notch higher than POSIX (the bench runs its
+        # burners at THREAD_PRIORITY_HIGHEST — see tools/rt-jitter-bench.c): a woken
+        # NORMAL-priority thread gets a wait-completion boost, so plain NORMAL load cannot
+        # deschedule it and the two arms are indistinguishable at the 1 ms timer floor.
+        # HIGHEST burners model the real competing audio/system threads a DAW runs — the
+        # load MMCSS "Pro Audio" is built to beat and a time-share thread cannot. BURNERS
+        # is bumped for a deeper HIGHEST-priority ready queue (a bigger RT-off tail) while
+        # the RT-promoted thread (15+) still preempts and holds the floor.
+        shell: msys2 {0}
+        env:
+          BURNERS: 16
+        run: bash scripts/rt-jitter-gate.sh ./build-rt/harp-rt-jitter-bench.exe

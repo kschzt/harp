@@ -2,7 +2,7 @@
  *
  * One portable entry point, harp_thread_set_realtime(), that lifts the CALLING
  * thread onto the host's hard real-time class (macOS THREAD_TIME_CONSTRAINT,
- * Linux SCHED_FIFO) so it is never descheduled by ordinary time-share work under
+ * Linux SCHED_FIFO, Windows MMCSS "Pro Audio") so it is never descheduled by ordinary time-share work under
  * host CPU load. This is the scheduling half of the §4.3 USB low-latency feed —
  * factored OUT of host/usb_io.c (which is compiled only when libusb is present)
  * so that:

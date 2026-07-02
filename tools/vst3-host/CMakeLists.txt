@@ -60,6 +60,11 @@ endif()
 target_link_libraries(harp-vst3-host PRIVATE sdk_hosting sdk_common base pluginterfaces)
 if(APPLE)
   target_link_libraries(harp-vst3-host PRIVATE "-framework CoreFoundation" "-framework Foundation")
+elseif(WIN32)
+  # host/rt_sched.c (compiled in above) promotes the render/pacing loop to real-time
+  # via MMCSS "Pro Audio" — link avrt (avrt.lib / -lavrt). This host doesn't pull in
+  # HARP_PLAT_LIBS, so it needs avrt explicitly. POSIX builds never reach this.
+  target_link_libraries(harp-vst3-host PRIVATE avrt)
 endif()
 target_include_directories(harp-vst3-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vst3sdk ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../host)
 
@@ -173,7 +178,10 @@ if(LIBUSB_FOUND)
     # ws2_32: the host stack (host/sock_io.c) is Winsock; harp-shell/clap get it
     # transitively via the VST3 `sdk` target, but a host-stack exe that doesn't link
     # `sdk` (registry-tests) needs it here — it's a plat lib the host stack requires.
-    set(HARP_PLAT_LIBS winmm ws2_32)
+    # avrt: host/rt_sched.c promotes the shell's feed/pump/reader threads to real-time
+    # via MMCSS "Pro Audio" (AvSetMmThreadCharacteristicsW) — every shell target that
+    # compiles HARP_CORE_SRC (which carries rt_sched.c) links this one plat lib.
+    set(HARP_PLAT_LIBS winmm ws2_32 avrt)
   else()
     set(HARP_PLAT_SRC ${HARP_ROOT}/core/src/plat_posix.c)
     set(HARP_PLAT_LIBS "")

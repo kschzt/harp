@@ -56,6 +56,25 @@ static int cpu_count(void) {
 static harp_flag g_burn_run;
 static HARP_THREAD_RET burn_main(void *arg) {
     (void)arg;
+#ifdef _WIN32
+    /* Windows models the contention ONE notch higher than POSIX — deliberately, and
+     * honestly. A periodically-waking NORMAL-priority thread gets a wait-completion
+     * priority BOOST (~+2), so it can still preempt equal-priority (NORMAL) burners:
+     * plain time-share load does NOT deschedule it, and RT-on vs RT-off wakeup tails
+     * come out identical, both pinned at the 1 ms timer-resolution floor (measured on
+     * the hosted runner: 1025µs vs 1023µs). That is not RT having no value on Windows
+     * — it is that the threat a pure-wakeup audio thread actually faces here is the
+     * OTHER elevated audio/system threads a DAW runs, which the boost can NOT beat.
+     * MMCSS "Pro Audio" (and the TIME_CRITICAL fallback) exist precisely to win that
+     * race. So the faithful Windows contention is THREAD_PRIORITY_HIGHEST burners (10
+     * within the NORMAL class): a boosted time-share feed thread ties/loses to them
+     * and its wakeup tail blows out, while the RT-promoted thread (MMCSS real-time /
+     * TIME_CRITICAL = 15) still preempts them and stays at the timer floor — which is
+     * exactly the RT-on-vs-off separation the ratio gate needs. POSIX is untouched:
+     * there, default-priority burners already deschedule a time-share thread (and
+     * SCHED_FIFO / THREAD_TIME_CONSTRAINT is what escapes them). */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
     volatile double x = 0.0;
     while (harp_flag_load_acq(&g_burn_run)) {
         for (int i = 0; i < 200000; i++) x += (double)i * 0.5 + 1.0;
