@@ -1,7 +1,11 @@
 # HARP — Hardware Audio Runtime Protocol
 
 [![ci](https://github.com/kschzt/harp/actions/workflows/ci.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/ci.yml)
+<!-- hw badge hidden while the self-hosted rig is offline: hw.yml is gated off (repo var HARP_RIG_ONLINE)
+     so the badge would read "no runs" / failing. Restore this line once PI4B-0002 is back online.
 [![hw — real device](https://github.com/kschzt/harp/actions/workflows/hw.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/hw.yml)
+-->
+
 [![eth — IP transport](https://github.com/kschzt/harp/actions/workflows/eth.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/eth.yml)
 [![license: Apache-2.0 | CC-BY-4.0](https://img.shields.io/badge/license-Apache--2.0%20%7C%20CC--BY--4.0-blue)](LICENSING.md)
 
@@ -160,8 +164,8 @@ archive-before-push, hash-verified restore.
 **See it yourself:** that walkthrough reproduces the total-recall claim on
 your laptop, no hardware. The bolder claims — byte-identical renders and
 ±1-sample timing — need a device: `harp-probe -d usb t15 4` renders twice and
-byte-compares (Path 2 below), and those same checks run on a real Pi in CI on
-every push (the green **hw** badge above).
+byte-compares (Path 2 below), and those same checks run on a real Pi in CI
+(`hw.yml`, on every push whenever the self-hosted rig is online).
 
 For the visual version, start the web panel (the device's "front panel"
 plus a live protocol inspector — refs, generations, the dirty flag in
