@@ -57,6 +57,14 @@ case "$(uname -s)" in
   *)                    OSID=linux;   EXE= ;;
 esac
 
+# Capture each executed cloud test's output so the §17 QUANTITATIVE GATES phase (below) can
+# extract the measured numbers (loopback delta-ms, cross-format hashes, converter SINAD / HF
+# margin) and assert them against the spec thresholds — with NO re-run of the heavy renders.
+# Output is buffered to a per-test file then echoed inside the ::group:: (the console output and
+# the exit codes are identical to a direct run — no pipe, so timeout rc=124 is preserved).
+CAPDIR="$(mktemp -d "${TMPDIR:-/tmp}/cert-cap.XXXXXX")"
+trap 'rm -rf "$CAPDIR"' EXIT
+
 find1() { find "$1" -name "$2" -type f 2>/dev/null | head -1; }
 
 # ---- locate binaries (env override wins; same layout logic as eth-suite.sh) ----
@@ -205,12 +213,17 @@ for n in $TORDER; do
         echo "   ▶ RUN   ${note}"
         echo "     \$ $rcmd"
         echo "::group::cert-harness $t: ${cmd##*/}"
-        if run_bounded "$CERT_TIMEOUT" bash -c "$rcmd"; then
+        # buffer to a per-test capture (keyed by the covering script's basename) so the §17 gate
+        # phase can parse the measured numbers; a direct redirect (not a pipe) preserves rc/124.
+        caplog="$CAPDIR/$(basename "${rcmd%%[ ]*}").log"
+        if run_bounded "$CERT_TIMEOUT" bash -c "$rcmd" >"$caplog" 2>&1; then
+          cat "$caplog"
           echo "::endgroup::"
           echo "   ✓ PASS  ${cmd##*/}"
           ran_pass=1
         else
           rc=$?
+          cat "$caplog"
           echo "::endgroup::"
           if [ "$rc" = 124 ]; then
             echo "   ✗ FAIL  ${cmd##*/} — TIMED OUT after ${CERT_TIMEOUT}s (a hang is a §17 fail)"
@@ -276,9 +289,137 @@ echo "                 it runs per-PR in the eth.yml 3-OS matrix"
 echo "   UNCOVERED     honest gap — no test covers this yet (follow-up)"
 echo "════════════════════════════════════════════════════════════════════════════"
 
-if [ $c_fail -gt 0 ]; then
-  echo " RESULT: FAIL — $c_fail T('s) had a failing cloud test."
+# ════════════════════════════════════════════════════════════════════════════
+#  §17 QUANTITATIVE THRESHOLD GATES (cloud-reachable subset)
+# ════════════════════════════════════════════════════════════════════════════
+# The T-battery above runs each covering test and aggregates pass/fail. This phase goes one level
+# deeper: it EXTRACTS the measured number from the run captured above and ASSERTS it against the
+# spec's §17 quantitative gate — so a numeric regression FAILS here with the actual value shown,
+# not buried in a sub-test's exit code. It reuses the already-captured output (no re-run); the two
+# tiny converter unit binaries are run directly because `ctest --output-on-failure` hides their
+# numbers on success. Cloud-UNREACHABLE gates (absolute ≥120 dB converter-alone stopband, ±200 ppm
+# long drift, ≥4 devices) SKIP with a logged reason — rig/bench measurements (hw.yml/soak.yml/bench).
+echo ""
+echo "════════════════════════════════════════════════════════════════════════════"
+echo " §17 QUANTITATIVE THRESHOLD GATES — cloud-reachable numbers, asserted (host: $OSID)"
+echo "════════════════════════════════════════════════════════════════════════════"
+GATE_FAILS=0
+gate_pass() { echo "   ✓ GATE       $1"; }
+gate_fail() { echo "::error::§17 gate: $1"; echo "   ✗ GATE FAIL  $1"; GATE_FAILS=$((GATE_FAILS+1)); }
+gate_skip() { echo "   ⏭ GATE SKIP  $1"; }
+# LC_ALL=C so the decimal point is '.' regardless of the runner locale (a comma-decimal locale
+# would otherwise truncate "26.3" at the period and misformat the printed number).
+fle() { LC_ALL=C awk -v a="$1" -v b="$2" 'BEGIN{exit !(a<=b)}'; }   # a <= b ?
+fge() { LC_ALL=C awk -v a="$1" -v b="$2" 'BEGIN{exit !(a>=b)}'; }   # a >= b ?
+
+# ── G1 §14.3/T11: loopback RTT accuracy — |measured − expected| ≤ 1 ms (Linux-strict) ──
+llog="$CAPDIR/loopback-eth-test.sh.log"
+if [ -f "$llog" ] && grep -q 'loopback: in=' "$llog"; then
+  # the script echoes the machine line indented ("   loopback: in=..."); match unanchored
+  lline=$(grep -E 'loopback: in=[0-9]+ out=' "$llog" | tail -1)
+  ldelta=$(printf '%s' "$lline" | sed -nE 's/.*delta-ms=([-0-9.]+).*/\1/p')
+  larmed=$(printf '%s' "$lline" | sed -nE 's/.*armed=([0-9]+).*/\1/p')
+  lecho=$(printf  '%s' "$lline" | sed -nE 's/.*echo=([0-9]+).*/\1/p')
+  lrtt=$(printf   '%s' "$lline" | sed -nE 's/.*rtt-samples=([-0-9.]+).*/\1/p')
+  lexp=$(printf   '%s' "$lline" | sed -nE 's/.*expected-samples=([-0-9.]+).*/\1/p')
+  labs=$(LC_ALL=C awk -v d="${ldelta:-999}" 'BEGIN{if(d<0)d=-d; print d}')
+  if [ "$larmed" = 1 ] && [ "$lecho" = 1 ]; then
+    if [ "$OSID" = linux ]; then
+      if [ -n "$ldelta" ] && fle "$labs" 1.0; then
+        gate_pass "§14.3/T11 loopback RTT accuracy: |measured−expected|=${labs} ms ≤ 1.000 ms (rtt=$lrtt exp=$lexp samples)"
+      else
+        gate_fail "§14.3/T11 loopback RTT off by ${labs} ms > 1.000 ms (rtt=$lrtt exp=$lexp)"
+      fi
+    else
+      gate_skip "§14.3/T11 loopback ±1 ms: strict gate is Linux-only (runner jitter); wiring OK on $OSID (delta=${ldelta} ms, rtt=$lrtt exp=$lexp)"
+    fi
+  else
+    gate_fail "§14.3/T11 loopback not wired end-to-end (armed=$larmed echo=$lecho)"
+  fi
+else
+  gate_skip "§14.3/T11 loopback ±1 ms — loopback-eth-test.sh not run here (host/shell not built; runs per-PR in eth.yml)"
+fi
+
+# ── G2 §6.4/T11: reported PDC latency exact + cross-format (VST3/CLAP/AU) agreement ──
+rlog="$CAPDIR/reported-latency-test.sh.log"
+if [ -f "$rlog" ] && grep -q 'reported-samples=' "$rlog"; then
+  mism=$(grep -E 'reported-samples=[0-9]+, want [0-9]+' "$rlog" | head -1)
+  fr=$(grep -E 'vst3-freerun: reported-samples=[0-9]+' "$rlog" | sed -nE 's/.*reported-samples=([0-9]+).*/\1/p' | tail -1)
+  hp=$(grep -E '✓ vst3: reported-samples=[0-9]+'       "$rlog" | sed -nE 's/.*reported-samples=([0-9]+).*/\1/p' | tail -1)
+  if grep -q 'REPORTED-LATENCY PASS' "$rlog" && [ -z "$mism" ]; then
+    gate_pass "§6.4/T11 reported PDC exact + cross-format agree to the sample (free-running=${fr:-?}, host-paced=${hp:-?} samples)"
+  else
+    gate_fail "§6.4/T11 reported PDC mismatch: ${mism:-no REPORTED-LATENCY PASS line}"
+  fi
+else
+  gate_skip "§6.4/T11 reported PDC — reported-latency-test.sh not run here (host/clap not built; runs per-PR in eth.yml)"
+fi
+
+# ── G3 §8.3/T15: offline bounce byte-identical across formats (VST3 == CLAP, ±0 samples) ──
+olog="$CAPDIR/offline-golden-eth.sh.log"
+if [ -f "$olog" ] && grep -q 'cross-format: VST3=' "$olog"; then
+  xline=$(grep -E 'cross-format: VST3=' "$olog" | tail -1)
+  xv=$(printf '%s' "$xline" | sed -nE 's/.*VST3=([0-9a-f]+).*/\1/p')
+  xc=$(printf '%s' "$xline" | sed -nE 's/.*CLAP=([0-9a-f]+).*/\1/p')
+  if [ -n "$xv" ] && [ "$xv" = "$xc" ]; then
+    gate_pass "§8.3/T15 offline bounce byte-identical across formats: VST3==CLAP hash=$xv (±0 samples)"
+  else
+    gate_fail "§8.3/T15 cross-format divergence: VST3=$xv != CLAP=$xc"
+  fi
+else
+  gate_skip "§8.3/T15 cross-format byte-identical — offline-golden-eth.sh not run here (host/clap not built; runs per-PR in eth.yml). AU==VST3 to the sample is gated on macOS (eth.yml + the reported-latency AU check)"
+fi
+
+# ── G4 §8.3/T14: shipped-converter fidelity — e2e SINAD floor + HF top-band margin ──
+RTP_BIN="$(find1 "${UNIT_DIR:-.}" "harp-rtp-tests$EXE")"
+RTPHF_BIN="$(find1 "${UNIT_DIR:-.}" "harp-rtp-hf-tests$EXE")"
+if have "$RTP_BIN"; then
+  slog="$CAPDIR/gate-rtp.log"
+  if run_bounded 90 "$RTP_BIN" >"$slog" 2>&1; then
+    sinad=$(grep 'rtp e2e:' "$slog" | sed -nE 's/.*SINAD ([0-9.]+) dB.*/\1/p' | tail -1)
+    if [ -n "$sinad" ] && fge "$sinad" 85; then
+      gate_pass "§8.3/T14 shipped-converter e2e SINAD=${sinad} dB ≥ 85 dB (the BEST converter passes; a MEDIUM/FASTEST downgrade fails)"
+    else
+      gate_fail "§8.3/T14 shipped-converter e2e SINAD=${sinad:-none} dB < 85 dB — converter path degraded"
+    fi
+  else
+    gate_fail "§8.3/T14 rtp converter e2e test did not pass (see the T14 log)"
+  fi
+else
+  gate_skip "§8.3/T14 converter e2e SINAD — harp-rtp-tests not built (no libsamplerate in this lane; runs per-OS in ci.yml core + macOS)"
+fi
+if have "$RTPHF_BIN"; then
+  hlog="$CAPDIR/gate-rtphf.log"
+  if run_bounded 120 "$RTPHF_BIN" >"$hlog" 2>&1; then
+    worst=$(LC_ALL=C awk '/<-top-band/{m=$5+0; if(seen==0||m<worst){worst=m; seen=1}} END{if(seen)printf "%.1f", worst}' "$hlog")
+    if [ -n "$worst" ] && fge "$worst" 15; then
+      gate_pass "§8.3/T14 HF top-band converter margin (18–23 kHz sweep): worst=${worst} dB ≥ 15 dB vs SRC_SINC_FASTEST (the cloud-reachable proxy for the ≥120 dB stopband)"
+    else
+      gate_fail "§8.3/T14 HF top-band margin worst=${worst:-none} dB < 15 dB — shipped converter not BEST-class near Nyquist"
+    fi
+  else
+    gate_fail "§8.3/T14 rtp-hf converter-band test did not pass (see the T14 log)"
+  fi
+else
+  gate_skip "§8.3/T14 HF converter band — harp-rtp-hf-tests not built (no libsamplerate in this lane; runs per-OS in ci.yml core + macOS)"
+fi
+
+# ── cloud-UNREACHABLE numeric gates: SKIP with reason (rig/bench, not faked) ──
+gate_skip "§8.3 absolute worst-case SINAD ≥ 120 dB (converter-alone 18–23 kHz sweep) — the e2e recovery loop ceilings the sine-fit ~87 dB, so ≥120 dB is a BENCH/converter-alone measurement; the HF rms-band margin above is the cloud proxy"
+gate_skip "§7.3/T14 ±200 ppm free-running drift torture (long sweep) — rig/nightly (soak.yml eth-flake + real converters on hw.yml)"
+gate_skip "§13/T13 ≥ 4 devices concurrent, ≥ 64 aggregate channels, 24 h — rig (scripts/multidevice-test.sh + the bench fleet soak)"
+
+echo "────────────────────────────────────────────────────────────────────────────"
+if [ "$GATE_FAILS" -gt 0 ]; then
+  echo " §17 GATES: $GATE_FAILS cloud-reachable numeric gate(s) REGRESSED — see the ✗ lines above."
+else
+  echo " §17 GATES: all cloud-reachable numeric thresholds within spec (rig/bench gates skipped-with-reason)."
+fi
+echo "════════════════════════════════════════════════════════════════════════════"
+
+if [ $c_fail -gt 0 ] || [ "${GATE_FAILS:-0}" -gt 0 ]; then
+  echo " RESULT: FAIL — $c_fail T('s) had a failing cloud test; ${GATE_FAILS:-0} §17 numeric gate(s) regressed."
   exit 1
 fi
-echo " RESULT: OK — no cloud FAILs. (SKIP/UNCOVERED are informational, not failures.)"
+echo " RESULT: OK — no cloud FAILs and all cloud-reachable §17 numeric gates within spec. (SKIP/UNCOVERED are informational.)"
 exit 0

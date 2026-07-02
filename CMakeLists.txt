@@ -42,6 +42,22 @@ if(HARP_FUZZ)
   add_link_options(-fsanitize=address)
 endif()
 
+# Coverage instrumentation (gcov/lcov): cmake -B build-cov -DHARP_COVERAGE=ON.
+# Adds the gcc/clang --coverage pair (-fprofile-arcs -ftest-coverage) tree-wide, plus -O0 -g
+# so the emitted .gcno/.gcda map 1:1 onto source lines (no inlining/reordering to confuse the
+# counters). ci.yml's `coverage` job builds with this switch, runs the cloud unit suite + the
+# clean-exit device-daemon drive, then reports the line-coverage % (the gcovr regression gate
+# AND an lcov summary + an uploaded lcov/genhtml artifact — the "no quantified metric" gap).
+# LINE coverage is the metric; branch counting differs gcc-vs-clang so it is reported, not gated.
+option(HARP_COVERAGE "Instrument for gcov/lcov line coverage" OFF)
+if(HARP_COVERAGE)
+  if(MSVC)
+    message(FATAL_ERROR "HARP_COVERAGE needs a gcov-capable toolchain (gcc/clang), not MSVC")
+  endif()
+  add_compile_options(--coverage -O0 -g)
+  add_link_options(--coverage)
+endif()
+
 add_library(harpcore STATIC
   core/src/cbor.c
   core/src/anonymize.c   # §16 device-section anonymizer — single source of truth (shell + probe)
