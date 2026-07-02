@@ -481,6 +481,8 @@ static void handle_hello(device *d, const harp_env *e) {
     d->granted = 0;
     d->sendq_head = d->sendq_tail = d->sendq_count = 0; /* §4.2.1: drop any backlog from a dead session */
     memset(d->txn, 0, sizeof d->txn); /* §9.6: abandon any open transactions on hello/reset */
+    d->rl_snapshot = (harp_op_bucket){0}; /* §16: hello resets the expensive-op rate-limit -> fresh burst */
+    d->rl_bundle = (harp_op_bucket){0};
 
     harp_cbuf m;
     harp_cbuf_init(&m);
@@ -551,7 +553,26 @@ static void handle_state_refs(device *d, const harp_env *e) {
     harp_cbuf_free(&m);
 }
 
+/* §16 DoS: shed an expensive-op flood on ONE session. state.snapshot serializes the whole live
+ * closure and diag.bundle assembles identity + counters + the log ring — each is O(state), so a
+ * peer spamming them pins the single recv thread and starves every other control request. A
+ * per-connection token bucket (op_ratelimit.h) lets a normal cadence through untouched but
+ * throttles a flood to a sustained trickle, failing CLOSED-BUT-POLITE with §5.3 `busy` (the
+ * session is NEVER dropped — cf. conn_ratelimit.h, which sheds only UNauthenticated half-opens).
+ * rate_limited (§14.2 vendor counter) makes it observable. Returns true = SHED (the caller must
+ * return without doing the work). Deployment-tunable thresholds (§16); these defaults pass every
+ * real host cadence and still shed a flood ~99%. */
+#define RL_COST_NS  100000000ull /* 100 ms per op: sustained 10 expensive ops/s per session */
+#define RL_BURST_NS 500000000ull /* 500 ms of credit: absorb a 5-op burst before throttling */
+static bool expensive_op_shed(device *d, const harp_env *e, harp_op_bucket *b) {
+    if (harp_op_admit(b, harp_now_ns(), RL_COST_NS, RL_BURST_NS)) return false;
+    CTR_INC(d->rate_limited);
+    send_error(d, e->rid, e->method, "busy", "rate-limited (§16); retry shortly");
+    return true;
+}
+
 static void handle_state_snapshot(device *d, const harp_env *e) {
+    if (expensive_op_shed(d, e, &d->rl_snapshot)) return; /* §16: shed a snapshot flood */
     char refname[HARP_REF_NAME_MAX] = "";
     char msg[256] = "";
     if (e->has_body) {
@@ -964,11 +985,16 @@ static void emit_counters(device *d, harp_cbuf *m) {
         freeb = (uint64_t)vs.f_bavail * vs.f_frsize;
     }
 #endif
-    harp_cbor_map(m, 16);
+    harp_cbor_map(m, 17);
     harp_cbor_text(m, "x.harp-refdev.fence_waits");
     harp_cbor_uint(m, CTR_GET(g_fence_waits));
     harp_cbor_text(m, "x.harp-refdev.fence_timeouts");
     harp_cbor_uint(m, CTR_GET(g_fence_timeouts));
+    /* §16: expensive control ops (state.snapshot/diag.bundle) shed under a per-connection flood.
+     * Vendor counter (x. prefix, §14.2) — 0 by construction on any normal-cadence session; a
+     * nonzero value is a live flood-DoS shed, the T9 rate-limits-expensive-ops observability. */
+    harp_cbor_text(m, "x.harp-refdev.rate_limited");
+    harp_cbor_uint(m, CTR_GET(d->rate_limited));
     harp_cbor_text(m, "usb_errors");
 #ifdef __linux__
     harp_cbor_uint(m, CTR_GET(g_usb_errors)); /* §14.2: abnormal FunctionFS transport errors */
@@ -1036,6 +1062,7 @@ static void handle_diag_counters(device *d, const harp_env *e) {
  * 3 (msg) — a device log line may carry serial/host/path free-text (§16). See
  * docs/diag-bundle-design.md. */
 static void handle_diag_bundle(device *d, const harp_env *e) {
+    if (expensive_op_shed(d, e, &d->rl_bundle)) return; /* §16: shed a bundle flood */
     harp_cbuf m;
     harp_cbuf_init(&m);
     rsp_head(&m, e->rid, e->method, true);
@@ -2241,6 +2268,8 @@ void harp_deviced_run_session(device *d, harp_io *io) {
     d->granted = 0;
     d->sendq_head = d->sendq_tail = d->sendq_count = 0;
     memset(d->txn, 0, sizeof d->txn); /* §9.6: a fresh session starts with no open transactions */
+    d->rl_snapshot = (harp_op_bucket){0}; /* §16: a fresh session starts with a full expensive-op burst */
+    d->rl_bundle = (harp_op_bucket){0};
     harp_link_init(&d->link);
     harp_cbuf msg;
     harp_cbuf_init(&msg);

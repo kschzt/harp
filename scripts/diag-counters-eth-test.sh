@@ -1,20 +1,21 @@
 #!/bin/bash
-# diag-counters-eth-test — ALL-16 §14.2 diagnostic counters, over the §8.7 loopback.
+# diag-counters-eth-test — ALL-17 §14.2 diagnostic counters, over the §8.7 loopback.
 #
-# COVERAGE GAP this closes: the §14.2 counter map is a frozen conformance golden
-# (device/session.c emit_counters — a 16-pair, text-keyed map shared byte-identically
+# COVERAGE GAP this closes: the §14.2 counter map is a conformance golden
+# (device/session.c emit_counters — a text-keyed map shared byte-identically
 # by diag.counters AND the diag.bundle device-section). But nothing GATED the whole
 # map: diag-bundle-eth greps just ONE key ('usb_errors'), and the rest of the suite
 # only asserts the HEADLINE three via targeted tests (evt_late via evt-storm,
 # audio_underruns/overruns via the rt paths, fence_timeouts via realtime-fence). A
-# rename / drop / added / retyped counter in the other thirteen would slip through.
+# rename / drop / added / retyped counter in the others would slip through.
 #
 # This reads diag.counters over the loopback (`harp-probe counters`) and gates EVERY
-# counter: (a) the exact 16-key NAME SET is present AND the map size is exactly 16
-# (no missing, no extras, no renames); (b) each value's TYPE (uint vs the one signed
-# int, clock_drift_ppb); (c) VALUE BOUNDS on a clean idle session — the 12 never-silent
-# safety counters are 0, the storage gauges are a sane positive total with 0<free<=total.
-# A regression in emit_counters() fails here loud.
+# counter: (a) the exact 17-key NAME SET is present AND the map size is exactly 17
+# (no missing, no extras, no renames — the 16 §14.2 mandatory/vendor counters plus the
+# §16 x.harp-refdev.rate_limited flood-DoS shed counter); (b) each value's TYPE (uint vs
+# the one signed int, clock_drift_ppb); (c) VALUE BOUNDS on a clean idle session — the 13
+# never-silent safety counters are 0, the storage gauges are a sane positive total with
+# 0<free<=total. A regression in emit_counters() fails here loud.
 #
 # Co-existence: unique port + kills ONLY its own device by pid; hard perl-alarm watchdog;
 # workspace-RELATIVE state dir (Git Bash /tmp->C:\ trips the device mkdir; see eth-tests.sh).
@@ -52,29 +53,30 @@ val() { grep -E "^[[:space:]]*$1 = " "$OUT" | tail -1 | sed -E 's/^.*= //'; }
 is_uint() { case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
 is_int()  { case "$1" in ''|-) return 1;; -*) is_uint "${1#-}";; *) is_uint "$1";; esac; }
 
-# The exact §14.2 16-counter set (device/session.c emit_counters). ALL must be present.
-ALL16="x.harp-refdev.fence_waits x.harp-refdev.fence_timeouts usb_errors frame_errors \
-audio_underruns audio_overruns audio_late_frames msc_discontinuities clock_drift_ppb \
+# The exact §14.2 17-counter set (device/session.c emit_counters): the 16 mandatory/vendor
+# counters plus the §16 x.harp-refdev.rate_limited expensive-op flood-DoS shed. ALL must be present.
+ALL17="x.harp-refdev.fence_waits x.harp-refdev.fence_timeouts x.harp-refdev.rate_limited usb_errors \
+frame_errors audio_underruns audio_overruns audio_late_frames msc_discontinuities clock_drift_ppb \
 evt_late evt_stale_epoch x.harp-refdev.evq_drops x.harp-refdev.ramp_late session_resets \
 storage_bytes_total storage_bytes_free"
 
-for c in $ALL16; do
+for c in $ALL17; do
     [ -n "$(val "$c")" ] || { cat "$OUT"; fail "counter '$c' ABSENT from diag.counters (§14.2 map incomplete)"; }
 done
-# exactly 16 — no missing, no extras/renames (the map is a frozen conformance golden).
+# exactly 17 — no missing, no extras/renames (the map is a conformance golden).
 lines="$(grep -cE '^[[:space:]]*[A-Za-z0-9._-]+ = ' "$OUT")"
-[ "$lines" = 16 ] || { cat "$OUT"; fail "diag.counters emitted $lines counter lines, expected exactly 16 (§14.2 map drift)"; }
-echo "   all 16 §14.2 counter keys present; map size exactly 16 ✓"
+[ "$lines" = 17 ] || { cat "$OUT"; fail "diag.counters emitted $lines counter lines, expected exactly 17 (§14.2 map drift)"; }
+echo "   all 17 §14.2 counter keys present; map size exactly 17 ✓"
 
 # ── value gates on a CLEAN idle session ─────────────────────────────────────
-# 12 safety counters MUST be 0 (never-silent invariants: any nonzero is a live fault).
-for z in x.harp-refdev.fence_timeouts usb_errors frame_errors audio_underruns \
-         audio_overruns audio_late_frames msc_discontinuities evt_late evt_stale_epoch \
+# 13 safety counters MUST be 0 (never-silent invariants: any nonzero is a live fault).
+for z in x.harp-refdev.fence_timeouts x.harp-refdev.rate_limited usb_errors frame_errors \
+         audio_underruns audio_overruns audio_late_frames msc_discontinuities evt_late evt_stale_epoch \
          x.harp-refdev.evq_drops x.harp-refdev.ramp_late session_resets; do
     v="$(val "$z")"; is_uint "$v" || fail "counter '$z' not a uint: '$v'"
     [ "$v" = 0 ] || fail "safety counter '$z' = $v on a clean idle session (expected 0 — §14.2 never-silent)"
 done
-echo "   12 safety counters all 0 on a clean session ✓"
+echo "   13 safety counters all 0 on a clean session ✓"
 
 # fence_waits: unsigned, >= 0 (idle may legitimately be 0).
 fw="$(val x.harp-refdev.fence_waits)"; is_uint "$fw" || fail "fence_waits not a uint: '$fw'"
@@ -95,4 +97,4 @@ case "${DEVICED:-}" in
 esac
 
 kill -9 "$DP" 2>/dev/null; wait "$DP" 2>/dev/null; DP=""
-echo "DIAG-COUNTERS PASS (all 16 §14.2 counters present + exact map size 16; 12 safety counters 0; every value typed + bounded)"
+echo "DIAG-COUNTERS PASS (all 17 §14.2 counters present + exact map size 17; 13 safety counters 0; every value typed + bounded)"

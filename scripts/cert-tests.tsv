@@ -60,6 +60,7 @@ T8	rig	-	-	24h soak is not per-PR. Cloud approximation: soak.yml eth-flake repea
 T9	meta	cloud	-	protocol fuzzing on all inbound streams: no crash, hang, or memory fault
 T9	run	probe	scripts/abuse-test.sh	§16 protocol abuse vs the daemon: malformed/oversized/hostile frames — no crash or hang (T9-lite)
 T9	run	probe	scripts/conn-flood-test.sh	§16 DoS: half-open drop + connect-storm survival
+T9	run	device,probe	scripts/rate-limit-ops-eth-test.sh	§16 DoS: state.snapshot + diag.bundle flood rate-limited — small burst admitted, rest shed `busy`; x.harp-refdev.rate_limited climbs; normal 150ms cadence unaffected
 T9	run	host	scripts/corrupt-cbor-eth-test.sh	§8.7 hostile CBOR byte-flip injection on ctl — the host survives + resets cleanly
 T9	rig	-	-	Coverage-guided libFuzzer under ASan (fuzz-cbor/envelope/object/link/audio/state/evt) runs per-PR in ci.yml (fuzz job) and deep nightly in soak.yml (deep-fuzz) — the memory-fault gate
 
