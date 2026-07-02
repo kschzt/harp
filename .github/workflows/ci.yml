@@ -309,11 +309,14 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: install gcovr + libsamplerate
-        run: sudo apt-get update && sudo apt-get install -y gcovr libsamplerate0-dev
-      - name: build (coverage-instrumented)
+      - name: install gcovr + lcov + libsamplerate
+        run: sudo apt-get update && sudo apt-get install -y gcovr lcov libsamplerate0-dev
+      - name: build (coverage-instrumented via -DHARP_COVERAGE=ON)
+        # The instrumentation now lives behind a first-class CMake switch (CMakeLists.txt:
+        # option(HARP_COVERAGE)) instead of raw CMAKE_C_FLAGS — same --coverage -O0 -g flags,
+        # one documented knob a local run can flip too.
         run: |
-          cmake -B build-cov -DCMAKE_C_FLAGS="--coverage -O0 -g" -DCMAKE_CXX_FLAGS="--coverage -O0 -g"
+          cmake -B build-cov -DHARP_COVERAGE=ON
           cmake --build build-cov -j
       - name: run the unit-test suite (clean exit flushes .gcda)
         # Exclude freerun_mt: it is a CONCURRENCY/timing stress test (race detection — covered in the
@@ -367,6 +370,53 @@ jobs:
           echo "── INFORMATIONAL: overall core/host/device (host socket I/O is eth-suite/HW-tested):"
           gcovr --root . --filter 'core/src/' --filter 'host/' --filter 'device/' \
             --exclude '.*test.*' --exclude '.*external.*' --exclude '.*vst3sdk.*' --print-summary
+      - name: line-coverage TOTAL % (lcov summary) + uploaded report artifact
+        # The panel's "no quantified metric" gap, as a SINGLE visible line-coverage number plus a
+        # browsable report. This step is REPORT-ONLY (exit 0): the regression FLOOR is the gcovr
+        # gate above; here we just surface the total. lcov captures the .gcda the build produced,
+        # drops tests/fuzz/external/system, prints the total line %, and genhtml renders the HTML
+        # artifact. lcov/gcov version quirks are made non-fatal (generous --ignore-errors + a gcovr
+        # fallback for the %) so the metric ALWAYS prints and the artifact always uploads.
+        run: |
+          set +e
+          IGN="--ignore-errors mismatch,unused,gcov,source,empty"
+          lcov --capture --directory build-cov --base-directory "$PWD" \
+               --output-file coverage.info --rc geninfo_unexecuted_blocks=1 $IGN
+          lcov --remove coverage.info \
+               '*/tests/*' '*/fuzz/*' '*/external/*' '*/vst3sdk/*' '/usr/*' \
+               --output-file coverage-filtered.info $IGN
+          genhtml coverage-filtered.info --output-directory coverage-html \
+                  --title "HARP cloud line coverage" $IGN
+          echo ""
+          echo "════════════════════════════════════════════════════════════════════════════"
+          echo " HARP CLOUD LINE-COVERAGE METRIC (core/ + host/ + device/, ffs.c HW-gated)"
+          echo "════════════════════════════════════════════════════════════════════════════"
+          pct=""
+          if [ -s coverage-filtered.info ]; then
+            lcov --summary coverage-filtered.info $IGN 2>&1 | tee lcov-summary.txt
+            pct=$(sed -nE 's/.*lines[^0-9]*([0-9]+(\.[0-9]+)?)%.*/\1/p' lcov-summary.txt | head -1)
+          fi
+          if [ -z "$pct" ]; then
+            echo "lcov summary unavailable — gcovr fallback for the TOTAL % (artifact still uploaded):"
+            gcovr --root . --filter 'core/src/' --filter 'host/' --filter 'device/' \
+              --exclude '.*test.*' --exclude '.*external.*' --exclude '.*vst3sdk.*' \
+              --exclude '.*ffs\.c$' --gcov-ignore-parse-errors 2>/dev/null | tee gcovr-total.txt
+            pct=$(sed -nE 's/^TOTAL.* ([0-9]+)%.*/\1/p' gcovr-total.txt | head -1)
+          fi
+          echo ""
+          echo "TOTAL_LINE_COVERAGE=${pct:-unknown}%"
+          echo "### HARP cloud line coverage: ${pct:-unknown}%" >> "${GITHUB_STEP_SUMMARY:-/dev/null}" 2>/dev/null || true
+          exit 0
+      - name: upload the lcov coverage report (info + summary + HTML)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: |
+            coverage-filtered.info
+            lcov-summary.txt
+            coverage-html
+          if-no-files-found: warn
 
   cert-harness:
     # §17.3 T1–T17 CERTIFICATION HARNESS (cloud subset). The maturity capstone flagged that,
