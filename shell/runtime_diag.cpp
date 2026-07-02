@@ -311,7 +311,7 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
     harp_cbor_uint(&out, 1);
     harp_cbor_uint(&out, padSamples_.load(std::memory_order_relaxed)); /* pad_debt_samples */
     harp_cbor_uint(&out, 2);
-    harp_cbor_uint(&out, evDrops_.load(std::memory_order_relaxed)); /* event_drops */
+    harp_cbor_uint(&out, events_.evDrops()); /* event_drops (EventManager-owned) */
     harp_cbor_uint(&out, 3);
     harp_cbor_uint(&out, framesSent_); /* frames_sent (audio-thread member, read off-path) */
     harp_cbor_uint(&out, 4);

@@ -465,10 +465,9 @@ void HarpRuntime::runLoopbackProbeLocked() {
             harp_audio_hdr_encode(&pace, hdr);
             /* event fence = the live high-water minus the epoch baseline (saturating),
              * IDENTICAL to the feeder's pacing fence — so the device's barrier is
-             * satisfied exactly as on a normal frame (no event is left pending). */
-            uint32_t hw = evtQueuedSeq_.load(std::memory_order_acquire);
-            uint32_t base = evtEpochBase_.load(std::memory_order_acquire);
-            uint32_t seq = hw > base ? hw - base : 0;
+             * satisfied exactly as on a normal frame (no event is left pending). Same
+             * EventManager::fenceStamp() the feeder stamps — one owner for both. */
+            uint32_t seq = events_.fenceStamp();
             hdr[HARP_AUDIO_HDR_LEN + 0] = (uint8_t)seq;
             hdr[HARP_AUDIO_HDR_LEN + 1] = (uint8_t)(seq >> 8);
             hdr[HARP_AUDIO_HDR_LEN + 2] = (uint8_t)(seq >> 16);

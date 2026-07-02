@@ -1,31 +1,34 @@
-/* shell/runtime_events.cpp — the §9 event plane (encode / queue / drain).
+/* shell/runtime_events.cpp — the §9 event plane, now a REAL owned-state type.
  *
- * Extracted VERBATIM from runtime.cpp (a pure translation-unit split — no
- * behavior change; the event wire bytes stay identical). Holds the HarpRuntime
- * event plane that sits ON TOP of the lock-free SPSC source ring: the per-event
- * CBOR encoders (encodeParamEvent / encodeRampEvent / encodeUmpEvent /
- * encodeModEvent / encodeTransportEvent), the audio-thread producers that push
- * onto the owner source ring (queueParamSet / queueRamp / queueNote / queueMod /
- * queueTransport), the §9.7 transport-change synthesizer (feedTransport), and the
- * eventPump's SPSC consumer body that frames a batch of events onto the wire
- * (drainSource). All member declarations already live in runtime.h, so this is
- * purely a move: the same code, compiled into its own object and linked into
- * every shell target.
+ * Prior PRs (#140/#144) moved the event encode/queue/drain methods into this TU,
+ * but they were still HarpRuntime:: methods over the shared god-object state. This
+ * file now implements EventManager (declared in runtime.h) — a genuine component
+ * that OWNS the SPSC event source ring, the §8.3.1 fence sequence, the drop
+ * counter, the escalated-panic latch, and the §9.7 transport detector. HarpRuntime
+ * holds ONE instance (events_) and DELEGATES its public event API to it, applying
+ * the §12.2/§11.4 read-only WRITE HOLD in the thin wrappers here BEFORE the plane
+ * (so the plane itself carries no reconcile/session policy).
  *
- * NOT moved (stays in runtime.cpp / runtime_audio.cpp): the SPSC ring itself
- * (EventSource, ring.h) and the RT threads that own it — the eventPump thread
- * that CALLS drainSource is the AudioManager cut. This slice is only the event
- * encode/queue/drain logic layered on the ring; it touches NO atomics ordering,
- * NO RT scheduling, and NO transport I/O beyond drainSource's in-memory framing.
+ * The event WIRE BYTES are byte-identical to before: the encoders are verbatim,
+ * queue* pushes onto the same ring with the same fence fetch_add + memory orders,
+ * and the read-only drop path is unchanged (it just lives in the wrapper now).
+ *
+ * NOT owned here (stays HarpRuntime / runtime_audio.cpp): the RT threads. The
+ * eventPump thread that CALLS drainOwner + takePanic, and the feeder that reads
+ * fenceStamp() + calls pollDropLog(), still live on the audio side — this plane is
+ * the ENCODE/QUEUE/DRAIN + fence STATE they operate through, not the scheduling.
  */
 #include "runtime.h"
+#include "runtime_log.h" /* log_msg (EventManager::pollDropLog) */
 
-#include <cstring> /* memcpy: bit-cast ppq <-> u64 (queueTransport / drainSource) */
+#include <cstring> /* memcpy: bit-cast ppq <-> u64 (queueTransport / drainOwner) */
+
+/* ============================ EventManager ============================ */
 
 /* Param set as a §9.4 event message: fire-and-forget, no response.
  * ts is an SSI (0 = "now"). Encode-only; the feeder frames and batches. */
-void HarpRuntime::encodeParamEvent(harp_cbuf *m, uint32_t id, float v, uint64_t ts,
-                                   uint8_t channel) {
+void EventManager::encodeParamEvent(harp_cbuf *m, uint32_t id, float v, uint64_t ts,
+                                    uint8_t channel) {
     harp_cbor_array(m, 3);
     harp_cbor_array(m, 2);
     harp_cbor_uint(m, 0);
@@ -45,17 +48,12 @@ void HarpRuntime::encodeParamEvent(harp_cbuf *m, uint32_t id, float v, uint64_t 
 /* Each queue* pushes to the owner source ring (its SPSC producer side) and bumps
  * the per-session fence (evtQueuedSeq_): the device must consume that many events
  * before rendering a fenced range. A null source (unacquired instance) is a
- * defensive no-op — the shells only queue once they hold the owner source. */
-void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t ts,
-                                uint8_t channel) {
+ * defensive no-op — the shells only queue once they hold the owner source. The
+ * §12.2/§11.4 read-only WRITE HOLD is applied by HarpRuntime's wrapper BEFORE
+ * this point (so this plane carries no reconcile policy). */
+void EventManager::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t ts,
+                                 uint8_t channel) {
     if (!src) return;
-    if (readOnlyDefault_.load(std::memory_order_relaxed) || roExplicit_.load(std::memory_order_relaxed)) {
-        /* §12.2/§11.4: read-only hold — a live param edit MUST NOT reach a mismatched-engine
-         * device; drop + count (the user exits read-only to make changes). The fresh-open default
-         * held the STORED state read-only; this closes the live-edit leak (re-audit HIGH #1). */
-        roWrDrops_.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
     /* M2 per-event part: an explicit channel (a satellite's MIDI channel N) targets part N;
      * the default resolves to the source's own channel (byte-identical for every prior caller). */
     uint8_t ch = (channel == kChanFromSource)
@@ -66,15 +64,9 @@ void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t
     else
         evDrops_.fetch_add(1, std::memory_order_relaxed);
 }
-void HarpRuntime::queueRamp(EventSource *src, uint32_t id, float target, uint64_t start,
-                            uint64_t end, uint8_t channel) {
+void EventManager::queueRamp(EventSource *src, uint32_t id, float target, uint64_t start,
+                             uint64_t end, uint8_t channel) {
     if (!src) return;
-    if (readOnlyDefault_.load(std::memory_order_relaxed) || roExplicit_.load(std::memory_order_relaxed)) {
-        /* §12.2/§11.4: read-only hold — drop the automation write so it can't reach the
-         * mismatched engine (re-audit HIGH #1). */
-        roWrDrops_.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
     uint8_t ch = (channel == kChanFromSource)
                      ? (uint8_t)(src->chan.load(std::memory_order_relaxed) & 0xf)
                      : (uint8_t)(channel & 0xf);
@@ -83,7 +75,7 @@ void HarpRuntime::queueRamp(EventSource *src, uint32_t id, float target, uint64_
     else
         evDrops_.fetch_add(1, std::memory_order_relaxed);
 }
-void HarpRuntime::queueNote(EventSource *src, uint32_t word, uint64_t ts) {
+void EventManager::queueNote(EventSource *src, uint32_t word, uint64_t ts) {
     if (!src) return;
     if (src->ring.push({2, word, 0.0f, ts, 0})) {
         evtQueuedSeq_.fetch_add(1, std::memory_order_release);
@@ -98,8 +90,8 @@ void HarpRuntime::queueNote(EventSource *src, uint32_t word, uint64_t ts) {
     }
 }
 
-void HarpRuntime::queueMod(EventSource *src, uint32_t id, float offset,
-                           uint32_t voice, uint64_t ts) {
+void EventManager::queueMod(EventSource *src, uint32_t id, float offset,
+                            uint32_t voice, uint64_t ts) {
     if (!src) return;
     /* kind 4 = mod; the §9.5 voice key rides in `end` (it is a packed uint, not
      * a timestamp). A dropped mod is benign — it leaves the base value as-is, no
@@ -114,8 +106,8 @@ void HarpRuntime::queueMod(EventSource *src, uint32_t id, float offset,
         evDrops_.fetch_add(1, std::memory_order_relaxed);
 }
 
-void HarpRuntime::queueTransport(EventSource *src, uint32_t flags, double tempo,
-                                 double ppq, uint64_t ts) {
+void EventManager::queueTransport(EventSource *src, uint32_t flags, double tempo,
+                                  double ppq, uint64_t ts) {
     /* Transport is GLOBAL (no part): force it onto the OWNER source whatever
      * `src` is, so a multitimbral group emits ONE transport stream — the
      * owner's is canonical — instead of N identical copies racing on the wire.
@@ -132,9 +124,9 @@ void HarpRuntime::queueTransport(EventSource *src, uint32_t flags, double tempo,
 /* (The attached-source registry — registerSource/unregisterSource — is retired:
  * one private runtime per instance, so the only event source is ownerSource_.) */
 
-void HarpRuntime::feedTransport(bool playing, bool tempoValid, double tempo,
-                                bool posValid, double ppq, uint32_t blockSamples,
-                                uint64_t base) {
+void EventManager::feedTransport(bool playing, bool tempoValid, double tempo,
+                                 bool posValid, double ppq, uint32_t blockSamples,
+                                 uint64_t base, uint32_t rate) {
     bool discont = false;
     if (playing && tpLastPlaying_ && posValid)
         /* half a MIDI tick of slack: anything bigger is a jump */
@@ -142,7 +134,7 @@ void HarpRuntime::feedTransport(bool playing, bool tempoValid, double tempo,
     tpSamplesSince_ += blockSamples;
     bool change =
         playing != tpLastPlaying_ || (tempoValid && tempo != tpLastTempo_) || discont;
-    bool refresh = playing && tpSamplesSince_ >= rate_;
+    bool refresh = playing && tpSamplesSince_ >= rate;
     if (change || refresh || !tpSent_) {
         uint32_t flags =
             (playing ? 1u : 0) | (tempoValid ? 1u << 3 : 0) | (posValid ? 1u << 5 : 0);
@@ -156,13 +148,13 @@ void HarpRuntime::feedTransport(bool playing, bool tempoValid, double tempo,
     tpLastPlaying_ = playing;
     tpLastTempo_ = tempo;
     tpLastEndPpq_ = playing && tempoValid && posValid
-                        ? ppq + blockSamples * tempo / (60.0 * rate_)
+                        ? ppq + blockSamples * tempo / (60.0 * rate)
                         : ppq;
 }
 
 /* transport event (§9.7): etype 7, body {0 flags, 1 tempo, 4 ppq} */
-void HarpRuntime::encodeTransportEvent(harp_cbuf *m, uint32_t flags, double tempo,
-                                       double ppq, uint64_t ts) {
+void EventManager::encodeTransportEvent(harp_cbuf *m, uint32_t flags, double tempo,
+                                        double ppq, uint64_t ts) {
     harp_cbor_array(m, 3);
     harp_cbor_array(m, 2);
     harp_cbor_uint(m, 0);
@@ -178,7 +170,7 @@ void HarpRuntime::encodeTransportEvent(harp_cbuf *m, uint32_t flags, double temp
 }
 
 /* UMP event (§9.10): etype 0, body = one packet, words big-endian. */
-void HarpRuntime::encodeUmpEvent(harp_cbuf *m, uint32_t word, uint64_t ts) {
+void EventManager::encodeUmpEvent(harp_cbuf *m, uint32_t word, uint64_t ts) {
     uint8_t bytes[4] = {(uint8_t)(word >> 24), (uint8_t)(word >> 16),
                         (uint8_t)(word >> 8), (uint8_t)word};
     harp_cbor_array(m, 3);
@@ -199,8 +191,8 @@ void HarpRuntime::encodeUmpEvent(harp_cbuf *m, uint32_t word, uint64_t ts) {
  * master bend/pressure reaches THIS instance's part, not always part 0. Key 5 is
  * omitted when the part is 0 (part-0 byte-economy; the device defaults absent to
  * part 0), so a part-0 source is byte-identical to before. */
-void HarpRuntime::encodeModEvent(harp_cbuf *m, uint32_t id, float offset,
-                                 uint64_t ts, uint32_t voice, uint8_t srcChan) {
+void EventManager::encodeModEvent(harp_cbuf *m, uint32_t id, float offset,
+                                  uint64_t ts, uint32_t voice, uint8_t srcChan) {
     uint8_t channel = voice ? (uint8_t)((voice >> 8) & 0xf) : (uint8_t)(srcChan & 0xf);
     harp_cbor_array(m, 3);
     harp_cbor_array(m, 2);
@@ -224,8 +216,8 @@ void HarpRuntime::encodeModEvent(harp_cbuf *m, uint32_t id, float offset,
 }
 
 /* Ramp event (§9.4): etype 5, msg tstamp = start, body {param, target, end}. */
-void HarpRuntime::encodeRampEvent(harp_cbuf *m, uint32_t id, float target,
-                                  uint64_t start, uint64_t end, uint8_t channel) {
+void EventManager::encodeRampEvent(harp_cbuf *m, uint32_t id, float target,
+                                   uint64_t start, uint64_t end, uint8_t channel) {
     harp_cbor_array(m, 3);
     harp_cbor_array(m, 2);
     harp_cbor_uint(m, 0);
@@ -255,17 +247,16 @@ void HarpRuntime::encodeRampEvent(harp_cbuf *m, uint32_t id, float target,
  * per-channel knob edits land on the right part (channel N -> part N).
  * Notes already carry their channel in the UMP word (the shell baked it in).
  * Transport (kind 3) is global and only ever lives on the owner source. */
-int HarpRuntime::drainSource(EventSource &src, harp_cbuf &batch, harp_cbuf &msgbuf,
-                             int budget) {
+int EventManager::drainOwner(harp_cbuf &batch, harp_cbuf &msgbuf, int budget) {
     /* M2: the target part (§9.4 key 5) is PER EVENT — te.channel, resolved at queue time
      * from the caller's explicit channel (a satellite's MIDI channel N) or this source's own
      * channel. So one main instance drives every part; an attached single-channel source is
      * byte-identical (its events all carry src.chan). Notes carry their channel in the UMP word. */
-    (void)src; /* channel now travels in each TimedEv, not read from the source here */
     TimedEv te;
     int sent = 0;
-    for (; sent < budget && src.ring.pop(te); sent++) {
-        harp_cbuf_reset(&msgbuf);        if (te.kind == 0)
+    for (; sent < budget && ownerSource_.ring.pop(te); sent++) {
+        harp_cbuf_reset(&msgbuf);
+        if (te.kind == 0)
             encodeParamEvent(&msgbuf, te.a, te.v, te.ts, te.channel);
         else if (te.kind == 1)
             encodeRampEvent(&msgbuf, te.a, te.v, te.ts, te.end, te.channel);
@@ -287,4 +278,61 @@ int HarpRuntime::drainSource(EventSource &src, harp_cbuf &batch, harp_cbuf &msgb
         harp_cbuf_put(&batch, msgbuf.buf, msgbuf.len);
     }
     return sent;
+}
+
+/* Feeder-thread poll: log the events newly dropped to ring overflow since the last
+ * call (log-on-change, so an idle stream is quiet). evDropsLogged_ is this plane's
+ * private bookkeeping; the feeder is its sole caller. */
+void EventManager::pollDropLog() {
+    uint64_t drops = evDrops_.load(std::memory_order_relaxed);
+    if (drops != evDropsLogged_) {
+        log_msg("WARNING: %llu events dropped (ring overflow)",
+                (unsigned long long)(drops - evDropsLogged_));
+        evDropsLogged_ = drops;
+    }
+}
+
+/* ================== HarpRuntime event-plane facade ==================
+ * The public event API delegates to events_. queueParamSet / queueRamp apply the
+ * §12.2/§11.4 read-only WRITE HOLD HERE (session/reconcile policy that must NOT
+ * live in the event plane) — byte-for-byte the check that used to open those two
+ * methods: a null source is a no-op, and while a read-only hold is active a live
+ * param/automation write is DROPPED + counted (roWrDrops_) so it can never reach a
+ * mismatched-engine device. queueNote/queueMod/queueTransport are never gated. */
+void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t ts,
+                                uint8_t channel) {
+    if (!src) return;
+    if (readOnlyDefault_.load(std::memory_order_relaxed) ||
+        roExplicit_.load(std::memory_order_relaxed)) {
+        roWrDrops_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    events_.queueParamSet(src, id, v, ts, channel);
+}
+void HarpRuntime::queueRamp(EventSource *src, uint32_t id, float target, uint64_t start,
+                            uint64_t end, uint8_t channel) {
+    if (!src) return;
+    if (readOnlyDefault_.load(std::memory_order_relaxed) ||
+        roExplicit_.load(std::memory_order_relaxed)) {
+        roWrDrops_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    events_.queueRamp(src, id, target, start, end, channel);
+}
+void HarpRuntime::queueNote(EventSource *src, uint32_t word, uint64_t ts) {
+    events_.queueNote(src, word, ts);
+}
+void HarpRuntime::queueMod(EventSource *src, uint32_t id, float offset,
+                           uint32_t voice, uint64_t ts) {
+    events_.queueMod(src, id, offset, voice, ts);
+}
+void HarpRuntime::queueTransport(EventSource *src, uint32_t flags, double tempo,
+                                 double ppq, uint64_t ts) {
+    events_.queueTransport(src, flags, tempo, ppq, ts);
+}
+void HarpRuntime::feedTransport(bool playing, bool tempoValid, double tempo,
+                                bool posValid, double ppq, uint32_t blockSamples,
+                                uint64_t base) {
+    events_.feedTransport(playing, tempoValid, tempo, posValid, ppq, blockSamples,
+                          base, rate_);
 }
