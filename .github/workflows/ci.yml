@@ -366,3 +366,58 @@ jobs:
           echo "── INFORMATIONAL: overall core/host/device (host socket I/O is eth-suite/HW-tested):"
           gcovr --root . --filter 'core/src/' --filter 'host/' --filter 'device/' \
             --exclude '.*test.*' --exclude '.*external.*' --exclude '.*vst3sdk.*' --print-summary
+
+  cert-harness:
+    # §17.3 T1–T17 CERTIFICATION HARNESS (cloud subset). The maturity capstone flagged that,
+    # although the individual conformance tests exist and run, NO single runner indexes the
+    # T1–T17 battery by number, runs the cloud-capable subset, and emits one pass/fail/skip/
+    # uncovered report. scripts/cert-harness.sh is that runner; scripts/cert-tests.tsv is the
+    # T → §17.3-title → covering-test index (honestly classified cloud|partial|rig|uncovered).
+    #
+    # This job builds the CLOUD stack (a localhost harp-deviced + probe + shell + host over
+    # TCP/RTP — exactly what eth.yml runs on GitHub-hosted runners, no physical rig) and runs
+    # the harness. It is a REPORT + a gate on the cloud subset: it fails the build ONLY on a
+    # genuine cloud-test FAIL. Rig-only T's (real USB unplug/replug, sleep/wake, power loss,
+    # chained hubs, 24 h soak, multi-device-at-scale) SKIP with a logged reason — they run in
+    # hw.yml + soak.yml when the self-hosted rig is online (HARP_RIG_ONLINE=1). Genuinely
+    # uncovered T's (T3 sleep/wake, T7 chained hubs, T10 power loss) are listed explicitly,
+    # never faked, and do NOT fail the build. The exhaustive per-OS conformance run stays in
+    # eth.yml; this is the single indexed T1–T17 view + a Linux cloud gate.
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: clone VST3 SDK
+        run: git clone --depth 1 --recursive
+             https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
+      - name: clone CLAP SDK (header-only)
+        run: git clone --depth 1 --branch 1.2.8
+             https://github.com/free-audio/clap.git external/clap
+      - name: install deps (libusb + libsamplerate + cbor2)
+        run: |
+          sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libsamplerate0-dev
+          # cbor2: some §8.7 sub-scripts (eth-tests / diag counters) decode the diag bundle with it.
+          python3 -m pip install cbor2 || python3 -m pip install --break-system-packages cbor2
+      - name: build device + eth tools + unit suite (root tree)
+        # The default `cmake --build build` builds harp-deviced, harp-probe, the fence/latefr eth
+        # tools, harp-engine-golden, AND every unit-test target the harness runs via ctest
+        # (core / freerun / rtp / engine_logic / param_map_hash) — so `ctest -R` actually RUNS them.
+        run: |
+          cmake -B build -S .
+          cmake --build build -j
+      - name: build shell + host + clap-host (the audio-render cloud tests)
+        run: |
+          cmake -B build-vst -S tools/vst3-host
+          cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host -j
+      - name: T1–T17 conformance harness (cloud subset) + report
+        # pipefail so a genuine cloud FAIL is not masked by tee's exit 0. SKIP/UNCOVERED never fail.
+        run: |
+          set -o pipefail
+          scripts/cert-harness.sh | tee cert-report.txt
+      - name: upload the T1–T17 certification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cert-report-t1-t17
+          path: cert-report.txt
+          if-no-files-found: warn

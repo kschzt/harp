@@ -1,0 +1,103 @@
+# HARP §17.3 certification battery — the T1–T17 index consumed by scripts/cert-harness.sh.
+#
+# ONE source of truth mapping each certification test to the concrete coverage that exists
+# in this repo, honestly classified. Tab-separated; five columns:
+#
+#   T        kind        requires          command                                    note
+#
+# kind:
+#   meta       — the T's headline class (cloud|partial|rig|uncovered) + its spec §17.3 title.
+#                (field3 = class, field4 = "-", field5 = the verbatim spec title)
+#   run        — a CLOUD-runnable covering test the harness EXECUTES (loopback / unit / golden,
+#                no physical rig). field3 = required binaries (comma list; ALL must be present or
+#                the row SKIPs as build-gated), field4 = the command (@UNIT@ = the ctest build dir).
+#   rig        — coverage that fundamentally needs the physical rig; the harness SKIPs it with the
+#                logged reason (field5) — these run in hw.yml / soak.yml when HARP_RIG_ONLINE=1.
+#   uncovered  — an honest gap: no test covers this today. field5 explains it.
+#
+# requires tokens:  device | probe | host | clap | fence | unit
+#   device=harp-deviced  probe=harp-probe  host=harp-vst3-host  clap=clap-host
+#   fence=harp-eth-fence-test  unit=a ctest build dir with the unit suite
+#
+# The `command` runs under `bash -c`, so any ctest -R regex is single-quoted (a bare `|` would
+# become a shell pipe). @UNIT@ is substituted with the located ctest build dir.
+#
+# The harness runs every satisfiable `run` row, aggregates per-T, and exits nonzero ONLY on a
+# genuine FAIL (never on a SKIP or an uncovered gap). See scripts/cert-harness.sh.
+
+T1	meta	cloud	-	enumeration, hello, identity, capability coherence
+T1	run	device	scripts/hello-gate-test.sh	§5.4 pre-hello request denied (the enumeration/hello gate holds)
+T1	run	probe	scripts/core-test.sh	§5.5 core.ping/identify/changed/bye + identity coherence (identify matches hello, no reset)
+T1	run	unit	ctest --test-dir @UNIT@ -R '^core$' --output-on-failure	CBOR/frame/envelope decode + identity/capability codec
+
+T2	meta	partial	-	1 000 × unplug/replug during streaming; session resume; zero host crashes; zero state loss
+T2	run	host	scripts/reconnect-eth-test.sh	§8.7 mid-session disconnect survival + session resume (cloud proxy for the resume path)
+T2	rig	-	-	1000× PHYSICAL unplug/replug + zero-state-loss: scripts/usb-stress.sh (crash/killd) + scripts/replug-test.sh on the USB rig (hw.yml / soak.yml hw-soak)
+
+T3	meta	uncovered	-	100 × sleep/wake during streaming; same criteria
+T3	uncovered	-	-	No sleep/wake driver exists. §9 makes host sleep detach-equivalent, so reconnect-eth-test.sh exercises the same resume code path — but there is NO 100× bus-suspend/wake automation. Genuine gap (rig capability).
+
+T4	meta	partial	-	sample-rate change matrix under load; state preserved; epochs correct
+T4	run	probe	scripts/epoch-test.sh	§7.1/§8.6 time.epoch on a sample-rate change: state preserved, epochs correct, stale-epoch events discarded (evt_stale_epoch)
+T4	run	unit	ctest --test-dir @UNIT@ -R '^freerun$' --output-on-failure	ASRC re-anchor across a rate change (device-side)
+T4	rig	-	-	The full rate matrix UNDER STREAMING LOAD is deepened on the rig (hw.yml timing-test.sh / soak.sh)
+
+T5	meta	partial	-	100 × DAW project reopen; recall verified by hash equality, silently (no dialogs on match)
+T5	run	host,probe	scripts/recall-eth-test.sh	§11.4 recall round-trip: save / restore verified by state-closure hash equality on loopback
+T5	rig	-	-	100× real-DAW reopen: scripts/recall-roundtrip.sh + scripts/reaper-e2e.sh (headless REAPER) + scripts/cross-format-recall-test.sh (VST3↔AU) on the rig (hw.yml)
+
+T6	meta	cloud	-	firmware/engine mismatch flows: refuse-gracefully and read-only paths
+T6	run	host	scripts/engine-mismatch-eth-test.sh	§12.2 engine-major change → read-only default; consent (0x4) overrides
+T6	run	probe	scripts/engine-gate-eth-test.sh	§13.4 device refuses a foreign-engine snapshot; consent overrides
+T6	run	host	scripts/staged-connected-eth-test.sh	§11.4 --load-state-after-connect onto a mismatched unit held read-only
+
+T7	meta	uncovered	-	operation through two chained hubs at minimum supported speed
+T7	uncovered	-	-	No hub-chaining test. Requires a physical two-hub topology at minimum supported USB speed; not automatable on cloud runners and no rig fixture exists. Genuine gap.
+
+T8	meta	rig	-	24 h streaming soak: zero unexplained session_resets, underrun budget per declared profile
+T8	rig	-	-	24h soak is not per-PR. Cloud approximation: soak.yml eth-flake repeats the full eth-suite ×N NIGHTLY (flake hunt). Real 24h streaming soak: soak.yml hw-soak (usb-stress full battery) + the bench fleet soak (scripts/harp-soak.sh). No bounded per-PR cloud proxy.
+
+T9	meta	cloud	-	protocol fuzzing on all inbound streams: no crash, hang, or memory fault
+T9	run	probe	scripts/abuse-test.sh	§16 protocol abuse vs the daemon: malformed/oversized/hostile frames — no crash or hang (T9-lite)
+T9	run	probe	scripts/conn-flood-test.sh	§16 DoS: half-open drop + connect-storm survival
+T9	run	host	scripts/corrupt-cbor-eth-test.sh	§8.7 hostile CBOR byte-flip injection on ctl — the host survives + resets cleanly
+T9	rig	-	-	Coverage-guided libFuzzer under ASan (fuzz-cbor/envelope/object/link/audio/state/evt) runs per-PR in ci.yml (fuzz job) and deep nightly in soak.yml (deep-fuzz) — the memory-fault gate
+
+T10	meta	uncovered	-	50 × power loss during state apply and during firmware stage/commit: device boots, state is old-or-new, never hybrid
+T10	uncovered	-	-	No power-loss-during-apply injection. §10.2 journaled atomic-apply exists and §11.3 CAS is tested (cas-conflict-eth-test.sh), but the "cut power mid-commit 50× → old-or-new-never-hybrid" torture is unautomated. Genuine gap (rig capability).
+
+T11	meta	cloud	-	latency profile accuracy vs loopback (±1 ms; harp-perf: exact at the stream timestamp)
+T11	run	host	scripts/loopback-eth-test.sh	§14.3 loopback round-trip RTT vs the reported profile (±1 ms strict on Linux)
+T11	run	host,clap	scripts/reported-latency-test.sh	§6.4 reported PDC latency exact + agreeing across VST3/CLAP/AU
+T11	run	host	scripts/eth-rtfloor-test.sh	§6.4 declared rt-profile floor/packet (identity key 14) + clamps
+
+T12	meta	cloud	-	four-safe-actions UX audit (hosts): archive-before-push verified on the wire
+T12	run	probe	scripts/archive-before-push-test.sh	§11.4 action 1: the displaced state is archived from device_head BEFORE the live overwrite (ordering on the wire)
+T12	run	host,probe	scripts/reconcile-readonly-eth-test.sh	§11.4 action 3 "open read-only": the explicit pick suppresses live writes
+T12	run	host	scripts/staged-connected-eth-test.sh	§11.4 mismatched staged state is held read-only, not auto-applied
+
+T13	meta	partial	-	four devices streaming concurrently (≥ 64 aggregate channels) for 24 h: independent per-device clock recovery; zero cross-session interference
+T13	run	host	scripts/multiout-iso-test.sh	17-bus per-part isolation over free-running RTP — zero cross-part bleed (the concurrency/isolation contract, one instance)
+T13	run	host	scripts/multiout-perchan-test.sh	per-channel param isolation — a CC on channel N reaches only part N (§9.4)
+T13	rig	-	-	FOUR PHYSICAL devices, ≥64 aggregate channels, 24h, independent clock recovery: scripts/multidevice-test.sh (2-board rules) + the bench fleet soak (scripts/harp-soak.sh)
+
+T14	meta	cloud	-	free-running clock torture: ±200 ppm offsets and drift sweeps; ASRC within quality floors; path latency constant; re-anchors only under starvation and always evented
+T14	run	host	scripts/eth-tests.sh	§8.7 RTP audio ASRC fidelity within quality floors (bit-exact + multichannel), free-running
+T14	run	unit	ctest --test-dir @UNIT@ -R 'freerun|rtp' --output-on-failure	device-side ASRC stopband (§14.4 filter gate) + re-anchor-only-under-starvation + SPSC race (TSan)
+T14	rig	-	-	The extreme ±200 ppm long drift-sweep torture is deepened nightly (soak.yml eth-flake) and on real converters on the rig
+
+T15	meta	cloud	-	(audio.deterministic) two host-paced renders of identical state/events/SSI range are byte-identical; (audio.offline-rate) likewise at 0.5× and 4× pacing
+T15	run	host,clap	scripts/offline-golden-eth.sh	deterministic host-paced OFFLINE bounce — byte-identical run-to-run + cross-format (VST3/CLAP) agreement
+T15	run	probe,fence	scripts/offline-fence-eth.sh	§8.3.1 fenced offline bounce: deterministic, fence_waits moves, fence_timeouts stays 0 (unbounded offline barrier)
+T15	run	unit	ctest --test-dir @UNIT@ -R '^engine_logic$' --output-on-failure	raw engine DSP determinism (integer note/arp/voice logic)
+T15	rig	-	-	Real-USB byte-identical golden render: scripts/golden-test.sh on the rig (hw.yml)
+
+T16	meta	partial	-	automation parity: point, ramp, mod, and per-voice events applied within ±1 sample; supersede rules honored; value↔display round-trips against descriptors
+T16	run	host	scripts/evt-storm-eth-test.sh	§9.2 evt_late stays 0 under dense automation on the rt-nsamples=64 free-running path (on-time application)
+T16	run	host,probe	scripts/offline-edit-eth-test.sh	§15.5 edit-while-absent: live param sets reach the device
+T16	run	unit	ctest --test-dir @UNIT@ -R '^param_map_hash$' --output-on-failure	param-map descriptor codec — value↔display round-trip
+T16	rig	-	-	±1-sample point/ramp/mod/per-voice parity + supersede + cross-format: scripts/note-expr-test.sh + scripts/clap-test.sh + scripts/flood-stress.sh (ramp_late=0) on the rig (hw.yml)
+
+T17	meta	partial	-	(evt.transport) sequencer lock: tempo/time-signature changes, locates, and loop wraps followed; realignment within ±1 sample host-paced, within the correlation bound free-running
+T17	run	probe	scripts/epoch-test.sh	§7.1/§8.6 transport/epoch re-anchor + stale-epoch discard (the re-alignment fragment provable on loopback)
+T17	rig	-	-	Full evt.transport sequencer lock — tempo/time-sig changes, locates, loop wraps followed within ±1 sample: scripts/tempo-lock-test.sh on the rig (hw.yml)
