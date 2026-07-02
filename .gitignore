@@ -24,3 +24,22 @@ staged-connected-*/
 core-state/
 admission-eth-state/
 credit-eth-state/
+# remaining per-test state dirs (indexed by scripts/cert-tests.tsv / run by scripts/cert-harness.sh
+# and eth-suite.sh) — completing the curated list so a conformance run never dirties the tree
+archive-before-push-state/
+bloat-state/
+cas-conflict-eth-state/
+engine-gate-state/
+engine-mismatch-eth-state/
+epoch-state/
+evtstorm-eth-state/
+gc-state/
+latefr-eth-state/
+loopback-eth-state/
+ratelimit-eth-state/
+reconcile-ro-eth-state/
+replat-eth-state/
+rtpreorder-eth-state/
+txn-state/
+# the cert harness report artifact (also uploaded by ci.yml)
+cert-report.txt
