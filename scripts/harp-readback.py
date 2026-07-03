@@ -67,7 +67,7 @@ def analyze(path):
     if clip_pct > 0.1:
         flags.append('clipping %.2f%%' % clip_pct)
     if abs(dc) > 0.01:
-        flags.append('DC offset %.4f (corruption)' % dc)
+        flags.append('DC offset %.4f (bias — wasted headroom / seam-click risk)' % dc)
 
     # ---- gaps: DROPOUTS — interior silence whose ONSET is a cliff (not a note-off) ----
     gap_ms = 0.0; gap_n = 0
@@ -132,7 +132,19 @@ def analyze(path):
             avg = S.mean(axis=0) + 1e-12
             cent = float((freqs * avg).sum() / avg.sum())
             diff = np.diff(S, axis=0)
-            flux = float((np.sqrt((np.maximum(diff, 0) ** 2).sum(axis=1)) / (S[:-1].sum(axis=1) + 1e-9)).mean())
+            # Per-frame normalized flux, averaged ONLY over frames with real energy.
+            # Near-silent frames (reverb-tail, quiet intros/outros) have ~0 spectral
+            # sum; the old 1e-9 epsilon let their tiny numerator divide by ~0 -> per-frame
+            # ratios of 1e4+ that swamped the mean and faked huge "flux" (spectral
+            # corruption) on perfectly clean songs. Floor at 0.1% of the peak frame
+            # energy so silence is EXCLUDED, not exploded.
+            energy = S[:-1].sum(axis=1)
+            active = energy > 1e-3 * float(energy.max()) if energy.size else np.zeros(0, bool)
+            if np.any(active):
+                fnum = np.sqrt((np.maximum(diff, 0) ** 2).sum(axis=1))
+                flux = float((fnum[active] / energy[active]).mean())
+            else:
+                flux = 0.0
             out.update(cent=round(cent, 0), flux=round(flux, 4))
 
     out['flags'] = flags
