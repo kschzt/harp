@@ -316,7 +316,8 @@ void *audio_thread(void *arg) {
     if (a->mode == 1) {
         host_paced_loop(d);
         harp_devlog(HARP_LOG_INFO, "audio", "harp-deviced: host-paced loop exited\n");
-        return NULL;
+        return NULL; /* NB: on stop this thread is pthread_cancel'd inside hp_read and never
+                      * reaches here — the §8.3.1 instrument dump runs in audio_stop after join */
     }
     /* voice starts from zero at audio.start (T15); notes/arp are reset by
      * evq_reset_for_new_stream, so zero ONLY the per-part voices here */
@@ -437,6 +438,9 @@ void audio_stop(device *d) {
         d->audio.host_paced_sock = -1;
     }
     d->audio.host_paced_port = 0;
+    /* §8.3.1 lock-coupling readout: the render thread is now joined (no g_evq_mu contender left),
+     * so dump this stream's acquire-wait vs lock-hold aggregates. INERT unless HARP_FENCE_INSTRUMENT. */
+    engine_fence_instr_dump();
     /* render thread is joined: free every voice + clear pending panic so nothing
      * leaks into the next stream (the engine owns the voice/part layout). */
     engine_voices_quiet();
