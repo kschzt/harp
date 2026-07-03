@@ -36,16 +36,25 @@ PROBE=${PROBE:-$ROOT/build-dev/harp-probe.exe}
 VST3_DIR=${HARP_VST3_DIR:-/c/Program Files/Common Files/VST3}
 PY=$(command -v python3 || command -v python)
 
-# REAPER's resource dir. We install portable (a reaper.ini next to reaper.exe), so the
-# resource dir IS the install dir; fall back to the roaming profile if it is not portable.
+# REAPER's resource dir. A reaper.ini next to reaper.exe SHOULD make REAPER run PORTABLE
+# (resource dir = install dir C:\REAPER); the workflow ALSO seeds one in the roaming
+# profile so that WHEREVER REAPER decides its resource dir is, it finds a config and never
+# blocks on the first-run wizard (a headless modal = no scan = the empty-cache symptom).
+# We do NOT trust the portable heuristic blindly: after the warm-up scan we adopt whichever
+# candidate REAPER actually wrote its plugin cache into, so the M1 scan CHECK matches where
+# REAPER writes. Candidate resource dirs, install-dir first then the roaming profile:
+res_candidates() {
+    printf '%s\n' /c/REAPER
+    [ -n "${APPDATA:-}" ]     && printf '%s\n' "$(cygpath -u "$APPDATA" 2>/dev/null)/REAPER"
+    [ -n "${USERPROFILE:-}" ] && printf '%s\n' "$(cygpath -u "$USERPROFILE" 2>/dev/null)/AppData/Roaming/REAPER"
+}
+uniq_res()  { res_candidates | awk 'NF && !seen[$0]++'; }
+cache_in()  { echo "$1/reaper-vstplugins64.ini"; }
+
+# RES/CACHE/SCRIPTS_DIR/INI are RE-RESOLVED for real in M1 (post-scan). Seed a best guess
+# (the portable install dir) so M0 can print it and cleanup() has a value under `set -u`.
 RES=/c/REAPER
-if [ ! -f "$RES/reaper.ini" ] && [ -n "${APPDATA:-}" ]; then
-    alt="$(cygpath -u "$APPDATA")/REAPER"
-    [ -f "$alt/reaper.ini" ] && RES="$alt"
-fi
-CACHE="$RES/reaper-vstplugins64.ini"
-SCRIPTS_DIR="$RES/Scripts"
-INI="$RES/reaper.ini"
+CACHE=$(cache_in "$RES"); SCRIPTS_DIR="$RES/Scripts"; INI="$RES/reaper.ini"
 
 # Repo-relative output dir (also the CI artifact dir). Keep it INSIDE the workspace so
 # the harp-deviced --state-dir stays a MinGW-friendly relative path — Git Bash rewrites
@@ -77,25 +86,86 @@ STAGED_VST=$(find "$VST3_DIR" -maxdepth 2 -iname 'harp-shell.vst3' 2>/dev/null |
 [ -n "$PY" ] || { echo "FAIL M0: no python3/python on PATH"; exit 1; }
 milestone "M0 (binaries + staged VST3 present)" 0
 say "REAPER=$REAPER  DEVICED=$DEVICED  PROBE=$PROBE"
-say "staged VST3=$STAGED_VST  resource-dir=$RES"
+say "staged VST3=$STAGED_VST"
+say "resource-dir candidates (REAPER may use any; M1 adopts the one it scans into):"
+for d in $(uniq_res); do
+    c=$(cache_in "$d")
+    say "  $d  [reaper.ini: $([ -f "$d/reaper.ini" ] && echo present || echo absent) | cache: $([ -f "$c" ] && echo present || echo absent)]"
+done
 
 # ── M1: REAPER must SCAN the shell (warm-up launch with NO __startup present) ─────────
-mkdir -p "$SCRIPTS_DIR"
-rm -f "$SCRIPTS_DIR/__startup.lua"      # never render during the scan pass
-scanned() { grep -qiE 'harp[-_]shell|HARP RefDev' "$CACHE" 2>/dev/null; }
-if ! scanned; then
-    say "warm-up launch to scan the VST3 folder ..."
+# scanned_dir : echo the FIRST candidate whose cache NAMES harp-shell (the success signal).
+scanned_dir() {
+    for d in $(uniq_res); do
+        grep -qiE 'harp[-_]shell|HARP RefDev' "$(cache_in "$d")" 2>/dev/null && { echo "$d"; return 0; }
+    done
+    return 1
+}
+# any_cache_dir : echo the first candidate with a NON-EMPTY cache (REAPER scanned SOMETHING
+# there) — used to tell "scanned but the shell was rejected" apart from "never scanned".
+any_cache_dir() {
+    for d in $(uniq_res); do
+        [ -s "$(cache_in "$d")" ] && { echo "$d"; return 0; }
+    done
+    return 1
+}
+# snapshot : copy every candidate cache + reaper.ini + the staged bundle tree into $OUT so
+# the artifact upload carries a full diagnosis even when M1 fails (task: dump ALL candidates).
+snapshot() {
+    { echo "=== staged VST3 bundle tree ($STAGED_VST) ==="; find "$STAGED_VST" 2>/dev/null
+      echo; echo "=== bundle parent dir ==="; ls -la "$(dirname "$STAGED_VST")" 2>/dev/null
+      win="$STAGED_VST/Contents/x86_64-win"
+      [ -d "$win" ] && { echo; echo "=== module dir $win (co-located runtime DLLs land here) ==="; ls -la "$win"; }
+    } >"$OUT/staging.txt" 2>&1
+    for d in $(uniq_res); do
+        tag=$(printf '%s' "$d" | tr -c 'A-Za-z0-9' '_')
+        c=$(cache_in "$d"); [ -f "$c" ]            && cp "$c" "$OUT/cache_${tag}.ini" 2>/dev/null || true
+        [ -f "$d/reaper.ini" ]                     && cp "$d/reaper.ini" "$OUT/reaperini_${tag}.ini" 2>/dev/null || true
+    done
+}
+
+if ! scanned_dir >/dev/null; then
+    say "warm-up launch to scan the VST3 folder (no __startup present) ..."
     timeout 90 "$REAPER" -nosplash -noactivate >"$OUT/warmup.reaper.log" 2>&1 &
     wpid=$!
-    for _ in $(seq 1 80); do scanned && break; sleep 1; done
-    taskkill //F //IM reaper.exe //T >/dev/null 2>&1 || true
+    for _ in $(seq 1 80); do scanned_dir >/dev/null && break; sleep 1; done
+    # GRACEFUL close FIRST so REAPER FLUSHES reaper-vstplugins64.ini to disk — a //F
+    # force-kill loses an unflushed cache, the prime suspect for the empty-cache M1 fail
+    # (the Linux path exits REAPER via SIGTERM, which flushes; taskkill //F does not).
+    taskkill //IM reaper.exe //T >/dev/null 2>&1 || true
+    for _ in $(seq 1 12); do kill -0 "$wpid" 2>/dev/null || break; sleep 1; done
+    taskkill //F //IM reaper.exe //T >/dev/null 2>&1 || true   # fallback if it ignored WM_CLOSE
     kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
-    sleep 3   # let REAPER's on-exit flush of reaper-vstplugins64.ini settle before we judge
+    sleep 2   # let the on-exit flush settle before we judge
 fi
-if scanned; then milestone "M1 (REAPER scanned harp-shell)" 0
-else echo "FAIL M1: harp-shell not scanned -> would render silence"; echo "  --- cache ---"; sed 's/^/  | /' "$CACHE" 2>/dev/null | tail -20; exit 1; fi
+
+snapshot   # capture caches/inis/bundle for artifacts regardless of the verdict below
+
+if RES_HIT=$(scanned_dir); then
+    RES="$RES_HIT"; CACHE=$(cache_in "$RES"); SCRIPTS_DIR="$RES/Scripts"; INI="$RES/reaper.ini"
+    say "resolved resource-dir=$RES  cache=$CACHE"
+    echo "  --- $CACHE (full) ---"; sed 's/^/  | /' "$CACHE" 2>/dev/null
+    milestone "M1 (REAPER scanned harp-shell — resource-dir=$RES)" 0
+elif SOME=$(any_cache_dir); then
+    # REAPER DID scan (a non-empty cache exists) but harp-shell is not named in it: the
+    # module was FOUND but REJECTED (failed to LOAD — a missing runtime dep or a bad DLL).
+    RES="$SOME"; CACHE=$(cache_in "$RES"); SCRIPTS_DIR="$RES/Scripts"; INI="$RES/reaper.ini"
+    echo "FAIL M1: REAPER scanned (cache=$CACHE) but harp-shell is NOT in it"
+    echo "         -> the shell was FOUND but the module FAILED TO LOAD (missing runtime dep / bad DLL) -> would render silence"
+    echo "  --- $CACHE (full) ---"; sed 's/^/  | /' "$CACHE" 2>/dev/null
+    exit 1
+else
+    # No cache in ANY candidate: REAPER never completed a scan pass at all.
+    echo "FAIL M1: REAPER wrote NO plugin cache in ANY candidate resource dir"
+    echo "         candidates: $(uniq_res | tr '\n' ' ')"
+    echo "         -> REAPER never completed a scan (first-run modal? crash? a resource dir not in the list) -> cannot proceed"
+    echo "  --- warm-up REAPER log (tail) ---"; tail -40 "$OUT/warmup.reaper.log" 2>/dev/null | sed 's/^/  | /'
+    exit 1
+fi
 
 # install the SHARED ReaScript as REAPER's auto-run startup script (device via the env)
+mkdir -p "$SCRIPTS_DIR"
+rm -f "$SCRIPTS_DIR/__startup.lua"      # ensure the render passes start from a clean slot
 cp "$HERE/reaper-e2e.lua" "$SCRIPTS_DIR/__startup.lua"
 
 # REAPER reopens the last (now-deleted) project + can pop a crash-recovery modal; scrub

@@ -124,8 +124,56 @@ jobs:
             '[audioconfig]'
             'mode=0'
           )
-          Set-Content -Path 'C:\REAPER\reaper.ini' -Value $ini -Encoding ASCII
-          Write-Host 'seeded C:\REAPER\reaper.ini (portable, dummy audio, VST3 path)'
+          # Seed BOTH the portable install dir AND the roaming profile: if the portable
+          # heuristic somehow does not trigger, REAPER falls back to %APPDATA%\REAPER —
+          # and without a reaper.ini THERE it would pop the first-run wizard, block the
+          # headless launch, never scan, and leave an EMPTY cache (the M1 symptom). With
+          # the ini in whichever dir REAPER actually uses, it always starts non-modal and
+          # scans; the driver then adopts whichever dir the cache lands in.
+          $dirs = @('C:\REAPER', (Join-Path $env:APPDATA 'REAPER'))
+          foreach ($d in $dirs) {
+            New-Item -ItemType Directory -Force $d | Out-Null
+            Set-Content -Path (Join-Path $d 'reaper.ini') -Value $ini -Encoding ASCII
+            Write-Host "seeded $d\reaper.ini (portable/roaming, dummy audio, VST3 path)"
+          }
+
+      - name: instrument shell deps + co-locate libusb DLL (defensive; static build needs none)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'   # diagnostics must never fail the job
+          $bundle = 'C:\Program Files\Common Files\VST3\harp-shell.vst3'
+          # the loadable module is the DLL inside Contents\x86_64-win (also named *.vst3)
+          $mod = Get-ChildItem -Recurse -File -Path $bundle -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match 'x86_64-win' -and $_.Extension -match '\.(vst3|dll)$' } |
+                 Select-Object -First 1
+          if (-not $mod) {
+            $mod = Get-ChildItem -Recurse -File -Path $bundle -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Extension -match '\.(vst3|dll)$' } | Select-Object -First 1
+          }
+          if (-not $mod) { Write-Host 'WARN: no module binary found in the staged bundle'; exit 0 }
+          Write-Host "module binary: $($mod.FullName)"
+          # dumpbin /dependents TELLS the run exactly which DLLs REAPER must resolve to load
+          # the shell — if libusb is statically linked (it is: MSVC static lib), it will NOT
+          # appear here, confirming the module is self-contained bar the system MSVC runtime.
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
+          if (-not $dumpbin) {
+            $dumpbin = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\2022' -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+                       Select-Object -First 1 | ForEach-Object FullName
+          }
+          if ($dumpbin) {
+            Write-Host "== dumpbin /dependents $($mod.Name) =="
+            & $dumpbin /dependents $mod.FullName
+          } else { Write-Host 'dumpbin not found; skipping the import dump' }
+          # DEFENSIVE co-location: drop libusb-1.0.dll next to the module (the module's own
+          # dir is first in the Windows DLL search order). A no-op for the static build, but
+          # it makes hypothesis (B) — REAPER silently skipping the plugin for a missing
+          # runtime dep — impossible regardless of how the shell ends up linked.
+          $dll = Get-ChildItem -Recurse -File -Path external/libusb-win -Filter libusb-1.0.dll -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match 'MS64|x64|MinGW64' } | Select-Object -First 1
+          if ($dll) {
+            Copy-Item -Force $dll.FullName (Split-Path $mod.FullName)
+            Write-Host "co-located $($dll.FullName) -> $(Split-Path $mod.FullName)"
+          } else { Write-Host 'no libusb-1.0.dll under external/libusb-win (static build: none needed)' }
 
       # ───────── the loopback e2e: M0 build → M1 scan → M2 non-silent → M3 determinism ─────────
       # The driver mirrors offline-golden-eth.sh (fresh daemon per render) + reaper-e2e.sh
