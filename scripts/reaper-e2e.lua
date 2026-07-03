@@ -25,7 +25,23 @@ local function set_render_cfg()
   reaper.GetSetProjectInfo(0, "RENDER_TAILFLAG", 0, true)   -- no tail (notes are within the render window)
   reaper.GetSetProjectInfo(0, "RENDER_SRATE", 48000, true)
   reaper.GetSetProjectInfo(0, "RENDER_CHANNELS", 2, true)
-  reaper.GetSetProjectInfo_String(0, "RENDER_FORMAT", "ZXZhdxgAAAA=", true) -- 24-bit WAV
+  -- Determinism hygiene (harmless to the Linux hw self-compare — both its renders share
+  -- this cfg — and required for a meaningful byte-pin): no dither/noise-shaping, no
+  -- normalize/brickwall, and force the project SR to equal the render SR so no SRC runs.
+  reaper.GetSetProjectInfo(0, "RENDER_DITHER", 0, true)      -- no dither / noise shaping
+  reaper.GetSetProjectInfo(0, "RENDER_NORMALIZE", 0, true)   -- no normalize / brickwall limit
+  reaper.GetSetProjectInfo(0, "PROJECT_SRATE_USE", 1, true)  -- pin the project SR ...
+  reaper.GetSetProjectInfo(0, "PROJECT_SRATE", 48000, true)  -- ... to 48k (== RENDER_SRATE, no SRC)
+  -- WAV bit depth is the 5th byte of REAPER's 'evaw' render blob: 0x18=24-bit PCM,
+  -- 0x20=32-bit (WAV offers float-only at 32/64, so 0x20 == 32-bit FLOAT). The env
+  -- selector keeps this ONE cross-platform script serving both suites: hw.yml (Linux,
+  -- USB) keeps its proven 24-bit render UNCHANGED (env unset), while the Windows
+  -- reaper-e2e.yml loopback sets HARP_E2E_RENDER_FMT=f32 for a lossless float capture
+  -- of the engine output (so a Tier-B byte-pin reflects the true samples).
+  local blob = (os.getenv("HARP_E2E_RENDER_FMT") == "f32")
+      and "ZXZhdyAAAAA="   -- evaw + 32  (32-bit float WAV)
+      or  "ZXZhdxgAAAA="   -- evaw + 24  (24-bit PCM WAV, the historical default)
+  reaper.GetSetProjectInfo_String(0, "RENDER_FORMAT", blob, true)
   reaper.GetSetProjectInfo_String(0, "RENDER_FILE", OUTDIR, true)   -- output DIRECTORY
   reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", NAME, true)  -- basename (no ext)
 end
