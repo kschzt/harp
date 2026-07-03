@@ -296,6 +296,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cppcheck
       - name: cppcheck (warning + portability, baselined)
         run: bash scripts/run-cppcheck.sh
+      - name: soak silence-oracle self-test (harp-soak.sh HARD-fails a silent render)
+        # hardware-free proof that the soak's #90 silence gate FIRES on a silent render
+        # (rms<floor) and PASSES real audio — so a refactor can't silently neuter it.
+        run: HARP_SOAK_SELFTEST=1 bash scripts/harp-soak.sh
 
   coverage:
     # Quantified test-coverage metric (gcovr) over the two surfaces CI is responsible for — the
