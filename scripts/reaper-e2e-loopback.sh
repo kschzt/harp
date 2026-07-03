@@ -269,10 +269,13 @@ else
     milestone "M3 (renders DIFFER — offline bounce not deterministic, see the DIAL MODE lines above)" 1
 fi
 
-# ── Tier-B drift pin: DORMANT until a hash is captured from a GREEN run (do not invent). ─
-# Once M2/M3 are green on main, copy the printed r1 data-chunk sha256 into PIN_REAPER_WIN
-# (here or via the env) to arm an absolute ground-truth pin against silent DSP drift.
-PIN_REAPER_WIN=${PIN_REAPER_WIN:-""}
+# ── Tier-B drift pin: ARMED. Absolute ground-truth hash of the REAPER offline render's
+# WAV data-chunk, captured from two INDEPENDENT green runs on fresh windows-2022 runners
+# (byte-identical across machines: MSVC build -> REAPER offline render -> §8.7 host-paced
+# device -> WAV is bit-exact), catching silent DSP/engine drift that run-to-run (Tier-A)
+# cannot. Override/disable via the env (PIN_REAPER_WIN= to skip). Re-capture the printed
+# r1 hash here if the shell DSP, the note input, or the pinned REAPER version changes.
+PIN_REAPER_WIN=${PIN_REAPER_WIN-"46f6160f1e8e7ef914a6fbfdad24ba1311d8fb20a539a3bfb6d7d22a313d115e"}
 if [ -n "$PIN_REAPER_WIN" ]; then
     if [ -n "$h1" ] && [ "$h1" = "$PIN_REAPER_WIN" ]; then
         milestone "Tier-B (data-chunk matches pinned ground truth $PIN_REAPER_WIN)" 0
