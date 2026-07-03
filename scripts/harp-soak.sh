@@ -23,6 +23,11 @@ HOST="$ROOT/build-vst/harp-vst3-host"
 BUNDLE="$(find "$ROOT/build-vst" -name harp-shell.vst3 -type d | head -1)"
 READBACK="$ROOT/scripts/harp-readback.py"
 ROUNDS="${1:-100000}"
+# A render that comes back below this whole-stream RMS was SILENT — the device produced
+# no audio for the full 8s. That is never valid output for ANY device (not engine
+# character, not a within-signal transient), so it is a HARD, LOUD fault (see is_silent).
+SILENCE_FLOOR="${SILENCE_FLOOR:-0.001}"
+SILENT_FAILS=0
 
 # fleet: name | conn (eth:host:port | usb:SERIAL) | transport label
 # name | conn | transport | kind (refdev = deterministic, analyzer trusted; synth = counters-only)
@@ -67,6 +72,24 @@ counter_delta() {
   awk -F= 'NR==FNR{b[$1]=$2;next}{if(($2+0)>(b[$1]+0))print $1" "b[$1]"->"$2}' <(echo "$1") <(echo "$2")
 }
 
+# is_silent RMS — exit 0 (true) if RMS is below the silence floor. A silent whole-render
+# is never valid output, so the soak flags it HARD + LOUD, distinct from the analyzer's
+# within-signal FLAGs (spikes/DC), and — unlike a within-signal flag on a synth — it is
+# NOT excused as engine character: a synth that emits pure silence has dropped out too.
+is_silent() { awk -v r="${1:-1}" -v f="$SILENCE_FLOOR" 'BEGIN{ exit !((r+0) < (f+0)) }'; }
+
+# Prove the silence gate without hardware: it must FIRE on silence and PASS real audio,
+# so a refactor that neuters it is caught in CI/pre-push.  HARP_SOAK_SELFTEST=1 scripts/harp-soak.sh
+if [ -n "${HARP_SOAK_SELFTEST:-}" ]; then
+  rc=0
+  is_silent 0.0    || { echo "SELFTEST FAIL: 0.0 not silent";       rc=1; }
+  is_silent 0.0005 || { echo "SELFTEST FAIL: 0.0005 not silent";    rc=1; }
+  is_silent 0.05   && { echo "SELFTEST FAIL: 0.05 flagged silent";  rc=1; }
+  is_silent 0.2    && { echo "SELFTEST FAIL: 0.2 flagged silent";   rc=1; }
+  [ $rc = 0 ] && echo "SOAK SELFTEST PASS: silence gate fires <$SILENCE_FLOOR, passes real audio"
+  exit $rc
+fi
+
 log "=== SOAK START — fleet: ${TARGETS[*]%%|*} — out $OUT ==="
 # resolve the level param index per device ONCE, by name (bash-3.2 safe: indexed arrays)
 NT=${#TARGETS[@]}; LVLS=(); SKIPPED=()
@@ -99,6 +122,17 @@ while [ "$round" -lt "$ROUNDS" ]; do
     if ! echo "$out" | grep -q "rms="; then log "$name r$round: NO RENDER ($(echo "$out"|grep -iE 'no HARP|error|timed'|head -1))"; continue; fi
     ca="$(err_counters "$pa")"
     delta="$(counter_delta "$cb" "$ca")"
+    # HARD silence oracle — BEFORE the kind-based analyzer classification, because a fully
+    # silent render is a real dropout for a synth too (it must not be excused as engine
+    # character). Preserve the wav + the counter repro, count it, keep soaking (all-day
+    # hunter), and fail LOUD at SOAK END.
+    rmsnum="${hostrms#rms=}"
+    if is_silent "${rmsnum:-1}"; then
+      SILENT_FAILS=$((SILENT_FAILS+1))
+      cp "$wav" "$OUT/${name}-r${round}-SILENT.wav" 2>/dev/null
+      log "!!! SILENT-FAIL: $name r$round $xport rms=${rmsnum:-?} < $SILENCE_FLOOR — device produced SILENCE (hard fault)${delta:+  COUNTER-DELTA[$(echo "$delta"|tr '\n' ';')]}"
+      continue
+    fi
     verdict="$(python3 "$READBACK" "$wav" 2>&1 | sed -n '1p' | grep -oE '(ok|<<<.*)$')"
     flag=""
     [ -n "$delta" ] && flag="  COUNTER-DELTA[$(echo "$delta"|tr '\n' ';')]"
@@ -132,4 +166,8 @@ while [ "$round" -lt "$ROUNDS" ]; do
     log "--- reconnect churn x8 on kria: $fails fail(s) ---"
   fi
 done
-log "=== SOAK END (round $round) ==="
+if [ "$SILENT_FAILS" -gt 0 ]; then
+  log "=== SOAK END (round $round) — !!! HARD FAILURE: $SILENT_FAILS SILENT render(s) (see $OUT/*-SILENT.wav) ==="
+  exit 1
+fi
+log "=== SOAK END (round $round) — 0 silent renders ==="
