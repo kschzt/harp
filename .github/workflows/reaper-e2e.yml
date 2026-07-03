@@ -1,0 +1,192 @@
+name: reaper-e2e
+
+# Headless-REAPER §8.7 LOOPBACK end-to-end on windows-2022 — closes HARP's "no Windows
+# DAW e2e" residual WITHOUT hardware. A real third-party VST3 host (REAPER) loads
+# harp-shell.vst3 and renders a MIDI chord OFFLINE to WAV; the shell dials a localhost
+# harp-deviced synth over §8.7 TCP (HARP_ETH_DEVICE) and, because the render is offline
+# (kOffline), negotiates the deterministic host-paced bounce. It is the Windows twin of
+# hw.yml's scripts/reaper-e2e.sh (real USB Pi under xvfb) — same cross-platform ReaScript,
+# fake hardware instead of a device. NO hardware gate: it runs on the cloud runner on
+# every push/PR, in parallel to eth.yml (fake-hw conformance) and hw.yml (real device).
+#
+# The Windows build lanes are lifted verbatim from eth.yml (§8.7): a native MinGW
+# harp-deviced.exe + harp-probe.exe (static, TCP-only) and the MSVC harp-shell.vst3.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  reaper-e2e:
+    runs-on: windows-2022
+    timeout-minutes: 60   # SDK clones + MinGW device + MSVC shell + REAPER install + 2 renders
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # ───────── SDKs (same as eth.yml) ─────────
+      - name: clone VST3 SDK
+        run: git clone --depth 1 --recursive
+             https://github.com/steinbergmedia/vst3sdk.git external/vst3sdk
+      - name: clone CLAP SDK (header-only)
+        run: git clone --depth 1 --branch 1.2.8
+             https://github.com/free-audio/clap.git external/clap
+
+      # ───────── native MinGW device + probe (static) — eth.yml's Windows lane ─────────
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
+      - name: build device + probe (MinGW, static)
+        shell: msys2 {0}
+        run: |
+          cmake -B build-dev -G Ninja -DHARP_FUZZ=OFF \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc"
+          # harp-probe is TCP-only here (no libusb in MSYS2 → usb_io.c omitted); the
+          # loopback dials over TCP, and the front-panel pin uses `harp-probe -d HOST:PORT`.
+          cmake --build build-dev --target harp-deviced harp-probe
+          ./build-dev/harp-deviced.exe --bogus 2>&1 | head -3 || true   # smoke: it starts
+
+      # ───────── MSVC shell (harp-shell.vst3) — eth.yml's Windows shell lane ─────────
+      - name: fetch libusb (prebuilt MSVC binaries)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ver = '1.0.27'
+          Invoke-WebRequest -UseBasicParsing `
+            "https://github.com/libusb/libusb/releases/download/v$ver/libusb-$ver.7z" `
+            -OutFile libusb.7z
+          New-Item -ItemType Directory -Force external/libusb-win | Out-Null
+          7z x libusb.7z -oexternal/libusb-win -y
+      - name: build shell (MSVC, Release)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake -B build-vst -S tools/vst3-host -G "Visual Studio 17 2022" -A x64
+          cmake --build build-vst --config Release --target harp-shell
+
+      # ───────── REAPER (PINNED 7.76, cached by URL) ─────────
+      - name: cache REAPER installer (pinned 7.76)
+        id: cache-reaper
+        uses: actions/cache@v4
+        with:
+          path: reaper-install.exe
+          key: reaper-7.76-x64-installer
+      - name: download REAPER 7.76 (x64)
+        if: steps.cache-reaper.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -UseBasicParsing `
+            'https://www.reaper.fm/files/7.x/reaper776_x64-install.exe' `
+            -OutFile reaper-install.exe
+      - name: install REAPER (silent, portable at C:\REAPER)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # NSIS: /S = silent, /D= must be LAST and unquoted (the install dir).
+          Start-Process .\reaper-install.exe -ArgumentList '/S /D=C:\REAPER' -Wait
+          if (!(Test-Path 'C:\REAPER\reaper.exe')) { throw 'REAPER install failed (no reaper.exe)' }
+          Write-Host 'REAPER installed at C:\REAPER'
+
+      - name: stage harp-shell.vst3 into the system VST3 folder
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # the VST3 SDK emits a BUNDLE DIRECTORY named harp-shell.vst3; pick the
+          # shallowest match (the top bundle, not the inner DLL).
+          $vst = Get-ChildItem -Recurse -Directory -Path build-vst -Filter harp-shell.vst3 |
+                 Sort-Object { $_.FullName.Length } | Select-Object -First 1
+          if (-not $vst) { throw 'harp-shell.vst3 bundle not found under build-vst' }
+          $dest = 'C:\Program Files\Common Files\VST3'
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          Copy-Item -Recurse -Force $vst.FullName (Join-Path $dest 'harp-shell.vst3')
+          Write-Host "staged $($vst.FullName) -> $dest\harp-shell.vst3"
+
+      - name: seed reaper.ini (portable + VST3 scan path + dummy audio, no first-run modal)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # A reaper.ini next to reaper.exe makes REAPER run PORTABLE (resource dir =
+          # C:\REAPER), and its presence means "not first run" so no setup wizard. The
+          # Dummy Audio backend keeps REAPER off real hardware; offline render needs no
+          # audio device anyway, so this only avoids a possible startup audio modal.
+          # (String array, not a here-string: a here-string body must sit at column 0,
+          # which would terminate the enclosing YAML block scalar.)
+          $ini = @(
+            '[REAPER]'
+            'vstpath64=C:\Program Files\Common Files\VST3'
+            '[audioconfig]'
+            'mode=0'
+          )
+          # Seed BOTH the portable install dir AND the roaming profile: if the portable
+          # heuristic somehow does not trigger, REAPER falls back to %APPDATA%\REAPER —
+          # and without a reaper.ini THERE it would pop the first-run wizard, block the
+          # headless launch, never scan, and leave an EMPTY cache (the M1 symptom). With
+          # the ini in whichever dir REAPER actually uses, it always starts non-modal and
+          # scans; the driver then adopts whichever dir the cache lands in.
+          $dirs = @('C:\REAPER', (Join-Path $env:APPDATA 'REAPER'))
+          foreach ($d in $dirs) {
+            New-Item -ItemType Directory -Force $d | Out-Null
+            Set-Content -Path (Join-Path $d 'reaper.ini') -Value $ini -Encoding ASCII
+            Write-Host "seeded $d\reaper.ini (portable/roaming, dummy audio, VST3 path)"
+          }
+
+      - name: instrument shell deps + co-locate libusb DLL (defensive; static build needs none)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'   # diagnostics must never fail the job
+          $bundle = 'C:\Program Files\Common Files\VST3\harp-shell.vst3'
+          # the loadable module is the DLL inside Contents\x86_64-win (also named *.vst3)
+          $mod = Get-ChildItem -Recurse -File -Path $bundle -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match 'x86_64-win' -and $_.Extension -match '\.(vst3|dll)$' } |
+                 Select-Object -First 1
+          if (-not $mod) {
+            $mod = Get-ChildItem -Recurse -File -Path $bundle -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Extension -match '\.(vst3|dll)$' } | Select-Object -First 1
+          }
+          if (-not $mod) { Write-Host 'WARN: no module binary found in the staged bundle'; exit 0 }
+          Write-Host "module binary: $($mod.FullName)"
+          # dumpbin /dependents TELLS the run exactly which DLLs REAPER must resolve to load
+          # the shell — if libusb is statically linked (it is: MSVC static lib), it will NOT
+          # appear here, confirming the module is self-contained bar the system MSVC runtime.
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
+          if (-not $dumpbin) {
+            $dumpbin = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\2022' -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+                       Select-Object -First 1 | ForEach-Object FullName
+          }
+          if ($dumpbin) {
+            Write-Host "== dumpbin /dependents $($mod.Name) =="
+            & $dumpbin /dependents $mod.FullName
+          } else { Write-Host 'dumpbin not found; skipping the import dump' }
+          # DEFENSIVE co-location: drop libusb-1.0.dll next to the module (the module's own
+          # dir is first in the Windows DLL search order). A no-op for the static build, but
+          # it makes hypothesis (B) — REAPER silently skipping the plugin for a missing
+          # runtime dep — impossible regardless of how the shell ends up linked.
+          $dll = Get-ChildItem -Recurse -File -Path external/libusb-win -Filter libusb-1.0.dll -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match 'MS64|x64|MinGW64' } | Select-Object -First 1
+          if ($dll) {
+            Copy-Item -Force $dll.FullName (Split-Path $mod.FullName)
+            Write-Host "co-located $($dll.FullName) -> $(Split-Path $mod.FullName)"
+          } else { Write-Host 'no libusb-1.0.dll under external/libusb-win (static build: none needed)' }
+
+      # ───────── the loopback e2e: M0 build → M1 scan → M2 non-silent → M3 determinism ─────────
+      # The driver mirrors offline-golden-eth.sh (fresh daemon per render) + reaper-e2e.sh
+      # (REAPER hosts the shell, renders through the device), and echoes each harp-deviced
+      # log so the run tells us whether the dial was host-paced (kOffline) or free-running RTP.
+      - name: reaper §8.7 loopback e2e (M0/M1/M2/M3 + kOffline-vs-RTP observation)
+        shell: bash
+        run: scripts/reaper-e2e-loopback.sh
+
+      - name: upload renders + REAPER/daemon logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reaper-e2e-out
+          path: reaper-e2e-out/
+          if-no-files-found: ignore
