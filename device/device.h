@@ -235,12 +235,24 @@ typedef struct {
  * names. Keep >= 64 slots of steady-state headroom over a full batch. */
 _Static_assert(DEV_EVQ_CAP >= DEV_TXN_EVENTS_MAX + 64, "evq needs headroom over a maximal txn batch");
 
+/* consume-side batching: max untagged events collected before a forced flush. It ONLY bounds
+ * the run when the transport has input continuously ready (a saturating flood); the normal
+ * flush trigger is "no more input ready this instant", so under real traffic the run is
+ * usually shorter. Kept modest so the worst-case deferral (this many decode passes) — and
+ * hence any added latency under saturation — stays far inside the §8.3.1 fence bound, while
+ * still amortising the evq lock by up to this factor. Bounded well under DEV_EVQ_CAP. */
+#define EVT_STAGE_CAP 64
+
 /* the queue itself (storage, count, mutex) and the per-param ramp state
  * are private to engine.c; sessions interact through these: */
 bool evq_full(void); /* the never-drop-a-note-off escalation check */
 /* §9.6: push a whole batch ALL-OR-NOTHING under one lock (a commit applies every buffered
  * event or none — a per-event push could partially drop at DEV_EVQ_CAP, breaking atomicity). */
 bool evq_push_batch(const dev_event *evs, size_t count);
+/* consume-side batching: push a RUN of independent events under one lock, BYTE-IDENTICAL to
+ * `count` sequential evq_push() calls (same order + per-event partial-fill/drop). NOT atomic
+ * (that is evq_push_batch); the flood of independent events has no all-or-nothing contract. */
+void evq_push_run(const dev_event *evs, size_t count);
 
 extern _Atomic int g_touch_pending;       /* dirty-flag work deferred off the
                                              render thread; set release, read
@@ -422,6 +434,18 @@ typedef struct {
     harp_hash sendq[HARP_SENDQ_CAP];
     size_t sendq_head, sendq_tail, sendq_count;
     dev_txn txn[DEV_TXN_MAX]; /* §9.6 open event transactions (recv-thread-private) */
+    /* consume-side event batching (recv-thread-private): a run of already-arrived untagged
+     * param/ramp/mod events, collected across back-to-back EVT messages and pushed to the evq
+     * under ONE lock (evt_stage_flush -> evq_push_run) to raise flood throughput. NOT a deeper
+     * queue: the run is flushed the instant the transport has no more input ready (io->readable
+     * == false) or at EVT_STAGE_CAP, so no event is ever held back (latency-neutral). evt_stage_n
+     * doubles as the deferred g_evt_consumed count — one staged event == one consumed EVT message
+     * — published (release) only AFTER the run is visible in the evq, so the §8.3.1 fence stays
+     * exact. evt_staged flags whether the LAST message staged (so the loop knows to defer its
+     * consume-bump vs. count it now). */
+    dev_event evt_stage[EVT_STAGE_CAP];
+    size_t evt_stage_n;
+    bool evt_staged;
     uint32_t rtp_peer_ip;   /* §8.7: the TCP peer's IPv4 (network order), or 0 when
                                the session is not over TCP (USB gadget). It is the
                                RTP audio destination when audio.start negotiates a

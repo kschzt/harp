@@ -462,6 +462,26 @@ bool evq_push_batch(const dev_event *evs, size_t count) {
     return ok;
 }
 
+/* Push a RUN of independent events under ONE lock — BYTE-IDENTICAL to `count` sequential
+ * evq_push() calls: same order, same PER-EVENT partial-fill-then-drop at DEV_EVQ_CAP, same
+ * g_evq_drops accounting. This is the consume-side flood path (session.c stages a run of
+ * already-arrived untagged param/ramp/mod events and commits them here); it amortises the
+ * mutex acquire/release — contended with the render thread's evq_apply_due — over the whole
+ * run instead of paying it per event. It is NOT the §9.6 atomic batch: evq_push_batch stays
+ * all-or-nothing for a transaction's same-instant commit, but an independent-event flood has
+ * no all-or-nothing contract, so matching per-event push exactly IS the bit-exact requirement
+ * (a partial fill under queue pressure must land the same events a per-event push would). */
+void evq_push_run(const dev_event *evs, size_t count) {
+    pthread_mutex_lock(&g_evq_mu);
+    for (size_t i = 0; i < count; i++) {
+        if (g_evq_n < DEV_EVQ_CAP)
+            g_evq[g_evq_n++] = evs[i];
+        else
+            CTR_INC(g_evq_drops);
+    }
+    pthread_mutex_unlock(&g_evq_mu);
+}
+
 bool evq_full(void) {
     pthread_mutex_lock(&g_evq_mu);
     bool full = g_evq_n >= DEV_EVQ_CAP;

@@ -34,8 +34,12 @@ static uint64_t fnv1a(uint64_t h, const void *p, size_t n) {
 }
 
 /* Render the fixed sequence once from a cold engine; return the FNV-1a hash over every rendered
- * float and (out) the mean-square energy so the caller can assert non-silence. */
-static uint64_t render_once(double *out_ms) {
+ * float and (out) the mean-square energy so the caller can assert non-silence. When `batched` is
+ * true the SAME events are enqueued with ONE evq_push_run() (the consume-side batch primitive)
+ * instead of per-event evq_push() — the render MUST be byte-identical, which pins evq_push_run's
+ * order+fill as equivalent to N sequential pushes through the real DSP (device/session.c stages a
+ * flood into exactly this call). The default (batched=false) path is the unchanged golden oracle. */
+static uint64_t render_once_impl(double *out_ms, int batched) {
     audio_state a;
     memset(&a, 0, sizeof a);
     a.rate = RATE;
@@ -63,14 +67,18 @@ static uint64_t render_once(double *out_ms) {
         {RATE * 3 / 2, DEV_EV_NOTE_OFF, 64, 0.0f},
         {RATE * 3 / 2, DEV_EV_NOTE_OFF, 67, 0.0f},
     };
+    dev_event evs[sizeof seq / sizeof seq[0]] = {0};
     for (size_t i = 0; i < sizeof seq / sizeof seq[0]; i++) {
-        dev_event ev = {0};
-        ev.ts = seq[i].ts;
-        ev.kind = seq[i].kind;
-        ev.a = seq[i].note;
-        ev.v = seq[i].vel;
-        ev.channel = 0;
-        evq_push(ev);
+        evs[i].ts = seq[i].ts;
+        evs[i].kind = seq[i].kind;
+        evs[i].a = seq[i].note;
+        evs[i].v = seq[i].vel;
+        evs[i].channel = 0;
+    }
+    if (batched) {
+        evq_push_run(evs, sizeof evs / sizeof evs[0]); /* one lock, whole run */
+    } else {
+        for (size_t i = 0; i < sizeof evs / sizeof evs[0]; i++) evq_push(evs[i]);
     }
 
     uint64_t h = 1469598103934665603ull;
@@ -92,8 +100,11 @@ static uint64_t render_once(double *out_ms) {
     return h;
 }
 
+/* the pinned golden oracle: per-event evq_push, unchanged rendered bytes */
+static uint64_t render_once(double *out_ms) { return render_once_impl(out_ms, 0); }
+
 int main(void) {
-    double ms1 = 0.0, ms2 = 0.0;
+    double ms1 = 0.0, ms2 = 0.0, msb = 0.0;
     uint64_t h1 = render_once(&ms1);
     uint64_t h2 = render_once(&ms2);
     double rms = sqrt(ms1);
@@ -104,6 +115,17 @@ int main(void) {
     if (h1 != h2) {
         fprintf(stderr, "ENGINE-GOLDEN FAIL: non-deterministic render (%016llx != %016llx)\n",
                 (unsigned long long)h1, (unsigned long long)h2);
+        return 1;
+    }
+    /* consume-side batching regression guard: the SAME sequence enqueued with ONE evq_push_run
+     * must render byte-identically to the per-event evq_push oracle. A reorder/partial-drop in
+     * the batch primitive shifts this hash while the printed oracle stays put — a loud, self-
+     * contained failure. Does NOT affect the printed/pinned hash (still h1). */
+    uint64_t hb = render_once_impl(&msb, 1);
+    if (hb != h1) {
+        fprintf(stderr, "ENGINE-GOLDEN FAIL: evq_push_run render %016llx != per-event evq_push %016llx"
+                " — consume-side batching is NOT bit-exact\n",
+                (unsigned long long)hb, (unsigned long long)h1);
         return 1;
     }
     if (!(rms > 1e-4)) {

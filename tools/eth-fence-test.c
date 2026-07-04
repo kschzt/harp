@@ -155,6 +155,31 @@ static bool send_note_evt(harp_client *c, harp_io *io, harp_link *link) {
     return rc == 0;
 }
 
+/* send ONE untagged §9.4 param-set (etype 1) at msc 0 (asap) on the EVT stream. UNLIKE the
+ * note (which the device pushes to the evq immediately), an untagged param-set takes the
+ * consume-side BATCHING path: the device STAGES it and bumps g_evt_consumed only when it
+ * flushes the staged run — which, after this single message, happens the instant the recv
+ * would block (harp_io.readable == false). So this releasing-with-a-param variant proves the
+ * staging deferral + readable-triggered flush + deferred consume-accounting release the fence
+ * end-to-end (a broken accounting would never reach want -> the offline barrier would wedge). */
+static bool send_param_evt(harp_io *io) {
+    harp_cbuf ev;
+    harp_cbuf_init(&ev);
+    harp_cbor_array(&ev, 3);
+    harp_cbor_array(&ev, 2);
+    harp_cbor_uint(&ev, 0); /* epoch 0 = now */
+    harp_cbor_uint(&ev, 0); /* msc 0 = asap */
+    harp_cbor_uint(&ev, 1); /* etype 1 = param set (§9.4) */
+    harp_cbor_map(&ev, 2);
+    harp_cbor_uint(&ev, 0);
+    harp_cbor_uint(&ev, 0); /* key 0 -> param id 0 */
+    harp_cbor_uint(&ev, 1);
+    harp_cbor_float(&ev, 0.5f); /* key 1 -> value */
+    int rc = harp_link_send(io, HARP_STREAM_EVT, ev.buf, ev.len);
+    harp_cbuf_free(&ev);
+    return rc == 0;
+}
+
 static uint64_t counter(harp_client *c, const char *name) {
     harp_cbuf req, rsp;
     harp_cbuf_init(&req);
@@ -189,7 +214,7 @@ static uint64_t counter(harp_client *c, const char *name) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: eth-fence-test HOST:PORT [realtime|load[:N]]\n");
+        fprintf(stderr, "usage: eth-fence-test HOST:PORT [realtime|load[:N]|param]\n");
         return 2;
     }
     /* realtime = exercise the §8.3.1 REAL-TIME bounded fence (deadline + count) instead of the
@@ -209,6 +234,10 @@ int main(int argc, char **argv) {
      * literal zero while audio_underruns stay 0. This mode MEASURES + prints; it never asserts on the
      * timeout count (that is the A/B the driving script/operator compares). N defaults to 4000. */
     bool load = (argc > 2 && strncmp(argv[2], "load", 4) == 0);
+    /* param = the OFFLINE single-fence flow, but release the fence with an untagged param-set
+     * (which takes the consume-side batching/staging path) instead of a note (pushed directly).
+     * Proves the staged event's deferred g_evt_consumed reaches the fence want via readable-flush. */
+    bool param = (argc > 2 && strcmp(argv[2], "param") == 0);
     long load_n = 4000;
     if (load && argv[2][4] == ':') {
         long v = strtol(argv[2] + 5, NULL, 10);
@@ -387,8 +416,11 @@ int main(int argc, char **argv) {
          * timeout — never wedge. drain_output blocks only until that bounded render lands. */
     } else {
         harp_sleep_ns(50ull * 1000 * 1000); /* 50 ms: audio thread parks on the fence (portable) */
-        if (!send_note_evt(&client, &tio.io, &link)) {
-            fprintf(stderr, "fence: note evt send failed\n");
+        /* param mode releases with a STAGED param-set (consume-side batching path); default with a
+         * note (immediate evq push). Both must bump g_evt_consumed to 1 and release the fence. */
+        bool sent = param ? send_param_evt(&tio.io) : send_note_evt(&client, &tio.io, &link);
+        if (!sent) {
+            fprintf(stderr, "fence: release evt send failed (%s)\n", param ? "param" : "note");
             return 1;
         }
     }

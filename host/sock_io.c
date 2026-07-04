@@ -59,10 +59,29 @@ static bool sock_write_all(harp_io *io, const void *buf, size_t n) {
     return true;
 }
 
+/* Non-blocking readiness (harp_io.readable): true iff a recv would return immediately
+ * (data queued in the socket buffer), via a 0-timeout select — the same primitive
+ * connect_bounded() already uses here, so it is portable to the MinGW device (Winsock
+ * select). The device event-consume loop calls this ONLY when it has staged events, to
+ * decide whether to keep batching the incoming EVT run or flush now; it never blocks and
+ * a false result flushes at once (latency-neutral). One cheap syscall per staged message
+ * under a flood, amortised against the evq lock it saves (the lock is contended with the
+ * render thread, so cutting its acquisitions is the win). EOF also reads as readable — the
+ * loop then recv's, gets the disconnect, and the post-loop flush drains the stage. */
+static bool sock_readable(harp_io *io) {
+    harp_sock_io *t = (harp_sock_io *)io;
+    fd_set rf;
+    FD_ZERO(&rf);
+    FD_SET(t->s, &rf);
+    struct timeval tv = {0, 0}; /* poll: return immediately */
+    return select((int)t->s + 1, &rf, NULL, NULL, &tv) > 0 && FD_ISSET(t->s, &rf);
+}
+
 void harp_sock_io_init(harp_sock_io *t, harp_sockhandle s) {
     t->io.read_exact = sock_read_exact;
     t->io.write_all = sock_write_all;
     t->io.corrupt_pct = 0; /* §8.7 fault injection is DEVICE-only; init so stack garbage never makes the host corrupt its own frames */
+    t->io.readable = sock_readable; /* §consume batching: 0-timeout select readiness (device event-consume loop) */
     t->s = s;
     t->deadline_ns = 0; /* §16: no deadline by default; the device arms it pre-hello (harp-deviced.c) */
 }
