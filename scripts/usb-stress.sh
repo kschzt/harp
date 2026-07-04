@@ -29,6 +29,9 @@ BUNDLE="$(find "$ROOT/build-vst" -name harp-shell.vst3 -type d | head -1)"
 SSH="ssh -o ConnectTimeout=8 $SSHH"
 # set_config(0) soft-wedge helper (a tiny libusb tool). Provide via $USBCTL or it's skipped.
 USBCTL="${USBCTL:-/tmp/usbctl}"
+# which vectors to run (subset of: crash killd stopstr wedgestop). Default all; CI uses "crash killd".
+VECTORS="${VECTORS:-crash killd stopstr wedgestop}"
+want() { case " $VECTORS " in *" $1 "*) return 0;; *) return 1;; esac; }
 
 HARD=0; DST=0
 # report any uninterruptible (D-state) thread in the device daemon — the hard-wedge signature.
@@ -36,7 +39,7 @@ dthreads() { $SSH 'P=$(pgrep -x harp-deviced|head -1); [ -z "$P" ]&&exit; for t 
   tid=$(basename $t); s=$(sed -E "s/^[^)]*\) //" /proc/$tid/stat 2>/dev/null|cut -d" " -f1)
   [ "$s" = "D" ]&&echo "D-STATE tid$tid: $(sudo cat /proc/$tid/stack 2>/dev/null|head -5|tr "\n" "@")"; done; true' 2>/dev/null; }
 probe_ok() { perl -e 'alarm 8; exec @ARGV' "$PROBE" -d usb:$SER params 2>&1 | grep -qi "Master Level"; }
-recover() { $SSH 'sudo systemctl restart harp-deviced-usb' >/dev/null 2>&1; sleep 3; }
+recover() { $SSH 'sudo -n systemctl restart harp-deviced-usb' >/dev/null 2>&1; sleep 3; }
 stream_bg() { HARP_DEVICE_SERIAL=$SER HARP_RECONCILE_TIMEOUT_MS=0 "$HOST" "$BUNDLE" --set 7=0.7 \
   --channel 1 --part 1 --notes 50,53,57,60 --seconds 15 --realtime --out /tmp/usbstress.wav >/dev/null 2>&1 & echo $!; }
 # after a stress: capture D-state, then assert recovery (fresh claim / 1 restart / NEVER a reboot)
@@ -47,24 +50,27 @@ assert_recovers() { local tag="$1" d; d=$(dthreads); [ -n "$d" ] && { DST=$((DST
 echo "=== USB stress: target $SER via $SSHH, $N iters/vector ==="
 recover; probe_ok || { echo "device not reachable at start; aborting"; exit 2; }
 
-echo "--- crash: SIGKILL host mid-stream + fresh claim, ${N}x ---"
+if want crash; then echo "--- crash: SIGKILL host mid-stream + fresh claim, ${N}x ---"
 for i in $(seq 1 $N); do HP=$(stream_bg); sleep 2; kill -9 $HP 2>/dev/null; wait $HP 2>/dev/null; assert_recovers "crash.$i"; done
+fi
 
-echo "--- killd: SIGKILL the daemon mid-stream -> systemd auto-restart, ${N}x ---"
+if want killd; then echo "--- killd: SIGKILL the daemon mid-stream -> systemd auto-restart, ${N}x ---"
 for i in $(seq 1 $N); do recover; HP=$(stream_bg); sleep 1.5
-  $SSH 'sudo pkill -9 -x harp-deviced' >/dev/null 2>&1; kill -9 $HP 2>/dev/null; wait $HP 2>/dev/null; sleep 3
+  $SSH 'sudo -n systemctl kill -s KILL harp-deviced-usb' >/dev/null 2>&1; kill -9 $HP 2>/dev/null; wait $HP 2>/dev/null; sleep 3
   assert_recovers "killd.$i"; done
+fi
 
-echo "--- stopstr: systemctl stop racing a live stream, ${N}x ---"
+if want stopstr; then echo "--- stopstr: systemctl stop racing a live stream, ${N}x ---"
 for i in $(seq 1 $N); do recover; HP=$(stream_bg); sleep 2
-  $SSH 'sudo systemctl stop harp-deviced-usb' >/dev/null 2>&1; sleep 1; kill -9 $HP 2>/dev/null; wait $HP 2>/dev/null
-  $SSH 'sudo systemctl start harp-deviced-usb' >/dev/null 2>&1; sleep 2; assert_recovers "stopstr.$i"; done
+  $SSH 'sudo -n systemctl stop harp-deviced-usb' >/dev/null 2>&1; sleep 1; kill -9 $HP 2>/dev/null; wait $HP 2>/dev/null
+  $SSH 'sudo -n systemctl start harp-deviced-usb' >/dev/null 2>&1; sleep 2; assert_recovers "stopstr.$i"; done
+fi
 
-if [ -x "$USBCTL" ]; then
+if want wedgestop && [ -x "$USBCTL" ]; then
   echo "--- wedgestop: set_config(0) soft-wedge THEN systemctl stop (UDC-unbind a wedged gadget), ${N}x ---"
   for i in $(seq 1 $N); do recover; "$USBCTL" $SER cfg0 >/dev/null 2>&1; sleep 1
-    $SSH 'sudo systemctl stop harp-deviced-usb' >/dev/null 2>&1; sleep 1
-    $SSH 'sudo systemctl start harp-deviced-usb' >/dev/null 2>&1; sleep 2; assert_recovers "wedgestop.$i"; done
+    $SSH 'sudo -n systemctl stop harp-deviced-usb' >/dev/null 2>&1; sleep 1
+    $SSH 'sudo -n systemctl start harp-deviced-usb' >/dev/null 2>&1; sleep 2; assert_recovers "wedgestop.$i"; done
 else echo "--- wedgestop: SKIP (no \$USBCTL set_config helper) ---"; fi
 
 echo "=== RESULT: D-states=$DST  reboot-class-wedges=$HARD ==="
