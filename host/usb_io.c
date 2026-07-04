@@ -752,6 +752,7 @@ static harp_io *usb_open_core(usb_io *u, const char *want, bool want_vp,
         u->io.read_exact = usb_read_exact;
         u->io.write_all = usb_write_all;
         u->io.corrupt_pct = 0; /* §8.7 fault injection is DEVICE-only (uninit guard) */
+        u->io.readable = NULL; /* host side never runs the device consume loop (uninit guard) */
 
         /* OUT slots pre-allocated; IN transfers posted before anything
          * else can write — "inbound read pending" from the first byte */

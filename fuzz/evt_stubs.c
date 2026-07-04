@@ -84,6 +84,7 @@ bool evq_push_batch(const dev_event *evs, size_t count) {
     (void)count;
     return true; /* "the whole batch landed" — keeps txn_commit's all-or-nothing path linear */
 }
+void evq_push_run(const dev_event *evs, size_t count) { (void)evs; (void)count; } /* consume-side batch flush */
 bool evq_full(void) { return false; } /* never full -> the note-off escalation branch is not taken */
 void evq_reset_for_new_stream(void) {}
 void engine_all_notes_off(void) {}

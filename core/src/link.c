@@ -78,6 +78,7 @@ void harp_io_fd_init(harp_io_fd *f, int rfd, int wfd) {
     f->io.read_exact = fd_read_exact;
     f->io.write_all = fd_write_all;
     f->io.corrupt_pct = 0; /* §8.7 fault injection off by default; the device opts in per-io */
+    f->io.readable = NULL; /* fd/pipe transport: no readiness probe -> the consume loop never batches */
     f->rfd = rfd;
     f->wfd = wfd;
 }

@@ -26,6 +26,15 @@ struct harp_io {
      * outgoing payload frames. Set ONLY by the device (--corrupt-ctl-pct); the host
      * leaves it 0, so host->device framing is never corrupted. */
     int corrupt_pct;
+    /* OPTIONAL non-blocking readiness probe: true iff a subsequent recv would NOT block
+     * (a whole/partial message is already buffered in the transport). Used ONLY by the
+     * device event-consume loop (harp_deviced_run_session) to batch a run of already-
+     * arrived EVT events under ONE evq lock without ever waiting for more — when it returns
+     * false the loop flushes immediately, so no event is held back (latency-neutral). NULL =
+     * unknown => the loop never batches (per-message, byte-identical to before). A transport
+     * with a userspace read buffer (FunctionFS) answers this with no syscall; a raw socket
+     * answers via a 0-timeout select. The core recv/send paths never call it. */
+    bool (*readable)(harp_io *io);
 };
 
 /* fd-backed transport (sockets, pipes, FunctionFS endpoints).

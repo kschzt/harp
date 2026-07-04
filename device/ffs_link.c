@@ -36,6 +36,19 @@ static bool ffs_read_exact(harp_io *io, void *buf, size_t n) {
     return true;
 }
 
+/* Non-blocking readiness (harp_io.readable): true iff bytes are ALREADY sitting in the
+ * userspace reassembly buffer, i.e. the next ffs_read_exact can make progress without a
+ * read(2) syscall. This is the batching signal for the device event-consume loop — the host
+ * streams several small EVT messages that the kernel hands us in one ≤16 KiB chunk, so after
+ * decoding one message rpos<rlen means the next is already here and can be decoded+staged
+ * under the same evq lock. No syscall; when the buffer drains (rpos==rlen) it returns false
+ * and the loop flushes the staged run at once (nothing is held back). It is deliberately
+ * conservative — it does NOT read(2) to see whether the kernel has more — so it never blocks. */
+static bool ffs_readable(harp_io *io) {
+    ffs_io *f = (ffs_io *)io;
+    return f->rpos < f->rlen;
+}
+
 static bool ffs_write_all(harp_io *io, const void *buf, size_t n) {
     ffs_io *f = (ffs_io *)io;
     const uint8_t *p = buf;
@@ -72,6 +85,7 @@ harp_io *ffs_io_init(ffs_io *f, int ep_in, int ep_out) {
     memset(f, 0, sizeof *f);
     f->io.read_exact = ffs_read_exact;
     f->io.write_all = ffs_write_all;
+    f->io.readable = ffs_readable; /* §consume batching: userspace-buffered readiness, no syscall */
     f->ep_in = ep_in;
     f->ep_out = ep_out;
     f->rd = read; /* seam defaults to the real syscalls (ffs.c path unchanged); */

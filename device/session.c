@@ -1531,6 +1531,46 @@ static void handle_evt_parse(device *d, const harp_env *e) {
     harp_cbuf_free(&m);
 }
 
+/* ---------------- consume-side event batching (throughput) ----------------
+ *
+ * A dense param-automation flood (tracker/Renoise per-tick, Elektron/Overbridge) arrives as
+ * many small back-to-back EVT messages, each historically decoded and pushed to the evq under
+ * its OWN g_evq_mu acquisition — a lock contended with the render thread (evq_apply_due), so
+ * the per-event lock traffic caps the sustainable event rate. These helpers collect a RUN of
+ * already-arrived untagged events (device.evt_stage) and commit them under ONE lock, cutting
+ * the lock/contention cost by up to EVT_STAGE_CAP-fold. It is NOT a deeper queue: the run is
+ * flushed the instant the transport has no more input ready (harp_io.readable == false, checked
+ * in the consume loop) or at EVT_STAGE_CAP, so nothing is ever held back (latency-neutral), and
+ * events land in the evq in the SAME order at the SAME timestamps (bit-exact). */
+
+/* true iff a recv would not block right now (a transport with a readiness probe that says so);
+ * NULL probe => unknown => treat as "would block" so the run flushes every message (per-message,
+ * byte-identical to the pre-batching path — the safe fallback for transports without a probe). */
+static bool harp_io_readable(harp_io *io) {
+    return io->readable && io->readable(io);
+}
+
+/* Flush the staged run: push it (ONE evq lock; byte-identical to per-event evq_push) and THEN
+ * publish its consume-count (release) — the §8.3.1 fence must see the events in the evq before
+ * g_evt_consumed counts them. One staged event == one consumed untagged EVT message, so the run
+ * length IS the deferred count. Idempotent, so it is safe to call defensively before any non-
+ * staged evq operation and at every loop/session exit. */
+static void evt_stage_flush(device *d) {
+    if (d->evt_stage_n == 0) return;
+    evq_push_run(d->evt_stage, d->evt_stage_n);
+    atomic_fetch_add_explicit(&g_evt_consumed, (uint32_t)d->evt_stage_n, memory_order_release);
+    d->evt_stage_n = 0;
+}
+
+/* Stage one untagged event (the txn_submit txn-id-0 fast path). At EVT_STAGE_CAP flush first so
+ * the buffer + worst-case deferral stay bounded. Marks evt_staged so the consume loop defers
+ * THIS message's g_evt_consumed bump into the run instead of counting it immediately. */
+static void evt_stage_add(device *d, dev_event ev) {
+    if (d->evt_stage_n >= EVT_STAGE_CAP) evt_stage_flush(d);
+    d->evt_stage[d->evt_stage_n++] = ev;
+    d->evt_staged = true;
+}
+
 /* ---------------- §9.6 event transactions ---------------- */
 
 /* find the OPEN txn with this id, or NULL. Linear scan of DEV_TXN_MAX (4); recv-thread-only. */
@@ -1562,7 +1602,7 @@ static void txn_begin(device *d, uint64_t id) {
 /* a decoded event tagged with txn_id (0 = untagged): apply NOW, or buffer in the open txn. A
  * tag for an unknown/closed txn is SWALLOWED + counted — applying it would break atomicity. */
 static void txn_submit(device *d, uint64_t txn_id, dev_event ev) {
-    if (txn_id == 0) { evq_push(ev); return; } /* untagged: byte-identical to pre-§9.6 */
+    if (txn_id == 0) { evt_stage_add(d, ev); return; } /* untagged: stage for a batched evq push (flushed same message when input drains) */
     dev_txn *t = txn_find(d, txn_id);
     if (!t) { CTR_INC(d->evt_txn_unknown); return; }
     if (t->n >= DEV_TXN_EVENTS_MAX) { CTR_INC(d->evt_txn_overflow); return; }
@@ -1587,6 +1627,7 @@ static bool txn_commit(device *d, uint64_t id, uint64_t commit_msc) {
      * live ref + fire a spurious state.changed for a commit that moved no parameter (misleading
      * recall and the §11.3 CAS). With the evq headroom over a maximal txn (device.h), this rejection
      * is reachable only under catastrophic queue pressure. */
+    evt_stage_flush(d); /* ordering: any staged untagged events precede this commit's batch in the evq */
     bool pushed = (t->n == 0) || evq_push_batch(t->ev, t->n);
     t->open = false; /* commit consumes the txn regardless */
     return had_dirty && pushed;
@@ -1627,6 +1668,11 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
                      p[3];
         uint32_t mt = w >> 28;
         if (mt == 2) { /* MIDI 1.0 channel voice in UMP */
+            /* flush any staged untagged run BEFORE this note touches the engine/evq: it must
+             * land in the evq ahead of the note (message order), and evq_full()'s escalation
+             * must see the true queue depth (staged events included) — exactly the pre-batching
+             * ordering, where each param was already evq_push'd by the time the note arrived. */
+            evt_stage_flush(d);
             uint32_t status = (w >> 20) & 0xf, note = (w >> 8) & 0x7f, vel = w & 0x7f;
             dev_event ev = {msc, 0, note, 0, 0, 0,
                             (uint8_t)((w >> 16) & 0xf), 0}; /* channel = part (§15.2); voice 0 */
@@ -1718,6 +1764,7 @@ static void handle_evt_msg(device *d, const uint8_t *buf, size_t len) {
                 return;
         }
         dev_event ev = {msc, DEV_EV_TRANSPORT, (uint32_t)flags, (float)tempo, 0, ppq, 0, 0};
+        evt_stage_flush(d); /* ordering: staged untagged events precede this transport anchor in the evq */
         evq_push(ev);
         return;
     }
@@ -2268,6 +2315,8 @@ void harp_deviced_run_session(device *d, harp_io *io) {
     d->granted = 0;
     d->sendq_head = d->sendq_tail = d->sendq_count = 0;
     memset(d->txn, 0, sizeof d->txn); /* §9.6: a fresh session starts with no open transactions */
+    d->evt_stage_n = 0; /* consume-side batching: no carried-over staged events across sessions */
+    d->evt_staged = false;
     d->rl_snapshot = (harp_op_bucket){0}; /* §16: a fresh session starts with a full expensive-op burst */
     d->rl_bundle = (harp_op_bucket){0};
     harp_link_init(&d->link);
@@ -2288,23 +2337,34 @@ void harp_deviced_run_session(device *d, harp_io *io) {
         if (!atomic_load_explicit(&d->hello_done, memory_order_acquire) &&
             harp_now_ns() - t_start > 10000000000ull)
             break;
-        if (stream == HARP_STREAM_CTL)
+        if (stream == HARP_STREAM_CTL) {
+            evt_stage_flush(d); /* publish any staged run before a control op (recall/audio.* may touch the engine/evq) */
             handle_ctl(d, msg.buf, msg.len); /* §5.4 hello gate lives inside handle_ctl (core.hello first) */
-        else if (!atomic_load_explicit(&d->hello_done, memory_order_acquire)) {
+        } else if (!atomic_load_explicit(&d->hello_done, memory_order_acquire)) {
             /* §5.4: OBJ and EVT carry NO pre-hello meaning. Before core.hello, drop them — else a
              * pre-hello peer could write the content store (handle_obj -> harp_store_put) and elicit a
              * core.credit grant, or inject events, all UNAUTHENTICATED on the §4.4 Ethernet binding.
-             * The ctl REQUEST gate already requires core.hello first; this extends it to OBJ/EVT. */
+             * The ctl REQUEST gate already requires core.hello first; this extends it to OBJ/EVT.
+             * (No staged run to flush: EVT is dropped before hello, so nothing was ever staged.) */
             CTR_INC(d->frame_errors);
-        } else if (stream == HARP_STREAM_OBJ)
+        } else if (stream == HARP_STREAM_OBJ) {
+            evt_stage_flush(d); /* publish any staged run before an object op (ordering) */
             handle_obj(d, msg.buf, msg.len);
-        else if (stream == HARP_STREAM_EVT) {
+        } else if (stream == HARP_STREAM_EVT) {
+            /* consume-side batching: handle_evt_msg STAGES an untagged param/ramp/mod (setting
+             * d->evt_staged) instead of pushing it now; every other event kind (note/transport/
+             * txn/malformed/stale) flushes the pending run inside handle_evt_msg before its own
+             * evq work. */
+            d->evt_staged = false;
             handle_evt_msg(d, msg.buf, msg.len);
-            /* fence bookkeeping (§8.3.1): every evt message counts once it
-             * is FULLY processed (events visible in evq) — including ones
-             * handle_evt_msg rejected, or a malformed message would leave
-             * the host's sequence unreachable and wedge every later fence */
-            atomic_fetch_add_explicit(&g_evt_consumed, 1, memory_order_release);
+            if (!d->evt_staged) {
+                /* not staged: publish any deferred run in order, THEN count this message. §8.3.1:
+                 * every processed evt message bumps g_evt_consumed exactly once (rejected/malformed
+                 * included — else the host's fence sequence becomes unreachable). A staged message
+                 * defers its +1 into the run (evt_stage_n), published when the run flushes. */
+                evt_stage_flush(d);
+                atomic_fetch_add_explicit(&g_evt_consumed, 1, memory_order_release);
+            }
         }
         /* §9.3 mid-session param-map re-announce: if the engine swapped its
          * advertised param table (a multi-engine synth changing engines — the
@@ -2328,7 +2388,15 @@ void harp_deviced_run_session(device *d, harp_io *io) {
                 evt_echo_param(d, g_params[i].id, engine_part_param_get(0, g_params[i].id), 0);
         }
         if (d->closing) break;
+        /* latency-neutral flush: keep batching the staged run ONLY while the transport already
+         * has more input buffered; the instant a recv would block (readable == false), flush so
+         * nothing waits. This is what makes it a throughput win with no added buffering delay —
+         * NOT a deeper queue. A NULL/absent readiness probe flushes every message (per-message,
+         * byte-identical to before). */
+        if (d->evt_stage_n && !harp_io_readable(io))
+            evt_stage_flush(d);
     }
+    evt_stage_flush(d); /* session over: drain any staged run (all loop exits fall through here) */
     harp_cbuf_free(&msg);
     harp_link_free(&d->link);
     audio_stop(d); /* session gone -> stream gone (§12) */

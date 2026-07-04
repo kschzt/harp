@@ -36,10 +36,15 @@ fail() { echo "OFFLINE-FENCE-ETH FAIL: $1"; exit 1; }
 DP=""
 trap '[ -n "$DP" ] && kill -9 "$DP" 2>/dev/null' EXIT
 
-# run NAME: start a fresh-state daemon, run the fence tool once, echo its fence-hash.
+# run NAME [MODE]: start a fresh-state daemon, run the fence tool once, echo its fence-hash.
+# MODE (default empty = release with a note) is passed through to the fence tool: "param"
+# releases the fence with a STAGED untagged param-set (the consume-side batching path), proving
+# a staged event's deferred g_evt_consumed reaches the fence want via the readable-triggered
+# flush — a broken accounting would never reach `want` and the offline barrier would WEDGE.
 # Returns the tool's exit code; prints the hash on stdout (last line scraped by caller).
 run_one() {
     local name="$1"
+    local mode="${2:-}"
     local devdir="offline-fence-eth-$name.$$"
     local out rc
     rm -rf "$devdir"; : > "$DEVLOG"
@@ -47,7 +52,7 @@ run_one() {
     DP=$!
     for _ in $(seq 1 25); do grep -q "listening on $PORT" "$DEVLOG" 2>/dev/null && break; sleep 0.2; done
     grep -q "listening on $PORT" "$DEVLOG" 2>/dev/null || { cat "$DEVLOG" >&2; echo "DEVFAIL"; return 1; }
-    out=$("$FENCE" "127.0.0.1:$PORT")
+    out=$("$FENCE" "127.0.0.1:$PORT" $mode)
     rc=$?
     echo "$out" >&2          # the FENCE PASS/FAIL + counter line, to the log
     kill -9 "$DP" 2>/dev/null; wait "$DP" 2>/dev/null; DP=""
@@ -68,5 +73,17 @@ echo "──── fence-hash #1=${h1:-<none>}  #2=${h2:-<none>}"
 [ -n "$h1" ] || fail "run #1 produced no fence-hash"
 [ "$h1" = "$h2" ] || fail "late-fenced offline bounce NON-DETERMINISTIC (#1=$h1 #2=$h2) — fence did not hold"
 
-echo "OFFLINE-FENCE-ETH PASS: fence reached + counted on both runs, fence_timeouts==0, deterministic ($h1)"
+# Consume-side batching: release the fence with a STAGED param-set (not a note). The device
+# stages the untagged param, and its deferred g_evt_consumed is published only when the recv
+# would block (readable==false) — so this reaching `want` proves the staging + readable-flush +
+# deferred consume-accounting release the fence end-to-end (broken -> the barrier WEDGES here).
+echo "──── run #3 (param-set release: consume-side batching / staging path)"
+h3=$(run_one c param) || fail "run #3: a STAGED param-set did not release the fence — consume-side batching consume-accounting is broken (barrier wedged)"
+echo "──── run #4 (param-set release, determinism)"
+h4=$(run_one d param) || fail "run #4: staged param-set release failed"
+echo "──── param fence-hash #3=${h3:-<none>}  #4=${h4:-<none>}"
+[ -n "$h3" ] || fail "run #3 produced no fence-hash"
+[ "$h3" = "$h4" ] || fail "staged-param-release offline bounce NON-DETERMINISTIC (#3=$h3 #4=$h4)"
+
+echo "OFFLINE-FENCE-ETH PASS: fence reached + counted (note $h1; staged-param $h3), fence_timeouts==0, both deterministic"
 exit 0
