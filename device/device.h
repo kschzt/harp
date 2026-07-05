@@ -503,6 +503,10 @@ void audio_stop(device *d);
 uint16_t render_output(audio_state *a, float *out, uint32_t n, float rate, uint64_t pos);
 void engine_voices_cold(void);   /* audio.start: cold-reset voices */
 void engine_voices_quiet(void);  /* audio_stop: free voices + clear panic */
+/* §8.3.1 fence lock-coupling instrumentation: reset at stream start, dump the acquire-wait vs
+ * lock-hold aggregates at teardown. INERT unless HARP_FENCE_INSTRUMENT is set — no golden impact. */
+void engine_fence_instr_reset(void);
+void engine_fence_instr_dump(void);
 /* §9.3 mid-session param-map change: an engine that mutates its advertised param
  * table at runtime (e.g. a multi-engine synth swapping engines) sets an internal
  * flag; the session loop polls this seam (take = read-and-clear, any thread) and,

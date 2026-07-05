@@ -10,6 +10,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h> /* getenv — HARP_FENCE_INSTRUMENT gate (off by default, inert) */
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -25,6 +26,7 @@
 #include "device.h"
 #include "fence_wait.h" /* §8.3.1 pure fence-wait predicate (host-unit-tested) */
 #include "harp/plat.h"  /* harp_now_ns: the §8.3.1 real-time fence bound */
+#include "log_ring.h"   /* harp_devlog — the HARP_FENCE_INSTRUMENT teardown dump (§14.4) */
 
 #include "arp_select.h"  /* pure §9.7 arp note-selection (host-unit-tested) */
 #include "voice_alloc.h" /* pure §9.5 voice-allocation policy (host-unit-tested) */
@@ -377,6 +379,136 @@ _Atomic uint32_t g_evt_consumed;
 _Atomic uint64_t g_fence_waits;
 _Atomic uint64_t g_fence_timeouts;
 
+/* ---------------- §8.3.1 fence lock-coupling INSTRUMENTATION (HARP_FENCE_INSTRUMENT) ----------------
+ *
+ * OFF by default and INERT when off: ONE relaxed atomic load (fi_on) gates EVERY probe, so with the
+ * env unset there is not a single added clock read on the hot path — shipped behavior and the render
+ * golden stay byte-identical (proven with scripts/engine-golden-test.sh, flag OFF *and* ON: the raw
+ * DSP hash is unchanged either way, so this is pure measurement, never logic). It measures the
+ * TWO sides of the established fence_timeout mechanism (the coarse g_evq_mu couples them) so an
+ * operator can decide the ROOT: coarse-lock coupling (fixable by decouple) vs an event-rate/jitter
+ * FLOOR (only an adaptive bound / host pacing helps):
+ *   (a) CONSUME side — the g_evq_mu ACQUIRE-WAIT at EVERY consume push site: evq_push_run (THE #160
+ *       batched flood path — untagged param/ramp/mod runs, one acquire per run), evq_push (transport
+ *       anchors / non-staged singles), and evq_push_batch (§9.6 same-instant txn commit). The
+ *       g_evt_consumed bump that RELEASES a fenced frame (session.c) cannot happen until the lock is won.
+ *   (b) RENDER side  — the per-call g_evq_mu HOLD in evq_apply_due, with the queue DEPTH N it scanned
+ *       (the O(S*N) drain that, held across the block, starves the consume side).
+ * VERDICT rule: if (a) p99 TRACKS the render hold / grows with N as depth climbs -> LOCK-DOMINANT
+ * (decouple reaches ~statistical-0). If (a) stays ~0 while fence_timeouts persist -> the FLOOR.
+ * Aggregates dump once at stream teardown (engine_fence_instr_dump) to the device log. */
+#define FI_BUCKETS 40 /* log2(ns) buckets: bucket b covers [2^(b-1), 2^b) ns; 0 = exactly 0 */
+static _Atomic int g_fi_state = -1;                              /* -1 unknown, 0 off, 1 on */
+static _Atomic uint64_t g_fi_acq_n, g_fi_acq_sum, g_fi_acq_max;  /* consume acquire-wait (ns) */
+static _Atomic uint64_t g_fi_acq_hist[FI_BUCKETS];
+static _Atomic uint64_t g_fi_hold_n, g_fi_hold_sum, g_fi_hold_max; /* render lock-hold per call (ns) */
+static _Atomic uint64_t g_fi_hold_hist[FI_BUCKETS];
+static _Atomic uint64_t g_fi_depth_sum, g_fi_depth_max;           /* g_evq_n scanned per apply call */
+
+static inline bool fi_on(void) {
+    int v = atomic_load_explicit(&g_fi_state, memory_order_relaxed);
+    if (v < 0) { /* resolve the env once, then cache (no getenv on the steady path) */
+        v = getenv("HARP_FENCE_INSTRUMENT") ? 1 : 0;
+        atomic_store_explicit(&g_fi_state, v, memory_order_relaxed);
+    }
+    return v == 1;
+}
+static inline uint64_t fi_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+static inline int fi_bucket(uint64_t ns) {
+    int b = 0;
+    while (ns) { b++; ns >>= 1; } /* 0->0, 1->1, 2..3->2, 4..7->3, ... */
+    return b < FI_BUCKETS ? b : FI_BUCKETS - 1;
+}
+static inline void fi_max(_Atomic uint64_t *m, uint64_t v) {
+    uint64_t cur = atomic_load_explicit(m, memory_order_relaxed);
+    while (v > cur &&
+           !atomic_compare_exchange_weak_explicit(m, &cur, v, memory_order_relaxed,
+                                                  memory_order_relaxed)) {
+    }
+}
+static void fi_record_acq(uint64_t ns) {
+    atomic_fetch_add_explicit(&g_fi_acq_n, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_fi_acq_sum, ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_fi_acq_hist[fi_bucket(ns)], 1, memory_order_relaxed);
+    fi_max(&g_fi_acq_max, ns);
+}
+static void fi_record_hold(uint64_t ns, size_t depth) {
+    atomic_fetch_add_explicit(&g_fi_hold_n, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_fi_hold_sum, ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_fi_hold_hist[fi_bucket(ns)], 1, memory_order_relaxed);
+    fi_max(&g_fi_hold_max, ns);
+    atomic_fetch_add_explicit(&g_fi_depth_sum, depth, memory_order_relaxed);
+    fi_max(&g_fi_depth_max, depth);
+}
+/* percentile from the log2 histogram: the LOWER bound (2^(b-1) ns) of the bucket where the
+ * cumulative count first crosses p — order-of-magnitude, enough to separate ~0 from S*N-tracking. */
+static uint64_t fi_pct(const _Atomic uint64_t *hist, uint64_t total, double p) {
+    if (!total) return 0;
+    uint64_t target = (uint64_t)(p * (double)total), cum = 0;
+    for (int b = 0; b < FI_BUCKETS; b++) {
+        cum += atomic_load_explicit(&hist[b], memory_order_relaxed);
+        if (cum >= target) return b <= 1 ? (uint64_t)b : (1ull << (b - 1));
+    }
+    return 1ull << (FI_BUCKETS - 1);
+}
+
+/* Zero the fence-coupling aggregates at stream start so each stream's dump is that stream's stats
+ * (evq_reset_for_new_stream). INERT when HARP_FENCE_INSTRUMENT is unset. */
+void engine_fence_instr_reset(void) {
+    if (!fi_on()) return;
+    atomic_store_explicit(&g_fi_acq_n, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_fi_acq_sum, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_fi_acq_max, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_fi_hold_n, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_fi_hold_sum, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_fi_hold_max, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_fi_depth_sum, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_fi_depth_max, 0, memory_order_relaxed);
+    for (int b = 0; b < FI_BUCKETS; b++) {
+        atomic_store_explicit(&g_fi_acq_hist[b], 0, memory_order_relaxed);
+        atomic_store_explicit(&g_fi_hold_hist[b], 0, memory_order_relaxed);
+    }
+}
+
+/* Dump the fence-coupling aggregates once at stream teardown (called from audio_stop after the
+ * render thread is joined). INERT when HARP_FENCE_INSTRUMENT is unset — this is the whole readout. */
+void engine_fence_instr_dump(void) {
+    if (!fi_on()) return;
+    uint64_t an = atomic_load_explicit(&g_fi_acq_n, memory_order_relaxed);
+    uint64_t asum = atomic_load_explicit(&g_fi_acq_sum, memory_order_relaxed);
+    uint64_t amax = atomic_load_explicit(&g_fi_acq_max, memory_order_relaxed);
+    uint64_t hn = atomic_load_explicit(&g_fi_hold_n, memory_order_relaxed);
+    uint64_t hsum = atomic_load_explicit(&g_fi_hold_sum, memory_order_relaxed);
+    uint64_t hmax = atomic_load_explicit(&g_fi_hold_max, memory_order_relaxed);
+    uint64_t dsum = atomic_load_explicit(&g_fi_depth_sum, memory_order_relaxed);
+    uint64_t dmax = atomic_load_explicit(&g_fi_depth_max, memory_order_relaxed);
+    harp_devlog(HARP_LOG_INFO, "fence-instr",
+                "harp-deviced: FENCE-INSTR consume-acquire-wait(g_evq_mu): n=%llu mean=%lluns "
+                "p50=%lluns p99=%lluns p999=%lluns max=%lluns\n",
+                (unsigned long long)an, (unsigned long long)(an ? asum / an : 0),
+                (unsigned long long)fi_pct(g_fi_acq_hist, an, 0.50),
+                (unsigned long long)fi_pct(g_fi_acq_hist, an, 0.99),
+                (unsigned long long)fi_pct(g_fi_acq_hist, an, 0.999),
+                (unsigned long long)amax);
+    harp_devlog(HARP_LOG_INFO, "fence-instr",
+                "harp-deviced: FENCE-INSTR render-lock-hold(evq_apply_due): calls=%llu mean=%lluns "
+                "p50=%lluns p99=%lluns max=%lluns depth_mean=%llu depth_max=%llu\n",
+                (unsigned long long)hn, (unsigned long long)(hn ? hsum / hn : 0),
+                (unsigned long long)fi_pct(g_fi_hold_hist, hn, 0.50),
+                (unsigned long long)fi_pct(g_fi_hold_hist, hn, 0.99),
+                (unsigned long long)hmax,
+                (unsigned long long)(hn ? dsum / hn : 0), (unsigned long long)dmax);
+    harp_devlog(HARP_LOG_INFO, "fence-instr",
+                "harp-deviced: FENCE-INSTR fence_waits=%llu fence_timeouts=%llu evq_drops=%llu\n",
+                (unsigned long long)atomic_load_explicit(&g_fence_waits, memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&g_fence_timeouts, memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&g_evq_drops, memory_order_relaxed));
+}
+
 /* §9.9 OUTPUT METERING atomics. Render thread folds (engine_meter_fold);
  * the session.c pump reads. Relaxed: meters order nothing, and the worst case
  * is a one-block-stale value the eye cannot see. */
@@ -438,7 +570,10 @@ void engine_meters_reset(void) {
 }
 
 void evq_push(dev_event ev) {
+    bool fi = fi_on();
+    uint64_t t0 = fi ? fi_now_ns() : 0; /* consume-side g_evq_mu acquire-wait (§8.3.1 instrument) */
     pthread_mutex_lock(&g_evq_mu);
+    if (fi) fi_record_acq(fi_now_ns() - t0);
     if (g_evq_n < DEV_EVQ_CAP)
         g_evq[g_evq_n++] = ev;
     else
@@ -452,7 +587,10 @@ void evq_push(dev_event ev) {
  * at DEV_EVQ_CAP and apply a partial kit-load. Returns false (batch rejected, counted) when
  * the queue can't hold all of it. */
 bool evq_push_batch(const dev_event *evs, size_t count) {
+    bool fi = fi_on();
+    uint64_t t0 = fi ? fi_now_ns() : 0; /* consume-side g_evq_mu acquire-wait (§8.3.1 instrument) */
     pthread_mutex_lock(&g_evq_mu);
+    if (fi) fi_record_acq(fi_now_ns() - t0);
     bool ok = (g_evq_n + count <= DEV_EVQ_CAP);
     if (ok)
         for (size_t i = 0; i < count; i++) g_evq[g_evq_n++] = evs[i];
@@ -472,7 +610,12 @@ bool evq_push_batch(const dev_event *evs, size_t count) {
  * no all-or-nothing contract, so matching per-event push exactly IS the bit-exact requirement
  * (a partial fill under queue pressure must land the same events a per-event push would). */
 void evq_push_run(const dev_event *evs, size_t count) {
+    bool fi = fi_on();
+    uint64_t t0 = fi ? fi_now_ns() : 0; /* consume-side g_evq_mu acquire-wait (§8.3.1 instrument):
+                                         * THE flood path (#160) — untagged param/ramp/mod runs win
+                                         * the lock here, once per run, contended with evq_apply_due. */
     pthread_mutex_lock(&g_evq_mu);
+    if (fi) fi_record_acq(fi_now_ns() - t0);
     for (size_t i = 0; i < count; i++) {
         if (g_evq_n < DEV_EVQ_CAP)
             g_evq[g_evq_n++] = evs[i];
@@ -523,6 +666,7 @@ void evq_reset_for_new_stream(void) {
     /* fence sequence space restarts with the stream (host resets its
      * queued-event counter at session start; both sides count from 0) */
     atomic_store_explicit(&g_evt_consumed, 0, memory_order_release);
+    engine_fence_instr_reset(); /* per-stream instrument reset; inert unless HARP_FENCE_INSTRUMENT */
 }
 /* ---------------- the sound engine ---------------- */
 /* (synth_voice is defined up top so 'part' can contain it — see P2.0;
@@ -939,7 +1083,10 @@ static void arp_fire_due(part *p, uint64_t pos, double rate) {
 
 static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
     uint64_t next = 0;
+    bool fi = fi_on();
     pthread_mutex_lock(&g_evq_mu);
+    uint64_t t_lock = fi ? fi_now_ns() : 0; /* render-side g_evq_mu HOLD (§8.3.1 instrument) */
+    size_t depth0 = g_evq_n;                /* what this O(N) scan+compact holds the lock over */
     size_t w = 0;
     for (size_t i = 0; i < g_evq_n; i++) {
         dev_event *ev = &g_evq[i];
@@ -1116,6 +1263,7 @@ static uint64_t evq_apply_due(uint64_t pos, uint64_t limit) {
         g_evq[w++] = *ev;
     }
     g_evq_n = w;
+    if (fi) fi_record_hold(fi_now_ns() - t_lock, depth0);
     pthread_mutex_unlock(&g_evq_mu);
     return next;
 }

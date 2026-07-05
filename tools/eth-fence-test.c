@@ -155,29 +155,55 @@ static bool send_note_evt(harp_client *c, harp_io *io, harp_link *link) {
     return rc == 0;
 }
 
-/* send ONE untagged §9.4 param-set (etype 1) at msc 0 (asap) on the EVT stream. UNLIKE the
- * note (which the device pushes to the evq immediately), an untagged param-set takes the
- * consume-side BATCHING path: the device STAGES it and bumps g_evt_consumed only when it
- * flushes the staged run — which, after this single message, happens the instant the recv
- * would block (harp_io.readable == false). So this releasing-with-a-param variant proves the
- * staging deferral + readable-triggered flush + deferred consume-accounting release the fence
- * end-to-end (a broken accounting would never reach want -> the offline barrier would wedge). */
-static bool send_param_evt(harp_io *io) {
+/* Send ONE untagged §9.4/§9.2 param-set (etype 1) at SSI sample `msc` on the EVT stream, with the
+ * given param id/value. Two callers:
+ *   - the L10-density flood (send_frame_batch): a BATCH of K of these releases a fenced frame whose
+ *     want counts them all; unlike the note (ts 0 = asap, applied in one segment) a distinct msc
+ *     lands the event at that exact sample, so a spread batch makes the render's evq_apply_due SPLIT
+ *     into many segments (the §8.3.1 lock-coupling hammer). param id/value are kept range-safe (a
+ *     valid refdev timbre id, value in [0,1]) so the flood surfaces only real faults.
+ *   - the `param` release mode: msc 0 (asap). UNLIKE the note (which the device pushes to the evq
+ *     immediately), an untagged param-set takes the consume-side BATCHING path (#160): the device
+ *     STAGES it and bumps g_evt_consumed only when it flushes the staged run — which, after a single
+ *     message, happens the instant the recv would block (harp_io.readable == false). So releasing a
+ *     fence with a param proves the staging deferral + readable-triggered flush + deferred
+ *     consume-accounting end-to-end (broken accounting would never reach want -> the barrier wedges). */
+static bool send_param_evt(harp_io *io, uint64_t msc, uint32_t pid, float val) {
     harp_cbuf ev;
     harp_cbuf_init(&ev);
     harp_cbor_array(&ev, 3);
     harp_cbor_array(&ev, 2);
-    harp_cbor_uint(&ev, 0); /* epoch 0 = now */
-    harp_cbor_uint(&ev, 0); /* msc 0 = asap */
-    harp_cbor_uint(&ev, 1); /* etype 1 = param set (§9.4) */
+    harp_cbor_uint(&ev, 0);   /* epoch 0 = now */
+    harp_cbor_uint(&ev, msc); /* §9.2 event instant = this SSI sample (spread => segment split) */
+    harp_cbor_uint(&ev, 1);   /* etype 1 = param set */
     harp_cbor_map(&ev, 2);
     harp_cbor_uint(&ev, 0);
-    harp_cbor_uint(&ev, 0); /* key 0 -> param id 0 */
+    harp_cbor_uint(&ev, pid); /* key 0: param id */
     harp_cbor_uint(&ev, 1);
-    harp_cbor_float(&ev, 0.5f); /* key 1 -> value */
+    harp_cbor_float(&ev, val); /* key 1: value (clamped [0,1] device-side) */
     int rc = harp_link_send(io, HARP_STREAM_EVT, ev.buf, ev.len);
     harp_cbuf_free(&ev);
     return rc == 0;
+}
+
+/* One fenced frame k of the L10-DENSITY driver: the fenced pacing frame (ssi=k*NS, want=(k+1)*K —
+ * the running EVT-message total this frame's batch completes), then its K param-set events spread
+ * across `spread` distinct SSI samples inside [ssi, ssi+NS). The valid refdev timbre-param pool
+ * (driver.py REF_POOL) is cycled so no two adjacent events collide on one id. With K near
+ * DEV_EVQ_CAP and a pipeline depth >= 2, the render is still draining an earlier frame's deep queue
+ * (holding g_evq_mu, O(S*N)) while the consume thread pushes THIS batch — the coupling under test. */
+static bool send_frame_batch(sockhandle dev, harp_io *io, long k, long K, long spread) {
+    static const uint32_t REF_POOL[6] = {5, 6, 12, 2, 3, 4}; /* attack release glide shape cutoff reso */
+    uint64_t ssi_k = (uint64_t)k * NS;
+    uint32_t want = (uint32_t)(((uint64_t)k + 1) * (uint64_t)K); /* cumulative EVT-message count */
+    if (!send_pacing_fenced(dev, ssi_k, want)) return false;
+    for (long j = 0; j < K; j++) {
+        uint64_t off = (uint64_t)(((j % spread) * (long)NS) / spread); /* distinct sample in the frame */
+        uint32_t pid = REF_POOL[(size_t)(j % 6)];
+        float val = 0.2f + 0.6f * (float)((j * 7) % 16) / 16.0f; /* range-safe [0.2,0.8) */
+        if (!send_param_evt(io, ssi_k + off, pid, val)) return false;
+    }
+    return true;
 }
 
 static uint64_t counter(harp_client *c, const char *name) {
@@ -232,7 +258,17 @@ int main(int argc, char **argv) {
      * fix targets). Run the daemon under load with HARP_DEVICE_RT=0 (time-share, the "before" arm) vs
      * default (SCHED_FIFO, the fix) and compare the printed fence_timeouts delta: the fix drives it to
      * literal zero while audio_underruns stay 0. This mode MEASURES + prints; it never asserts on the
-     * timeout count (that is the A/B the driving script/operator compares). N defaults to 4000. */
+     * timeout count (that is the A/B the driving script/operator compares). N defaults to 4000.
+     *
+     * L10-DENSITY (the off-hardware fence_timeout repro, scripts/fence-l10-repro.sh): the defaults
+     * above are ONE note/frame in strict ping-pong — the queue stays shallow, the render never splits,
+     * and render/consume never overlap, so it reads 0 (which is why the stock gate does). Three env
+     * knobs turn the stock loop into the §8.3.1 lock-coupling flood (see driver.py L10):
+     *   HARP_FENCE_K       events (timestamped param-sets) per fenced frame  -> deep queue N (->512)
+     *   HARP_FENCE_SPREAD  distinct SSI samples/frame the batch spans         -> render segment count S
+     *   HARP_FENCE_PIPE    frames in flight (>=2)                             -> render-drain / consume-push OVERLAP
+     * With HARP_FENCE_INSTRUMENT=1 on the daemon the acquire-wait vs lock-hold readout decides the ROOT
+     * (lock-dominant vs floor). Defaults (K=1,PIPE=1) keep the legacy path byte-identical to the gate. */
     bool load = (argc > 2 && strncmp(argv[2], "load", 4) == 0);
     /* param = the OFFLINE single-fence flow, but release the fence with an untagged param-set
      * (which takes the consume-side batching/staging path) instead of a note (pushed directly).
@@ -330,21 +366,62 @@ int main(int argc, char **argv) {
         uint64_t al_before = counter(&client, "audio_late_frames");
         uint64_t fe_before = counter(&client, "frame_errors");
         uint64_t el_before = counter(&client, "evt_late");
-        uint64_t ssi = 0;
-        for (long k = 0; k < load_n; k++) {
-            if (!send_pacing_fenced(dev, ssi, (uint32_t)(k + 1))) {
-                fprintf(stderr, "fence: load fenced send failed at k=%ld\n", k);
-                return 1;
+        uint64_t dr_before = counter(&client, "x.harp-refdev.evq_drops");
+        /* L10-DENSITY knobs. Defaults K=1,PIPE=1 => the legacy one-event ping-pong, byte-identical to
+         * the fence-load-rt.sh gate. Set HARP_FENCE_K (events/frame, sized toward DEV_EVQ_CAP=512),
+         * HARP_FENCE_PIPE (>=2: frames in flight so the render's deep-queue drain OVERLAPS the
+         * consume-push — the coupling), HARP_FENCE_SPREAD (distinct SSI samples/frame => the render's
+         * segment count S) to reproduce the §8.3.1 fence flood off-hardware (see driver.py L10). */
+        long K = 1, PIPE = 1, SPREAD = NS;
+        { const char *e; long v;
+          if ((e = getenv("HARP_FENCE_K")))      { v = strtol(e, NULL, 10); if (v >= 1) K = v; }
+          if ((e = getenv("HARP_FENCE_PIPE")))   { v = strtol(e, NULL, 10); if (v >= 1) PIPE = v; }
+          if ((e = getenv("HARP_FENCE_SPREAD"))) { v = strtol(e, NULL, 10); if (v >= 1) SPREAD = v; } }
+        if (SPREAD > NS) SPREAD = NS;
+        bool dense = (K > 1 || PIPE > 1);
+        if (!dense) {
+            /* legacy: one note event per fenced frame, strict ping-pong (the unchanged gate path) */
+            uint64_t ssi = 0;
+            for (long k = 0; k < load_n; k++) {
+                if (!send_pacing_fenced(dev, ssi, (uint32_t)(k + 1))) {
+                    fprintf(stderr, "fence: load fenced send failed at k=%ld\n", k);
+                    return 1;
+                }
+                if (!send_note_evt(&client, &tio.io, &link)) {
+                    fprintf(stderr, "fence: load note evt send failed at k=%ld\n", k);
+                    return 1;
+                }
+                if (!drain_output(dev)) {
+                    fprintf(stderr, "fence: load fenced output never arrived at k=%ld (wedge?)\n", k);
+                    return 1;
+                }
+                ssi += NS;
             }
-            if (!send_note_evt(&client, &tio.io, &link)) {
-                fprintf(stderr, "fence: load note evt send failed at k=%ld\n", k);
-                return 1;
+        } else {
+            /* L10-density PIPELINED driver: keep PIPE frames+batches in flight so the consume thread
+             * pushes a later frame's K-event batch WHILE the render still holds g_evq_mu draining an
+             * earlier frame's deep queue (O(S*N)) — the coupling that stalls the g_evt_consumed bump
+             * past the 5 ms fence bound. drain_output paces to the render so the queue stays bounded
+             * near DEV_EVQ_CAP (overflow => evq_drops, still counted; the fence still releases). */
+            long sent = 0;
+            for (; sent < PIPE && sent < load_n; sent++)
+                if (!send_frame_batch(dev, &tio.io, sent, K, SPREAD)) {
+                    fprintf(stderr, "fence: load batch send failed at k=%ld\n", sent);
+                    return 1;
+                }
+            for (long dn = 0; dn < load_n; dn++) {
+                if (!drain_output(dev)) {
+                    fprintf(stderr, "fence: load fenced output never arrived at k=%ld (wedge?)\n", dn);
+                    return 1;
+                }
+                if (sent < load_n) {
+                    if (!send_frame_batch(dev, &tio.io, sent, K, SPREAD)) {
+                        fprintf(stderr, "fence: load batch send failed at k=%ld\n", sent);
+                        return 1;
+                    }
+                    sent++;
+                }
             }
-            if (!drain_output(dev)) {
-                fprintf(stderr, "fence: load fenced output never arrived at k=%ld (wedge?)\n", k);
-                return 1;
-            }
-            ssi += NS;
         }
         uint64_t w_after = counter(&client, "x.harp-refdev.fence_waits");
         uint64_t t_after = counter(&client, "x.harp-refdev.fence_timeouts");
@@ -353,6 +430,7 @@ int main(int argc, char **argv) {
         uint64_t al_after = counter(&client, "audio_late_frames");
         uint64_t fe_after = counter(&client, "frame_errors");
         uint64_t el_after = counter(&client, "evt_late");
+        uint64_t dr_after = counter(&client, "x.harp-refdev.evq_drops");
 
         harp_cbuf sreq, srsp;
         harp_cbuf_init(&sreq);
@@ -367,18 +445,20 @@ int main(int argc, char **argv) {
         harp_sock_close(s);
 
         /* machine-parseable A/B line: the driving script/operator compares two arms (device
-         * HARP_DEVICE_RT=0 "before" vs default SCHED_FIFO "after"). fence_timeouts is the target. */
-        printf("fence-load: frames=%ld fence_waits=+%llu fence_timeouts=+%llu "
+         * HARP_DEVICE_RT=0 "before" vs default SCHED_FIFO "after"). fence_timeouts is the target.
+         * k/pipe/spread echo the L10-density config so a sweep row is self-describing. */
+        printf("fence-load: frames=%ld k=%ld pipe=%ld spread=%ld fence_waits=+%llu fence_timeouts=+%llu "
                "audio_underruns=+%llu audio_overruns=+%llu audio_late_frames=+%llu "
-               "frame_errors=+%llu evt_late=+%llu\n",
-               load_n,
+               "frame_errors=+%llu evt_late=+%llu evq_drops=+%llu\n",
+               load_n, K, PIPE, SPREAD,
                (unsigned long long)(w_after - w_before),
                (unsigned long long)(t_after - t_before),
                (unsigned long long)(au_after - au_before),
                (unsigned long long)(ao_after - ao_before),
                (unsigned long long)(al_after - al_before),
                (unsigned long long)(fe_after - fe_before),
-               (unsigned long long)(el_after - el_before));
+               (unsigned long long)(el_after - el_before),
+               (unsigned long long)(dr_after - dr_before));
         return 0;
     }
 
@@ -418,7 +498,7 @@ int main(int argc, char **argv) {
         harp_sleep_ns(50ull * 1000 * 1000); /* 50 ms: audio thread parks on the fence (portable) */
         /* param mode releases with a STAGED param-set (consume-side batching path); default with a
          * note (immediate evq push). Both must bump g_evt_consumed to 1 and release the fence. */
-        bool sent = param ? send_param_evt(&tio.io) : send_note_evt(&client, &tio.io, &link);
+        bool sent = param ? send_param_evt(&tio.io, 0, 0, 0.5f) : send_note_evt(&client, &tio.io, &link);
         if (!sent) {
             fprintf(stderr, "fence: release evt send failed (%s)\n", param ? "param" : "note");
             return 1;
