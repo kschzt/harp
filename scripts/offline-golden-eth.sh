@@ -30,6 +30,7 @@ VPLUG="${VPLUG:-$(find build-vst -maxdepth 5 -name harp-shell.vst3 -type d 2>/de
 CPLUG="${CPLUG:-$(find build-vst -maxdepth 5 -name harp-clap.clap 2>/dev/null | head -1)}"
 PORT="${PORT:-17990}"
 export HARP_RECONCILE_TIMEOUT_MS=0   # headless: no front panel to answer a recall pick
+. "$(dirname "$0")/eth-extern-lib.sh"   # EXTERNAL-ENDPOINT MODE detection (HARP_ETH_EXTERN)
 
 # The canonical golden render (same musical content as scripts/golden-test.sh): a clean
 # patch (SETTLE) plus a 4-note line. Deterministic input => deterministic bounce.
@@ -72,6 +73,37 @@ case "$OSID" in
     macos)   PIN_BOUNCE=154cba5fe21e31b7; PIN_TOGGLE=e8d637b2234e9894 ;;
     windows) PIN_BOUNCE=bbd4641960ded032; PIN_TOGGLE=48e46816b8f6e5a6 ;;
 esac
+# EXTERNAL-ENDPOINT pin: the audio is rendered ON THE DEVICE, so over a REAL §8.7 hop the
+# bounce hash is the DEVICE arch's DSP, NOT the host runner's (the PIN_BOUNCE above are the
+# x86_64/arm64-runner local values). The eth-hw rig device is the arm64 Raspberry Pi 4B, so
+# its host-paced kOffline bounce hashes to this. Re-baseline like any golden if the on-device
+# engine DSP changes deliberately (say so in the commit); an unexpected drift is a HARD FAIL.
+PIN_BOUNCE_EXTERN=eb6a3b838d1d8ec3   # PI4B (arm64) harp-deviced, §8.7 host-paced kOffline
+
+# ── EXTERNAL-ENDPOINT MODE (§8.7 over a REAL network hop) ──────────────────────────────────
+# The self-skip is gone: host-paced kOffline is DETERMINISTIC by construction (the host paces
+# every block; the device renders exactly those frames — no free-running clock, no ASRC), and
+# the device connects its audio plane BACK to the control-peer IP (device/audio_loop.c
+# audio_open_tcp_paced + shell/eth_transport INADDR_ANY listen), which is routable over the real
+# rig link. So the strongest possible gate runs here: a byte-exact bounce off the REAL hardware
+# over the REAL network, pinned. SETTLE resets all 12 params, so prior-suite state can't perturb
+# it. (Free-running audio fidelity necessarily self-skips — that path IS non-deterministic.)
+if eth_extern_active; then
+    EP="$(eth_extern_ep)"; eth_extern_export_serial
+    echo "── [offline-golden] EXTERNAL-ENDPOINT MODE: byte-exact host-paced kOffline bounce over the REAL §8.7 hop against $EP (device DSP, deterministic)"
+    { [ -x "$VHOST" ] && [ -d "$VPLUG" ]; } || { echo "   ⏭ SKIP offline-golden (external): VST3 host/bundle not built"; exit 0; }
+    rext() { HARP_ETH_DEVICE="$EP" perl -e 'alarm 60; exec @ARGV' "$VHOST" "$VPLUG" $SETTLE $SEQ 2>/dev/null | sed -nE 's/output-hash: //p'; }
+    h1=$(rext); h2=$(rext)
+    echo "   real-hop bounce: run1=${h1:-none} run2=${h2:-none}  (arm64 device pin=$PIN_BOUNCE_EXTERN)"
+    if [ -z "$h1" ] || [ "$h1" != "$h2" ]; then
+        echo "   ✗ FAIL: host-paced bounce over the real hop is NON-deterministic / silent (#1=${h1:-none} #2=${h2:-none})"; exit 1
+    fi
+    if [ "$h1" = "$PIN_BOUNCE_EXTERN" ]; then
+        echo "   ✓ real-link BYTE-EXACT: host-paced §8.7 kOffline bounce off the arm64 device over the real network matches the pin ($h1)"
+        exit 0
+    fi
+    echo "   ✗ FAIL: real-hop bounce DRIFTED from pin: got $h1 expected $PIN_BOUNCE_EXTERN — on-device DSP changed (bump the pin ONLY if intentional)"; exit 1
+fi
 # GOLDEN_PIN=0 disables the pin (for an intentional, in-progress DSP change whose new
 # value isn't captured yet). OPT-OUT and LOUD: default is enforced; a skip warns on
 # stderr so it can't hide. CI must NOT set GOLDEN_PIN.
