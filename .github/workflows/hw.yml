@@ -241,28 +241,23 @@ jobs:
           cmake --build build-vst --target install-linux
 
       - name: bring up the Pi in ETH (TCP) transport for THIS commit
-        # USB and ETH are mutually exclusive (harp-deviced-usb.service Conflicts=
-        # harp-deviced.service), so stop USB and start the TCP daemon built from this commit.
-        # The harp-hw concurrency group already serializes this against the USB `hardware` job.
-        # TODO(main-session): if the eth unit is named/parameterized differently on PI4B-0002,
-        # fix the systemctl line; the direct-launch fallback needs a matching sudoers allowance.
+        # systemd owns the daemon lifecycle (unit harp-deviced-eth.service, ExecStart points at
+        # ~/harp/build/harp-deviced which we rebuild in place below). USB and ETH are mutually
+        # exclusive: the eth unit has Conflicts=harp-deviced-usb.service, so `systemctl start`
+        # stops USB atomically. This replaces the old `ssh -f`/setsid detach, which held the ssh
+        # channel open and hung the session (exit 255) — systemd is the robust, RME-grade path
+        # and matches how harp-deviced-usb is already deployed. The harp-hw concurrency group
+        # serializes this against the USB `hardware` job.
         run: |
           set -x
           rsync -a --delete --exclude build --exclude .git --exclude external \
             ./ ci@${HARP_ETH_HOST}:harp/
-          # 1) build THIS commit on the Pi + free the device from USB mode. This ssh runs no
-          #    background job, so it returns cleanly (USB/ETH are mutually exclusive).
+          # 1) build THIS commit on the Pi (the unit runs ~/harp/build/harp-deviced).
           ssh ci@${HARP_ETH_HOST} "cmake -B ~/harp/build ~/harp \
-            && cmake --build ~/harp/build -j4 --target harp-deviced \
-            && sudo -n systemctl stop harp-deviced-usb"
-          # 2) launch the TCP daemon FULLY DETACHED. `ssh -f` backgrounds the client right after
-          #    auth so it never waits on the daemon's channel; setsid + </dev/null + redirects
-          #    detach the daemon. (The old inline `& ` held the ssh channel open -> hang -> 255.)
-          ssh -n -f ci@${HARP_ETH_HOST} \
-            "pkill -f 'harp-deviced --port' 2>/dev/null; sleep 1; \
-             setsid ~/harp/build/harp-deviced --port ${HARP_ETH_PORT} \
-               --state-dir ~/harp-eth-state --serial ${HARP_ETH_SERIAL} \
-               </dev/null >/tmp/harp-deviced-eth.log 2>&1"
+            && cmake --build ~/harp/build -j4 --target harp-deviced"
+          # 2) hand the daemon to systemd — starting eth stops usb via Conflicts=. No ssh
+          #    backgrounding, so this ssh returns cleanly.
+          ssh ci@${HARP_ETH_HOST} "sudo -n systemctl restart harp-deviced-eth"
           # 3) verify from the RUNNER by probing the real TCP port (robust; independent of the
           #    remote log format/timing).
           for i in $(seq 1 25); do
@@ -273,7 +268,8 @@ jobs:
           done
           if [ -z "${UP:-}" ]; then
             echo "::error::eth daemon did not come up on ${HARP_ETH_PORT}"
-            ssh ci@${HARP_ETH_HOST} "tail -40 /tmp/harp-deviced-eth.log" || true
+            ssh ci@${HARP_ETH_HOST} "sudo -n systemctl status harp-deviced-eth --no-pager -l | tail -30; \
+              journalctl -u harp-deviced-eth -n 40 --no-pager" || true
             exit 1
           fi
 
@@ -287,6 +283,5 @@ jobs:
         if: always()
         run: |
           ssh ci@${HARP_ETH_HOST} \
-            "( sudo -n systemctl stop harp-deviced 2>/dev/null; \
-               pkill -f 'harp-deviced --port' 2>/dev/null ) || true; \
+            "sudo -n systemctl stop harp-deviced-eth 2>/dev/null || true; \
              sudo -n systemctl start harp-deviced-usb 2>/dev/null || true"
