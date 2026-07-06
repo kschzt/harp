@@ -247,17 +247,35 @@ jobs:
         # TODO(main-session): if the eth unit is named/parameterized differently on PI4B-0002,
         # fix the systemctl line; the direct-launch fallback needs a matching sudoers allowance.
         run: |
+          set -x
           rsync -a --delete --exclude build --exclude .git --exclude external \
             ./ ci@${HARP_ETH_HOST}:harp/
+          # 1) build THIS commit on the Pi + free the device from USB mode. This ssh runs no
+          #    background job, so it returns cleanly (USB/ETH are mutually exclusive).
           ssh ci@${HARP_ETH_HOST} "cmake -B ~/harp/build ~/harp \
             && cmake --build ~/harp/build -j4 --target harp-deviced \
-            && sudo -n systemctl stop harp-deviced-usb 2>/dev/null || true; \
-            ( sudo -n systemctl restart harp-deviced 2>/dev/null ) \
-            || ( pkill -f 'harp-deviced --port' 2>/dev/null; \
-                 setsid ~/harp/build/harp-deviced --port ${HARP_ETH_PORT} \
-                   --state-dir ~/harp-eth-state --serial ${HARP_ETH_SERIAL} \
-                   </dev/null >/tmp/harp-deviced-eth.log 2>&1 & sleep 3; \
-                 grep -q \"listening on ${HARP_ETH_PORT}\" /tmp/harp-deviced-eth.log )"
+            && sudo -n systemctl stop harp-deviced-usb"
+          # 2) launch the TCP daemon FULLY DETACHED. `ssh -f` backgrounds the client right after
+          #    auth so it never waits on the daemon's channel; setsid + </dev/null + redirects
+          #    detach the daemon. (The old inline `& ` held the ssh channel open -> hang -> 255.)
+          ssh -n -f ci@${HARP_ETH_HOST} \
+            "pkill -f 'harp-deviced --port' 2>/dev/null; sleep 1; \
+             setsid ~/harp/build/harp-deviced --port ${HARP_ETH_PORT} \
+               --state-dir ~/harp-eth-state --serial ${HARP_ETH_SERIAL} \
+               </dev/null >/tmp/harp-deviced-eth.log 2>&1"
+          # 3) verify from the RUNNER by probing the real TCP port (robust; independent of the
+          #    remote log format/timing).
+          for i in $(seq 1 25); do
+            if timeout 2 bash -c "exec 3<>/dev/tcp/${HARP_ETH_HOST}/${HARP_ETH_PORT}" 2>/dev/null; then
+              echo "eth daemon up: ${HARP_ETH_HOST}:${HARP_ETH_PORT} accepting TCP"; UP=1; break
+            fi
+            sleep 1
+          done
+          if [ -z "${UP:-}" ]; then
+            echo "::error::eth daemon did not come up on ${HARP_ETH_PORT}"
+            ssh ci@${HARP_ETH_HOST} "tail -40 /tmp/harp-deviced-eth.log" || true
+            exit 1
+          fi
 
       - name: §8.7 conformance over REAL Ethernet (external-endpoint mode, PI4B-0002)
         env:
