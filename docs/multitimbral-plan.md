@@ -20,7 +20,7 @@
 > runtime registry*, the *event merge* and *owner/attached* roles, and the per-instance
 > *"Part" routing param* (P4/P5/P6). The per-machine daemon is also dropped — the
 > embedded in-process runtime is the reference architecture. See the 1.1.2 changelog
-> note atop [`spec/harp-spec-1.0.md`](../spec/harp-spec-1.0.md).
+> note atop [`spec/harp-spec.md`](../spec/harp-spec.md).
 
 Scopes debt #6 (§15.1 runtime/shell split) concretely: one physical device,
 many shells, full per-part multitimbral. Spec model landed in 0.3.6
