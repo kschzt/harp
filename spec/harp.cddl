@@ -37,6 +37,13 @@ ramp-event  = { 0 => uint, 1 => float32, 2 => tstamp, ? 3 => uint, ? 4 => uint, 
 mod-event   = { 0 => uint, 1 => float32, ? 3 => uint, ? 4 => uint, ? 5 => uint }
 transport-event = { 0 => uint, ? 1 => float64, ? 2 => [uint, uint], ? 3 => uint64,
                     ? 4 => float64, ? 5 => [float64, float64], ? 6 => float64 }
+; §9.6 transaction control bodies (cap evt.txn). txn-id 0 (or absent key 4) = untagged,
+; applies immediately; a device MUST reject txn-begin{0}. Commit re-stamps the buffered
+; batch onto one instant (optional key 1 tstamp, else the message's own) and applies it
+; all-or-nothing; abort discards it. A commit/abort for an unknown/closed id is a no-op.
+txn-begin   = { 0 => uint }                ; etype 2 — txn-id
+txn-commit  = { 0 => uint, ? 1 => tstamp } ; etype 3 — apply the batch all-or-nothing
+txn-abort   = { 0 => uint }                ; etype 4 — discard the batch
 param  = { 0 => uint, 1 => tstr, ? 2 => tstr, ? 3 => tstr, ? 4 => [float, float],
            ? 5 => uint, ? 6 => tstr, ? 8 => uint, ? 9 => [* tstr],
            ? 10 => [* [float32, float]], ? 11 => uint }
