@@ -1,7 +1,7 @@
 # Technical debt ledger
 
 Living document; items leave by being fixed, not forgotten.
-(Started 2026-06-11; updated through the MPE-input session, 2026-06-17.)
+(Started 2026-06-11; updated through the spec-1.1.2 host-runtime reconciliation, 2026-07-06.)
 
 | # | item | severity | status |
 |---|------|----------|--------|
@@ -10,7 +10,7 @@ Living document; items leave by being fixed, not forgotten.
 | 3 | parsers never fuzzed (spec §16/T9 requires it) | high | DONE — fuzz/ targets for cbor/envelope/object/link/audio (harpcore framing), the §10 params-blob codec (fuzz-state, device/state.c), AND the §9.2 EVT-stream parser (fuzz-evt, device/session.c::handle_evt_msg — the deepest host→device attack surface; was the gap behind the earlier OVERSTATED "DONE" that listed only the harpcore framing parsers). fuzz-evt TU-includes session.c to reach the `static` handler + fuzz/evt_stubs.c resolves the engine/store surface (mirrors fuzz-state). libFuzzer+ASan smoke in CI (Linux), ASan corpus replay locally (Apple clang has no fuzzer runtime); gen-corpus seeds from canonical encoders incl. the evt etypes (ump/ramp/mod/transport/txn); scripts/abuse-test.sh slams a live daemon (T9-lite). Follow-up: continuous fuzzing (OSS-Fuzz-style) once public; wire fuzz-evt into the ci.yml fuzz-loop matrix (currently `cbor envelope object link audio state` — add `evt`) |
 | 4 | shell: no reconnect on device replug; log-and-continue error paths; `staged*` naming is stale | medium | DONE — supervisor thread owns session lifecycle: hot-plug attach, unplug -> silence + 1 s retry, replug -> hello + bundle re-assert + stream (scripts/replug-test.sh proves it on hardware); staged* renamed bundle* |
 | 5 | debt tracked informally | low | this file |
-| 6 | §15.1 runtime/shell process split + multi-shell session sharing | medium | IN PROGRESS — scoped as full per-part multitimbral: one device, many shells. Spec model landed (0.3.6: §15.1 session sharing keyed by (vid,pid,serial), §15.2 state-controller vs multitimbral event group, audio owner). Plan + 7-phase build + 3-platform test matrix in `docs/multitimbral-plan.md`. Decisions: 16 per-part synths; params channel-scoped (NOT id-namespaced — param-map-hash unchanged); host registry + per-shell SPSC event rings merged by the single feeder (keeps TSan invariant); first-bind is audio owner, siblings silent. Item 2 (host/client.{h,c}) remains the stepping stone for the eventual daemon split |
+| 6 | §15.1 runtime/shell process split + multi-shell session sharing | medium | RETIRED (resolved by spec 1.1.2, 2026-06-30) — the multi-shell shared-session design (the 0.3.6 registry keyed by (vid,pid,serial), owner + dormant-attached refcount, §15.2 state-controller vs multitimbral event group, audio-owner election, cross-shell event merge) was RETIRED, not shipped. §15.1/§15.2 now mandate **one private runtime per plugin instance, exactly one instance per device**; multiple synths are kept apart by *selection* (serial via `selectDevice()`), the only process-global state is the §8.4 admission ledger (keyed by transport path), and **multitimbrality is realized in the host** (the DAW routes a MIDI channel per part into one multi-out instance, §9.4/§9.10, and routes the per-part output buses §6.3 back to tracks). SHIPPED and kept: the per-part engine/params/recall + per-part audio-bus demux + mid-session re-negotiation. DROPPED: the cross-instance registry/session-sharing AND the speculative per-machine daemon (the embedded in-process runtime is the reference architecture). `docs/multitimbral-plan.md` carries a SUPERSEDED banner |
 | 16 | multi-device: one shared runtime singleton -> all instances grab device #1 | high | DONE — per-instance runtime; selection by USB vid:pid:serial (exact serial -> same-model fallback -> fresh-any -> never cross-model); reconnect pins the bound serial; bundle records usb-identity (key 5, additive). Verified on a two-board bus: scripts/multidevice-test.sh (all rules) + replug-test (rule 6). harp-probe `list`, `-d usb:SERIAL`; au-host `--instances N`; HARP_DEVICE_SERIAL override |
 | 7 | free-running mode unexercised by any DAW path (no analog device yet) | low | deferred until a converter HAT / real analog device |
 | 8 | recall-test transient failure after cold boot (one occurrence, error codes now logged) | watch | monitoring |
@@ -30,7 +30,7 @@ Living document; items leave by being fixed, not forgotten.
 
 ## Spec-conformance gaps (bar §13)
 
-A separate axis from the engineering-debt table above: these are normative HARP-0.3
+A separate axis from the engineering-debt table above: these are normative HARP (1.x, bar §13)
 MUST/SHOULD requirements found unimplemented or stubbed by the adversarial spec-vs-impl
 audit (2026-06-21; see the `harp-spec-conformance` note). The audio/state/control core
 is mature and genuinely well-tested with zero rubber-stamped stubs — what is tracked

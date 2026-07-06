@@ -8,7 +8,7 @@
 [![license: Apache-2.0 | CC-BY-4.0](https://img.shields.io/badge/license-Apache--2.0%20%7C%20CC--BY--4.0-blue)](LICENSING.md)
 
 **Make hardware instruments behave like plugins.** HARP is an open protocol — a
-**Version 1.0** specification with a machine-readable CDDL schema — and a complete
+**Version 1.1.2** specification with a machine-readable CDDL schema — and a complete
 reference implementation that proves it: a Raspberry Pi 4B plays as an instrument
 track in Ableton Live today, with Git-style total recall through the project's own
 save/reopen, knobs as sample-accurate automation lanes, and offline bounce *through
@@ -48,12 +48,20 @@ speaks the protocol gets the same treatment from any conforming host:
   DAW compensates), and free-running live play goes **as low as ~9 ms** with a
   device-declared real-time profile — in the neighborhood of a good audio
   interface, and *measured*, never guessed (§14.3 loopback).
+- **Audio in, not just out (§8.8, new in 1.1)** — a device may also *process*
+  host audio as an insert or send effect, not only synthesize: the host streams
+  the track in and mixes the device's returned **wet** against the dry it keeps
+  locally (the dry never crosses the wire), with round-trip latency reported for
+  PDC. The reference ships a dedicated **FX shell** (`harp-fx-shell`) that drives
+  an `audio.fx` device this way; a tight-feedback effect closes its loop *in the
+  hardware*, at single-sample latency — the reason to put such an engine in a box
+  at all.
 - **Multitimbral, addressed like plugins** — one physical device is one
-  session, and several shell instances can share it: drop the plugin on a
-  handful of DAW tracks and each instance drives its own *part* — its own
-  channel, params, recall state, and stereo output (16 parts, with a summed
-  main mix alongside the per-part outputs). A recall-safe **Part** knob persists
-  each track's part in the project, and that per-part state moves intact between
+  instance, and multitimbrality lives in the host: the DAW routes multi-channel
+  MIDI into that single multi-out instance — channel N plays part N — and the
+  instance exposes the device's per-part output buses (bus 0 the summed main mix,
+  buses 1..N the 16 per-part stereo pairs) so each part returns to its own track.
+  Per-part timbre and recall state persist in the project and move intact between
   the VST3 and AU formats (the CLAP shell writes the same recall bundle).
 - **Polyphonic, with per-voice modulation** — each part is an 8-voice pool with
   deterministic voice allocation, so overlapping notes ring out on their own
@@ -85,8 +93,8 @@ speaks the protocol gets the same treatment from any conforming host:
 audio) are implemented end-to-end and verified on real hardware — recall
 through Ableton's own save/reopen, a tempo-locked arpeggiator, sample-accurate
 automation, offline bounce through the box, and a 16-part multitimbral,
-8-voice-polyphonic instrument with per-voice modulation, driven by several
-plugin instances over one shared session. The plugin shell builds and is
+8-voice-polyphonic instrument with per-voice modulation, driven as one
+multi-out instance with the DAW routing a MIDI channel per part. The plugin shell builds and is
 CI-validated on **macOS, Windows, and Linux** — a VST3 on all three (pluginval
 strictness 10), an Audio Unit on macOS (`auval`) at full parity, and a CLAP on
 all three — all three formats rendering byte-identically (the conformance kit
@@ -95,21 +103,24 @@ asserts it), and a project's per-part recall state moving between VST3 and AU
 Live** (macOS + Windows) and **Renoise** (Windows) by hand, plus a headless
 **REAPER** render-and-recall e2e on Linux that runs on every push.
 
-**Where 1.0 stands.** The spec is **Version 1.0** (26 June 2026); a spec→code audit
-cleared the implementation with **zero blockers**. What 1.0 *is*: a complete,
-normative protocol with a CDDL schema and a working reference device + host that
-prove it implementable end-to-end and byte-identically. What 1.0 *isn't, yet*: an
-ecosystem of instruments (building richer synths and shipping real devices on the
-protocol is the roadmap, not a claim about the present), and not yet a turn-key
-*certification* kit — the test suite is strong functional verification, but a unified
-T1–T17 conformance harness and the §13 firmware-management bar are still ahead. The
+**Where the spec stands.** The spec is **Version 1.1.2** (30 June 2026) — the 1.0 wire
+frozen, with `audio.fx` (§8.8) added as a backward-compatible capability in 1.1 and
+1.1.1–1.1.2 editorial clarifications on top; a spec→code audit cleared the implementation
+with **zero blockers**. What 1.x *is*: a complete, normative protocol with a CDDL schema
+and a working reference device + host that prove it implementable end-to-end and
+byte-identically. What it *isn't, yet*: an ecosystem of instruments (building richer
+synths and shipping real devices on the protocol is the roadmap, not a claim about the
+present), and not yet a turn-key *certification* kit — the unified T1–T17 conformance
+harness now ships (`scripts/cert-harness.sh`, gated per-PR in `ci.yml`) and runs the
+cloud-capable battery with its numeric thresholds asserted, but the rig-only tests at
+full certification scale and the §13 firmware-management bar remain. The
 [Status](#status) section is the full breakdown, and [Building on HARP](#building-on-harp)
 is the on-ramp for device and host implementers.
 
 ## Repository map
 
 ```
-spec/             the specification (v1.0) + machine-readable CDDL (the
+spec/             the specification (v1.1.2) + machine-readable CDDL (the
                   normative wire schema, Appendix A)
 core/             portable C11 protocol library, no dependencies:
                   framing, deterministic CBOR, SHA-256, content-addressed
@@ -122,15 +133,19 @@ host/             harp-probe — host-side CLI: recall flows, audio capture,
                   offline render, determinism + conformance checks (libusb)
 shell/            the plugin shells over one embedded runtime: VST3 ("HARP
                   RefDev"), Audio Unit (shell/au) and CLAP (shell/clap) — same
-                  params, same Recall Bundle, same "Part" routing param, same
-                  noteId->voice map (note_voice_map.h). The runtime registry lets
-                  several instances naming one device SHARE its session (each owns
-                  a part); the AU also joins the host's CoreAudio workgroup. All
-                  three render BYTE-IDENTICAL audio and a project's recall state
-                  moves between them (asserted by the conformance kit)
+                  params, same Recall Bundle, same noteId->voice map
+                  (note_voice_map.h) — plus the §8.8 audio.fx variant
+                  (fx_plugin.cpp / harp-fx-shell). One PRIVATE runtime per
+                  instance (no shared image, no cross-instance registry): a single
+                  multi-out instance exposes the device's per-part output buses and
+                  the DAW routes a MIDI channel per part; the AU also joins the
+                  host's CoreAudio workgroup. All three render BYTE-IDENTICAL audio
+                  and a project's recall state moves between them (asserted by the
+                  conformance kit)
 tools/vst3-host/  CLI VST3 host for automated testing of any plugin —
                   params, block processing, WAV+hash, state round-trips,
-                  multi-instance shared-session driving
+                  multi-out per-part channel routing, and the §8.8 FX
+                  multi-insert repro (--fx-instances)
 tools/au-host/    its Audio Unit twin (drives the AU shell; same hashes;
                   save/load-state for the cross-format recall e2e)
 tools/clap-host/  its CLAP twin (dlopens the .clap; drives notes/params and
@@ -302,24 +317,29 @@ debug), not an implementer tutorial. §13 firmware management is specified but n
 implemented on the reference device.
 
 **Build a host.** §15 defines the host runtime + shell requirements; the reference
-runtime (`shell/runtime.cpp` / `.h`) — embedded in the VST3/AU/CLAP shells — is working
-proof of DAW integration: discovery, sessions, the event merge, per-part demux, and
-recall. *Not yet provided:* the runtime is not packaged as a standalone library (it is
-embedded per plugin instance); the per-machine daemon (§15.1) that would cleanly separate
-transport and sessions is on the roadmap.
+runtime (`shell/runtime.cpp` / `.h`) — embedded in the VST3/AU/CLAP/FX shells — is working
+proof of DAW integration: discovery, sessions, per-part MIDI-channel routing, per-part
+audio-bus demux, and recall. *By design (§15.1):* the runtime is one private instance per
+device, embedded in-process — not packaged as a standalone library, with no shared
+cross-instance registry; the speculative per-machine daemon was dropped in 1.1.2, so the
+in-process runtime is the reference architecture, not a placeholder for one.
 
 **Verify conformance.** The conformance classes (§2.3, §17 — harp-core, harp-recall,
 harp-stream, harp-class-audio, harp-perf, harp-fw) tell you exactly what a given claim
 requires, and the test suite is strong functional verification: `scripts/eth-suite.sh`
 is the single source of truth across three OSes, the four "no silent state loss" safety
 contracts (CAS conflict §11.3, archive-before-push §11.4, param-map-hash §9.3, the event
-fence §8.3.1) each have a regression-catching test, and the CDDL is machine-readable.
-*Not yet provided:* a unified harness that runs the §17 T1–T17 battery by number and emits
-a certification report — today the cert behaviors are spread across `hw-tests-linux.sh`
-and `eth-suite.sh`, and the quantitative thresholds (±1 ms, ±1 sample, 24 h soak, ≥4
-device / ≥64 channel, ±200 ppm) are documented in §17 but not yet enforced at full
-certification scale. That harness — the path from *reference implementation* to
-*certification kit* — is the headline post-1.0 project.
+fence §8.3.1) each have a regression-catching test, and the CDDL is machine-readable. A
+**unified §17 T1–T17 harness ships** (`scripts/cert-harness.sh`, the `cert-harness` gate
+in `ci.yml`): it indexes the battery by number (`scripts/cert-tests.tsv`), runs the
+cloud-capable covering tests, asserts the cloud-reachable numeric thresholds (±1 ms
+loopback, ±1 sample, cross-format byte-identity, converter SINAD floor), and emits one
+pass/skip/uncovered report — with the rig-only tests (real USB unplug/replug, sleep/wake,
+power-loss, chained hubs, 24 h soak, multi-device-at-scale) and the full-scale numeric
+thresholds (24 h soak, ≥4 device / ≥64 channel, ±200 ppm) skipped with a logged reason and
+run on the rig in `hw.yml` / `soak.yml`. Closing those at certification scale, together
+with §13 firmware management, is the remaining bar from *reference implementation* to a
+turn-key *certification kit*.
 
 ## Documentation
 
@@ -334,13 +354,15 @@ certification scale. That harness — the path from *reference implementation* t
 - **VST3 shell design plan**: [`docs/vst3-shell-plan.md`](docs/vst3-shell-plan.md)
   — decisions, DAW-compatibility lore, and what's deliberately deferred.
 - **Multitimbral plan + test matrix**: [`docs/multitimbral-plan.md`](docs/multitimbral-plan.md)
-  — the per-part build (device parts → per-part params → session sharing →
-  event merge → per-part audio → Part param), what each phase verified, and
-  the deferred items.
+  — the per-part build history (device parts → per-part params → per-part audio
+  buses), what each phase verified, and the deferred items. **Superseded** by the
+  1.1.2 one-instance / host-side-multitimbral model (§15.1); see the banner atop
+  that doc.
 - **Ethernet/IP transport design**: [`docs/ethernet-transport-plan.md`](docs/ethernet-transport-plan.md)
   — the §4.4 network binding (RTP/UDP for audio, the framed link over TCP for
   control, trusted-segment security, an AES67 bridge reserved). Now folded into
-  the spec (§4.4, §7.3, §8.7) and CI-gated (`eth.yml`, three OSes): the framed
+  the spec (§4.4, §7.3, §8.7) and CI-gated on three OSes (`eth.yml`) — and, as of
+  2026-07-06, over a **real network hop** against the rig Pi (`hw.yml`): the framed
   control link, the RTP/UDP audio plane, the host-locked rate-trim loop + ASRC,
   and host-paced offline bounce. PTP-grade sync stays a hardware prototype
   (~22 µs idle), not yet wired into the runtime.
@@ -400,16 +422,16 @@ certification scale. That harness — the path from *reference implementation* t
   lands on division boundaries sample-exactly, survives loop wraps, and renders
   a byte-identical *groove hash*. (The automatable param map is 12 ids, shared
   across parts; old projects map onto matching ids with a warning, §9.3.)
-- **Multitimbral (§9.4, §15.1–§15.2)** — one device is one session, and several
-  shell instances that name the same unit *share* it, each owning a part
-  (channel): its own params, its own recall, its own demuxed stereo output (16
-  parts; a summed main mix alongside the per-part pairs). A recall-safe **Part**
-  parameter persists each instance's part in the project, and per-part state
-  moves between the VST3 and AU formats (CLAP writes the same recall bundle).
-  Verified on hardware: channel→part routing is exclusive (no bleed), per-part
-  timbres restore losslessly across save/reopen, sibling parts engage in the
-  summed mix, a part added mid-session re-negotiates its own audio, and a
-  per-part param reaches only its own part.
+- **Multitimbral (§9.4, §15.1–§15.2)** — one device is one multi-out instance;
+  multitimbrality lives in the host. The DAW routes a MIDI channel per part into
+  the single instance (channel N → part N), and the instance exposes the device's
+  per-part output buses (16 per-part stereo pairs plus a summed main mix)
+  demultiplexed to the tracks. Per-part timbre and recall state persist in the
+  project and move between the VST3 and AU formats (CLAP writes the same recall
+  bundle). Verified on hardware: channel→part routing is exclusive (no bleed),
+  per-part timbres restore losslessly across save/reopen, per-part output buses
+  demux to their tracks (including a bus that activates mid-session and
+  re-negotiates its own audio), and a per-part param reaches only its own part.
 - **Multi-device** — two *separate* boards on one bus (distinct from
   multitimbral above): each instance binds its own by USB identity (saved
   serial, else first unclaimed same-model — never a different synth), reconnect
@@ -433,50 +455,62 @@ certification scale. That harness — the path from *reference implementation* t
   spec-conformance closures (credit flow-control §4.2.1, event transactions §9.6,
   admission control §8.4, engine-major read-only §12.2, the §14.4 diag bundle and
   §14.3 loopback, mDNS discovery §4.4.3 on macOS), and the four safety-contract
-  tests (CAS conflict, archive-before-push, param-map-hash, event fence).
-- **Hardware suite** on a real Pi (`scripts/hw-tests-linux.sh`, the `hw`
-  badge): 21 sub-tests — 17 pass / 4 skip on the one-board, no-AU CI rig (the
-  two-device and VST3↔AU-recall tests self-skip, and two multi-instance USB
-  tests run on the eth rig instead). It gates the **golden
-  oracle across VST3 + AU + CLAP** (byte-identical), **8-voice polyphony with
-  deterministic voice-stealing**, **per-voice modulation** (VST3 Note Expression,
-  CLAP per-note PARAM_MOD, and **MPE** pitch/timbre/pressure), **§9.9 output
-  metering**, ±1-sample note timing with zero late events, a realtime soak
-  flooding automation + notes + panel traffic at the DAW block (zero silence
-  gaps, zero drops, bounded padding; a separate `soak-matrix.sh` sweeps buffers
-  64–1024 as a release-grade check), an automated mid-stream replug, an
-  IDM-flood determinism gate, the REAPER real-DAW determinism + recall
-  round-trip, and the **multitimbral matrix** — channel→part routing, per-part
-  recall, session sharing, an alias group playing, per-part audio demux (incl. a
+  tests (CAS conflict, archive-before-push, param-map-hash, event fence). As of
+  2026-07-06 the same §8.7 suite also runs over a **real network hop** against the
+  rig Pi (PI4B-0002 in TCP transport) as a green standing gate in `hw.yml` —
+  closing the loopback-only gap — with the tests that need a harness-local
+  co-process (SIGKILL fault injection, deterministic offline goldens) self-skipping
+  there with a logged reason.
+- **Hardware suite** on real Pis (`scripts/hw-tests-linux.sh`, the `hw`
+  badge) driving the two-board, no-AU CI rig (PI4B-0002 + PI4B-0003): VST3↔AU
+  cross-format recall self-skips (AU is macOS-only) and the two sustained
+  wide-stream per-part tests run on the eth loopback rig instead; everything else
+  runs over real USB. It gates the **golden oracle across VST3 + AU + CLAP**
+  (byte-identical), **8-voice polyphony with deterministic voice-stealing**,
+  **per-voice modulation** (VST3 Note Expression, CLAP per-note PARAM_MOD, and
+  **MPE** pitch/timbre/pressure), **§9.9 output metering**, ±1-sample note timing
+  with zero late events, a realtime soak flooding automation + notes + panel
+  traffic at the DAW block (zero silence gaps, zero drops, bounded padding; a
+  separate `soak-matrix.sh` sweeps buffers 64–1024 as a release-grade check), an
+  automated mid-stream replug, an IDM-flood determinism gate, the REAPER real-DAW
+  determinism + recall round-trip, a **USB never-wedge stress guard** (DAW-crash +
+  daemon-SIGKILL mid-stream), a **SCHED_FIFO fence-under-load gate** (§8.3.1 zero
+  fence_timeouts under CPU contention), **multi-device selection across the two
+  boards** (exact-serial / same-model fallback / never-cross-model), and the
+  **multitimbral matrix** — channel→part routing, per-part recall, several parts
+  playing into the one multi-out instance, per-part audio demux (incl. a
   mid-session re-negotiation), per-part param isolation, and cross-format VST3↔AU
   recall (macOS) — with the daemon under test built on the board from the commit
   being tested. The runtime threads are also ThreadSanitizer-clean (incl. the
-  multi-source event merge + demux) on the rig.
+  per-part event + audio demux) on the rig.
 - **Sandboxed suite**: builds + unit tests on three OSes, pluginval
   strictness 10 (macOS / Windows / Linux), `auval` (macOS), fuzzed parsers
   (libFuzzer + ASan), and a protocol-abuse test that slams a live daemon with
   hostile traffic (sessions reset, nothing crashes).
 
 **Certification status.** The §17 conformance battery (T1–T17) is normatively
-specified; a portion runs today in the suites above — **T2** (unplug/replug,
-`replug-test`), **T5** (silent hash-verified reopen, `recall-test`), **T9**
-(malformed input, corrupt-CBOR + abuse), **T15** (byte-identical on-device renders,
-`golden-test`), **T16** (event timing, `timing-test`), **T17** (musical-time tempo
-lock, `tempo-lock-test`). **T3** (sleep/wake) and **T10** (power-loss on real hardware)
-are not yet deployed, and the numeric thresholds in §17 are not yet enforced at full
-certification scale. A unified harness that runs all of T1–T17 by number and emits a
-report — together with §13 firmware management — is the remaining bar to a
-*certification claim* (distinct from the functional completeness above).
+specified, and a **unified harness now runs it by number and emits a report**
+(`scripts/cert-harness.sh`, the `cert-harness` gate in `ci.yml`): it runs the
+cloud-capable covering tests — including **T2** (unplug/replug, `replug-test`),
+**T5** (silent hash-verified reopen, `recall-test`), **T9** (malformed input,
+corrupt-CBOR + abuse), **T11** (loopback latency ±1 ms), **T15** (byte-identical
+on-device renders, `golden-test`), **T16** (event timing, `timing-test`), **T17**
+(musical-time tempo lock, `tempo-lock-test`) — asserts the cloud-reachable §17 numeric
+thresholds, and marks the rig-only and uncovered tests honestly. What remains for a
+certification *claim*: the rig-only battery at full certification scale (**T3**
+sleep/wake, **T7** chained hubs, **T10** power-loss, T13's ≥4-device / ≥64-channel 24 h
+soak, T14's ±200 ppm drift torture) and §13 firmware management.
 
-**Not yet:** runtime/shell process split (§15.1 — currently embedded in-process, a
-daemon refactor on the roadmap); firmware management (§13 — the structural bar for
-certification); class-audio coexistence (§8.5 — specified, hardware-pending); the
-free-running ASRC analog-device proof (the loop is implemented; the analog converter
-HAT is pending); PTP-grade Ethernet clock sync wired into the runtime (the §8.7 binding
-ships with a rate-trim loop + ASRC; PTP stays a hardware prototype); and the unified
-T1–T17 certification harness. The §5.5 `core.changed` / `core.bye` / `core.identify` /
-`core.ping` handlers ship; only the shell's auto-`bye`-on-disconnect is deferred (it
-regressed the USB teardown — pending a USB-safe fix).
+**Not yet:** firmware management (§13 — the structural bar for certification);
+class-audio coexistence (§8.5 — specified, hardware-pending); the free-running ASRC
+analog-device proof (the loop is implemented; the analog converter HAT is pending); and
+PTP-grade Ethernet clock sync wired into the runtime (the §8.7 binding ships with a
+rate-trim loop + ASRC; PTP stays a hardware prototype). Per §15.1 (1.1.2) the runtime is
+embedded in-process **by design** — one private runtime per instance — and the
+speculative per-machine daemon is dropped, not deferred. The §5.5 `core.changed` /
+`core.bye` / `core.identify` / `core.ping` handlers ship; only the shell's
+auto-`bye`-on-disconnect is deferred (it regressed the USB teardown — pending a USB-safe
+fix).
 
 Breaking protocol changes are still negotiated at `core.hello` (§5.4) and flow through
 HARP Enhancement Proposals (§18); two interoperating implementations are required before

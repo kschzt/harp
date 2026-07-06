@@ -1,5 +1,27 @@
 # Multitimbral RefDev + multi-shell session sharing — implementation plan
 
+> ⚠️ **SUPERSEDED (spec 1.1.2, 30 June 2026).** This is a historical build log. The
+> **multi-shell session-sharing / registry model it describes was RETIRED**, not
+> shipped: the reference shells no longer share one device session across N plugin
+> instances (owner + dormant-attached refcount, a process-global `(vid,pid,serial)`
+> runtime registry, a controller/contributor multitimbral event group, cross-shell
+> event merge, audio-owner election). The shipped model, normative in **§15.1/§15.2**,
+> is **one private runtime per plugin instance, exactly one instance per device**.
+> Two synths are two instances kept apart by *selection* (each binds a different unit
+> by serial via `selectDevice()`), never a shared table; the only process-global state
+> is the §8.4 admission ledger (keyed by transport path). **Multitimbrality is realized
+> in the host**: the DAW routes multi-channel MIDI into the one multi-out instance
+> (channel N → part N, §9.4/§9.10) and routes the per-part output buses (§6.3: bus 0
+> main mix, buses 1..N parts) back to tracks.
+>
+> **Still accurate and shipped** (read these freely): the per-part *engine, params,
+> recall*, and the *per-part audio-bus demux + mid-session re-negotiation* (P1–P3, P5b).
+> **Retired — do NOT build from this doc**: the cross-instance *session sharing /
+> runtime registry*, the *event merge* and *owner/attached* roles, and the per-instance
+> *"Part" routing param* (P4/P5/P6). The per-machine daemon is also dropped — the
+> embedded in-process runtime is the reference architecture. See the 1.1.2 changelog
+> note atop [`spec/harp-spec-1.0.md`](../spec/harp-spec-1.0.md).
+
 Scopes debt #6 (§15.1 runtime/shell split) concretely: one physical device,
 many shells, full per-part multitimbral. Spec model landed in 0.3.6
 (§15.1 session sharing, §15.2 state-controller vs multitimbral event group,
