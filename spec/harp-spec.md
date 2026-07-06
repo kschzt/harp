@@ -296,6 +296,8 @@ A HARP device on Ethernet/IP carries the framed link (§4.2) over TCP and the au
 5. **Clock.** A single device's clock is recovered host-side from the audio stream itself (§7.3) — the host is not required to be a PTP node. Multi-device timeline alignment MAY use device-side PTP (§7.3, capability `net.ptp`).
 6. **AES67/Dante interop** — full participation in an AES67/Dante fabric (PTPv2 media profile, SDP/SAP) is **reserved as an optional, firmware-deliverable capability `net.aes67-bridge`** (§8.7), not part of the base binding; its purpose is the live/install/computer-less world that the plugin path does not serve. AVB (802.1AS gPTP, Layer 2) is out of scope.
 
+**Capability advertisement.** `net.tcp` and `net.rtp` name the base binding a session is *established over*, not optional features negotiated within it: reaching a device over this Ethernet/IP binding already means the framed link is a TCP connection and the audio plane is RTP/UDP, and the host's RTP audio endpoint is supplied per stream in `audio.start` (key 6, §8.2), not gated by a capability. A device MAY therefore omit `net.tcp`/`net.rtp` from its `core.hello` capability list — they are implied by the binding over which `core.hello` itself arrived, so §6.2's "absent capabilities are unsupported" does not make a host that connected over TCP treat TCP as unsupported. The *remaining* network capabilities — `net.offline`, `net.ptp`, `net.ptp.hw`, and `net.aes67-bridge` — DO name optional extensions beyond the base binding; a device advertises each only when it implements it, and §6.2 governs those normally. (The reference Ethernet device advertises the transport-agnostic `audio.*`/`evt.*`/`diag.*`/`harp-*` capabilities and provides offline bounce over §8.7 through `audio.host-paced`/`audio.offline-rate`, so it lists no `net.*` string — consistent with this rule.)
+
 This binding adds no wire change to the framed link, control plane, state model, or event plane (§5–§12) — they are transport-agnostic and carry over unchanged.
 
 ---
@@ -396,7 +398,7 @@ semver = tstr            ; "MAJOR.MINOR.PATCH", SemVer 2.0.0
 hash   = bstr .size 33   ; 1 algorithm byte (0x01 = SHA-256) + digest
 ```
 
-Capability strings include conformance classes (`harp-core`, `harp-recall`, …) and granular features (`evt.ump`, `evt.param`, `state.autosnapshot`, `fw.ab-slots`, `diag.loopback.analog`, …). The complete registry is Appendix C. Hosts MUST treat absent capabilities as unsupported and degrade per §15.
+Capability strings include conformance classes (`harp-core`, `harp-recall`, …) and granular features (`evt.ump`, `evt.param`, `evt.param.mod`, `evt.param.meter` (§9.9), `state.autosnapshot`, `fw.ab-slots`, `diag.loopback.analog`, …). The complete registry is Appendix C. Hosts MUST treat absent capabilities as unsupported and degrade per §15. Capabilities intrinsic to the *binding a session was established over* are implied, not gated — see §4.4 for the Ethernet `net.tcp`/`net.rtp` case.
 
 The **engine** triple is central to recall validity. `engine.version` MUST change whenever device behavior that affects rendering of stored state changes — DSP algorithms, modulation ranges, voice allocation. Firmware MAY rev without an engine change (UI fixes, USB fixes). `param-map-hash` is the hash of the canonical parameter descriptor set (§9.2); hosts use it to validate automation lanes across firmware updates.
 
@@ -493,7 +495,11 @@ Requirements: devices MUST support `float32`; `nsamples` MUST be constant within
 ```
 req audio.start → { 0 => uint rate-hz, 1 => uint nsamples, 2 => uint target-depth-frames,
                     3 => [* uint] active-slots-in, 4 => [* uint] active-slots-out,
-                    ? 5 => uint clock-mode }        ; 0 free-running (default), 1 host-paced
+                    ? 5 => uint clock-mode,        ; 0 free-running (default), 1 host-paced
+                    ? 6 => uint rtp-audio-port,    ; §8.7 Ethernet: host UDP port for the D→H RTP
+                                                   ; audio plane (absent/0 => the USB audio endpoints)
+                    ? 7 => uint hostpaced-tcp-port } ; §8.7 Ethernet host-paced: host TCP port for the
+                                                   ; bidirectional audio plane (absent => USB endpoints)
 rsp             → { 0 => uint clock-mode-in-effect,
                     1 => uint device-pipeline-samples }   ; fixed engine+transport pipeline
 req audio.stop
@@ -717,7 +723,7 @@ Hosts render values locally from range, curve, piecewise map, and enum labels �
 
 ### 9.9 Output parameters
 
-Parameters flagged readonly are outputs: meters, gain reduction, voice counts, sequencer step position. The device streams them via echo at no more than the descriptor's meter rate hint; hosts present them in UI, MUST NOT offer them as automation targets, and MUST NOT record them as automation. This is VST3's read-only/`kIsReadOnly` and CLAP's readonly parameters — plugin-grade metering with zero host-side audio analysis.
+Parameters flagged readonly are outputs: meters, gain reduction, voice counts, sequencer step position. The device streams them via echo at no more than the descriptor's meter rate hint; hosts present them in UI, MUST NOT offer them as automation targets, and MUST NOT record them as automation. This is VST3's read-only/`kIsReadOnly` and CLAP's readonly parameters — plugin-grade metering with zero host-side audio analysis. A device that emits output-parameter meters SHOULD advertise capability `evt.param.meter` so a host can gate its metering UI on support; the meters also appear as readonly descriptors in `evt.params`/identity (§9.3), and being readonly they are excluded from `param-map-hash` so adding or removing them never disturbs recall (§9.3). The reference device advertises `evt.param.meter`.
 
 ### 9.10 UMP carriage
 
@@ -1121,6 +1127,7 @@ error-body = { 0 => tstr, ? 1 => tstr, ? 2 => any }
 ; --- common ---
 semver = tstr .regexp "\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.-]+)?"
 hash   = bstr .size 33
+uint64 = uint                      ; a 64-bit-range unsigned counter (CBOR shortest-encoded)
 tstamp = [uint, uint64]            ; (epoch, msc)
 
 ; --- identity ---
