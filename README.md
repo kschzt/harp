@@ -1,11 +1,7 @@
 # HARP — Hardware Audio Runtime Protocol
 
 [![ci](https://github.com/kschzt/harp/actions/workflows/ci.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/ci.yml)
-<!-- hw badge hidden while the eth-hw leg is being stabilized on the rig: eth_hw dispatches
-     land on main and can flip hw.yml red even though the USB `hardware` job is green. Restore
-     once eth-hw is a reliable standing gate (HARP_ETH_HW_ENABLED=1, consistently green).
 [![hw — real device](https://github.com/kschzt/harp/actions/workflows/hw.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/hw.yml)
--->
 [![eth — IP transport](https://github.com/kschzt/harp/actions/workflows/eth.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/eth.yml)
 [![reaper — real DAW](https://github.com/kschzt/harp/actions/workflows/reaper-e2e.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/reaper-e2e.yml)
 [![perf — RT feed](https://github.com/kschzt/harp/actions/workflows/perf-gate.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/perf-gate.yml)
