@@ -10,8 +10,8 @@
 # The SINAD VALUE is intentionally floored, not tightly gated: over a real NIC the packet jitter
 # drives eth-rtp-test's ASRC rate-centering trim, which FM-modulates the recovered tone (a HARNESS
 # artifact, documented in tools/eth-rtp-test.c) — so the value swings run-to-run (~29-51 dB on the
-# rig) while frequency + zero-loss are deterministic. The floor (20 dB, well under the observed
-# min) catches a GROSS failure without flaking; frequency+loss are the real teeth.
+# rig) while frequency + zero-loss are deterministic. The floor (SINAD_FLOOR, default 15 dB — well under
+# the observed min) catches a GROSS failure without flaking; frequency+loss are the real teeth.
 set -u
 EP="${1:?usage: freerun-sinad-eth-test.sh TONE_HOST:PORT [tone_hz]}"
 TONE_HZ="${2:-1000}"
