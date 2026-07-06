@@ -292,6 +292,26 @@ jobs:
           HARP_ETH_EXTERN_SERIAL: ${{ env.HARP_ETH_SERIAL }}
         run: scripts/eth-suite.sh
 
+      - name: free-running real-hop RTP fidelity gate (SINAD, §8.7 over the real NIC)
+        # The FREE-RUNNING (live/ASRC) twin of the byte-exact host-paced offline-golden gate.
+        # A --tone harp-deviced (harp-deviced-eth-tone.service on PI4B-0002, port 47801, 1 kHz sine,
+        # its own state-dir + panel-sock so it coexists with the synth eth daemon on 47800) emits a
+        # pure tone; eth-rtp-test recovers it over the real §8.7 RTP hop and asserts CORRECT tone
+        # frequency + zero packet loss/underflow + a loose SINAD floor. The SINAD value is jitter-
+        # driven (real-NIC jitter -> eth-rtp-test's ASRC rate-trim FMs the tone, a harness artifact),
+        # so frequency + zero-loss are the deterministic teeth and the floor only catches a gross
+        # failure. Needs libsamplerate on the runner (the ASRC); the tone daemon runs THIS commit's
+        # binary (rebuilt in the bring-up). See scripts/freerun-sinad-eth-test.sh.
+        run: |
+          cmake -B build >/dev/null 2>&1
+          cmake --build build -j4 --target harp-eth-rtp-test 2>/dev/null \
+            || echo "::warning::harp-eth-rtp-test not built (libsamplerate absent on the runner?) — SINAD gate skips"
+          ssh ci@${HARP_ETH_HOST} "sudo -n systemctl restart harp-deviced-eth-tone"
+          RTP=./build/harp-eth-rtp-test scripts/freerun-sinad-eth-test.sh ${HARP_ETH_HOST}:47801 1000; rc=$?
+          ssh ci@${HARP_ETH_HOST} "sudo -n systemctl stop harp-deviced-eth-tone" 2>/dev/null || true
+          [ "$rc" = 2 ] && { echo "::warning::free-running SINAD gate skipped (rc=2)"; exit 0; }
+          exit $rc
+
       - name: restore the USB daemon (leave the rig as the USB `hardware` job expects)
         if: always()
         run: |
