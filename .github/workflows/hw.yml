@@ -205,11 +205,15 @@ jobs:
   # so it never overlaps the USB `hardware` job on the exclusive Pi. To park it for a planned rig
   # outage without red pushes, unset HARP_ETH_HW_ENABLED.
   #
-  # DEPLOYMENT (on-device, reprovisionable — NOT created by scripts/pi-stage2-install.sh yet):
+  # DEPLOYMENT (on-device, reprovisionable via scripts/rig-eth-provision.sh — run once as root on the
+  # rig Pi; rig-specific, so it is deliberately NOT in the general scripts/pi-stage2-install.sh which
+  # provisions every Pi, cf. the --trusted-peer 10.10.0.3 runner IP + 478xx ports below):
   #   PI4B-0002 runs a systemd unit `harp-deviced-eth.service` (Conflicts= harp-deviced-usb.service,
   #   ExecStart=~ci/harp/build/harp-deviced --port 47800 --state-dir ~ci/harp-eth-state
-  #   --serial PI4B-0002 --trusted-peer 10.10.0.3). The bring-up step below rebuilds the daemon
-  #   from THIS commit + `systemctl restart harp-deviced-eth`, then a runner-side TCP probe. The
+  #   --serial PI4B-0002 --trusted-peer 10.10.0.3) AND `harp-deviced-eth-tone.service` (port 47801,
+  #   --tone 1000, own state-dir/panel-sock — the free-running SINAD source). The bring-up step below
+  #   rebuilds the daemon from THIS commit + `systemctl restart harp-deviced-eth`, then a runner-side
+  #   TCP probe; the SINAD step restarts the tone unit onto the same freshly-built binary. The
   #   runner service carries LimitRTPRIO (systemd drop-in) so the host's --realtime audio thread
   #   gets SCHED_FIFO. --trusted-peer exempts the runner IP from the §16(b) pre-hello rate-limit
   #   (the readiness probe + §5.4 hello-gate would otherwise shed the next request).
@@ -303,16 +307,33 @@ jobs:
         # frequency + zero packet loss/underflow + a loose SINAD floor. The SINAD value is jitter-
         # driven (real-NIC jitter -> eth-rtp-test's ASRC rate-trim FMs the tone, a harness artifact),
         # so frequency + zero-loss are the deterministic teeth and the floor only catches a gross
-        # failure. Needs libsamplerate on the runner (the ASRC); the tone daemon runs THIS commit's
-        # binary (rebuilt in the bring-up). See scripts/freerun-sinad-eth-test.sh.
+        # failure. The tone daemon runs THIS commit's binary (rebuilt in the bring-up).
+        # eth-rtp-test needs libsamplerate (the §8.7 ASRC). It is built in a DEDICATED build dir
+        # (build-eth), NOT the shared `build`: the self-hosted runner's persistent `build/` CMake
+        # cache was configured before libsamplerate was installed and cached it as "not found", so a
+        # reused `cmake -B build` never rebuilt the ASRC tool — the gate then ran a MISSING binary and
+        # got the parser's all-sentinel output (tone -1.0 Hz, loss 99), a red gate that was NOT a real
+        # fidelity failure. A fresh dir re-detects libsamplerate every run (root-caused live on the
+        # rig: fresh dir -> "Found samplerate 0.2.2" -> 35.2 dB clean over the real hop). A build or
+        # run failure is now a LOUD ERROR, never a hollow-green skip — this gate MUST actually prove
+        # free-running fidelity on the rig, which always provisions libsamplerate0-dev.
+        # Rig eth-service provisioning (synth 47800 + tone 47801) is reproducible via
+        # scripts/rig-eth-provision.sh. See scripts/freerun-sinad-eth-test.sh.
         run: |
-          cmake -B build >/dev/null 2>&1
-          cmake --build build -j4 --target harp-eth-rtp-test 2>/dev/null \
-            || echo "::warning::harp-eth-rtp-test not built (libsamplerate absent on the runner?) — SINAD gate skips"
-          ssh ci@${HARP_ETH_HOST} "sudo -n systemctl restart harp-deviced-eth-tone"
-          RTP=./build/harp-eth-rtp-test scripts/freerun-sinad-eth-test.sh ${HARP_ETH_HOST}:47801 1000; rc=$?
+          cmake -B build-eth -S . >/dev/null 2>&1
+          cmake --build build-eth -j4 --target harp-eth-rtp-test
+          test -x ./build-eth/harp-eth-rtp-test \
+            || { echo "::error::harp-eth-rtp-test failed to build — the rig MUST provide libsamplerate0-dev (the §8.7 ASRC); the free-running SINAD fidelity gate cannot be skipped"; exit 1; }
+          # `systemctl restart` returns as soon as the process spawns (Type=simple), ~100 ms BEFORE
+          # the daemon binds :47801 (confirmed live on the rig). Probe the port until it is READY, or
+          # the runner's eth-rtp-test connects to a not-yet-bound port and gets all-sentinel output —
+          # a false red. Fail LOUD if the tone daemon never binds within 5 s.
+          ssh ci@${HARP_ETH_HOST} "sudo -n systemctl restart harp-deviced-eth-tone; \
+            n=0; while [ \$n -lt 50 ]; do ss -tln 2>/dev/null | grep -q ':47801 ' && exit 0; n=\$((n+1)); sleep 0.1; done; exit 1" \
+            || { echo '::error::harp-deviced-eth-tone did not bind :47801 within 5 s of restart — the free-running SINAD source is down'; exit 1; }
+          RTP=./build-eth/harp-eth-rtp-test scripts/freerun-sinad-eth-test.sh ${HARP_ETH_HOST}:47801 1000; rc=$?
           ssh ci@${HARP_ETH_HOST} "sudo -n systemctl stop harp-deviced-eth-tone" 2>/dev/null || true
-          [ "$rc" = 2 ] && { echo "::warning::free-running SINAD gate skipped (rc=2)"; exit 0; }
+          if [ "$rc" = 2 ]; then echo "::error::SINAD gate could not run (rc=2, eth-rtp-test missing) — libsamplerate must be provisioned on the rig; a fidelity gate must not silently skip"; exit 1; fi
           exit $rc
 
       - name: restore the USB daemon (leave the rig as the USB `hardware` job expects)
