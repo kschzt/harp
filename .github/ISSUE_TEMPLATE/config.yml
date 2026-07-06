@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Protocol change (HEP)
+    url: https://github.com/kschzt/harp/blob/main/CONTRIBUTING.md#changing-the-protocol--the-hep-process-18
+    about: >-
+      Wire-format, semantics, or conformance changes go through the HARP Enhancement
+      Proposal process (spec §18), not the issue tracker. A HEP needs a normative diff,
+      capability strings, test additions, and two interoperating implementations before
+      it merges. Start with the CONTRIBUTING guide.
+  - name: Security / a parser crash or hang
+    url: https://github.com/kschzt/harp/blob/main/SECURITY.md
+    about: >-
+      Report vulnerabilities and any crash/hang on malformed input privately, per the
+      security policy — not as a public issue.

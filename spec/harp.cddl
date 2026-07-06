@@ -1,5 +1,5 @@
 ; HARP — consolidated CDDL (extracted from spec v1.1.2, Appendix A)
-; Schemas are normative; see spec/harp-spec-1.0.md for prose.
+; Schemas are normative; see spec/harp-spec.md for prose.
 
 ; --- framing (binary, not CBOR; given here for completeness) ---
 ; frame = fver(u8) stream(u8) flags(u16le) length(u32le) payload

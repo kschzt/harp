@@ -343,7 +343,7 @@ turn-key *certification kit*.
 
 ## Documentation
 
-- **The specification**: [`spec/harp-spec-1.0.md`](spec/harp-spec-1.0.md).
+- **The specification**: [`spec/harp-spec.md`](spec/harp-spec.md).
   First read: §1 (motivation and design principles), §2 (conformance + terminology),
   §10–§11 (the state model — "Git, not SysEx"), §8 (the audio plane and clock domains),
   §17 (conformance classes). The changelog at the top records what implementation taught us.
