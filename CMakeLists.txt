@@ -70,6 +70,25 @@ if(HARP_COVERAGE)
   add_link_options(--coverage)
 endif()
 
+# AddressSanitizer + LeakSanitizer: cmake -B build-lsan -DHARP_ASAN=ON.
+# Adds -fsanitize=address tree-wide (-g + frame pointers so a report carries a readable stack).
+# This is a PLAIN ASan knob (unlike HARP_FUZZ, which couples ASan with the libFuzzer engine + -O1):
+# ci.yml's `lsan` job builds harp-deviced + harp-probe + the eth-audio tools with it, then runs
+# scripts/lsan-drive.sh — a CLEAN-EXIT daemon drive with ASAN_OPTIONS=detect_leaks=1, so LSan's
+# process-exit leak check GATES the long-running device daemon (the eth-asan job runs detect_leaks=0
+# and the DoS soaks SIGKILL the daemon, so a never-freed daemon allocation was previously unproven).
+# Leak detection is a RUNTIME option (ASAN_OPTIONS), not a build flag — the build just links the
+# runtime; the drive turns leaks on for the daemon and off for the throwaway CLI tools. LSan RUNS on
+# Linux only (the CI job is the oracle); the same build works on macOS for the memory-error checks.
+option(HARP_ASAN "Instrument with AddressSanitizer (+LeakSanitizer at runtime on Linux)" OFF)
+if(HARP_ASAN)
+  if(MSVC)
+    message(FATAL_ERROR "HARP_ASAN targets clang/gcc (-fsanitize=address), not MSVC")
+  endif()
+  add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=address)
+endif()
+
 add_library(harpcore STATIC
   core/src/cbor.c
   core/src/anonymize.c   # §16 device-section anonymizer — single source of truth (shell + probe)

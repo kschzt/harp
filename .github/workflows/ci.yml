@@ -440,6 +440,43 @@ jobs:
             coverage-html
           if-no-files-found: warn
 
+  lsan:
+    # LeakSanitizer gate on the long-running device DAEMON — closes the maturity-panel blocker
+    # "no LSan leak gate: eth-asan.yml sets detect_leaks=0 ... the all-day audio daemon has no
+    # automated leak gate — unproven either way". eth-asan.yml runs the daemon with detect_leaks=0,
+    # and the two DoS soaks (abuse-test.sh / conn-flood-test.sh) SIGKILL it mid-session, so a
+    # daemon allocation that is never freed was UNPROVEN. LSan reports at process EXIT, which needs
+    # a CLEAN exit — so this job builds an ASan (leaks-ON) harp-deviced + harp-probe + the eth-audio
+    # tool via the -DHARP_ASAN=ON knob and runs scripts/lsan-drive.sh: a HARP_CLEAN_EXIT=1 daemon
+    # driven through a bounded REAL session (recall save/restore + §11.3 CAS + §9.6 txn, §9 events,
+    # a short RTP render, a §14.4 diag bundle, two connect/disconnect cycles) then SIGTERMed. The
+    # DAEMON runs with ASAN_OPTIONS=detect_leaks=1; a leak makes its clean exit non-zero AND prints
+    # a LeakSanitizer report — either fails the drive. The throwaway CLI tools run detect_leaks=0
+    # (they exit-leak CLI scratch, irrelevant to "does the daemon leak" — the same rationale
+    # abuse-test.sh already documents) while keeping FULL ASan memory-error checking. Linux-only:
+    # LSan does not RUN on macOS (eth-asan.yml documents that arm64e ASan artifact) — this Ubuntu
+    # job is the oracle. Separate from eth-asan.yml on purpose: that soak intentionally SIGKILLs and
+    # must keep detect_leaks=0; this is the NEW, clean-exit path where leaks are ON.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: install libsamplerate + libusb (the §8.7 eth-audio tool + probe transport deps)
+        run: sudo apt-get update && sudo apt-get install -y libsamplerate0-dev libusb-1.0-0-dev
+      - name: build harp-deviced + harp-probe + eth-rtp tool (ASan, leaks ON via -DHARP_ASAN=ON)
+        # -DHARP_ASAN=ON is a plain -fsanitize=address build (CMakeLists.txt); leak detection is a
+        # RUNTIME option the drive sets per-process, not a build flag — so nothing here sets
+        # detect_leaks. The eth-rtp tool exercises the daemon's audio_loop/engine/RTP alloc paths.
+        run: |
+          cmake -B build-lsan -S . -DHARP_ASAN=ON
+          cmake --build build-lsan --target harp-deviced harp-probe harp-eth-rtp-test -j
+      - name: LSan clean-exit daemon drive (daemon detect_leaks=1; ANY retained-at-exit alloc fails)
+        # The gate. The drive defaults its binaries to ./build-lsan/* (built above), starts the
+        # daemon with detect_leaks=1, drives the bounded real session, clean-exits it, and asserts
+        # BOTH a rc-0 shutdown AND no "LeakSanitizer: detected memory leaks" line. A real daemon
+        # leak fails this step. LSAN_OPTIONS picks up .lsan-suppressions.txt if present (none today).
+        run: ./scripts/lsan-drive.sh
+
   cert-harness:
     # §17.3 T1–T17 CERTIFICATION HARNESS (cloud subset). The maturity capstone flagged that,
     # although the individual conformance tests exist and run, NO single runner indexes the
