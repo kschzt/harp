@@ -91,7 +91,8 @@ static int e2e(void) {
         if (blk > warmup)
             for (int i = 0; i < BLK; i++) {
                 double step = fabs(out[i] - prev);
-                if (step > 0.5) glitches++; if (step > maxstep) maxstep = step;
+                if (step > 0.5) glitches++;
+                if (step > maxstep) maxstep = step;
                 sumsq += out[i] * out[i]; outn++; prev = out[i]; ya[na++] = out[i];
             }
         else prev = out[BLK - 1];

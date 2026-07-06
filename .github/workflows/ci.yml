@@ -35,7 +35,7 @@ jobs:
         # build them here or `-L unit` reports them "Not Run". freerun_mt is the TSan SPSC
         # race test; rtp-hf is the §8.3 high-frequency converter-quality gate.
         run: |
-          cmake -B build
+          cmake -B build -DHARP_WERROR=ON
           cmake --build build --target harp-engine-logic-tests harp-tests harp-logring-tests harp-device-tests harp-ffs-link-tests harp-freerun-tests harp-rtp-tests harp-rtp-hf-tests harp-freerun-mt-tests harp-param-map-hash-tests -j3
           ctest --test-dir build -L unit --output-on-failure
       - name: AU shell + auval (Apple's own validation gate)
@@ -102,7 +102,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true   # native nonzero exit => step fails
-          cmake -B build -G "Visual Studio 17 2022" -A x64
+          cmake -B build -G "Visual Studio 17 2022" -A x64 -DHARP_WERROR=ON
           cmake --build build --config RelWithDebInfo --target harp-tests harp-engine-logic-tests harp-probe
           ctest --test-dir build -C RelWithDebInfo --output-on-failure
       - name: shell + host build, ring tests
@@ -218,7 +218,7 @@ jobs:
       - name: install libsamplerate (enables the freerun/rtp ASRC unit tests)
         run: sudo apt-get update && sudo apt-get install -y libsamplerate0-dev
       - name: build
-        run: cmake -B build && cmake --build build -j
+        run: cmake -B build -DHARP_WERROR=ON && cmake --build build -j
       - name: unit tests (core + device_codec + freerun/rtp ASRC stopband/reanchor)
         run: ctest --test-dir build --output-on-failure
       - name: engine-render golden (debt #19 — raw device DSP render_output(): determinism + non-silence + pinned hash)
@@ -292,10 +292,18 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: install cppcheck
-        run: sudo apt-get update && sudo apt-get install -y cppcheck
+      - name: install cppcheck + clang-tidy
+        run: sudo apt-get update && sudo apt-get install -y cppcheck clang-tidy
       - name: cppcheck (warning + portability, baselined)
         run: bash scripts/run-cppcheck.sh
+      - name: clang-tidy (curated static analysis — .clang-tidy)
+        # clang-analyzer path-sensitive analysis (null derefs, leaks, uninit, logic) + a
+        # curated bugprone/cert set over HARP's wire-facing + RT C sources. Config + the
+        # per-check disable rationale live in .clang-tidy; WarningsAsErrors makes a finding
+        # fail the gate. Needs the compile DB (no SDK — the default build tree).
+        run: |
+          cmake -B build-tidy -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >/dev/null
+          run-clang-tidy -p build-tidy -quiet $(git ls-files 'core/src/*.c' 'device/*.c' 'host/*.c')
       - name: soak silence-oracle self-test (harp-soak.sh HARD-fails a silent render)
         # hardware-free proof that the soak's #90 silence gate FIRES on a silent render
         # (rms<floor) and PASSES real audio — so a refactor can't silently neuter it.
