@@ -324,7 +324,13 @@ jobs:
           cmake --build build-eth -j4 --target harp-eth-rtp-test
           test -x ./build-eth/harp-eth-rtp-test \
             || { echo "::error::harp-eth-rtp-test failed to build — the rig MUST provide libsamplerate0-dev (the §8.7 ASRC); the free-running SINAD fidelity gate cannot be skipped"; exit 1; }
-          ssh ci@${HARP_ETH_HOST} "sudo -n systemctl restart harp-deviced-eth-tone"
+          # `systemctl restart` returns as soon as the process spawns (Type=simple), ~100 ms BEFORE
+          # the daemon binds :47801 (confirmed live on the rig). Probe the port until it is READY, or
+          # the runner's eth-rtp-test connects to a not-yet-bound port and gets all-sentinel output —
+          # a false red. Fail LOUD if the tone daemon never binds within 5 s.
+          ssh ci@${HARP_ETH_HOST} "sudo -n systemctl restart harp-deviced-eth-tone; \
+            n=0; while [ \$n -lt 50 ]; do ss -tln 2>/dev/null | grep -q ':47801 ' && exit 0; n=\$((n+1)); sleep 0.1; done; exit 1" \
+            || { echo '::error::harp-deviced-eth-tone did not bind :47801 within 5 s of restart — the free-running SINAD source is down'; exit 1; }
           RTP=./build-eth/harp-eth-rtp-test scripts/freerun-sinad-eth-test.sh ${HARP_ETH_HOST}:47801 1000; rc=$?
           ssh ci@${HARP_ETH_HOST} "sudo -n systemctl stop harp-deviced-eth-tone" 2>/dev/null || true
           if [ "$rc" = 2 ]; then echo "::error::SINAD gate could not run (rc=2, eth-rtp-test missing) — libsamplerate must be provisioned on the rig; a fidelity gate must not silently skip"; exit 1; fi
