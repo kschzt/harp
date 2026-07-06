@@ -33,6 +33,7 @@ typedef SOCKET sockhandle;
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <sys/socket.h>
+#  include <sys/time.h> /* struct timeval for the SO_RCVTIMEO ctl-recv bound (dial) */
 #  include <unistd.h>
 typedef int sockhandle;
 #  define SOCK_INVALID (-1)
@@ -151,6 +152,23 @@ static sockhandle dial(const char *hostport) {
     if (fd == SOCK_INVALID) die("cannot connect to device");
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+    /* §8.7 host-side HANG GUARD: bound every ctl recv so a wedged/slow device (one that
+     * ACCEPTS the TCP connect but never answers, or dies mid-response) makes harp-probe RETURN
+     * with a clear "link failed" line instead of blocking in recv() FOREVER. sock_read_exact
+     * returns false on the WSAETIMEDOUT/EAGAIN, so the request fails fast. This mirrors the
+     * shell (setCtlTimeout) and the USB path (harp_usb_set_ctl_timeout) — the eth path was the
+     * one unbounded ctl recv left. CRITICAL ON WINDOWS: the harness `perl alarm` around the
+     * NATIVE harp-probe.exe SIGALRM-kills only the Cygwin/MSYS stub, NOT the native child, so
+     * without this INTERNAL bound a single lost/late response hangs the whole eth-suite (the
+     * intermittent windows-2022 step-14 hang). 8s is generous (loopback responses are <1ms) and
+     * well under both the harness alarm and the suite's per-test watchdog. */
+#ifdef _WIN32
+    DWORD rtmo = 8000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rtmo, sizeof rtmo);
+#else
+    struct timeval rtv = {8, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rtv, sizeof rtv);
+#endif
     return fd;
 }
 
@@ -2066,7 +2084,9 @@ int main(int argc, char **argv) {
          * draining the endpoint) makes the probe RETURN + release the interface cleanly,
          * instead of relying on an external `perl alarm` that SIGALRM-kills it mid-claim —
          * an ungraceful exit that leaves a torn frame and can wedge the next claimant. The
-         * shell sets this via setCtlTimeout; harp-probe did not. (USB only; eth is socket-bounded.) */
+         * shell sets this via setCtlTimeout; harp-probe did not. (USB here; the eth/TCP path
+         * arms the equivalent SO_RCVTIMEO in dial() — on Windows the external alarm can't kill
+         * the native probe, so both transports MUST bound their ctl recv internally.) */
         harp_usb_set_ctl_timeout(p.io, 8000);
 #else
         die("built without libusb; -d usb unavailable");

@@ -13,8 +13,10 @@
  */
 #include "runtime.h"
 #include "runtime_registry.h" /* §8.4 ledger_reserved (path-utilization key 14) */
+#include "runtime_log.h"      /* log_msg — LOUD device-section fetch failure over a live link */
 #include "freerun.h"          /* HARP_ASRC_QUALITY (asrc-stats key 4) */
 
+#include "harp/plat.h" /* harp_sleep_ns — bounded backoff between device-section fetch retries */
 #include <cmath>   /* llround: est_ppm -> ppb (clock-stats key 0) */
 #include <cstring> /* memcpy: bit-cast the snapshot atomics (ratio/uncertainty) */
 #include <ctime>   /* time: bundle-meta tstamp (key 2) */
@@ -191,14 +193,51 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
     std::lock_guard<std::mutex> lk(ctlMutex_);
 
     /* Fetch the device-section FIRST (its bytes are embedded verbatim at key 4):
-     * issue `req diag.bundle` and keep the response body. A failure (device gone,
-     * or no diag.bundle cap) leaves an empty section — the bundle stays valid. */
+     * issue `req diag.bundle` and keep the response body.
+     *
+     * request() is a SYNCHRONOUS round-trip (harp_client_request = send + wait), so the
+     * device-section is genuinely awaited — the bundle is never assembled from a stale
+     * cache. But the wait is bounded by the §15.1 live-session SO_RCVTIMEO (8 s), and on a
+     * loaded Windows runner a single response can land JUST PAST it: the recv times out
+     * (WSAETIMEDOUT), request() returns false with a TRANSPORT hiccup (HARP_CLIENT_EIO — NOT
+     * a device error), haveDev goes false, and key 4 is written as an empty map. The device
+     * counters (usb_errors et al.) + identity then vanish from the bundle — the rare
+     * diag-bundle-host Windows flake. This is the GET-path twin of the getStateBundle race
+     * (recall), which already retries for exactly this reason.
+     *
+     * So retry the round-trip a few times WHILE STILL connected(), 100 ms apart, re-issuing a
+     * FRESH rid each attempt. A clean SO_RCVTIMEO consumes no bytes (sock_read_exact fails at
+     * the frame-header boundary), so the framed link stays in sync across attempts; a stale
+     * late response from a prior attempt is skipped by the single-in-flight rid filter in
+     * harp_client_wait. Terminal (non-transient) outcomes break out at once and never spin:
+     * !connected() (the device is genuinely gone — there is no live link, an empty section is
+     * correct) and a device reply WITHOUT a body (authoritative "no diag.bundle cap" — a
+     * legitimately empty section, not a hiccup). If we stay connected() but every bounded
+     * attempt is a transport failure, the device-section cannot be fetched over a live link:
+     * that is a LOUD explicit error (below), never a silently-partial bundle. */
     harp_cbuf devReq, devRsp;
     harp_cbuf_init(&devReq);
     harp_cbuf_init(&devRsp);
-    harp_client_req_head(&client_, &devReq, "diag.bundle", false); /* no body */
     harp_env de = {};
-    bool haveDev = connected() && request(&devReq, &devRsp, &de) && de.has_body;
+    bool haveDev = false;
+    bool deviceAnswered = false; /* device replied at all (body or not) => authoritative, not a transport hiccup */
+    for (int attempt = 0; attempt < 3 && connected(); attempt++) {
+        harp_client_req_head(&client_, &devReq, "diag.bundle", false); /* fresh rid, no body */
+        harp_env re = {};
+        if (request(&devReq, &devRsp, &re)) {
+            de = re;                 /* de.body points into devRsp (freed after key 4 is written) */
+            haveDev = re.has_body;   /* body present => embed verbatim; bodyless => authoritative empty */
+            deviceAnswered = true;
+            break;
+        }
+        harp_sleep_ns(100000000ull); /* 100 ms: transport hiccup — back off and re-issue */
+    }
+    /* LOUD, never silent: connected to a live link but the device-section round-trip never
+     * completed (every bounded attempt timed out / failed at the transport). Distinct from a
+     * bodyless reply (deviceAnswered — a genuine no-cap empty section, which is expected). */
+    if (!deviceAnswered && connected())
+        log_msg("diag.bundle: device-section fetch FAILED over the live link after retries — "
+                "key 4 (device-section) will be EMPTY (partial bundle)");
 
     /* §14.4 host-context-B: snapshot the instrumentation rings under ctlMutex_
      * (control-path read; both snapshots are non-destructive, so a later bundle
