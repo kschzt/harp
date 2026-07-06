@@ -79,7 +79,7 @@ echo "   PROBE=${PROBE:-<none>}  $(have "$PROBE" && echo '(present)' || echo '(a
 # tests that structurally need a harness-owned local co-process (SIGKILL fault-injection,
 # deterministic host-paced offline goldens, or a daemon started with specific flags/config).
 export HARP_ETH_EXTERN HARP_ETH_EXTERN_SERIAL 2>/dev/null || true
-EXTERN_CAP=" eth-tests core txn epoch cas-conflict admission loopback diag-bundle-host hello-gate "
+EXTERN_CAP=" eth-tests offline-golden core txn epoch cas-conflict admission loopback diag-bundle-host hello-gate "
 if eth_extern_active; then
   echo ""
   echo "── eth-suite EXTERNAL-ENDPOINT MODE: targeting $(eth_extern_ep) over a REAL §8.7 hop (NOT spawning a localhost deviced)"
@@ -90,8 +90,8 @@ fi
 extern_reason() {
   case "$1" in
     main-multi-out) echo "host-side only — does not exercise the external §8.7 endpoint";;
-    offline-golden|offline-fence|realtime-fence|latefr)
-      echo "host-paced OFFLINE bounce needs deterministic LOCAL device-clock control (byte-exact in-process golden / connect-back socket)";;
+    offline-fence|realtime-fence|latefr)
+      echo "harness-owned local device-clock control (in-process golden / connect-back fence tool)";;
     corrupt-cbor|reconnect|conn-flood)
       echo "fault-injection SIGKILLs/restarts the local deviced — the harness must own its lifecycle";;
     rtp-loss|rtp-reorder)
