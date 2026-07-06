@@ -1,12 +1,10 @@
 # HARP — Hardware Audio Runtime Protocol
 
 [![ci](https://github.com/kschzt/harp/actions/workflows/ci.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/ci.yml)
-<!-- hw badge hidden while the self-hosted rig is offline: hw.yml is gated off (repo var HARP_RIG_ONLINE)
-     so the badge would read "no runs" / failing. Restore this line once PI4B-0002 is back online.
 [![hw — real device](https://github.com/kschzt/harp/actions/workflows/hw.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/hw.yml)
--->
-
 [![eth — IP transport](https://github.com/kschzt/harp/actions/workflows/eth.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/eth.yml)
+[![reaper — real DAW](https://github.com/kschzt/harp/actions/workflows/reaper-e2e.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/reaper-e2e.yml)
+[![perf — RT feed](https://github.com/kschzt/harp/actions/workflows/perf-gate.yml/badge.svg)](https://github.com/kschzt/harp/actions/workflows/perf-gate.yml)
 [![license: Apache-2.0 | CC-BY-4.0](https://img.shields.io/badge/license-Apache--2.0%20%7C%20CC--BY--4.0-blue)](LICENSING.md)
 
 **Make hardware instruments behave like plugins.** HARP is an open protocol — a
