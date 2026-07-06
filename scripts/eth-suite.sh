@@ -140,12 +140,14 @@ PLAN  $name"; return; fi
   # the whole test regardless of which child wedged. `alarm` survives exec on all three OSes
   # (POSIX keeps the itimer across exec; MSYS perl exec's the bash script as a real Cygwin
   # process), so a wedged test dies at RUN_TIMEOUT and rc=142 (128+SIGALRM) marks it TIMED OUT.
-  # 120s is generous (the slowest real sub-test is ~26s), so it only ever trips on a genuine hang.
-  perl -e 'alarm shift; exec @ARGV' "${RUN_TIMEOUT:-120}" "$@"; rc=$?
+  # 300s is generous — the slowest LEGITIMATE sub-test is eth-tests' macOS bit-exact RETRY path
+  # (jittery fake-timing -> multiple render attempts, ~1-2 min under cloud-runner load). A genuine
+  # hang sits until the 45-min job timeout, so 300s only ever trips on a real wedge, not a slow retry.
+  perl -e 'alarm shift; exec @ARGV' "${RUN_TIMEOUT:-300}" "$@"; rc=$?
   if [ "$rc" = 0 ]; then echo "✓ $name"; RESULTS="$RESULTS
 PASS  $name"
-  elif [ "$rc" = 142 ]; then echo "::error::eth-suite: $name TIMED OUT (> ${RUN_TIMEOUT:-120}s) — killed by the per-test watchdog (a wedged sub-test, not a slow one)"; RESULTS="$RESULTS
-FAIL  $name (TIMEOUT >${RUN_TIMEOUT:-120}s)"; FAILED=1
+  elif [ "$rc" = 142 ]; then echo "::error::eth-suite: $name TIMED OUT (> ${RUN_TIMEOUT:-300}s) — killed by the per-test watchdog (a wedged sub-test, not a slow one)"; RESULTS="$RESULTS
+FAIL  $name (TIMEOUT >${RUN_TIMEOUT:-300}s)"; FAILED=1
   else echo "::error::eth-suite: $name FAILED (rc=$rc)"; RESULTS="$RESULTS
 FAIL  $name (rc=$rc)"; FAILED=1; fi
   echo "::endgroup::"
