@@ -254,9 +254,9 @@ jobs:
             && sudo -n systemctl stop harp-deviced-usb 2>/dev/null || true; \
             ( sudo -n systemctl restart harp-deviced 2>/dev/null ) \
             || ( pkill -f 'harp-deviced --port' 2>/dev/null; \
-                 nohup ~/harp/build/harp-deviced --port ${HARP_ETH_PORT} \
+                 setsid ~/harp/build/harp-deviced --port ${HARP_ETH_PORT} \
                    --state-dir ~/harp-eth-state --serial ${HARP_ETH_SERIAL} \
-                   >/tmp/harp-deviced-eth.log 2>&1 & sleep 2; \
+                   </dev/null >/tmp/harp-deviced-eth.log 2>&1 & sleep 3; \
                  grep -q \"listening on ${HARP_ETH_PORT}\" /tmp/harp-deviced-eth.log )"
 
       - name: §8.7 conformance over REAL Ethernet (external-endpoint mode, PI4B-0002)
