@@ -130,9 +130,23 @@ run() {  # run <name> <script...>
   if [ "${DRY_RUN:-0}" = 1 ]; then echo "▶ WOULD RUN $name ($*)"; RESULTS="$RESULTS
 PLAN  $name"; return; fi
   echo "::group::eth-suite: $name"
-  if "$@"; then echo "✓ $name"; RESULTS="$RESULTS
+  # Per-test HANG WATCHDOG (task #112 / RME no-flake bar): a single wedged sub-test must FAIL
+  # THAT test fast — never sit until the 45-min job timeout (the intermittent windows-2022
+  # step-14 hang). The prime offender is Windows: an MSYS `perl exec` of a NATIVE binary
+  # (harp-vst3-host/clap-host/harp-probe.exe) does NOT replace the calling process, so a
+  # sub-script's own inner `perl alarm` SIGALRM-kills only the Cygwin stub while the wedged
+  # native child keeps its stdout pipe open -> the sub-script's $(...) blocks forever. Wrapping
+  # the SUB-SCRIPT ITSELF — an MSYS bash program, which SIGALRM *can* kill — in one alarm bounds
+  # the whole test regardless of which child wedged. `alarm` survives exec on all three OSes
+  # (POSIX keeps the itimer across exec; MSYS perl exec's the bash script as a real Cygwin
+  # process), so a wedged test dies at RUN_TIMEOUT and rc=142 (128+SIGALRM) marks it TIMED OUT.
+  # 120s is generous (the slowest real sub-test is ~26s), so it only ever trips on a genuine hang.
+  perl -e 'alarm shift; exec @ARGV' "${RUN_TIMEOUT:-120}" "$@"; rc=$?
+  if [ "$rc" = 0 ]; then echo "✓ $name"; RESULTS="$RESULTS
 PASS  $name"
-  else rc=$?; echo "::error::eth-suite: $name FAILED (rc=$rc)"; RESULTS="$RESULTS
+  elif [ "$rc" = 142 ]; then echo "::error::eth-suite: $name TIMED OUT (> ${RUN_TIMEOUT:-120}s) — killed by the per-test watchdog (a wedged sub-test, not a slow one)"; RESULTS="$RESULTS
+FAIL  $name (TIMEOUT >${RUN_TIMEOUT:-120}s)"; FAILED=1
+  else echo "::error::eth-suite: $name FAILED (rc=$rc)"; RESULTS="$RESULTS
 FAIL  $name (rc=$rc)"; FAILED=1; fi
   echo "::endgroup::"
 }
