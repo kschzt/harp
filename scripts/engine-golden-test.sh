@@ -17,7 +17,7 @@ BIN="${ENGINE_GOLDEN:-./build/harp-engine-golden}"
 case "$(uname -s)" in
   Darwin)               WANT=e47077a6d7469763 ;;
   Linux)                WANT=21976313a078b4ec ;;
-  MINGW*|MSYS*|CYGWIN*) WANT= ;;   # capture-then-pin from CI
+  MINGW*|MSYS*|CYGWIN*) WANT=6ef2ade6b5c50b8e ;;   # captured from the eth.yml MinGW lane (#116)
   *)                    WANT= ;;
 esac
 

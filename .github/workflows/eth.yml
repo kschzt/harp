@@ -89,9 +89,15 @@ jobs:
           # now builds under MinGW (winsock connect-back socket), so the Windows eth lane proves
           # the host-paced fence BOUNDS the wait + counts fence_timeouts under a starved input
           # (offline ran POSIX-only before; gap #fence-windows).
-          cmake --build build-dev --target harp-deviced harp-probe harp-device-tests harp-eth-fence-test
+          # harp-engine-golden too — the debt #19 RAW-device-DSP oracle (render_output() /
+          # engine_voices_cold(), no shell/transport). Linux+macOS pin their per-OS hash; this
+          # runs it on the production MinGW binary so the Windows/MinGW libm render is pinned as
+          # well — a MinGW-vs-clang DSP divergence can no longer slip past (#116, closes the
+          # third-OS gap in the engine-render regression oracle).
+          cmake --build build-dev --target harp-deviced harp-probe harp-device-tests harp-eth-fence-test harp-engine-golden
           ./build-dev/harp-deviced.exe --bogus 2>&1 | head -3 || true   # smoke: it starts
           ./build-dev/harp-device-tests.exe   # device_codec on the production MinGW binary
+          ENGINE_GOLDEN=./build-dev/harp-engine-golden.exe ./scripts/engine-golden-test.sh
       - name: fetch libusb (prebuilt MSVC binaries)
         if: runner.os == 'Windows'
         shell: pwsh
