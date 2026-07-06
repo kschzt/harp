@@ -700,8 +700,11 @@ private:
      * 5 blocks (26.7 ms) against its 20-25 ms completion tails; the async
      * transport (dedicated event thread, always-pending transfers) killed
      * the tails, and 2 blocks passed the full flood matrix at every DAW
-     * block size 64-1024 with only the startup underrun. Reported latency
-     * derives from this: 16 ms total at DAW blocks <= 256 (48 k).
+     * block size 64-1024 with only the startup underrun. This 2-block ring is
+     * the TRANSPORT floor of reported latency (ring 512 + event headroom 256 =
+     * 768 ≈ 16 ms at DAW blocks <= 256, 48 k); latencySamples() folds in the
+     * §6.4/§14.3 device render/turnaround block (256, ~5 ms) for the ~21 ms
+     * full reported PDC (see devicePathLatency()).
      * HARP_CUSHION_BLOCKS overrides for measurement. */
     static constexpr uint32_t kTargetDepthFrames = 2;
 

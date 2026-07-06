@@ -1,5 +1,7 @@
 # Architecture — one page
 
+*Tracks HARP spec **1.1.2**. Two normative transport bindings: USB (§4.3) and Ethernet/IP (§4.4, §8.7).*
+
 ## The shape of the system
 
 ```
@@ -28,9 +30,43 @@
 └───────────────────────────────────────────────────────────────────┘
 ```
 
-The same `harp-deviced` also speaks the framed link over TCP for
-hardware-free development (`harp-probe -d host:port`), and `harp-probe`
-exercises every protocol flow from the command line.
+`harp-probe` exercises every protocol flow from the command line, over either
+binding.
+
+## Two transport bindings (spec §4.3–§4.4)
+
+Everything above the pipe is transport-agnostic (`harp_io`,
+`core/include/harp/link.h`); one protocol rides two normative bindings.
+
+**USB (§4.3)** — the diagram above, the normative floor. A FunctionFS gadget
+exposes the vendor interface (FF/48/01): bulk pair 1 carries the framed link
+(ctl │ obj │ evt │ log), bulk pair 2 the native §8.2 audio frame. Reliable,
+ordered, host-paced.
+
+**Ethernet/IP (§4.4, §8.7)** — a first-class second binding for when USB stops
+scaling (hub chains, ≳ 5 devices, §8.4 admission), not "USB with a longer
+cable." The *same* framed link runs over one TCP connection (ctl/obj/evt/log
+verbatim — socket buffering dissolves the §4.2.1 bulk-pair deadlock); the audio
+plane moves to **RTP/UDP** (§8.7: payload type 96 single-packet / 97 grouped,
+one SSRC per stream-slot group, sequence numbers for the loss detection USB's
+reliable bulk made unnecessary). Devices are found by mDNS/DNS-SD
+(`_harp._tcp`) on a dedicated **trusted segment** — media in the clear, signed
+firmware the one constant (§16). The hardware-free dev link
+(`harp-deviced --port` / `harp-probe -d host:port`) is this binding on
+localhost, the same code path.
+
+```
+   host ⇄ ── framed link over TCP (ctl │ obj │ evt │ log) ─────── device
+          └─ audio over RTP/UDP, free-running (live) ───────────┘
+             or host-paced over TCP (deterministic offline bounce)
+```
+
+Both bindings are conformance-bearing and CI-gated: the §8.7 suite
+(`scripts/eth-suite.sh`, the `eth.yml` workflow) runs on localhost across
+macOS / Windows / Linux, and — since 2026-07-06 — over a **real network hop**
+against the rig Pi (`hw.yml`): framed control, the RTP/UDP audio plane, the
+host-locked rate-trim + ASRC, and the byte-exact host-paced offline bounce. USB
+itself is gated on the real Pis (`hw.yml`).
 
 ## The four planes (spec §3.2)
 
@@ -39,7 +75,10 @@ exercises every protocol flow from the command line.
 | control | CBOR request/response/notify (`core.*`, `state.*`, `audio.*`) | framed link, stream 0 |
 | state | content-addressed objects, credit-controlled bulk | framed link, stream 2 |
 | events | UMP notes + timestamped param sets/ramps + echo (§9) | framed link, stream 1 |
-| audio | timestamped PCM frames | dedicated bulk endpoint pair |
+| audio | timestamped PCM frames | bulk pair (USB) │ RTP/UDP (Ethernet, §8.7) |
+
+The three framed-link streams (0/1/2) carry over both bindings unchanged; only
+the audio plane and the outermost pipe differ (bulk vs TCP+RTP/UDP).
 
 ## State model in one breath (spec §10–§11)
 
@@ -56,8 +95,41 @@ Free-running mode: the device crystal owns the stream, frames carry
 domain. Host-paced mode (pure-digital paths): the host's Stream Sample
 Index paces rendering — no device clock in the loop, deterministic
 byte-identical output, pacing faster than real time = offline bounce.
-The reference shell uses host-paced exclusively (the refdev has no
-converters).
+
+Over **USB** the reference shell is host-paced exclusively (the refdev is
+pure-digital, no converters). Over the **§8.7 Ethernet** binding the real-time
+audio path is free-running RTP: because the refdev has a tunable emit rate it
+advertises `audio.rate-lock`, so the host holds it **bit-exact** with an
+`audio.trim` rate-correction loop (no resampler in the path), falling back to
+receiver-side ASRC otherwise — while the **offline** bounce stays host-paced
+over the reliable TCP link (deterministic, byte-identical, T15). A single
+device's clock is recovered host-side from the stream itself (§7.3); device-side
+PTPv2 for multi-device timeline alignment is a hardware prototype only (~22 µs
+idle, software-timestamped), not yet wired into the runtime.
+
+## Latency (spec §6.4, measured §14.3)
+
+The reported PDC latency at DAW buffers ≤ 256 is **~21 ms** (1024 samples at
+48 kHz), host-paced — the value the plugin advertises to the DAW
+(`getLatencySamples`) and the DAW delay-compensates. Its breakdown:
+
+| term | frames | ms @48k |
+|---|---|---|
+| ring buffer (2 × 256 pacing block) | 512 | 10.7 |
+| event headroom (§9.2, one block) | 256 | 5.3 |
+| device render/turnaround block (§6.4 key 3, what §14.3 measures as the RTT) | 256 | 5.3 |
+| **total reported** | **1024** | **~21** |
+
+The transport alone (ring + headroom = 768 frames ≈ **16 ms**) is the
+async-libusb milestone figure recorded in `debt.md` #10; the reported *total*
+folds in the device render block so the **declared** PDC equals the
+**§14.3-measured** one. The value is CI-asserted to the sample
+(`scripts/reported-latency-test.sh`).
+
+On the free-running §8.7 path the constant is the RTP jitter buffer instead of
+the USB ring: ~32 ms at the safe undeclared default (block 256), down to
+**~9 ms** when a device declares a real-time profile (`audio.rt-floor`: a
+320-frame buffer floor + 64-sample RTP packet at block 64).
 
 ## Threading rules that bit us (so they're rules now)
 
@@ -81,9 +153,10 @@ converters).
   owns completion reaping at elevated QoS, both IN pipes keep transfers
   always pending into byte FIFOs, pacing writes are fire-and-forget
   slots. This killed the sync transport's 20-25 ms completion tails and
-  let the ring cushion drop 5 -> 2 blocks: 16 ms total reported latency
-  at DAW blocks <= 256, and the §4.2.1 drain-on-stall dance is gone by
-  construction. Debugging it taught: a die() mid-stream with transfers
+  let the ring cushion drop 5 -> 2 blocks (the ~16 ms transport floor: ring
+  512 + event headroom 256; the full reported PDC folds in the device render
+  block for ~21 ms — see Latency above), and the §4.2.1 drain-on-stall dance
+  is gone by construction. Debugging it taught: a die() mid-stream with transfers
   pending can corrupt bus state (toggle desync) that survives
   process death and makes EVERY subsequent run fail — heal with a
   bus-level reattach (daemon restart) before trusting any A/B result.
@@ -128,14 +201,14 @@ converters).
   timestamps (a pacing frame triggers the render of its range), they're
   batched into one framed write per cycle (per-event writes starve the
   pipe), and reported latency includes a DAW block of event headroom
-  (spec 0.3.3, normative).
+  (§9.2, normative).
 - Events get their OWN thread (the event pump) — their wire deadline is
   ~one DAW block while a pacing write can stall 8 ms in drain-on-stall,
   and sharing a loop spends the event budget on someone else's stall.
   But decoupling alone is WORSE than sharing: events and pacing ride
   different USB pipes with no mutual ordering, and the in-loop ordering
   was silently load-bearing (measured: pump-alone tripled evt_late).
-  The event fence (spec 0.3.4, §8.3.1) restores order by construction:
+  The event fence (§8.3.1, normative) restores order by construction:
   every pacing frame names the count of events queued so far; the
   device won't render the range until it has consumed that many. Fence
   waits are µs; timeouts are harmless overshoot (the fence counts
