@@ -193,9 +193,12 @@ jobs:
   # REASON (see scripts/eth-suite.sh EXTERN_CAP).
   # AUDIO over the real hop: the HOST-PACED kOffline path is gated BYTE-EXACT (offline-golden in
   # EXTERN_CAP asserts the bounce hashes to the arm64 device pin — the strongest possible gate).
-  # The FREE-RUNNING (live/ASRC) path is gated only by a non-silence RMS floor over the real hop;
-  # its converter-SINAD + sub-10ms latency are proven in synthetic units / a manual probe, not yet
-  # standing-gated over the real NIC (a known follow-up).
+  # The FREE-RUNNING (live/ASRC) path is gated over the real hop by a non-silence RMS floor AND a
+  # standing free-running SINAD gate (freerun-sinad-eth-test.sh below: device streams a fixed tone,
+  # host recovers it through the rate-trim loop + ASRC and asserts frequency +-5Hz with ZERO packet
+  # loss/underflow/bad frames, plus a loose converter-SINAD floor as a gross-failure catch — the
+  # SINAD absolute value is jitter-variable on a consumer NIC, so frequency + zero-loss carry it).
+  # Only sub-10ms latency remains synthetic-unit / manual-probe, not yet standing-gated over the NIC.
   #
   # Triggers: every push (repo var HARP_ETH_HW_ENABLED == '1'), OR a workflow_dispatch with the
   # `eth_hw` input ticked. Shares the `harp-hw` concurrency group + the single self-hosted runner,

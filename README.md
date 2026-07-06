@@ -329,7 +329,9 @@ harp-stream, harp-class-audio, harp-perf, harp-fw) tell you exactly what a given
 requires, and the test suite is strong functional verification: `scripts/eth-suite.sh`
 is the single source of truth across three OSes, the four "no silent state loss" safety
 contracts (CAS conflict §11.3, archive-before-push §11.4, param-map-hash §9.3, the event
-fence §8.3.1) each have a regression-catching test, and the CDDL is machine-readable. A
+fence §8.3.1) each have a regression-catching test, and the CDDL is machine-readable
+*and CI-enforced* (`scripts/cddl-validate.py` checks encoded wire samples against the
+schema on every push). A
 **unified §17 T1–T17 harness ships** (`scripts/cert-harness.sh`, the `cert-harness` gate
 in `ci.yml`): it indexes the battery by number (`scripts/cert-tests.tsv`), runs the
 cloud-capable covering tests, asserts the cloud-reachable numeric thresholds (±1 ms
@@ -458,9 +460,18 @@ turn-key *certification kit*.
   tests (CAS conflict, archive-before-push, param-map-hash, event fence). As of
   2026-07-06 the same §8.7 suite also runs over a **real network hop** against the
   rig Pi (PI4B-0002 in TCP transport) as a green standing gate in `hw.yml` —
-  closing the loopback-only gap — with the tests that need a harness-local
-  co-process (SIGKILL fault injection, deterministic offline goldens) self-skipping
-  there with a logged reason.
+  closing the loopback-only gap. The host-paced kOffline bounce is gated
+  **byte-exact over the real link** (pinned to the arm64 device's on-device DSP —
+  the strongest possible gate); the free-running/live ASRC path is gated over the
+  real hop by a non-silence RMS floor **and a free-running SINAD gate**
+  (`freerun-sinad-eth-test.sh`: the device streams a fixed tone, the host recovers
+  it through the rate-trim loop + ASRC and asserts the tone's frequency ±5 Hz with
+  **zero packet loss, underflow, or malformed frames**, plus a converter-SINAD
+  floor as a gross-failure catch — the SINAD absolute value is jitter-variable on a
+  consumer NIC, so frequency + zero-loss carry the assertion). Sub-10 ms latency
+  remains proven in synthetic units. Only the tests that structurally need a
+  harness-local co-process (SIGKILL fault injection, daemons launched with specific
+  flags) self-skip there with a logged reason.
 - **Hardware suite** on real Pis (`scripts/hw-tests-linux.sh`, the `hw`
   badge) driving the two-board, no-AU CI rig (PI4B-0002 + PI4B-0003): VST3↔AU
   cross-format recall self-skips (AU is macOS-only) and the two sustained
@@ -471,7 +482,10 @@ turn-key *certification kit*.
   **MPE** pitch/timbre/pressure), **§9.9 output metering**, ±1-sample note timing
   with zero late events, a realtime soak flooding automation + notes + panel
   traffic at the DAW block (zero silence gaps, zero drops, bounded padding; a
-  separate `soak-matrix.sh` sweeps buffers 64–1024 as a release-grade check), an
+  separate `soak-matrix.sh` sweeps buffers 64–1024 as a release-grade check), a
+  dedicated **multi-minute continuous-audio dropout gate** (default 180 s,
+  `soak.sh` with `SOAK_KNOB=0`: sustained real-time audio asserting zero silence
+  gaps, padded samples within a 0.5% budget, and clean device counters), an
   automated mid-stream replug, an IDM-flood determinism gate, the REAPER real-DAW
   determinism + recall round-trip, a **USB never-wedge stress guard** (DAW-crash +
   daemon-SIGKILL mid-stream), a **SCHED_FIFO fence-under-load gate** (§8.3.1 zero
@@ -483,10 +497,27 @@ turn-key *certification kit*.
   recall (macOS) — with the daemon under test built on the board from the commit
   being tested. The runtime threads are also ThreadSanitizer-clean (incl. the
   per-part event + audio demux) on the rig.
-- **Sandboxed suite**: builds + unit tests on three OSes, pluginval
+- **Sandboxed suite**: builds + unit tests on three OSes with **warnings
+  promoted to errors** on every core/device build (`-Werror` / `/WX` via
+  `HARP_WERROR`, so a warning can no longer land silently), pluginval
   strictness 10 (macOS / Windows / Linux), `auval` (macOS), fuzzed parsers
   (libFuzzer + ASan), and a protocol-abuse test that slams a live daemon with
-  hostile traffic (sessions reset, nothing crashes).
+  hostile traffic (sessions reset, nothing crashes). The **raw device-DSP render**
+  is pinned as a regression oracle (`engine-golden-test.sh`, debt #19: it drives
+  `render_output()` / `engine_voices_cold()` directly — no shell, no transport —
+  and asserts determinism + non-silence plus a **per-OS byte hash on all three of
+  Linux, macOS, and Windows/MinGW**, since libm `sin`/`exp` differ across
+  platforms), so a silent change to the synth math cannot slip past cloud CI.
+- **Static analysis + coverage**: a `static-analysis` job runs **cppcheck** and
+  **clang-tidy** (path-sensitive `clang-analyzer-*`, findings-as-errors — config
+  and per-check rationale in `.clang-tidy`) over the wire-facing and real-time C
+  sources, plus a **CDDL wire-validation gate** (`scripts/cddl-validate.py`,
+  pycddl) that parses the normative `spec/harp.cddl` and checks representative
+  encoded wire artifacts — envelope, param/mod/transaction events, blob/list/tree/
+  snapshot objects, refs, identity, and the recall bundle — against it, so the
+  schema is an enforced contract, not just documentation (it already caught a real
+  schema bug). A `coverage` job publishes a quantified `gcovr`/`lcov` line-coverage
+  metric with regression floors on the protocol core and the device daemon.
 
 **Certification status.** The §17 conformance battery (T1–T17) is normatively
 specified, and a **unified harness now runs it by number and emits a report**
@@ -514,7 +545,12 @@ fix).
 
 Breaking protocol changes are still negotiated at `core.hello` (§5.4) and flow through
 HARP Enhancement Proposals (§18); two interoperating implementations are required before
-a HEP merges, once the process formalizes.
+a HEP merges, once the process formalizes. [`CONTRIBUTING.md`](CONTRIBUTING.md) documents
+the HEP mechanics and the "prove it with a test" bar, [`GOVERNANCE.md`](GOVERNANCE.md) how
+the spec and the reference evolve and who decides, [`SECURITY.md`](SECURITY.md) the §16
+threat model and the disclosure process, and [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) the
+community norms; bug/feature issue forms and a PR checklist live under
+[`.github/`](.github/).
 
 ## Licensing
 
