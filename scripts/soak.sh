@@ -10,8 +10,12 @@ S=${1:-30}
 HOST=${HARP_HOST:-harp.local}
 VST=${VST:-$HOME/Library/Audio/Plug-Ins/VST3/harp-shell.vst3}
 HOSTBIN=${HOSTBIN:-./build-vst/harp-vst3-host}
-OUT=/tmp/harp-soak.wav
-LOG=/tmp/harp-soak.log
+# Per-RUN private scratch (mktemp): on the shared rig a prior run's root/other-owned
+# /tmp/harp-soak.* would EACCES the next run (same collision class as multidevice-test).
+SOAKTMP=$(mktemp -d "${TMPDIR:-/tmp}/harp-soak.XXXXXX")
+trap 'rm -rf "$SOAKTMP"' EXIT INT TERM
+OUT=${OUT:-$SOAKTMP/soak.wav}
+LOG=${LOG:-$SOAKTMP/soak.log}
 fail() {
     echo "SOAK FAIL: $1"
     echo "   (realtime test — machine load matters: $(uptime | sed 's/.*load/load/'))"
@@ -26,11 +30,19 @@ fi
 NOTES=$(python3 -c "import sys; n=int($S/0.6); print(','.join(['60','64','67','72'][i%4] for i in range(n)))")
 C0=$(curl -s --max-time 3 "http://$HOST:8080/api/counters") || fail "panel unreachable"
 
-# concurrent front-panel traffic (Osc Shape wiggles; echo events flow back)
-( end=$((SECONDS + S)); while [ $SECONDS -lt $end ]; do
-    curl -s --max-time 1 "http://$HOST:8080/api/knob?id=2&value=0.$((RANDOM % 90 + 10))" > /dev/null
-    sleep 0.4
-  done ) & KNOBPID=$!
+# concurrent front-panel traffic (Osc Shape wiggles; echo events flow back). This
+# web-panel knob FLOOD is a burst-stress tool calibrated for the 30 s default; over
+# minutes its echo events + the duration-scaled note flood overrun the shell event
+# ring. For a MULTI-MINUTE sustained-audio dropout gate set SOAK_KNOB=0 — the §9.2
+# event-plane flood is separately gated (flood-stress.sh / IDM-flood), so this run
+# stays a clean continuous-audio probe, not an event-ring overload.
+KNOBPID=""
+if [ "${SOAK_KNOB:-1}" = 1 ]; then
+  ( end=$((SECONDS + S)); while [ $SECONDS -lt $end ]; do
+      curl -s --max-time 1 "http://$HOST:8080/api/knob?id=2&value=0.$((RANDOM % 90 + 10))" > /dev/null
+      sleep 0.4
+    done ) & KNOBPID=$!
+fi
 
 # A sustained low chord (held 0.1 s -> end) keeps the mix continuously audible now
 # the drone is gone — without it the gaps between the 0.6 s-spaced --notes read as
@@ -39,7 +51,7 @@ C0=$(curl -s --max-time 3 "http://$HOST:8080/api/counters") || fail "panel unrea
     --set 7=0.5 --ramp 3=0.15:0.9 --ramp 4=0.2:0.6 --ramp 1=0.35:0.6 \
     --chord 36,43 --notes "$NOTES" --seconds "$S" --out "$OUT" > "$LOG" 2>&1
 RC=$?
-kill $KNOBPID 2>/dev/null; wait $KNOBPID 2>/dev/null
+[ -n "$KNOBPID" ] && { kill "$KNOBPID" 2>/dev/null; wait "$KNOBPID" 2>/dev/null; }
 [ $RC -eq 0 ] || { cat "$LOG"; fail "host exited $RC"; }
 
 grep -q "WARNING" "$LOG" && { grep WARNING "$LOG"; fail "shell dropped events"; }

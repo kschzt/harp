@@ -103,6 +103,21 @@ jobs:
           RUNS: ${{ inputs.late_sink_runs }}
         run: scripts/hw-tests-linux.sh
 
+      - name: multi-minute continuous-audio zero-dropout soak (PI4B-0002, §14.1 RME bar)
+        # Sustained real-time audio for MINUTES against real hardware — the RME "zero
+        # dropouts over minutes" bar the conformance suite's 30 s soak only touches.
+        # SOAK_KNOB=0 drops the web-panel knob FLOOD (that event-plane burst stress is the
+        # 30 s soak + IDM-flood's job) so this stays a clean continuous-audio dropout probe:
+        # ZERO audible silence gaps (absolute), padded samples within the 0.5% budget, and
+        # clean device counters (evq_drops/evt_late/frame_errors/session_resets). Validated
+        # on the rig at 240 s: 3 underruns / 768 padded (0.007%, no gaps) through the vfio
+        # USB passthrough. ~3 min added to the job.
+        env:
+          SOAK_KNOB: '0'
+          HARP_HOST: harptest.local
+          HARP_DEVICE_SERIAL: PI4B-0002
+        run: VST="$HOME/.vst3/harp-shell.vst3" scripts/soak.sh "${HW_SUSTAIN_SECONDS:-180}"
+
       - name: IDM-flood event-plane stress (PI4B-0002 over USB)
         # hammer the shell's event plane with dense automation + notes + loop
         # wraps; assert the device dropped/delayed nothing (§14.2 counters).
@@ -174,11 +189,13 @@ jobs:
   # external-capable §8.7 tests (bit-exact RTP stream, §14.3 loopback RTT, §14.4/§8.3 diag
   # counters, §8.4 admission, §5.4/§5.5 control plane, §9.6 txn, §7.1/§8.6 epoch, §11.3 CAS)
   # run over the real link; everything that structurally needs a harness-owned LOCAL co-process
-  # (SIGKILL fault-injection, deterministic host-paced offline goldens, daemons started with
-  # specific flags) self-skips WITH A LOGGED REASON (see scripts/eth-suite.sh EXTERN_CAP).
-  # NOTE: over the real hop the audio assertion is a non-silence RMS floor, not bit-exact —
-  # bit-exactness / converter-quality / offline goldens are loopback-only (eth.yml). See #TODO
-  # real-link-fidelity for the plan to add a deterministic bit-exact/quality assertion here.
+  # (SIGKILL fault-injection, daemons started with specific flags) self-skips WITH A LOGGED
+  # REASON (see scripts/eth-suite.sh EXTERN_CAP).
+  # AUDIO over the real hop: the HOST-PACED kOffline path is gated BYTE-EXACT (offline-golden in
+  # EXTERN_CAP asserts the bounce hashes to the arm64 device pin — the strongest possible gate).
+  # The FREE-RUNNING (live/ASRC) path is gated only by a non-silence RMS floor over the real hop;
+  # its converter-SINAD + sub-10ms latency are proven in synthetic units / a manual probe, not yet
+  # standing-gated over the real NIC (a known follow-up).
   #
   # Triggers: every push (repo var HARP_ETH_HW_ENABLED == '1'), OR a workflow_dispatch with the
   # `eth_hw` input ticked. Shares the `harp-hw` concurrency group + the single self-hosted runner,
