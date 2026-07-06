@@ -10,12 +10,24 @@ endif()
 
 # Warnings + math lib: MSVC speaks neither -Wall/-Wextra nor a separate libm
 # (math lives in the CRT). Keep the GNU/Clang flags for every other toolchain.
+# HARP_WERROR promotes warnings to errors: the tree is warning-clean under
+# -Wall -Wextra / /W4, so CI builds with -DHARP_WERROR=ON to keep it that way
+# (a warning regression fails the build instead of landing silently). Default
+# OFF so a contributor on a newer/stricter compiler version isn't blocked. Only
+# HARP's own targets see it — the third-party SDKs build in the build-vst tree.
+option(HARP_WERROR "Treat compiler warnings as errors (CI keeps the tree warning-clean)" OFF)
 if(MSVC)
   add_compile_options(/W4 /permissive-)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+  if(HARP_WERROR)
+    add_compile_options(/WX)
+  endif()
   set(HARP_MATH_LIB "")
 else()
   add_compile_options(-Wall -Wextra)
+  if(HARP_WERROR)
+    add_compile_options(-Werror)
+  endif()
   set(HARP_MATH_LIB m)
 endif()
 
