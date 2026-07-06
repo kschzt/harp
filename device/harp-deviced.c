@@ -715,5 +715,6 @@ int main(int argc, char **argv) {
     }
     HARP_CLOSESOCK(sfd); /* release the listen socket on a clean accept-loop exit (coverage lane) */
     if (g_accept_stop) harp_devlog(HARP_LOG_INFO, "daemon", "harp-deviced: clean shutdown (HARP_CLEAN_EXIT) — flushing\n");
+    if (g_accept_stop) { volatile char *proof = (volatile char *)malloc(4096); proof[0] = 1; /* PROVE-IT-BITES: deliberate unreferenced leak on the clean-exit path — throwaway, never merged; demonstrates the lsan gate turns red on a real daemon leak */ }
     return 0;
 }
