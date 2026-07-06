@@ -26,7 +26,7 @@ on:
         required: false
         default: ''
       eth_hw:
-        description: 'DORMANT: run the real-Ethernet §8.7 eth-hw job (external-endpoint mode against the rig Pi over a real network hop). Leave OFF until the Pi eth daemon service+port are confirmed on-rig — see the eth-hw TODO.'
+        description: 'Force a dispatch run of the real-Ethernet §8.7 eth-hw job (external-endpoint mode against the rig Pi over a real network hop). It ALSO runs automatically on every push via repo var HARP_ETH_HW_ENABLED=1 — tick this only to force a manual run.'
         type: boolean
         required: false
         default: false
@@ -42,12 +42,11 @@ permissions:
 
 jobs:
   hardware:
-    # never run on a fork; and SKIP while the self-hosted rig is offline.
-    # Gate: runs only when repo var HARP_RIG_ONLINE == '1'. The rig (twwwth / harp-runner VM) is
-    # DOWN as of 2026-07-01 (a USB xHCI passthrough reset hung the libvirt host; needs a hands-on
-    # power-cycle at the closet). Until then this job SKIPS (neutral) instead of queuing/false-red.
-    # RE-ENABLE when PI4B-0002 is back: `gh variable set HARP_RIG_ONLINE --body 1` (then `virsh
-    # start harp-runner` on the host). TODO: remove this gate once the rig is stable again.
+    # never run on a fork; SKIP (neutral) when the self-hosted rig is parked.
+    # Gate: runs only when repo var HARP_RIG_ONLINE == '1'. The rig (twwwth / harp-runner VM, two
+    # boards PI4B-0002 + PI4B-0003 via PCI USB-controller passthrough) is ONLINE (HARP_RIG_ONLINE=1).
+    # Toggle the var OFF to park the gate for a planned rig outage without red/queued pushes, then
+    # `virsh start harp-runner` + set it back to '1' to resume. (Rig had a 07-01..07-06 outage.)
     if: github.repository == 'kschzt/harp' && vars.HARP_RIG_ONLINE == '1'
     runs-on: [self-hosted, harp-hw]
     timeout-minutes: 25
@@ -166,7 +165,8 @@ jobs:
           "
 
   # ─────────────────────────────────────────────────────────────────────────────
-  # DORMANT: real two-host Ethernet §8.7 conformance against the rig Pi.
+  # LIVE STANDING GATE: real two-host Ethernet §8.7 conformance against the rig Pi.
+  # (Went green + enabled on 2026-07-06 — HARP_ETH_HW_ENABLED=1.)
   #
   # Runs scripts/eth-suite.sh in EXTERNAL-ENDPOINT MODE (HARP_ETH_EXTERN=host:port) over a
   # REAL network hop against a harp-deviced running on PI4B-0002 in ETH (TCP) transport —
@@ -176,27 +176,23 @@ jobs:
   # run over the real link; everything that structurally needs a harness-owned LOCAL co-process
   # (SIGKILL fault-injection, deterministic host-paced offline goldens, daemons started with
   # specific flags) self-skips WITH A LOGGED REASON (see scripts/eth-suite.sh EXTERN_CAP).
+  # NOTE: over the real hop the audio assertion is a non-silence RMS floor, not bit-exact —
+  # bit-exactness / converter-quality / offline goldens are loopback-only (eth.yml). See #TODO
+  # real-link-fidelity for the plan to add a deterministic bit-exact/quality assertion here.
   #
-  # ── GATED OFF until the main session validates it on-rig ──
-  #   * Triggers ONLY when the workflow_dispatch input `eth_hw` is ticked, OR the repo variable
-  #     HARP_ETH_HW_ENABLED is set to '1' (Settings → Secrets and variables → Actions →
-  #     Variables). A normal main push / a plain dispatch (for the USB `hardware` job) does
-  #     NOT run this job. It shares the `harp-hw` concurrency group + the single self-hosted
-  #     runner, so it never overlaps the USB job on the exclusive Pi.
+  # Triggers: every push (repo var HARP_ETH_HW_ENABLED == '1'), OR a workflow_dispatch with the
+  # `eth_hw` input ticked. Shares the `harp-hw` concurrency group + the single self-hosted runner,
+  # so it never overlaps the USB `hardware` job on the exclusive Pi. To park it for a planned rig
+  # outage without red pushes, unset HARP_ETH_HW_ENABLED.
   #
-  # ══ TODO(main-session, on-rig) — MUST confirm before enabling ══════════════════════════════
-  #   The repo provisioning (scripts/pi-stage2-install.sh) installs only the USB unit
-  #   `harp-deviced-usb.service`; the TCP/ETH unit is `harp-deviced.service` (it `Conflicts=`
-  #   the USB unit — one protocol stack owns the state store at a time) and is NOT created by
-  #   the provisioner, so its exact NAME + PORT on PI4B-0002 are deployment-specific:
-  #     1. Confirm the eth daemon on PI4B-0002: service name (repo assumes `harp-deviced`) and
-  #        the listen PORT. Device default --port is 47800 (device/harp-deviced.c); the
-  #        PI4B-0001 desk deployment runs on 47988 (on-device service flag, not baked) — so
-  #        PI4B-0002's port MUST be confirmed on the box.
-  #     2. Set the job env below: HARP_ETH_PORT (and, if the service name differs, fix the
-  #        `systemctl` line in the bring-up step).
-  #     3. Enable: tick the `eth_hw` dispatch input, or set repo var HARP_ETH_HW_ENABLED=1.
-  #   Once green on the real Pi, this job is the standing real-Ethernet §8.7 gate.
+  # DEPLOYMENT (on-device, reprovisionable — NOT created by scripts/pi-stage2-install.sh yet):
+  #   PI4B-0002 runs a systemd unit `harp-deviced-eth.service` (Conflicts= harp-deviced-usb.service,
+  #   ExecStart=~ci/harp/build/harp-deviced --port 47800 --state-dir ~ci/harp-eth-state
+  #   --serial PI4B-0002 --trusted-peer 10.10.0.3). The bring-up step below rebuilds the daemon
+  #   from THIS commit + `systemctl restart harp-deviced-eth`, then a runner-side TCP probe. The
+  #   runner service carries LimitRTPRIO (systemd drop-in) so the host's --realtime audio thread
+  #   gets SCHED_FIFO. --trusted-peer exempts the runner IP from the §16(b) pre-hello rate-limit
+  #   (the readiness probe + §5.4 hello-gate would otherwise shed the next request).
   eth-hw:
     if: >-
       github.repository == 'kschzt/harp' &&
@@ -206,7 +202,7 @@ jobs:
     timeout-minutes: 25
     env:
       HARP_ETH_HOST: harptest.local
-      HARP_ETH_PORT: '47800'          # TODO(main-session): confirm PI4B-0002's eth port (default 47800; deployments vary, e.g. 47988)
+      HARP_ETH_PORT: '47800'          # PI4B-0002 harp-deviced-eth.service listens here (device default)
       HARP_ETH_SERIAL: PI4B-0002
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1

@@ -13,7 +13,10 @@
 #   - no AU: it is macOS-only, so golden/tempo-lock auto-skip the AU half and
 #     cross-format-recall-test self-SKIPs (exit 2) — VST3<->AU project move is
 #     exercised only on the macOS desk unit (no AU-capable automated runner)
-#   - multidevice-test self-skips (it needs two boards; the rig has one)
+#   - multidevice-test RUNS: the rig now has two boards (PI4B-0002 + PI4B-0003,
+#     the 2nd via PCI USB-controller passthrough) so it exercises the selection
+#     rules (exact / same-model-fallback / never-cross-model); self-skips (exit 2)
+#     only if a board is absent
 # The Ableton "Live" claim guards are harmless here (no DAW on the runner).
 set -u
 cd "$(dirname "$0")/.."
