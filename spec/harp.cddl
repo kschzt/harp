@@ -11,6 +11,9 @@ error-body = { 0 => tstr, ? 1 => tstr, ? 2 => any }
 ; --- common ---
 semver = tstr .regexp "\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.-]+)?"
 hash   = bstr .size 33
+uint64 = uint                      ; a 64-bit-range unsigned counter (CBOR shortest-encoded);
+                                   ; `uint` in the CDDL prelude already admits 64-bit values —
+                                   ; the name documents the semantic width (msc, gen, ppq)
 tstamp = [uint, uint64]            ; (epoch, msc)
 
 ; --- identity ---

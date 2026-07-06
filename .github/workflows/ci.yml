@@ -304,6 +304,16 @@ jobs:
         run: |
           cmake -B build-tidy -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >/dev/null
           run-clang-tidy -p build-tidy -quiet $(git ls-files 'core/src/*.c' 'device/*.c' 'host/*.c')
+      - name: CDDL wire-validation (schema-as-contract)
+        # The normative schema (spec/harp.cddl) is MACHINE-READABLE but was never machine-CHECKED:
+        # a rule could drift from Appendix A / the code and no test would notice. scripts/cddl-validate.py
+        # proves harp.cddl is well-formed AND validates representative on-the-wire CBOR artifacts
+        # (envelope, param/txn events, objects, ref, identity, recall-bundle) against their rules with a
+        # real CDDL validator (pycddl). It already caught a real bug: `uint64` was referenced but never
+        # defined (not a CDDL prelude type) — now `uint64 = uint`. Complements the behavioural wire tests.
+        run: |
+          pip3 install --quiet pycddl cbor2
+          python3 scripts/cddl-validate.py
       - name: soak silence-oracle self-test (harp-soak.sh HARD-fails a silent render)
         # hardware-free proof that the soak's #90 silence gate FIRES on a silent render
         # (rms<floor) and PASSES real audio — so a refactor can't silently neuter it.
