@@ -177,6 +177,14 @@ static int g_corrupt_ctl_pct = 0;
  * path under test. NOT for production use — the real RTP destination still uses the true peer IP.
  * Network-order (matching getpeername's sin_addr.s_addr); 0 = off / unset = the real behavior. */
 static uint32_t g_force_peer_ip = 0;
+/* §16(b) DEPLOYMENT SEAM: --trusted-peer A.B.C.D exempts one peer IP from the pre-hello shed/
+ * penalize rate-limit, exactly like the built-in 127.* loopback exemption. For a device deployed
+ * behind a KNOWN, trusted host on a private/direct link (e.g. the CI eth-hw rig: the runner dials
+ * the daemon over a direct rig link, and legitimately does pre-hello interactions — a bare TCP
+ * readiness probe, the §5.4 hello-gate rejection test — that would otherwise penalize its own IP
+ * and shed the very next request). This does NOT weaken production DoS protection: it names ONE
+ * trusted peer, unset = the full rate-limit is active for every non-loopback peer. */
+static uint32_t g_trusted_peer_ip = 0;
 
 /* §16 DoS: a deadline-bounded read_exact for the eth control socket's PRE-HELLO phase. Re-arms
  * SO_RCVTIMEO to the REMAINING budget (harp_sock_io.deadline_ns) before each recv, so a slow-
@@ -411,6 +419,13 @@ int main(int argc, char **argv) {
         struct in_addr fa;
         if (fenv && *fenv && inet_pton(AF_INET, fenv, &fa) == 1) g_force_peer_ip = fa.s_addr;
     }
+    /* §16(b) DEPLOYMENT SEAM: env HARP_TRUSTED_PEER is the no-argv route for --trusted-peer;
+     * an explicit --trusted-peer below still wins. See g_trusted_peer_ip. */
+    {
+        const char *tenv = getenv("HARP_TRUSTED_PEER");
+        struct in_addr ta;
+        if (tenv && *tenv && inet_pton(AF_INET, tenv, &ta) == 1) g_trusted_peer_ip = ta.s_addr;
+    }
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc)
             state_dir = argv[++i];
@@ -456,6 +471,12 @@ int main(int argc, char **argv) {
             struct in_addr fa;
             if (inet_pton(AF_INET, argv[++i], &fa) == 1) g_force_peer_ip = fa.s_addr;
         }
+        else if (strcmp(argv[i], "--trusted-peer") == 0 && i + 1 < argc) {
+            /* §16(b) DEPLOYMENT SEAM: see g_trusted_peer_ip — exempt this peer IP from the
+             * pre-hello rate-limit (like the 127.* loopback exemption). */
+            struct in_addr ta;
+            if (inet_pton(AF_INET, argv[++i], &ta) == 1) g_trusted_peer_ip = ta.s_addr;
+        }
         else if (strcmp(argv[i], "--product") == 0 && i + 1 < argc)
             product = argv[++i]; /* identity product/model + panel product + mDNS instance name */
         else if (strcmp(argv[i], "--engine-name") == 0 && i + 1 < argc)
@@ -463,7 +484,7 @@ int main(int argc, char **argv) {
         else {
             harp_devlog(HARP_LOG_ERROR, "daemon",
                     "usage: harp-deviced [--state-dir DIR] [--serial S] [--product NAME] [--engine-name NAME] "
-                    "[--panel-sock PATH] [--tone HZ] [--no-rate-lock] [--rt-floor N] [--rt-nsamples N] [--in-lat N] [--out-lat N] [--engine-ver X.Y.Z] "
+                    "[--panel-sock PATH] [--tone HZ] [--no-rate-lock] [--rt-floor N] [--rt-nsamples N] [--in-lat N] [--out-lat N] [--engine-ver X.Y.Z] [--trusted-peer A.B.C.D] "
                     "[--port P | --ffs FFS_DIR [--gadget CONFIGFS_PATH]]\n");
             return 2;
         }
@@ -661,7 +682,11 @@ int main(int argc, char **argv) {
          * substitutes a forced (non-loopback) IP HERE so a 127.0.0.1 DoS test exercises the shed/
          * penalize path; the real RTP destination above (d->rtp_peer_ip) is left untouched. */
         uint32_t peer_ip = g_force_peer_ip ? g_force_peer_ip : d->rtp_peer_ip;
-        bool rl_peer = peer_ip && ((const unsigned char *)&peer_ip)[0] != 127u;
+        /* rate-limit every non-loopback peer EXCEPT a configured trusted peer (§16(b) deployment
+         * seam): the CI eth-hw runner legitimately does pre-hello interactions (readiness probe,
+         * §5.4 hello-gate) that would otherwise penalize its own IP and shed its next request. */
+        bool rl_peer = peer_ip && peer_ip != g_trusted_peer_ip &&
+                       ((const unsigned char *)&peer_ip)[0] != 127u;
         if (rl_peer && harp_peer_penalized(d->prehello_penalty, 16, peer_ip, harp_now_ns())) {
             d->ctl_sock = HARP_SOCK_INVALID;
             d->rtp_peer_ip = 0;
