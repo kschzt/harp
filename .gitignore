@@ -43,3 +43,6 @@ rtpreorder-eth-state/
 txn-state/
 # the cert harness report artifact (also uploaded by ci.yml)
 cert-report.txt
+
+# transient device state captured by ad-hoc probe/test runs (never a source artifact)
+*.state

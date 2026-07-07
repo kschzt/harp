@@ -43,8 +43,31 @@ def extract_appendix_a(md):
 
 APPA = extract_appendix_a(SPEC_MD)
 
-def rules(cddl):  # rule names defined (LHS of `name =`), ignoring comment lines
-    return set(re.findall(r'^([a-z][a-z0-9-]*)\s*=', cddl, re.M))
+def rule_bodies(cddl):
+    # {rule-name: normalized body}. A rule spans from its `name =` line to the line before
+    # the next rule start; ;-comments are stripped and whitespace collapsed so the compare is
+    # on SEMANTICS, not formatting. A name-set-only parity would miss a rule whose *definition*
+    # (not just its name) drifted between harp.cddl and Appendix A.
+    out, name, buf = {}, None, []
+    for raw in cddl.splitlines():
+        line = re.sub(r';.*$', '', raw)
+        m = re.match(r'^([a-z][a-z0-9-]*)\s*=(.*)$', line)
+        if m:
+            if name is not None:
+                out[name] = ' '.join(' '.join(buf).split())
+            name, buf = m.group(1), [m.group(2)]
+        elif name is not None:
+            buf.append(line)
+    if name is not None:
+        out[name] = ' '.join(' '.join(buf).split())
+    return out
+
+# sub-component / primitive rules that never appear as a standalone top-level wire artifact —
+# they are validated TRANSITIVELY through a parent sample (identity embeds vendor/product/engine/
+# channel-map/latency-profile/txn-limits/semver; recall-bundle embeds identity-expectation; object
+# is the blob/list/tree/snapshot group-choice, each sampled; uint64 rides tstamp/ref).
+TRANSITIVE = {"vendor", "product", "engine", "channel-map", "latency-profile",
+              "identity-expectation", "txn-limits", "semver", "uint64", "object"}
 
 def f32(x):  # CBOR float32 (major 7, ai 26) — the wire encodes param values as float32
     return b"\xfa" + struct.pack(">f", x)
@@ -77,10 +100,20 @@ ARTIFACTS = [
     ("snapshot",    cbor2.dumps({0: 3, 1: H33, 2: [H33], 3: 7, 4: "refdev-synth", 5: "2.1.0"}), "snapshot object"),
     ("ref",         cbor2.dumps({0: "live", 1: H33, 2: 3, 3: True}),       "ref (live)"),
     ("ref",         cbor2.dumps({0: "project", 1: None, 2: 0, 3: False}),  "ref (null hash)"),
-    ("identity",    cbor2.dumps(identity),                                 "identity (hello)"),
+    ("identity",    cbor2.dumps(identity),                                 "identity (hello response)"),
     ("recall-bundle",
      cbor2.dumps({0: "harpb", 1: 1, 2: idexp, 3: [{0: "live", 1: H33, 2: 3, 3: True}], 4: None}),
      "recall-bundle"),
+    # standalone message/event/object rules — each carries its own positive wire sample so the
+    # gate's "all conform" is honest (a rule used on the wire but never sampled is a silent gap):
+    ("event",           cbor2.dumps([[1, 480], 0, {0: 7}]),                "event [tstamp,etype,body]"),
+    ("ramp-event",      b"\xa3\x00\x07\x01" + f32(0.8) + b"\x02" + cbor2.dumps([2, 4800]), "ramp-event"),
+    ("transport-event", cbor2.dumps({0: 0, 1: 120.0, 2: [4, 480], 3: 96000}), "transport-event (tempo/pos)"),
+    ("param",           cbor2.dumps({0: 7, 1: "Cutoff", 4: [0.0, 1.0], 5: 1}), "param descriptor"),
+    ("params-rsp",      cbor2.dumps({0: H33, 1: [{0: 7, 1: "Cutoff", 4: [0.0, 1.0]}], 2: 12}), "params-rsp (evt.params)"),
+    ("rt-profile",      cbor2.dumps({0: 320, 1: 64}),                      "rt-profile (§8.7 setpoints)"),
+    ("ump-group-map",   cbor2.dumps([{0: 0, 1: "notes"}]),                 "ump-group-map (§9.10)"),
+    ("hash",            cbor2.dumps(H33),                                  "hash (bstr .size 33)"),
 ]
 
 def run_suite(cddl, name):
@@ -99,18 +132,36 @@ def run_suite(cddl, name):
             fails.append(f"{name}:{label}")
     return fails
 
-# (0) rule-set parity: Appendix A IS the normative schema; harp.cddl is its extract. They MUST
-# define the same rules, or one has drifted — exactly how `uint64` slipped out of Appendix A.
-r_cddl, r_appa = rules(CDDL), rules(APPA)
-if r_cddl != r_appa:
+# (0) parity: Appendix A IS the normative schema; harp.cddl is its extract. They MUST define the
+# same rules with the same BODIES, or one has drifted — exactly how `uint64` slipped out of
+# Appendix A. Body-level (not just name-level) so a changed definition can't pass unnoticed.
+b_cddl, b_appa = rule_bodies(CDDL), rule_bodies(APPA)
+if set(b_cddl) != set(b_appa):
     sys.exit("cddl-validate: harp.cddl and spec Appendix A DEFINE DIFFERENT RULES — "
-             f"only in harp.cddl: {sorted(r_cddl - r_appa) or '—'}; "
-             f"only in Appendix A: {sorted(r_appa - r_cddl) or '—'}")
-print(f"rule-set parity: harp.cddl ≡ spec Appendix A ({len(r_cddl)} rules) ✓")
+             f"only in harp.cddl: {sorted(set(b_cddl) - set(b_appa)) or '—'}; "
+             f"only in Appendix A: {sorted(set(b_appa) - set(b_cddl)) or '—'}")
+body_diffs = [r for r in sorted(b_cddl) if b_cddl[r] != b_appa[r]]
+if body_diffs:
+    sys.exit(f"cddl-validate: harp.cddl and Appendix A AGREE on rule names but DISAGREE on bodies: {body_diffs}\n"
+             + "\n".join(f"    {r}:\n      harp.cddl   = {b_cddl[r]}\n      Appendix A  = {b_appa[r]}" for r in body_diffs))
+print(f"rule parity: harp.cddl ≡ spec Appendix A — {len(b_cddl)} rules, names AND bodies match ✓")
+
+# (0b) coverage honesty: every standalone (non-transitive) rule MUST carry a positive wire sample,
+# so "all wire samples conform" is not a blanket over an unsampled rule. A new standalone rule with
+# no sample fails the gate rather than passing silently.
+sampled = {a[0] for a in ARTIFACTS}
+allrules = set(b_cddl)
+unsampled = allrules - sampled - TRANSITIVE
+if unsampled:
+    sys.exit(f"cddl-validate: standalone rule(s) with NO positive wire sample: {sorted(unsampled)} — "
+             "add a sample to ARTIFACTS, or classify it TRANSITIVE if it only rides a parent")
+print(f"rule coverage: {len(sampled & allrules)}/{len(allrules)} rules directly sampled, "
+      f"{len(TRANSITIVE & allrules)} validated transitively via a parent artifact ✓")
 
 # (1) well-formedness + (2) wire-artifact conformance, against BOTH normative surfaces
 fails = run_suite(CDDL, "harp.cddl") + run_suite(APPA, "spec/harp-spec.md Appendix A (normative)")
 
 if fails:
     sys.exit(f"\ncddl-validate: {len(fails)} sample(s) do NOT conform: {', '.join(fails)}")
-print("\ncddl-validate: harp.cddl + spec Appendix A — rule-parity, well-formed, all wire samples conform ✓")
+print(f"\ncddl-validate: harp.cddl + spec Appendix A — body-parity, {len(sampled & allrules)}/{len(allrules)} rules "
+      f"directly sampled (rest transitive), well-formed, all samples conform ✓")
