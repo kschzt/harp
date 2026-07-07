@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # cert-harness.sh — the unified HARP §17.3 T1–T17 conformance harness + report.
 #
-# The maturity capstone flagged that although the individual conformance tests exist and run
-# (ci.yml, eth.yml, hw.yml, soak.yml), NO single runner indexes the T1–T17 certification battery
+# Although the individual conformance tests exist and run across
+# (ci.yml, eth.yml, hw.yml, soak.yml), NO single runner otherwise indexes the T1–T17 certification battery
 # by number, runs the cloud-capable subset, and emits one pass/fail/skip/uncovered report. This
 # is that runner. It is a pure ADDITION — it re-uses the existing test scripts and unit suite
 # unchanged (no test or golden is modified); it only orchestrates and reports.

@@ -185,7 +185,7 @@ jobs:
   #
   # Runs scripts/eth-suite.sh in EXTERNAL-ENDPOINT MODE (HARP_ETH_EXTERN=host:port) over a
   # REAL network hop against a harp-deviced running on PI4B-0002 in ETH (TCP) transport —
-  # closing the "eth CI is loopback-only" hardware gap the maturity capstone flagged. The
+  # closing the "eth CI is loopback-only" hardware gap. The
   # external-capable §8.7 tests (bit-exact RTP stream, §14.3 loopback RTT, §14.4/§8.3 diag
   # counters, §8.4 admission, §5.4/§5.5 control plane, §9.6 txn, §7.1/§8.6 epoch, §11.3 CAS)
   # run over the real link; everything that structurally needs a harness-owned LOCAL co-process
