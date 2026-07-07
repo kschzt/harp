@@ -10,8 +10,8 @@
 #   sudo SERIAL=PI4B-000X PEER=10.10.0.3 scripts/rig-eth-provision.sh   # another rig board
 # Idempotent: re-running rewrites the units + reloads systemd. The daemon BINARY is rebuilt from the
 # commit under test by the hw.yml eth-hw bring-up (`systemctl restart harp-deviced-eth`); this only
-# owns the unit definitions. It replaces the previously hand-created units the maturity panel flagged
-# as un-reproducible (the tone unit's absence from any script was the SINAD gate's provenance gap).
+# owns the unit definitions. It replaces the previously hand-created units, which were
+# un-reproducible (the tone unit's absence from any script was the SINAD gate's provenance gap).
 #
 # The two units:
 #   harp-deviced-eth       — the synth daemon on :47800 (the §8.7 conformance-suite target). Conflicts

@@ -441,9 +441,9 @@ jobs:
           if-no-files-found: warn
 
   lsan:
-    # LeakSanitizer gate on the long-running device DAEMON — closes the maturity-panel blocker
-    # "no LSan leak gate: eth-asan.yml sets detect_leaks=0 ... the all-day audio daemon has no
-    # automated leak gate — unproven either way". eth-asan.yml runs the daemon with detect_leaks=0,
+    # LeakSanitizer gate on the long-running device DAEMON — closes a real gap in the sanitizer
+    # coverage: eth-asan.yml sets detect_leaks=0 ... the all-day audio daemon otherwise has no
+    # automated leak gate — unproven either way. eth-asan.yml runs the daemon with detect_leaks=0,
     # and the two DoS soaks (abuse-test.sh / conn-flood-test.sh) SIGKILL it mid-session, so a
     # daemon allocation that is never freed was UNPROVEN. LSan reports at process EXIT, which needs
     # a CLEAN exit — so this job builds an ASan (leaks-ON) harp-deviced + harp-probe + the eth-audio
@@ -478,8 +478,8 @@ jobs:
         run: ./scripts/lsan-drive.sh
 
   cert-harness:
-    # §17.3 T1–T17 CERTIFICATION HARNESS (cloud subset). The maturity capstone flagged that,
-    # although the individual conformance tests exist and run, NO single runner indexes the
+    # §17.3 T1–T17 CERTIFICATION HARNESS (cloud subset). Although the individual conformance
+    # tests exist and run, NO single runner otherwise indexes the
     # T1–T17 battery by number, runs the cloud-capable subset, and emits one pass/fail/skip/
     # uncovered report. scripts/cert-harness.sh is that runner; scripts/cert-tests.tsv is the
     # T → §17.3-title → covering-test index (honestly classified cloud|partial|rig|uncovered).

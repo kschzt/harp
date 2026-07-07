@@ -5,7 +5,7 @@
 # HARP_ETH_EXTERN=host:port switches the eth harness from its DEFAULT "spawn a localhost
 # harp-deviced and talk to it over loopback (same clock domain, no NIC)" to "target an
 # ALREADY-RUNNING external harp-deviced at that address over a REAL two-host network hop" —
-# closing the loopback-only gap the maturity capstone flagged. When set, an external-capable
+# closing the loopback-only gap. When set, an external-capable
 # sub-script does NOT spawn/kill a local deviced; it dials $HARP_ETH_EXTERN. Unset/empty =>
 # the default spawn-local loopback path, 100% unchanged (eth.yml is unaffected).
 #
