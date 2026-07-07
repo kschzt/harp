@@ -358,8 +358,8 @@ jobs:
         # regression); the audio fidelity is gated in eth.yml, not re-asserted here. ALL binaries were
         # built by the coverage build above; the .gcda ACCUMULATES on top of the unit run.
         run: ./scripts/device-coverage-drive.sh
-      - name: coverage metric (gcovr) — gate the unit-tested core AND the driven device daemon
-        # The quantified metric the panel asked for, now over BOTH responsible surfaces:
+      - name: coverage metric (gcovr) — gate the unit-tested core, the driven device daemon AND the host wire transport
+        # The quantified test-coverage metric (gcovr), now over the three responsible surfaces:
         #  • core/src/  — the protocol library the UNIT suite covers (~85% lines:
         #                 cbor/store/object/frame/audio/envelope/link). Gate: --fail-under-line 78.
         #  • device/    — the device daemon (session/state/audio_loop/engine + harp-deviced + panel),
@@ -368,6 +368,12 @@ jobs:
         #                 with headroom for gcc-vs-clang + Linux/platform-#ifdef variance, same ~7-pt
         #                 margin as the core gate's 78-vs-85; PRINTED below so a green run can tighten
         #                 it — capture-then-pin, like the engine-golden hashes).
+        #  • host/      — the wire-facing socket + RTP transport (sock_io.c/rtp.c/rtp_udp.c/client.c),
+        #                 driven by the unit suite (rtp/rtp-hf/freerun) + the harp-probe/eth-rtp drive
+        #                 above (~81% lines). Gate: --fail-under-line 72 (GATE 3/3 below). Until now
+        #                 host/ was INFORMATIONAL-only (no --fail-under) so a socket/RTP tested-ness
+        #                 regression was silent; harp-probe.c (the CLI) + the USB/mDNS host paths stay
+        #                 out of the filter (HW-gated / CLI, not the wire layer).
         # SCOPE (honest): the gate gates LINE coverage (branch counting differs across gcc/clang, so it
         # is REPORTED, not gated — same as the core gate). device/ffs.c (the USB/FunctionFS gadget
         # transport) is EXCLUDED from the device gate: it needs real USB hardware, has no cloud path,
@@ -375,21 +381,44 @@ jobs:
         # meaningless aggregate. ffs_link.c (framed-link codec) stays in: it is unit-tested cross-OS.
         # The plat shim (core) has no unit test by design.
         run: |
-          echo "── GATE 1/2: core protocol unit coverage (core/src/, the unit-test target):"
+          echo "── GATE 1/3: core protocol unit coverage (core/src/, the unit-test target):"
           gcovr --root . --filter 'core/src/' --exclude '.*plat_.*' \
             --print-summary --fail-under-line 78
           echo ""
           echo "════════════════════════════════════════════════════════════════════════════"
-          echo "── GATE 2/2: DEVICE DAEMON coverage (device/, clean-exit-driven; ffs.c = HW-gated):"
+          echo "── GATE 2/3: DEVICE DAEMON coverage (device/, clean-exit-driven; ffs.c = HW-gated):"
           echo "════════════════════════════════════════════════════════════════════════════"
           gcovr --root . --filter 'device/' \
             --exclude '.*test.*' --exclude '.*ffs\.c$' \
             --print-summary --fail-under-line 64
           echo ""
+          echo "════════════════════════════════════════════════════════════════════════════"
+          echo "── GATE 3/3: HOST WIRE TRANSPORT coverage (host/ socket + RTP; unit + drive):"
+          echo "════════════════════════════════════════════════════════════════════════════"
+          # The wire-facing host transport: the §16 eth control socket (sock_io.c), the §8.7 RTP
+          # packetiser (rtp.c), the RTP/UDP datagram plane (rtp_udp.c) and the transport-agnostic
+          # client dial/session library (client.c). Driven to a REAL line number by the runs above —
+          # the ctest unit suite (rtp/rtp-hf/freerun) covers rtp.c, and device-coverage-drive.sh dials
+          # harp-probe + the eth-rtp/bitexact tools over TCP/RTP, exercising sock_io.c/client.c/rtp_udp.c.
+          # host/ was previously INFORMATIONAL-only (no --fail-under), so a socket/RTP tested-ness
+          # regression here was SILENT. Measured 80.6% lines (694/861) on the coverage build; floor 72
+          # leaves ~8pt for gcc-vs-clang line attribution + drive-timing variance (same capture-then-pin
+          # margin as the 78/85 core and 64/71 device gates). harp-probe.c (the interactive CLI, ~63%)
+          # and the USB/mDNS/rt_sched host paths (HW-gated, ~0% in the cloud) are DELIBERATELY excluded
+          # from the filter — this gates the substantive TCP/RTP wire layer, not a padded aggregate.
+          gcovr --root . \
+            --filter 'host/sock_io\.c' --filter 'host/rtp\.c' \
+            --filter 'host/rtp_udp\.c' --filter 'host/client\.c' \
+            --print-summary --fail-under-line 72
+          echo ""
+          echo "── INFORMATIONAL: per-file host/ wire-transport breakdown (harp-probe.c CLI = report-only):"
+          gcovr --root . --filter 'host/' --exclude '.*test.*' --txt 2>/dev/null | \
+            grep -E '^host/.*\.(c|h)' || true
+          echo ""
           echo "── INFORMATIONAL: per-file device/ breakdown (panel.c = sidecar-driven; ffs.c = USB/HW):"
           gcovr --root . --filter 'device/' --exclude '.*test.*' --txt 2>/dev/null | \
             grep -E '^device/.*\.(c|h)' || true
-          echo "── INFORMATIONAL: overall core/host/device (host socket I/O is eth-suite/HW-tested):"
+          echo "── INFORMATIONAL: overall core/host/device (host wire layer gated in GATE 3/3 above):"
           gcovr --root . --filter 'core/src/' --filter 'host/' --filter 'device/' \
             --exclude '.*test.*' --exclude '.*external.*' --exclude '.*vst3sdk.*' --print-summary
       - name: line-coverage TOTAL % (lcov summary) + uploaded report artifact
