@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -195,6 +196,37 @@ bool harp_store_have(const harp_store *s, const harp_hash *h) {
  * leaves the ref old-or-new, never a hybrid. */
 bool harp_store_fault_skip_rename = false;
 
+/* Test seam (§T10 crash-atomicity, SIGKILL torture): widen the "durable in the tmp,
+ * not yet renamed" torn window so an EXTERNAL SIGKILL of the daemon reliably lands
+ * INSIDE it — the in-process fault_skip_rename above proves recovery for a single
+ * store, this proves it for the whole daemon over the wire (scripts/t10-crash-atomic-
+ * test.sh). Read ONCE from HARP_STORE_COMMIT_DELAY_US; zero in production (env unset),
+ * so write_atomic is byte-for-byte unchanged and pays only one cached compare.
+ * When >0 the sleep sits between the tmp's durable flush and the atomic rename, and is
+ * bracketed by markers on stderr (the daemon log): a kill during the sleep leaves a
+ * window-enter with no matching window-exit, which the test counts as a PROVEN
+ * mid-commit kill. rename(2) is a single atomic step, so a crash on either side of it
+ * leaves the target old-or-new — never a hybrid — which is exactly what the sleep makes
+ * observable. */
+static long commit_delay_us(void) {
+    static long us = -1;
+    if (us < 0) {
+        const char *e = getenv("HARP_STORE_COMMIT_DELAY_US");
+        us = e ? atol(e) : 0;
+        if (us < 0) us = 0;
+    }
+    return us;
+}
+
+static void commit_sleep(long us) {
+#ifdef _WIN32
+    Sleep((DWORD)(us / 1000));
+#else
+    struct timespec ts = {us / 1000000L, (us % 1000000L) * 1000L};
+    nanosleep(&ts, NULL);
+#endif
+}
+
 /* Write a file atomically: tmp in the same directory, fsync, rename. */
 static int write_atomic(const char *path, const uint8_t *data, size_t len) {
     char tmp[HARP_STORE_PATH_MAX + 64];
@@ -213,11 +245,17 @@ static int write_atomic(const char *path, const uint8_t *data, size_t len) {
         return -1;
     }
     fclose(f);
+    long delay_us = commit_delay_us();
+    if (delay_us > 0) { /* §T10 torture seam only; unset in production */
+        fprintf(stderr, "T10-window-enter %s\n", path);
+        commit_sleep(delay_us);
+    }
     if (harp_store_fault_skip_rename) return -1; /* simulated crash: tmp synced, rename never happens */
     if (rename_atomic(tmp, path) != 0) {
         remove(tmp);
         return -1;
     }
+    if (delay_us > 0) fprintf(stderr, "T10-window-exit %s\n", path);
     return 0;
 }
 

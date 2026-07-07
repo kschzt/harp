@@ -257,6 +257,14 @@ jobs:
           # §9.8 evt.format/evt.parse round-trip (continuous + stepped params)
           ./build/harp-probe -d 127.0.0.1:17800 -s /tmp/host format-test | tee format.out
           grep -q "FORMAT-TEST PASS" format.out
+      - name: T10 crash-atomicity — simulated power-loss-during-apply (§17.3 T10, no hardware)
+        # SIGKILL -9 the daemon mid state.snapshot commit ×N (kill swept across the object-write→
+        # ref-advance window widened by HARP_STORE_COMMIT_DELAY_US), restart on the same state-dir,
+        # and assert live/project recovers OLD-or-NEW — closure-complete + hash-consistent, never a
+        # torn/hybrid graph (§10.2). Simulates the storage-atomicity half of the T10 power-loss
+        # torture; the PHYSICAL power-cut stays rig-only (hw.yml). Uses harp-deviced + harp-probe
+        # built above — no libusb, no shell, no hardware.
+        run: ./scripts/t10-crash-atomic-test.sh
       - name: reconcile relay (§11.4 four actions over the protocol, sim device + panel)
         run: ./scripts/reconcile-relay-test.sh
       - name: web panel sidecar smoke (§11 — harp-panel.py JSON endpoints over the sim daemon)
