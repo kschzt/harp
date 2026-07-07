@@ -288,6 +288,17 @@ static harp_hash remote_snapshot(probe *p, const char *msg) {
     return h;
 }
 
+/* snapshot [msg]: drive §11.2 state.snapshot of live/project and print the FULL new head
+ * hash. A wire primitive (mirrors `knob`) that opens the write-objects-then-advance-the-ref
+ * commit window (§10.2) which scripts/t10-crash-atomic-test.sh cuts across with a SIGKILL. */
+static void cmd_snapshot(probe *p, const char *msg) {
+    do_hello(p);
+    harp_hash h = remote_snapshot(p, (msg && msg[0]) ? msg : "probe snapshot");
+    char hex[2 * HARP_HASH_LEN + 1];
+    harp_hash_hex(&h, hex);
+    printf("snapshot: live/project @ %s\n", hex);
+}
+
 static void fetch_closure(probe *p, const harp_hash *root) {
     size_t fetched = 0;
     ck(p, harp_client_fetch_closure(&p->client, root, &fetched));
@@ -2131,6 +2142,8 @@ int main(int argc, char **argv) {
         cmd_archive(&p, argv[i + 1], atoi(argv[i + 2]));
     else if (strcmp(cmd, "knob") == 0 && i + 2 < argc) {
         cmd_knob(&p, strtoull(argv[i + 1], NULL, 10), strtod(argv[i + 2], NULL));
+    } else if (strcmp(cmd, "snapshot") == 0) {
+        cmd_snapshot(&p, (i + 1 < argc) ? argv[i + 1] : NULL);
     } else if (strcmp(cmd, "save") == 0) {
         do_hello(&p);
         do_save(&p);

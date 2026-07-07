@@ -64,8 +64,9 @@ T9	run	device,probe	scripts/rate-limit-ops-eth-test.sh	§16 DoS: state.snapshot 
 T9	run	host	scripts/corrupt-cbor-eth-test.sh	§8.7 hostile CBOR byte-flip injection on ctl — the host survives + resets cleanly
 T9	rig	-	-	Coverage-guided libFuzzer under ASan (fuzz-cbor/envelope/object/link/audio/state/evt) runs per-PR in ci.yml (fuzz job) and deep nightly in soak.yml (deep-fuzz) — the memory-fault gate
 
-T10	meta	uncovered	-	50 × power loss during state apply and during firmware stage/commit: device boots, state is old-or-new, never hybrid
-T10	uncovered	-	-	No power-loss-during-apply injection. §10.2 journaled atomic-apply exists and §11.3 CAS is tested (cas-conflict-eth-test.sh), but the "cut power mid-commit 50× → old-or-new-never-hybrid" torture is unautomated. Genuine gap (rig capability).
+T10	meta	partial	-	50 × power loss during state apply and during firmware stage/commit: device boots, state is old-or-new, never hybrid
+T10	run	device,probe	scripts/t10-crash-atomic-test.sh	§10.2 power-loss-during-apply, SIMULATED: SIGKILL -9 the daemon mid state.snapshot commit ×N (kill swept across the object-write→ref-advance window), restart on the same state-dir → live/project recovers OLD-or-NEW, closure-complete + hash-consistent, never torn/hybrid. Automated on cloud runners (the storage-atomicity/ordering half).
+T10	rig	-	-	The PHYSICAL power-loss torture (cut power 50× during state apply AND during firmware stage/commit; device boots old-or-new) is rig-only: SIGKILL models process death across the atomic rename but NOT lost-unfsynced-data (the kernel keeps the page cache), so the durability half + firmware stage/commit (§13) run on the power/USB rig (hw.yml / soak.yml when HARP_RIG_ONLINE=1).
 
 T11	meta	cloud	-	latency profile accuracy vs loopback (±1 ms; harp-perf: exact at the stream timestamp)
 T11	run	host	scripts/loopback-eth-test.sh	§14.3 loopback round-trip RTT vs the reported profile (±1 ms strict on Linux)
