@@ -97,7 +97,7 @@ automation, offline bounce through the box, and a 16-part multitimbral,
 8-voice-polyphonic instrument with per-voice modulation, driven as one
 multi-out instance with the DAW routing a MIDI channel per part. The plugin shell builds and is
 CI-validated on **macOS, Windows, and Linux** — a VST3 on all three (pluginval
-strictness 10), an Audio Unit on macOS (`auval`) at full parity, and a CLAP on
+strictness 10, for both the instrument and the §8.8 FX shell), an Audio Unit on macOS (`auval`) at full parity, and a CLAP on
 all three — all three formats rendering byte-identically (the conformance kit
 asserts it), and a project's per-part recall state moving between VST3 and AU
 (CLAP writes the same recall bundle). The device has been driven from **Ableton
@@ -462,7 +462,10 @@ turn-key *certification kit*.
   reconnect, RTP packet-loss tolerance, hostile-frame fault injection, the
   spec-conformance closures (credit flow-control §4.2.1, event transactions §9.6,
   admission control §8.4, engine-major read-only §12.2, the §14.4 diag bundle and
-  §14.3 loopback, mDNS discovery §4.4.3 on macOS), and the four safety-contract
+  §14.3 loopback, mDNS discovery §4.4.3 on macOS), the §8.8 **effect path** (the
+  `examples/fx-filter` device through the FX shell: track audio in / wet out,
+  automation applied on the exact sample of its audio, exact-hash recall incl. the
+  host Mix, front-panel echo), and the four safety-contract
   tests (CAS conflict, archive-before-push, param-map-hash, event fence). As of
   2026-07-06 the same §8.7 suite also runs over a **real network hop** against the
   rig Pi (PI4B-0002 in TCP transport) as a green standing gate in `hw.yml` —
@@ -506,7 +509,7 @@ turn-key *certification kit*.
 - **Sandboxed suite**: builds + unit tests on three OSes with **warnings
   promoted to errors** on every core/device build (`-Werror` / `/WX` via
   `HARP_WERROR`, so a warning can no longer land silently), pluginval
-  strictness 10 (macOS / Windows / Linux), `auval` (macOS), fuzzed parsers
+  strictness 10 on the instrument and FX shells (macOS / Windows / Linux), `auval` (macOS), fuzzed parsers
   (libFuzzer + ASan), and a protocol-abuse test that slams a live daemon with
   hostile traffic (sessions reset, nothing crashes). The **raw device-DSP render**
   is pinned as a regression oracle (`engine-golden-test.sh`, debt #19: it drives
