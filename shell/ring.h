@@ -63,6 +63,8 @@ public:
     }
     /* producer: the monotonic count of floats ever written (the next write's index) */
     size_t writeIndex() const { return head_.load(std::memory_order_relaxed); }
+    /* consumer: the monotonic count of floats ever read (the next read's index) */
+    size_t readIndex() const { return tail_.load(std::memory_order_relaxed); }
 
 private:
     const size_t cap_, mask_;
@@ -91,6 +93,11 @@ struct TimedEv {
      * the source's own channel — so a single main instance drives every part per-event instead
      * of one fixed part per source. A note (kind 2) carries its channel in the UMP word instead. */
     uint8_t channel = 0;
+    /* §8.8 SSI-domain tag (EventManager::setDomainTag): 0 = untagged (the instrument — always
+     * valid). An effect tags each event with the session domain its timestamp was computed
+     * in; the pump re-stamps one from an older domain to "now" (its audio was discarded with
+     * that domain, but its value must still land). */
+    uint32_t tag = 0;
 };
 
 /* SPSC ring of fixed-capacity POD items. Capacity must be a power of two. Overflow REFUSES (push

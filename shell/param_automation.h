@@ -23,6 +23,7 @@
 #define HARP_PARAM_AUTOMATION_H
 
 #include <cstddef>
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -57,6 +58,16 @@ public:
     /* Once per process() block, BEFORE its points: the §15.5 reconnect replay,
      * then flush any folded point whose gesture is over. */
     void beginBlock(HarpRuntime &rt, EventSource *src, uint64_t base) {
+        /* A new session is a new SSI domain (§7.1): the last emitted point and any pending
+         * fold carry OLD-domain timestamps — kept, a fold would never flush and every later
+         * point would read as "before" the last one (a set, never a ramp). Forget them; the
+         * §15.5 current values and offline-dirty flags are domain-free and survive. */
+        uint64_t gen = rt.sessionGeneration();
+        if (gen != gen_) {
+            gen_ = gen;
+            std::fill(hasLast_.begin(), hasLast_.end(), 0);
+            std::fill(pendHas_.begin(), pendHas_.end(), 0);
+        }
         connected_ = rt.connected();
         if (connected_ && !wasConnected_) {
             if (everConnected_)
@@ -109,6 +120,7 @@ private:
     std::vector<float> pendVal_;
     std::vector<uint8_t> hasLast_, pendHas_;
     std::vector<uint8_t> dirtyOffline_; /* edited during an offline gap -> replayed on reconnect */
+    uint64_t gen_ = 0;            /* the session generation lastTs_/pendTs_ belong to */
     bool connected_ = false;      /* rt.connected() sampled at this block's start */
     bool wasConnected_ = false;
     bool everConnected_ = false;  /* replay only on a TRUE reconnect, never the first connect */

@@ -35,6 +35,8 @@
  *     live insert. The plugin reports exactly that for PDC and delays its local dry
  *     by the same amount, so dry and wet are sample-aligned at every Mix.
  */
+#include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -160,6 +162,8 @@ public:
         rate_ = (uint32_t)setup.sampleRate;
         maxBlock_ = (uint32_t)setup.maxSamplesPerBlock;
         offline_ = setup.processMode == kOffline;
+        /* 3 ms one-pole for the Mix de-click */
+        mixCoef_ = 1.0f - std::exp(-1.0f / (0.003f * (float)(rate_ ? rate_ : 48000)));
         if (runtime()) runtime()->configure(rate_, maxBlock_);
         if (runtime()) runtime()->setOffline(offline_);
         return AudioEffect::setupProcessing(setup);
@@ -195,9 +199,16 @@ public:
                 runtime()->setStateBundle(pendingState_.data(), pendingState_.size());
             runtime()->start(rate_);
             source_ = runtime()->ownerSource();
-            /* the dry path waits as long as the wet does (off the audio thread) */
-            dryDelay_.assign(2 * (size_t)runtime()->fxLatencySamples(), 0.0f);
-            dryPos_ = 0;
+            /* audio-thread buffers, allocated here — never on the audio thread. The dry
+             * line holds kDryMaxFrames: it follows the runtime's ACTUAL wet delay every
+             * block (fxWetDelay), which can differ from the value sized at activation (a
+             * device profile learned at connect, a late-guard re-anchor). */
+            fxin_.assign(2 * (size_t)maxBlock_, 0.0f);
+            wet_.assign(2 * (size_t)maxBlock_, 0.0f);
+            dryBuf_.assign(2 * (size_t)kDryMaxFrames, 0.0f);
+            dryW_ = 0;
+            mixLin_ = mixSm_ = mixTarget_.load(std::memory_order_relaxed);
+            mixFresh_ = true; /* the first block STARTS at its first Mix value (no glide) */
         } else {
             /* §14.4 host-context-A capture, OPT-IN by env (harp-vst3-host --diag-bundle),
              * exactly as the instrument shell: read-only, after the render, while the
@@ -220,7 +231,7 @@ public:
         /* §8.8 PDC: the runtime ENFORCES this delay between the input and its wet
          * (fxLatencySamples), so what the host compensates is what it gets. */
         if (runtime()) return runtime()->fxLatencySamples();
-        return offline_ ? HarpRuntime::fxOfflineLatency() : HarpRuntime::latencyFor(maxBlock_);
+        return offline_ ? HarpRuntime::fxOfflineLatency() : HarpRuntime::fxLiveLatencyFor(maxBlock_);
     }
 
     tresult PLUGIN_API canProcessSampleSize(int32 symbolicSampleSize) override {
@@ -271,6 +282,10 @@ public:
     tresult PLUGIN_API process(ProcessData &data) override {
         if (!runtime() || !source_) return passthroughDry(data);
         HarpRuntime &rt = *runtime();
+        /* Adopt a new session's SSI domain FIRST (a reconnect or late connect happened on
+         * the supervisor thread): from here on this block's input, events and pull all
+         * belong to it. */
+        rt.fxBeginBlock();
         /* Stream position of THIS block's input (§9.2): its events must land on the
          * same SSI as the audio they accompany, and the runtime knows that SSI exactly
          * (fxInputPos). (The instrument shell leads by latencySamples() because its
@@ -281,6 +296,7 @@ public:
          * instrument shell's policy); the host-side Mix updates the local dry/wet
          * ratio and is never sent. */
         automation_.beginBlock(rt, source_, base);
+        nMixPts_ = 0;
         if (data.inputParameterChanges) {
             int32 nq = data.inputParameterChanges->getParameterCount();
             for (int32 i = 0; i < nq; i++) {
@@ -292,8 +308,9 @@ public:
                     int32 off;
                     ParamValue v;
                     if (q->getPoint(k, off, v) != kResultOk) continue;
-                    if (id == kMixParamId) {
-                        mix_ = (float)v;
+                    if (id == kMixParamId) { /* host-side: sample-accurate, applied below */
+                        if (nMixPts_ < kMaxMixPts) mixPts_[nMixPts_++] = {off, (float)v};
+                        else mixPts_[kMaxMixPts - 1] = {off, (float)v};
                         continue;
                     }
                     size_t slot = automation_.slotOf(id);
@@ -320,59 +337,82 @@ public:
             inR = data.inputs[0].numChannels > 1 ? data.inputs[0].channelBuffers32[1] : inL;
         }
         const size_t ncols = kFxInSlots.size() >= 2 ? 2 : 1;
-        static thread_local std::vector<float> fxin;
-        if (fxin.size() < ncols * (size_t)n) fxin.resize(ncols * (size_t)n);
+        if (fxin_.size() < 2 * (size_t)n) { /* host broke maxSamplesPerBlock: survive it */
+            fxin_.resize(2 * (size_t)n);
+            wet_.resize(2 * (size_t)n);
+        }
         for (int32 s = 0; s < n; s++) {
             float l = inL ? inL[s] : 0.0f, r = inR ? inR[s] : 0.0f;
             if (ncols == 2) {
-                fxin[2 * (size_t)s] = l;
-                fxin[2 * (size_t)s + 1] = r;
+                fxin_[2 * (size_t)s] = l;
+                fxin_[2 * (size_t)s + 1] = r;
             } else
-                fxin[(size_t)s] = 0.5f * (l + r);
+                fxin_[(size_t)s] = 0.5f * (l + r);
         }
-        rt.writeFxInput(fxin.data(), (size_t)n);
+        rt.writeFxInput(fxin_.data(), (size_t)n);
 
         /* WET: pull the device's processed stereo return, fxLatencySamples() behind
          * its input. Offline blocks until it has arrived (deterministic bounce);
          * real-time pads silence on underrun (and drops the late wet, keeping the delay). */
-        static thread_local std::vector<float> wet;
-        if ((int)wet.size() < 2 * n) wet.resize(2 * n);
         /* Offline waits as long as the device is CONNECTED — a bounce has no real-time
          * deadline, and giving up early would pad silence into a render that must be
          * deterministic (a stalled host or device for 0.5 s used to do exactly that). The
          * bound (20000 polls x 0.5 ms = 10 s) only catches a connected-but-wedged device;
          * a disconnect ends the wait at once. */
         if (offline_)
-            rt.pullAudioBlocking(wet.data(), (size_t)n, 20000);
+            rt.pullAudioBlocking(wet_.data(), (size_t)n, 20000);
         else
-            rt.pullAudio(wet.data(), (size_t)n);
+            rt.pullAudio(wet_.data(), (size_t)n);
 
-        /* MIX: out = mix*wet + (1-mix)*dry. wet[s] trails its input by exactly
-         * fxLatencySamples(), so the dry goes through a delay line of that length
-         * (dryDelay_) and the two stay sample-aligned. */
-        float mix = mix_ < 0.f ? 0.f : (mix_ > 1.f ? 1.f : mix_);
+        /* MIX: out = mix*wet + (1-mix)*dry, per sample.
+         * - The wet trails its input by the runtime's actual wet delay (fxWetDelay), so the
+         *   dry is read that far back in dryBuf_ and the two stay sample-aligned — also
+         *   after a reconnect or a late-guard re-anchor changes the delay.
+         * - Mix automation is sample-accurate: linear between this block's points (VST3
+         *   point semantics), from the previous block's value; with no points it heads for
+         *   mixTarget_ (a UI edit or a restored state). A 3 ms one-pole de-clicks steps. */
+        uint32_t d = rt.fxWetDelay();
+        if (d >= kDryMaxFrames) d = kDryMaxFrames - 1; /* > 1.3 s of device latency: clamp */
+        if (!nMixPts_) mixPts_[nMixPts_++] = {0, mixTarget_.load(std::memory_order_relaxed)};
+        if (mixFresh_) { /* a render's first block starts at the value the host gave it, not a
+                          * glide from the default — so how the Mix arrived (automation, a
+                          * restored state) cannot change the bounce */
+            mixLin_ = mixSm_ = mixPts_[0].off == 0 ? mixPts_[0].v : mixLin_;
+            mixFresh_ = false;
+        }
         int32 nch = data.outputs[0].numChannels;
         float *outL = data.outputs[0].channelBuffers32[0];
         float *outR = nch > 1 ? data.outputs[0].channelBuffers32[1] : nullptr;
-        const size_t dlen = dryDelay_.size() / 2;
+        float segV0 = mixLin_;
+        int32 segS0 = 0;
+        uint32_t pi = 0;
         for (int32 s = 0; s < n; s++) {
-            float dryL = inL ? inL[s] : 0.0f;
-            float dryR = inR ? inR[s] : 0.0f;
-            if (dlen) {
-                float dl = dryDelay_[2 * dryPos_], dr = dryDelay_[2 * dryPos_ + 1];
-                dryDelay_[2 * dryPos_] = dryL;
-                dryDelay_[2 * dryPos_ + 1] = dryR;
-                dryPos_ = dryPos_ + 1 == dlen ? 0 : dryPos_ + 1;
-                dryL = dl;
-                dryR = dr;
+            while (pi < nMixPts_ && mixPts_[pi].off < s) { /* passed: next segment */
+                segV0 = mixPts_[pi].v;
+                segS0 = mixPts_[pi].off;
+                pi++;
             }
-            float wL = wet[2 * s], wR = wet[2 * s + 1];
-            float l = mix * wL + (1.0f - mix) * dryL;
-            float r = mix * wR + (1.0f - mix) * dryR;
+            float lin = segV0;
+            if (pi < nMixPts_) {
+                int32 span = mixPts_[pi].off - segS0;
+                lin = span > 0 ? segV0 + (mixPts_[pi].v - segV0) * (float)(s - segS0) / (float)span
+                               : mixPts_[pi].v;
+            }
+            lin = lin < 0.f ? 0.f : (lin > 1.f ? 1.f : lin);
+            mixSm_ += (lin - mixSm_) * mixCoef_;
+            size_t w = dryW_, r = (dryW_ - d) & (kDryMaxFrames - 1);
+            dryBuf_[2 * w] = inL ? inL[s] : 0.0f;
+            dryBuf_[2 * w + 1] = inR ? inR[s] : 0.0f;
+            float dryL = dryBuf_[2 * r], dryR = dryBuf_[2 * r + 1];
+            dryW_ = (dryW_ + 1) & (kDryMaxFrames - 1);
+            float l = mixSm_ * wet_[2 * (size_t)s] + (1.0f - mixSm_) * dryL;
+            float rr = mixSm_ * wet_[2 * (size_t)s + 1] + (1.0f - mixSm_) * dryR;
             outL[s] = l;
-            if (outR) outR[s] = r;
-            else outL[s] = 0.5f * (l + r); /* mono host: sum */
+            if (outR) outR[s] = rr;
+            else outL[s] = 0.5f * (l + rr); /* mono host: sum */
         }
+        mixLin_ = mixPts_[nMixPts_ - 1].v; /* the curve ends at its last point */
+        mixTarget_.store(mixLin_, std::memory_order_relaxed);
         data.outputs[0].silenceFlags = 0;
         /* device front-panel echoes (§9.4) -> output parameter changes, so a knob
          * turned on the hardware moves (and records into) the DAW's parameter. An
@@ -411,7 +451,8 @@ public:
         uint8_t header[kFxStateHeaderLen];
         memcpy(header, kFxStateMagic, sizeof kFxStateMagic);
         uint32_t bits;
-        memcpy(&bits, &mix_, sizeof bits);
+        const float mix = mixTarget_.load(std::memory_order_relaxed);
+        memcpy(&bits, &mix, sizeof bits);
         for (int i = 0; i < 4; i++) header[sizeof kFxStateMagic + i] = (uint8_t)(bits >> (8 * i));
         int32 written = 0;
         if (state->write(header, (int32)sizeof header, &written) != kResultOk) return kResultFalse;
@@ -422,7 +463,7 @@ public:
         std::vector<uint8_t> bundle;
         float mix;
         if (!fxStateDecode(readStream(state), mix, bundle)) return kResultFalse;
-        mix_ = mix;
+        mixTarget_.store(mix, std::memory_order_relaxed); /* the audio thread glides to it */
         pendingState_ = bundle;
         if (runtime())
             return runtime()->setStateBundle(bundle.data(), bundle.size()) ? kResultOk : kResultFalse;
@@ -441,10 +482,20 @@ private:
     uint32_t rate_ = 48000;
     uint32_t maxBlock_ = 1024;
     bool offline_ = false;
-    float mix_ = 1.0f; /* §8.8 host dry/wet; 1.0 = 100% wet */
-    /* the dry's delay line: fxLatencySamples() stereo frames, sized in setActive */
-    std::vector<float> dryDelay_;
-    size_t dryPos_ = 0;
+    /* §8.8 host dry/wet (1.0 = 100% wet). mixTarget_ crosses threads (getState/setState
+     * on the host's threads, process() on the audio thread); the rest is audio-thread. */
+    std::atomic<float> mixTarget_{1.0f};
+    float mixLin_ = 1.0f, mixSm_ = 1.0f, mixCoef_ = 0.0f;
+    bool mixFresh_ = true;
+    struct MixPt { int32 off; float v; };
+    static constexpr uint32_t kMaxMixPts = 64;
+    MixPt mixPts_[kMaxMixPts];
+    uint32_t nMixPts_ = 0;
+    /* audio-thread buffers, sized in setActive: device input columns, the wet, and the
+     * dry delay line (a power of two, so the read index wraps by mask) */
+    static constexpr size_t kDryMaxFrames = 1u << 16;
+    std::vector<float> fxin_, wet_, dryBuf_;
+    size_t dryW_ = 0;
     /* DAW automation -> §9.4 set/ramp events + §15.5 offline-edit replay (shared
      * with the instrument shell). Seeded from kFxParams in the constructor. */
     ParamAutomation automation_;

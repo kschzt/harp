@@ -520,26 +520,11 @@ bool HarpRuntime::sessionUp() {
     ssi_ = framesSent_ = framesRecv_ = 0;
     framesRecvAtomic_.store(0, std::memory_order_relaxed);
     ssiRead_.store(0, std::memory_order_relaxed);
-    padDebtFloats_ = 0;
-    /* §8.8: the effect's input ring restarts with the SSI domain — input left over from
-     * the previous session must not render at the new SSI 0 — and fxInputPos() counts
-     * from the cleared index. This (supervisor) thread is the ring's consumer here: the
-     * feeder runs on it too, and not until after this returns. Then arm the pre-roll that
-     * holds the wet exactly fxLatencySamples() behind its input (see fxLatencySamples). */
-    if (fxArmed()) {
-        fxInBase_.store(fxInRing_.clear(), std::memory_order_release);
-        uint32_t preroll = fxLatencySamples();
-        /* TEST seam (fx-filter-eth-test T10): HARP_FX_TEST_UNDERBUDGET=N enforces N frames
-         * LESS than the reported latency — a transport slower than its budget — so the
-         * wet is persistently late and the live late guard (fxLateGuard) must re-anchor.
-         * Unset (production) = the exact reported latency. */
-        if (const char *e = getenv("HARP_FX_TEST_UNDERBUDGET")) {
-            long u = atol(e);
-            if (u > 0) preroll = (uint32_t)u >= preroll ? 0 : preroll - (uint32_t)u;
-        }
-        fxPreroll_.store(preroll, std::memory_order_release);
-        fxLateRunFrames_ = 0;
-    }
+    if (!fxArmed()) padDebtFloats_ = 0; /* an FX's pad debt is audio-thread-owned (fxBeginBlock) */
+    /* §8.8: an armed effect's timing state (input base, pre-roll, pad debt, late guard) is
+     * NOT reset here — this supervisor thread runs while process() does. The audio thread
+     * adopts the new domain itself at its next block (fxBeginBlock), triggered by the
+     * sessionGen_ bump at the end of this function. */
     /* §14.4 host-context-C: reset the clock-stats snapshot for the new session
      * (trimCount_/lastTrimPpb_ are per-session, like framesSent_; asrcLive_ flips
      * true only when the ASRC reader branch runs). Off the render path. */
@@ -754,6 +739,17 @@ bool HarpRuntime::start(uint32_t sampleRate) {
             int in = atoi(ein), out = atoi(eout);
             if (in >= 0 && in <= 33 && out >= 0 && out <= 33) setLoopbackSlots(in, out);
         }
+    /* TEST seam (fx-filter-eth-test T10): HARP_FX_TEST_UNDERBUDGET=N enforces N frames LESS
+     * than the reported FX latency — a transport slower than its budget — so the live wet is
+     * persistently late and the late guard (fxLateGuard) must re-anchor. Unset in production;
+     * announced loudly when set so it can never hide in a real session. */
+    if (const char *e = getenv("HARP_FX_TEST_UNDERBUDGET")) {
+        long u = atol(e);
+        fxTestUnderbudget_ = u > 0 ? (uint32_t)u : 0;
+        if (fxTestUnderbudget_)
+            log_msg("WARNING: TEST SEAM HARP_FX_TEST_UNDERBUDGET=%u active — FX latency deliberately under-budget",
+                    fxTestUnderbudget_);
+    }
     running_.store(true);
     /* One libusb context for the whole active life — every connect attempt
      * (incl. the device-less retry loop) borrows it, so we never churn

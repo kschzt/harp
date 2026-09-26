@@ -206,6 +206,11 @@ public:
         evtQueuedSeq_.store(0, std::memory_order_release);
         evtEpochBase_.store(0, std::memory_order_release);
     }
+    /* §8.8 SSI-domain tag stamped into every event queued from now on (audio thread, at an
+     * effect's domain adoption — fxBeginBlock); 0 = untagged (the instrument). The pump
+     * re-stamps an event whose tag is not the current one to "now" (drainOwner). */
+    void setDomainTag(uint32_t tag) { domainTag_.store(tag, std::memory_order_release); }
+    uint64_t staleRestamped() const { return staleRestamped_.load(std::memory_order_relaxed); }
     /* session start: drain events left carrying the PREVIOUS stream's stale
      * timestamps (safe: no pump runs yet, so this is the only ring toucher). */
     void drainStaleOwnerRing() {
@@ -249,6 +254,8 @@ private:
     std::atomic<uint32_t> evtQueuedSeq_{0};
     std::atomic<uint32_t> evtEpochBase_{0};
     std::atomic<uint64_t> evDrops_{0};    /* events lost to ring overflow — never silent */
+    std::atomic<uint32_t> domainTag_{0};       /* §8.8 current SSI-domain tag (0 = untagged) */
+    std::atomic<uint64_t> staleRestamped_{0};  /* §8.8 older-domain events delivered "now" */
     uint64_t evDropsLogged_ = 0;          /* feeder-owned: last count pollDropLog reported */
     std::atomic<bool> panicPending_{false}; /* a note-off was lost: all-off NOW */
 
@@ -367,24 +374,46 @@ public:
      * frames actually written. */
     size_t writeFxInput(const float *interleaved, size_t nFrames);
 
-    /* §8.8 effect TIMING. The feeder never paces a range without its input (the
-     * availability gate) and consumes the input ring in order from the session's
-     * start, so input frame k of a session renders at SSI k — exactly, by
-     * construction. fxInputPos() is the SSI the NEXT writeFxInput() frame will
-     * occupy: the effect shell stamps a block's events against it, so automation
-     * lands on the sample of the audio it accompanies in every mode. Producer
-     * (process-thread) side; fxInBase_ is the ring index the session started at. */
+    /* §8.8 effect TIMING, owned by the AUDIO THREAD (process()).
+     *
+     * The feeder never paces a range without its input and consumes the input ring in
+     * order, so input frame k of a session renders at SSI k — exactly, by construction.
+     * A session (re)starts on the supervisor thread while process() runs (late connect,
+     * hot-plug, every reconnect), so the supervisor only bumps sessionGen_; the audio
+     * thread ADOPTS the new domain at the top of its next block, before it writes input
+     * or stamps events (fxBeginBlock): it fixes the input base at its own write index,
+     * arms the pre-roll, and resets the pad debt, gaps and late guard it owns. The
+     * feeder paces the new session's input only after that adoption is published and
+     * discards input below the base; events stamped against the previous domain are
+     * re-stamped "now" by the event pump (EventManager domain tag). No cross-thread
+     * writes to audio-thread state, and no event ever carries a stale-domain SSI.
+     * Returns true on the block that adopted a new session. No-op for the instrument. */
+    bool fxBeginBlock();
+    /* the SSI the NEXT writeFxInput() frame will occupy: a block's events are stamped
+     * against it, so automation lands on the sample of the audio it accompanies */
     uint64_t fxInputPos() const {
         size_t cols = fxInSlots_.empty() ? 1 : fxInSlots_.size();
-        return (uint64_t)((fxInRing_.writeIndex() - fxInBase_.load(std::memory_order_acquire)) / cols);
+        return (uint64_t)((fxInRing_.writeIndex() - fxInBase_.load(std::memory_order_relaxed)) / cols);
     }
-    /* The effect's CONSTANT input->wet delay in DAW samples — what the FX shell
-     * reports for PDC and what the pull side ENFORCES (the wet stream is pre-rolled
-     * by exactly this many frames of silence at stream start, and an underrun later
-     * is paid back as pad debt, so the delay never drifts):
-     *   live (real-time): latencySamples() — the ring target + device path + event
-     *     headroom the instrument reports, which covers the kBlock framing wait plus
-     *     the transport round trip;
+    /* The effect's input->wet delay in DAW samples — what the FX shell reports for PDC
+     * and what the pull side ENFORCES: the wet stream is pre-rolled by exactly this many
+     * frames of silence at each session's start, and an underrun later is paid back as
+     * pad debt, so the delay never drifts.
+     *   live: fxLiveLatency() = ring target (>= 2 DAW blocks and >= 512: the one-block
+     *     pipeline plus transport margin) + kBlock-1 (the framing wait).
+     *     No event headroom: an effect's events are ordered by the input gate itself
+     *     (a block's events are queued before its input is written), so the instrument's
+     *     event lead would only add latency.
+     *     No §6.4 device-path term either, deliberately: it is unknown until hello, so a
+     *     value including it changes when a device connects AFTER activation (late connect,
+     *     hot-plug, a reconnect to another unit) — and VST3 can only announce a latency
+     *     change from the UI thread, which a UI-less plugin does not reliably have (the SDK
+     *     timer is a no-op on Linux without an editor). Its converter terms are not in a
+     *     host-paced digital path, and a host-paced pipeline depth sits inside the target's
+     *     margin (>= one block + 255 beyond the measured one-block turnaround). So the value
+     *     is a pure function of the DAW block size and mode: identical before and after
+     *     connect, reported once, always true. A device whose pipeline exceeds the margin is
+     *     still safe: the late guard re-anchors (counted, logged) and the dry follows.
      *   offline: fxOfflineLatency() = kBlock-1. §8.2 fixes every pacing frame at the
      *     negotiated nsamples (kBlock), so input reaches the device in kBlock units
      *     and a DAW block that ends mid-frame has no wet yet. kBlock-1 is the smallest
@@ -393,9 +422,19 @@ public:
      *     zero-latency lockstep stalled a full pull timeout and dropped that block's
      *     wet on every short block.) A bounce compensates it exactly (PDC). */
     static constexpr uint32_t fxOfflineLatency() { return kBlock - 1; }
+    uint32_t fxLiveLatency() const { return targetFrames_ + (kBlock - 1); }
+    static uint32_t fxLiveLatencyFor(uint32_t maxDawBlock) { return targetFramesFor(maxDawBlock) + (kBlock - 1); }
     uint32_t fxLatencySamples() const {
-        return wantHostPaced_.load(std::memory_order_relaxed) ? fxOfflineLatency() : latencySamples();
+        return wantHostPaced_.load(std::memory_order_relaxed) ? fxOfflineLatency() : fxLiveLatency();
     }
+    /* The wet's ACTUAL delay behind its input this session (audio thread): the armed
+     * pre-roll plus what a late-guard re-anchor added. The FX shell delays its dry by
+     * this, so dry and wet stay aligned even when it differs from the reported value. */
+    uint32_t fxWetDelay() const { return fxArmedDelay_ + fxExtraDelay_; }
+    /* input frames writeFxInput dropped on ring overflow (their wet is replaced by
+     * silence at their position, so the stream stays aligned); diagnostic */
+    uint64_t fxInputDropped() const { return fxInDropped_.load(std::memory_order_relaxed); }
+    uint64_t sessionGeneration() const { return sessionGen_.load(std::memory_order_acquire); }
 
     /* §8.8 audio.fx NEVER-SILENT guard (RME "loud, not logged"). An armed effect is
      * host-paced (H→D track in, D→H wet); if that input path ever breaks (the device
@@ -1310,23 +1349,33 @@ private:
      * never touched off the FX path, so the instrument render is unaffected). */
     std::vector<uint32_t> fxInSlots_;
     FloatRing fxInRing_{1 << 15};
-    /* §8.8 timing (see fxInputPos / fxLatencySamples). fxInBase_: the input ring
-     * index this session's SSI 0 starts at (sessionUp clears the ring — stale input
-     * from a previous session must not render at the new SSI 0). fxPreroll_: frames
-     * of silence the pull still owes at the head of the wet stream this session. */
+    /* §8.8 timing state (see fxBeginBlock). fxInBase_ (input ring index of this
+     * session's SSI 0) and fxAdoptedGen_ (the sessionGen_ the audio thread adopted) are
+     * written by the audio thread and read by the feeder — base first, then the gen with
+     * release, so a feeder that sees the gen sees its base. Everything else is audio-
+     * thread-only. */
     std::atomic<size_t> fxInBase_{0};
-    std::atomic<uint32_t> fxPreroll_{0};
-    std::atomic<uint64_t> fxReanchors_{0}; /* host-readable: x.harp.fx_reanchors */
-    uint64_t fxLateRunFrames_ = 0;         /* audio thread: frames pulled with late wet owed */
+    std::atomic<uint64_t> fxAdoptedGen_{0};
+    std::atomic<uint64_t> fxReanchors_{0};  /* host-readable: x.harp.fx_reanchors */
+    std::atomic<uint64_t> fxInDropped_{0};  /* writeFxInput overflow, frames */
+    uint64_t fxInDroppedLogged_ = 0;        /* feeder: last value logged */
+    uint32_t fxPreroll_ = 0;                /* audio thread: pre-roll frames still owed */
+    uint32_t fxArmedDelay_ = 0;             /* audio thread: the pre-roll armed this session */
+    uint32_t fxExtraDelay_ = 0;             /* audio thread: added by late-guard re-anchors */
+    uint64_t fxLateRunFrames_ = 0;          /* audio thread: frames pulled with late wet owed */
+    uint32_t fxTestUnderbudget_ = 0;        /* TEST seam HARP_FX_TEST_UNDERBUDGET (read in start) */
+    /* input gaps (writeFxInput overflow): `frames` of input never reached the device just
+     * before SSI `ssi`; the live pull plays that many frames of silence when it reaches
+     * `ssi`, so the wet after the gap stays aligned with its dry. Audio thread only. */
+    struct FxGap { uint64_t ssi; uint32_t frames; };
+    FxGap fxGaps_[8];
+    uint32_t fxGapN_ = 0;
     void fxLateGuard(size_t nFrames);
-    /* audio thread: take up to n frames of the remaining pre-roll (0 once spent) */
+    size_t pullFxLive(float *dst, size_t nFrames);
     uint32_t takeFxPreroll(uint32_t n) {
-        uint32_t r = fxPreroll_.load(std::memory_order_acquire);
-        while (r) {
-            uint32_t t = r < n ? r : n;
-            if (fxPreroll_.compare_exchange_weak(r, r - t, std::memory_order_acq_rel)) return t;
-        }
-        return 0;
+        uint32_t t = fxPreroll_ < n ? fxPreroll_ : n;
+        fxPreroll_ -= t;
+        return t;
     }
 
     /* §8.8 never-silent guard state (see observeFxWet / writeFxInput). The

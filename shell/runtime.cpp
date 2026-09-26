@@ -884,27 +884,80 @@ size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
      * host-paced frames into it; Ethernet's reader() writes the 1:1 RTP frames
      * into it (bit-exact). The DAW audio thread therefore never touches transport_,
      * so a reconnect reaping the transport can't race this thread. */
-    /* §8.8: an armed effect's wet stream starts with exactly fxLatencySamples() of
-     * pre-roll silence (armed in sessionUp), so the wet trails its input by the latency
-     * the shell reports — no more, no less. Pre-roll is not an underrun and does not
-     * advance ssiRead_ (the wet SSI consumed). After it, a short read IS an underrun:
-     * pad it and owe the late wet (settlePadDebt drops it on arrival), exactly as the
-     * synth path does, so the delay never drifts. Instrument: pre == 0 always. */
-    size_t pre = fxArmed() ? takeFxPreroll((uint32_t)nFrames) : 0;
-    memset(dst, 0, pre * 2 * sizeof(float));
+    if (fxArmed()) return pullFxLive(dst, nFrames); /* §8.8: see pullFxLive */
     settlePadDebt();
-    size_t want = (nFrames - pre) * 2;
-    size_t got = audioRing_.read(dst + pre * 2, want);
-    ssiRead_.fetch_add(nFrames - pre, std::memory_order_relaxed);
+    size_t want = nFrames * 2;
+    size_t got = audioRing_.read(dst, want);
+    ssiRead_.fetch_add(nFrames, std::memory_order_relaxed);
     size_t shortBy = 0;
     if (got < want)
-        shortBy = padUnderrun(dst + pre * 2, got, want, &padDebtFloats_,
+        shortBy = padUnderrun(dst, got, want, &padDebtFloats_,
                               connected_.load(std::memory_order_acquire));
-    if (fxArmed() && !pre) fxLateGuard(nFrames);
-    /* §8.8 never-silent guard: observe the wet just delivered (read-only). Gated on
-     * fxArmed, so the instrument path is byte-identical (the golden gate). */
-    if (fxArmed()) observeFxWet(dst, nFrames);
     return shortBy;
+}
+
+/* §8.8 live pull for an armed effect. The wet stream is, in order: the session's pre-roll
+ * (exactly fxWetDelay() frames of silence, armed by fxBeginBlock), then the wet by SSI —
+ * with `frames` of silence played at each input gap (writeFxInput overflow: that input
+ * never reached the device, so nothing of its wet exists). Pre-roll and gap silence are
+ * not underruns and do not advance ssiRead_ (the wet SSI consumed). A short read of real
+ * wet IS an underrun: pad it and owe the late wet (settlePadDebt drops it on arrival),
+ * exactly as the synth path does, so the delay never drifts; the late guard re-anchors a
+ * wet that stays late. Audio thread only. */
+size_t HarpRuntime::pullFxLive(float *dst, size_t nFrames) {
+    settlePadDebt();
+    const bool conn = connected_.load(std::memory_order_acquire);
+    size_t done = 0, shortBy = 0;
+    bool preroll = false;
+    while (done < nFrames) {
+        size_t rem = nFrames - done;
+        if (uint32_t pre = takeFxPreroll((uint32_t)rem)) {
+            memset(dst + done * 2, 0, (size_t)pre * 2 * sizeof(float));
+            done += pre;
+            preroll = true;
+            continue;
+        }
+        uint64_t pos = ssiRead_.load(std::memory_order_relaxed);
+        if (fxGapN_ && fxGaps_[0].ssi <= pos) {
+            uint32_t g = fxGaps_[0].frames < rem ? fxGaps_[0].frames : (uint32_t)rem;
+            memset(dst + done * 2, 0, (size_t)g * 2 * sizeof(float));
+            done += g;
+            if ((fxGaps_[0].frames -= g) == 0) {
+                memmove(fxGaps_, fxGaps_ + 1, (size_t)(--fxGapN_) * sizeof fxGaps_[0]);
+            }
+            continue;
+        }
+        size_t take = rem;
+        if (fxGapN_ && fxGaps_[0].ssi - pos < take) take = (size_t)(fxGaps_[0].ssi - pos);
+        size_t want = take * 2;
+        size_t got = audioRing_.read(dst + done * 2, want);
+        ssiRead_.fetch_add(take, std::memory_order_relaxed);
+        if (got < want) shortBy += padUnderrun(dst + done * 2, got, want, &padDebtFloats_, conn);
+        done += take;
+    }
+    if (!preroll) fxLateGuard(nFrames);
+    observeFxWet(dst, nFrames); /* §8.8 never-silent guard (read-only) */
+    return shortBy;
+}
+
+/* §8.8 — see runtime.h. The audio thread adopts a new session's SSI domain at the top of
+ * its block: nothing below races the supervisor's sessionUp, and the feeder starts pacing
+ * this session's input only once fxAdoptedGen_ is published (after fxInBase_). */
+bool HarpRuntime::fxBeginBlock() {
+    if (!fxArmed()) return false;
+    uint64_t g = sessionGen_.load(std::memory_order_acquire);
+    if (g == fxAdoptedGen_.load(std::memory_order_relaxed)) return false;
+    uint32_t lat = fxLatencySamples();
+    fxInBase_.store(fxInRing_.writeIndex(), std::memory_order_relaxed);
+    fxArmedDelay_ = fxTestUnderbudget_ >= lat ? 0 : lat - fxTestUnderbudget_;
+    fxPreroll_ = fxArmedDelay_;
+    fxExtraDelay_ = 0;
+    fxGapN_ = 0;
+    fxLateRunFrames_ = 0;
+    padDebtFloats_ = 0; /* the previous domain's debt is meaningless in this one */
+    events_.setDomainTag((uint32_t)g + 1); /* events stamped from here on belong to g */
+    fxAdoptedGen_.store(g, std::memory_order_release);
+    return true;
 }
 
 /* Per-part pull: drain THIS sink's demuxed stereo ring. Structurally identical
@@ -1033,7 +1086,22 @@ size_t HarpRuntime::writeFxInput(const float *interleaved, size_t nFrames) {
             break;
         }
     fxInRunFrames_ = energy ? fxInRunFrames_ + nFrames : 0;
-    return fxInRing_.write(interleaved, nFrames * cols) / cols;
+    size_t written = fxInRing_.write(interleaved, nFrames * cols) / cols;
+    if (written < nFrames) {
+        /* overflow (the feeder stalled for a whole ring): the dropped input never reaches
+         * the device, but its dry does. Record the gap at the SSI where it happened; the
+         * live pull plays that much silence there, keeping every later wet aligned. */
+        uint32_t dropped = (uint32_t)(nFrames - written);
+        uint64_t at = fxInputPos();
+        if (fxGapN_ && fxGaps_[fxGapN_ - 1].ssi == at)
+            fxGaps_[fxGapN_ - 1].frames += dropped;
+        else if (fxGapN_ < sizeof fxGaps_ / sizeof fxGaps_[0])
+            fxGaps_[fxGapN_++] = {at, dropped};
+        else
+            fxGaps_[fxGapN_ - 1].frames += dropped; /* 8 distinct gaps pending: merge (rare) */
+        fxInDropped_.fetch_add(dropped, std::memory_order_relaxed);
+    }
+    return written;
 }
 
 /* §8.8 audio.fx NEVER-SILENT guard — see runtime.h. Runs on the audio/process thread
@@ -1108,12 +1176,13 @@ void HarpRuntime::fxLateGuard(size_t nFrames) {
         return;
     size_t owed = padDebtFloats_ / 2;
     padDebtFloats_ = 0;
+    fxExtraDelay_ += (uint32_t)owed; /* the wet now trails by this much more: the dry follows */
     fxReanchors_.fetch_add(1, std::memory_order_relaxed);
     char msg[200];
     snprintf(msg, sizeof msg,
              "armed FX wet later than its reported latency (%u) for 250 ms — re-anchored: the "
              "wet now trails by %zu more frames than the host compensates",
-             fxLatencySamples(), owed);
+             fxArmedDelay_, owed);
     recordLog(HARP_LOG_ERROR, "audio.fx", msg);
     log_msg("§8.8 FX re-anchor: %s", msg);
 }

@@ -492,13 +492,35 @@ void HarpRuntime::feeder() {
          * returns WET. Not armed (the instrument) => fxCols==0 => the byte-identical
          * slots=0 pacing frame, no payload, no input gate. */
         const size_t fxCols = fxArmed() ? fxInSlots_.size() : 0;
+        /* §8.8: pace an effect's input only once the audio thread has adopted THIS session's
+         * domain (fxBeginBlock published fxInBase_, then fxAdoptedGen_), and never input from
+         * before it — discard the ring below the base (this thread is the ring's consumer). */
+        bool fxReady = false;
+        if (fxCols) {
+            fxReady = fxAdoptedGen_.load(std::memory_order_acquire) ==
+                      sessionGen_.load(std::memory_order_acquire);
+            if (fxReady) {
+                size_t base = fxInBase_.load(std::memory_order_relaxed);
+                float scratch[1024];
+                while (fxInRing_.readIndex() < base) {
+                    size_t stale = base - fxInRing_.readIndex();
+                    fxInRing_.read(scratch, stale < 1024 ? stale : 1024);
+                }
+            }
+            uint64_t dropped = fxInDropped_.load(std::memory_order_relaxed);
+            if (dropped != fxInDroppedLogged_) {
+                log_msg("WARNING: %llu FX input frames dropped (input ring overflow) — their wet is "
+                        "replaced by silence in place", (unsigned long long)(dropped - fxInDroppedLogged_));
+                fxInDroppedLogged_ = dropped;
+            }
+        }
         /* §8.8: an effect's pacing is bounded by its INPUT (the gate below) — and that
          * gate is also its event-timing guarantee: a block's events are queued before its
          * input is written, so they can never be born into an already-paced range. The
          * instrument's ring-fill + frontier caps do not apply: the effect's ring
          * deliberately holds the wet for its fixed latency (fxLatencySamples), and
          * capping pacing on that fill would starve the very wet it is waiting for. */
-        while ((fxCols || (ringFrames < (size_t)targetFrames_ && ssi_ + kBlock <= frontierCap)) &&
+        while ((fxCols ? fxReady : (ringFrames < (size_t)targetFrames_ && ssi_ + kBlock <= frontierCap)) &&
                inFlight < ahead_) {
             /* §8.8: only pace once the track input for this range is in the SPSC
              * ring — this couples the H→D input 1:1 to the D→H wet the reader fills,
