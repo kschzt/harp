@@ -956,6 +956,9 @@ bool HarpRuntime::fxBeginBlock() {
     fxGapN_ = 0;
     fxLateRunFrames_ = 0;
     padDebtFloats_ = 0; /* the previous domain's debt is meaningless in this one */
+    audioRing_.clear(); /* and so is any previous-session wet (this thread is its consumer;
+                         * the new session's wet only starts once the feeder paces it,
+                         * which it does only after this adoption is published) */
     ssiRead_.store(0, std::memory_order_relaxed); /* the wet SSI counter restarts with the
                                                    * domain: gap SSIs are measured against it */
     events_.setDomainTag((uint32_t)g + 1); /* events stamped from here on belong to g */

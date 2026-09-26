@@ -536,7 +536,11 @@ bool HarpRuntime::sessionUp() {
     trimCount_.store(0, std::memory_order_relaxed);
     asrcLive_.store(false, std::memory_order_relaxed);
     ahead_ = 2; /* small fixed pipeline; the reader thread keeps RTT short */
-    audioRing_.clear();
+    /* audioRing_.clear() is a CONSUMER op, and an armed FX's consumer is the audio thread,
+     * which is pulling right now (a reconnect): clearing from here races its read (a read
+     * that loaded the old tail stores it back, resurrecting cleared wet into the new
+     * session's timeline). The FX's audio thread clears it itself at adoption. */
+    if (!fxArmed()) audioRing_.clear();
     /* P5b: clear every per-part sink's ring + pad debt for the new SSI domain,
      * exactly as audioRing_/padDebtFloats_ above. No reader runs yet (spawned
      * below), and the lock guards against a sink register/unregister racing. */
