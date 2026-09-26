@@ -20,6 +20,7 @@
  * ledger_release / log_msg / log_param_map_drift are shared via the headers below.
  */
 #include "runtime.h"
+#include "fx_arm.h"          /* §8.8 FX session arming (the sessionUp warnings share it) */
 #include "runtime_registry.h" /* §8.4 ledger_release (sessionDown frees the reservation) */
 #include "runtime_log.h"      /* log_msg / log_param_map_drift (shared w/ runtime.cpp) */
 #include "shell_config.h"     /* HARP_SHELL_ENGINE_FILTER / HARP_SHELL_ETHERNET_ONLY */
@@ -560,24 +561,48 @@ bool HarpRuntime::sessionUp() {
      * sessionGen_>=flipTargetGen_ test). EVERY sessionUp re-reads wantHostPaced_, so the
      * session is always in the latest requested mode — even a coincidental reconnect
      * satisfies a pending flip. */
-    /* this session's device pipeline, published with the gen bump below: the audio thread
-     * arms the wet with it on adoption (fxBeginBlock, #187) and must not read latProfiles_,
-     * which the next connect's identity parse rewrites. */
-    uint32_t pipe = devicePipelineSamples();
+    /* this session's content pipeline (audio.start rsp key 1), published with the gen bump
+     * below: the audio thread arms the wet with it on adoption (fxBeginBlock) and never reads
+     * supervisor-owned session state, which the next connect rewrites. */
+    uint32_t pipe = devPipelineSamples_;
     fxSessionPipeline_.store(pipe, std::memory_order_relaxed);
-    /* a deeper pipeline than the latch: the wet is armed with it but the host was told less.
-     * (A shallower one is harmless: the latched delay still holds.) */
-    uint32_t latchedPipe = fxLatchedPipeline_.load(std::memory_order_relaxed);
-    if (fxArmed() && fxLatched_ && pipe > latchedPipe) {
+    if (fxArmed()) {
         char msg[400];
-        snprintf(msg, sizeof msg,
-                 "WARNING: this device's host-paced pipeline (%u samples) is %u samples deeper "
-                 "than the one in the FX latency reported to the host (%u, latched at activation) "
-                 "— the host's delay compensation lags by the difference; dry and wet stay "
-                 "aligned. Re-activate the plugin to report it.",
-                 pipe, pipe - latchedPipe, fxLatencySamples());
-        recordLog(HARP_LOG_WARN, "audio.fx", msg);
-        log_msg("§8.8 %s", msg);
+        /* the same arithmetic fxBeginBlock arms with (fx_arm.h). The latch is taken in start()
+         * right after its synchronous first session, so this warns only for a later one. */
+        FxArm arm = fxArmFor(fxModeBase(), fxLatchedPipeline_.load(std::memory_order_relaxed), pipe,
+                             kFxMaxWetDelay);
+        if (fxLatched_ && arm.lag) {
+            snprintf(msg, sizeof msg,
+                     "WARNING: this device's FX pipeline (%u samples) puts the wet %u samples later "
+                     "than the FX latency reported to the host (%u, latched at activation) — the "
+                     "host's delay compensation lags by that much; dry and wet stay aligned. "
+                     "Re-activate the plugin to report it.",
+                     pipe, arm.lag, fxLatencySamples());
+            recordLog(HARP_LOG_WARN, "audio.fx", msg);
+            log_msg("§8.8 %s", msg);
+        }
+        if (arm.capped) {
+            snprintf(msg, sizeof msg,
+                     "this device's FX pipeline (%u samples) exceeds the longest wet delay a shell "
+                     "can align its dry to (%u) — the wet will arrive late and dry and wet will "
+                     "not be aligned",
+                     pipe, kFxMaxWetDelay);
+            recordLog(HARP_LOG_ERROR, "audio.fx", msg);
+            log_msg("§8.8 ERROR: %s", msg);
+        }
+        /* §6.4 key 3 is WHEN the wet arrives: the live ring target budgets a one-block
+         * turnaround, and the pacing window (ahead_) keeps only a couple of blocks in flight */
+        uint32_t turn = deviceTurnaroundSamples();
+        if (turn > kBlock) {
+            snprintf(msg, sizeof msg,
+                     "WARNING: this device declares a %u-sample render/turnaround block (§6.4 key 3); "
+                     "the runtime budgets %u — its wet may arrive late (a content pipeline belongs "
+                     "in device-pipeline-samples)",
+                     turn, kBlock);
+            recordLog(HARP_LOG_WARN, "audio.fx", msg);
+            log_msg("§8.8 %s", msg);
+        }
     }
     uint64_t gen = sessionGen_.fetch_add(1, std::memory_order_release) + 1;
     /* §8.8: from here on only events stamped in THIS session's domain (tag gen+1, set by the
@@ -804,7 +829,8 @@ bool HarpRuntime::start(uint32_t sampleRate) {
     bool now = sessionUp(); /* fast path: report a present USB/pinned device immediately */
     if (fxArmed()) {
         /* latch the effect's latency for this activation (see fxLatencySamples) */
-        fxLatchedPipeline_.store(now ? devicePipelineSamples() : 0, std::memory_order_relaxed);
+        fxLatchedPipeline_.store(now ? fxSessionPipeline_.load(std::memory_order_relaxed) : 0,
+                                 std::memory_order_relaxed);
         fxLatched_ = true;
     }
     allowDiscovery_.store(true, std::memory_order_relaxed);

@@ -435,26 +435,32 @@ public:
     static uint32_t fxLiveLatencyFor(uint32_t maxDawBlock) {
         return targetFramesFor(maxDawBlock) + maxDawBlock + (kBlock - 1);
     }
-    /* + the device's declared host-paced pipeline (§8.8: an effect MUST report it; §6.4 key 3,
-     * buf_depth — the converter keys are not in a host-paced digital path), LATCHED once per
+    /* + the device's CONTENT pipeline (§8.8: an effect MUST report its engine contribution as
+     * device-pipeline-samples, the audio.start response key 1; see fx_arm.h), LATCHED once per
      * activation in start(): known when the device is connected at activation (start()'s
      * first session is synchronous — the common case), else 0. So the value is constant for
      * the activation and always what the host was told; a device that connects later with a
-     * pipeline the latch lacks is warned about loudly (sessionUp) — the dry still follows the
-     * wet, only the host's compensation lags, and re-activating the plugin reports it. */
-    uint32_t fxLatencySamples() const {
-        uint32_t base = wantHostPaced_.load(std::memory_order_relaxed) ? fxOfflineLatency() : fxLiveLatency();
-        return base + fxLatchedPipeline_.load(std::memory_order_relaxed);
+     * deeper pipeline is warned about loudly (sessionUp) — the dry still follows the wet, only
+     * the host's compensation lags, and re-activating the plugin reports it.
+     * The §6.4 key-3 render/turnaround block is NOT in it: it is when the wet arrives, not
+     * where, and the ring target's one-block turnaround covers it (a deeper one is warned
+     * about in sessionUp — the pacing window does not cover it either). */
+    uint32_t fxLatencySamples() const { return fxModeBase() + fxLatchedPipeline_.load(std::memory_order_relaxed); }
+    /* the runtime's own timing budget for the current mode (what the pre-roll must cover) */
+    uint32_t fxModeBase() const {
+        return wantHostPaced_.load(std::memory_order_relaxed) ? fxOfflineLatency() : fxLiveLatency();
     }
-    uint32_t devicePipelineSamples() const {
+    /* §6.4 key 3 for the session rate: the device's render/turnaround block */
+    uint32_t deviceTurnaroundSamples() const {
         for (size_t i = 0; i < nLat_; i++)
             if (latProfiles_[i].rate == rate_) return latProfiles_[i].buf_depth;
         return 0;
     }
     /* The wet's ACTUAL delay behind its input this session (audio thread): the armed
-     * pre-roll plus what a late-guard re-anchor added. The FX shell delays its dry by
-     * this, so dry and wet stay aligned even when it differs from the reported value. */
-    uint32_t fxWetDelay() const { return fxArmedDelay_ + fxExtraDelay_; }
+     * pre-roll, what a late-guard re-anchor added, and the device's content pipeline. The FX
+     * shell delays its dry by this, so dry and wet stay aligned even when it differs from
+     * the reported value. */
+    uint32_t fxWetDelay() const { return fxArmedDelay_ + fxExtraDelay_ + fxPipe_; }
     /* the longest wet delay a shell must be able to align its dry to (re-anchors stop growing
      * it here, and say so) */
     static constexpr uint32_t kFxMaxWetDelay = 65535;
@@ -1387,7 +1393,8 @@ private:
     std::atomic<size_t> fxInBase_{0};
     std::atomic<uint64_t> fxAdoptedGen_{0};
     std::atomic<uint32_t> fxLatchedPipeline_{0}; /* device pipeline in the latched latency (start) */
-    std::atomic<uint32_t> fxSessionPipeline_{0}; /* the current session's device pipeline (sessionUp) */
+    std::atomic<uint32_t> fxSessionPipeline_{0}; /* the current session's content pipeline (sessionUp) */
+    uint32_t devPipelineSamples_ = 0; /* audio.start rsp key 1, host-paced (supervisor thread) */
     /* §8.8 automation horizon (SSI, current domain): the audio thread publishes the input
      * position at which it finished queueing a block's events (writeFxInput, before writing
      * that block's input); the feeder paces only frames that END at or before it, and the
@@ -1406,11 +1413,13 @@ private:
     uint32_t fxPreroll_ = 0;                /* audio thread: pre-roll frames still owed */
     uint32_t fxArmedDelay_ = 0;             /* audio thread: the pre-roll armed this session */
     uint32_t fxExtraDelay_ = 0;             /* audio thread: added by late-guard re-anchors */
+    uint32_t fxPipe_ = 0;                   /* audio thread: the session's content pipeline */
     uint64_t fxLateRunFrames_ = 0;          /* audio thread: frames pulled with late wet owed */
     uint32_t fxTestUnderbudget_ = 0;        /* TEST seam HARP_FX_TEST_UNDERBUDGET (read in start) */
     /* input gaps (writeFxInput overflow): `frames` of input never reached the device just
-     * before SSI `ssi`; the live pull plays that many frames of silence when it reaches
-     * `ssi`, so the wet after the gap stays aligned with its dry. Audio thread only. */
+     * before the input whose wet is at SSI `ssi`; the live pull plays that many frames of
+     * silence when it reaches `ssi`, so the wet after the gap stays aligned with its dry.
+     * Audio thread only. */
     struct FxGap { uint64_t ssi; uint32_t frames; };
     FxGap fxGaps_[8];
     uint32_t fxGapN_ = 0;

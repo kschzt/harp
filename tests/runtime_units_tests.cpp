@@ -20,6 +20,7 @@
 #endif
 
 #include "runtime_registry.h" /* runtime_acquire() — the no-device construction seam */
+#include "fx_arm.h"
 #include "fx_late_guard.h"
 #include "runtime.h"          /* HarpRuntime, EventSource, queue*, setStateBundle */
 #include "ring.h"             /* TimedEv, TimedRing — the host-free observable */
@@ -449,6 +450,31 @@ static void test_fx_late_guard_policy() {
  *    be delivered "now" (ts 0, a ramp as a set) and still SENT (the §8.3.1 fence counts
  *    it); an event of the expected domain, and any untagged (instrument) event, keep their
  *    timestamps. Drives EventManager directly: no runtime, no wire. */
+/* §8.8 session arming policy (shell/fx_arm.h): delivered = preroll + pipe; delivered ==
+ * reported (base + latched) whenever the session's pipeline is no deeper than the latched
+ * one; the timing budget `base` is never cut unless the dry line's maximum forces it. */
+static void test_fx_arm_policy() {
+    struct { uint32_t base, latched, pipe, max, preroll, delivered, lag; bool capped; } t[] = {
+        {767, 0, 0, 65535, 767, 767, 0, false},              /* no pipeline */
+        {767, 2048, 2048, 65535, 767, 2815, 0, false},       /* at activation: exact */
+        {767, 2048, 1000, 65535, 1815, 2815, 0, false},      /* shallower: padded to reported */
+        {767, 2048, 0, 65535, 2815, 2815, 0, false},         /* pipeline-less: padded */
+        {767, 0, 2048, 65535, 767, 2815, 2048, false},       /* late connect: lags by the pipe */
+        {767, 256, 2048, 65535, 767, 2815, 1792, false},     /* deeper unit: lags by the difference */
+        {767, 0, 65000, 65535, 535, 65535, 64768, true},     /* capped: the pre-roll is cut */
+        {767, 0, 70000, 65535, 0, 70000, 69233, true},       /* a pipe past the dry line */
+        {767, 70000, 0, 65535, 65535, 65535, 0, true},       /* a latched pipe past it */
+    };
+    for (auto &c : t) {
+        FxArm a = fxArmFor(c.base, c.latched, c.pipe, c.max);
+        CHECK(a.preroll == c.preroll);
+        CHECK(a.delivered == c.delivered);
+        CHECK(a.delivered == a.preroll + c.pipe);
+        CHECK(a.lag == c.lag);
+        CHECK(a.capped == c.capped);
+    }
+}
+
 static void test_fx_event_domain_restamp() {
     const uint64_t kOldTs = 28000000; /* an old-domain SSI (minutes into the previous session) */
     auto has_ts = [](const harp_cbuf &b, uint64_t ts) { /* CBOR uint32 encoding of ts present? */
@@ -513,25 +539,46 @@ struct HarpRuntimeTestPeer {
         CHECK(rt->fxGapN_ == 0);
         CHECK(rt->ssiRead_.load() == 300); /* gap silence consumes no SSI */
     }
-    /* 11. #187: a session whose device pipeline is deeper than the latched one (a late
-     *     connect, or a reconnect to a deeper unit) arms the wet with the difference too —
-     *     else it is late from the first block (dropout, then a re-anchor). A shallower one
-     *     arms just the latched latency (the pre-roll pads the rest). */
+    /* 11. #187: the armed wet sits at pre-roll + the session's CONTENT pipeline, and the dry
+     *     follows it (fxWetDelay). Connected at activation: exactly the reported latency. A
+     *     late connect to a deeper pipeline: later by the difference (the host lags; warned).
+     *     A shallower one: the pre-roll pads it back to the reported latency. */
     static void pipeline() {
         std::unique_ptr<HarpRuntime> rt = runtime_acquire();
         rt->configure(48000, 256);
         rt->setFxInputSlots({0, 1});
-        rt->fxLatchedPipeline_.store(256); /* activated with a 256-sample-pipeline device */
+        const uint32_t base = rt->fxModeBase();
+        rt->fxLatchedPipeline_.store(2048); /* activated with a 2048-sample-pipeline device */
         const uint32_t reported = rt->fxLatencySamples();
-        rt->fxSessionPipeline_.store(2048); /* ...then a deeper one connected */
+        CHECK(reported == base + 2048);
+        rt->fxSessionPipeline_.store(2048);
         rt->sessionGen_.store(1);
         CHECK(rt->fxBeginBlock());
-        CHECK(rt->fxWetDelay() == reported + 2048 - 256);
-        CHECK(rt->fxLatencySamples() == reported); /* the host's value is unchanged */
-        rt->fxSessionPipeline_.store(0); /* a pipeline-less device */
+        CHECK(rt->fxWetDelay() == reported);   /* dry + wet at exactly what the host was told */
+        CHECK(rt->fxPreroll_ == base);         /* the pipeline itself is never pre-rolled */
+        rt->fxSessionPipeline_.store(0);       /* reconnect: a pipeline-less device */
         rt->sessionGen_.store(2);
         CHECK(rt->fxBeginBlock());
-        CHECK(rt->fxWetDelay() == reported);
+        CHECK(rt->fxWetDelay() == reported);   /* padded back to the reported position */
+        CHECK(rt->fxPreroll_ == reported);
+        rt->fxLatchedPipeline_.store(0);       /* activated with no device... */
+        rt->fxSessionPipeline_.store(2048);    /* ...then a 2048 one connected (#187) */
+        rt->sessionGen_.store(3);
+        CHECK(rt->fxBeginBlock());
+        CHECK(rt->fxWetDelay() == base + 2048);
+        CHECK(rt->fxPreroll_ == base);
+        CHECK(rt->fxLatencySamples() == base); /* the host's value is unchanged */
+        /* an input gap (ring overflow) shows in the wet `pipe` frames after its input SSI:
+         * the wet just before it is still due for that long */
+        rt->fxInRing_.reset(new FloatRing(1 << 12));
+        rt->sessionGen_.store(4);
+        CHECK(rt->fxBeginBlock()); /* re-bases on the new ring */
+        std::vector<float> in(2 * 4096, 0.25f);
+        size_t w = rt->writeFxInput(in.data(), 4096);
+        CHECK(w < 4096);
+        CHECK(rt->fxGapN_ == 1);
+        CHECK(rt->fxGaps_[0].ssi == w + 2048);
+        CHECK(rt->fxGaps_[0].frames == 4096 - w);
     }
 };
 static void test_fx_late_connect_pipeline() { HarpRuntimeTestPeer::pipeline(); }
@@ -657,6 +704,7 @@ int main() {
     test_fx_event_domain_restamp();
     test_fx_pull_gap_and_rebase();
     test_fx_late_connect_pipeline();
+    test_fx_arm_policy();
     test_rtp_never_silent();
 
     return check_report("harp-runtime-units-tests");

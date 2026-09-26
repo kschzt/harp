@@ -368,7 +368,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, 2);
     harp_cbor_uint(m, d->out_lat); /* §6.4 key 2: analog-out path latency (--out-lat) */
     harp_cbor_uint(m, 3);
-    harp_cbor_uint(m, d->buf_depth); /* §6.4 key 3: host-paced pipeline (256 unless --pipeline) */
+    harp_cbor_uint(m, 256);
     harp_cbor_uint(m, 9); /* build id */
     harp_cbor_text(m, "refdev sim " __DATE__);
     harp_cbor_uint(m, 10); /* boot count */
@@ -1385,8 +1385,9 @@ static void handle_audio_start(device *d, const harp_env *e) {
     harp_cbor_uint(&m, 0);
     harp_cbor_uint(&m, mode); /* clock-mode in effect */
     harp_cbor_uint(&m, 1);
-    /* device pipeline: one block free-running; zero host-paced (pure render) */
-    harp_cbor_uint(&m, mode ? 0 : d->audio.nsamples);
+    /* device pipeline: one block free-running; host-paced, the engine's content pipeline
+     * (--pipeline; 0 = a pure render) — §8.8: how an effect reports its latency */
+    harp_cbor_uint(&m, mode ? d->audio.pipeline : d->audio.nsamples);
     send_ctl(d, &m);
     harp_cbuf_free(&m);
 }

@@ -58,11 +58,14 @@ Rules the example follows, and yours should too:
   offline bounce is host-paced and must be byte-identical run to run; the tests check it.
 - **Stay stable everywhere.** Every parameter value a DAW can send must be safe to render
   at any automation speed. The filter is a topology-preserving SVF for exactly that reason.
-- **Declare your pipeline.** If the device holds audio back in host-paced mode (it answers a
-  pacing frame with output that trails its input), declare that depth in its §6.4 latency
-  profile (`buf_depth`). The plugin adds it to the latency it reports when the device is
-  connected at activation; a device that connects later is warned about, since the host was
-  already told a latency without it (re-activating the plugin fixes that).
+- **Report your pipeline.** If the engine's wet trails its input (a lookahead, a block FFT,
+  a delay line inside the effect), report that depth as `device-pipeline-samples`, the
+  host-paced `audio.start` response key 1 (§8.8). The device must still answer every pacing
+  frame on time; only its content lags. The plugin adds the pipeline to the latency it reports
+  when the device is connected at activation, and delays its dry to match. A device that
+  connects later with a deeper pipeline is warned about, since the host was already told a
+  latency without it (re-activating the plugin fixes that). `harp-fx-filter --pipeline N`
+  simulates one; the tests use it.
 - **Never go subnormal.** Recursive state decaying toward zero on a silent track passes
   through denormal floats, which are many times slower on x86. Flush tiny state to zero
   (as `svf_run` does) or set flush-to-zero on the render thread.

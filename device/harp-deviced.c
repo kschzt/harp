@@ -403,7 +403,7 @@ int main(int argc, char **argv) {
     uint32_t rt_floor = 0;                            /* --rt-floor N: declared safe ethTargetFrames floor (frames), identity key 14 */
     uint32_t rt_nsamples = 0;                         /* --rt-nsamples N: declared RTP packet size (frames), identity key 14 sub-key 1 */
     uint32_t in_lat = 0, out_lat = 0;                 /* --in-lat / --out-lat N: §6.4 latency-profile keys 1/2 (converter latency, samples) */
-    uint32_t pipeline = 0;                            /* --pipeline N: a real host-paced output pipeline (engine-applied), declared as §6.4 key 3 */
+    long pipeline = 0;                                /* --pipeline N: an effect engine's content pipeline (§8.8 device-pipeline-samples) */
     const char *engine_ver = NULL;                    /* --engine-ver X.Y.Z: §12.2 test seam, override reported engine semver */
     const char *product = DEVICE_PRODUCT;             /* --product STRING: identity product/model + panel + mDNS instance name (NULL => harp-refdev) */
     const char *engine_name = NULL;                   /* --engine-name STRING: identity engine name (NULL => ENGINE_ID; media-type unaffected) */
@@ -465,7 +465,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--out-lat") == 0 && i + 1 < argc)
             out_lat = (uint32_t)atoi(argv[++i]); /* §6.4: declare analog-out path latency (latency-profile key 2) */
         else if (strcmp(argv[i], "--pipeline") == 0 && i + 1 < argc)
-            pipeline = (uint32_t)atoi(argv[++i]); /* §6.4: a real host-paced pipeline (latency-profile key 3) */
+            pipeline = atol(argv[++i]); /* §8.8: an effect's content pipeline (audio.start rsp key 1) */
         else if (strcmp(argv[i], "--engine-ver") == 0 && i + 1 < argc)
             engine_ver = argv[++i]; /* §12.2 test seam: report this engine semver instead of ENGINE_VERSION */
         else if (strcmp(argv[i], "--force-peer-ip") == 0 && i + 1 < argc) {
@@ -524,8 +524,12 @@ int main(int argc, char **argv) {
     d->rt_nsamples = rt_nsamples; /* §6.4 rt-profile: emitted as identity key 14 sub-key 1 when nonzero */
     d->in_lat = in_lat;           /* §6.4 latency-profile key 1 (converter analog-in; 0 = pure-digital refdev) */
     d->out_lat = out_lat;         /* §6.4 latency-profile key 2 (converter analog-out) */
-    d->buf_depth = pipeline ? pipeline : 256; /* §6.4 key 3: the declared host-paced pipeline */
-    d->audio.pipeline = pipeline; /* ...and the real one, for an engine that applies it */
+    if (pipeline < 0 || pipeline > (long)DEVICE_PIPELINE_MAX || (pipeline && !engine_is_fx())) {
+        harp_devlog(HARP_LOG_ERROR, "daemon", "harp-deviced: --pipeline takes 0..%u, on an effect engine only\n",
+                    DEVICE_PIPELINE_MAX);
+        return 2;
+    }
+    d->audio.pipeline = (uint32_t)pipeline; /* §8.8: reported as device-pipeline-samples (host-paced) */
     d->engine_ver = engine_ver;   /* §12.2 test seam: NULL => ENGINE_VERSION */
     d->ctl_sock = HARP_SOCK_INVALID; /* §16: armed per-connection by the eth accept loop */
     d->product = product;         /* identity product/model + panel + mDNS name; NULL => "harp-refdev" */
