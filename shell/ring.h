@@ -54,7 +54,15 @@ public:
         return n;
     }
 
-    void clear() { tail_.store(head_.load(std::memory_order_acquire), std::memory_order_release); }
+    /* consumer: drop everything readable. Returns the index it cleared to — the
+     * write index the NEXT frame read will come from (monotonic, see writeIndex). */
+    size_t clear() {
+        size_t h = head_.load(std::memory_order_acquire);
+        tail_.store(h, std::memory_order_release);
+        return h;
+    }
+    /* producer: the monotonic count of floats ever written (the next write's index) */
+    size_t writeIndex() const { return head_.load(std::memory_order_relaxed); }
 
 private:
     const size_t cap_, mask_;

@@ -814,7 +814,6 @@ void HarpRuntime::unregisterAudioSink(AudioSink *sink) {
  * start() (never mutated mid-session), so reading it here is race-free, and the
  * INSTRUMENT shell never arms it — its synth/free-running path is unchanged. */
 void HarpRuntime::settlePadDebt() {
-    if (fxArmed()) return;
     while (padDebtFloats_) {
         float scratch[1024];
         size_t take = padDebtFloats_ < 1024 ? padDebtFloats_ : 1024;
@@ -884,22 +883,22 @@ size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
      * host-paced frames into it; Ethernet's reader() writes the 1:1 RTP frames
      * into it (bit-exact). The DAW audio thread therefore never touches transport_,
      * so a reconnect reaping the transport can't race this thread. */
+    /* §8.8: an armed effect's wet stream starts with exactly fxLatencySamples() of
+     * pre-roll silence (armed in sessionUp), so the wet trails its input by the latency
+     * the shell reports — no more, no less. Pre-roll is not an underrun and does not
+     * advance ssiRead_ (the wet SSI consumed). After it, a short read IS an underrun:
+     * pad it and owe the late wet (settlePadDebt drops it on arrival), exactly as the
+     * synth path does, so the delay never drifts. Instrument: pre == 0 always. */
+    size_t pre = fxArmed() ? takeFxPreroll((uint32_t)nFrames) : 0;
+    memset(dst, 0, pre * 2 * sizeof(float));
     settlePadDebt();
-    size_t want = nFrames * 2;
-    size_t got = audioRing_.read(dst, want);
-    ssiRead_.fetch_add(nFrames, std::memory_order_relaxed);
+    size_t want = (nFrames - pre) * 2;
+    size_t got = audioRing_.read(dst + pre * 2, want);
+    ssiRead_.fetch_add(nFrames - pre, std::memory_order_relaxed);
     size_t shortBy = 0;
-    if (got < want) {
-        /* §8.8: only the 1:1 synth path owes droppable pad debt. For an armed FX
-         * (fxArmed) this short read is PRIMING silence while the fixed-latency wet
-         * pipeline fills — the wet is PDC-late, not spent — so pass a null accumulator
-         * (no drop scheduled; settlePadDebt early-returns for the FX too). We still
-         * COUNT the underrun when connected_: for the FX these are the expected handful
-         * of priming blocks, after which the ring stays full and there are none.
-         * fxInSlots_ is fixed before start(). */
-        shortBy = padUnderrun(dst, got, want, fxArmed() ? nullptr : &padDebtFloats_,
+    if (got < want)
+        shortBy = padUnderrun(dst + pre * 2, got, want, &padDebtFloats_,
                               connected_.load(std::memory_order_acquire));
-    }
     /* §8.8 never-silent guard: observe the wet just delivered (read-only). Gated on
      * fxArmed, so the instrument path is byte-identical (the golden gate). */
     if (fxArmed()) observeFxWet(dst, nFrames);
@@ -930,6 +929,7 @@ size_t HarpRuntime::pullAudio(AudioSink *sink, float *dst, size_t nFrames) {
 }
 
 size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeoutMs) {
+    size_t pre = 0; /* §8.8 pre-roll frames at the head of this block (see pullAudio) */
     size_t want = nFrames * 2;
     size_t got = 0;
     unsigned waited = 0;
@@ -947,8 +947,13 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
                             flipTargetGen_.load(std::memory_order_acquire);
         if (!flipping) {
             if (!settled) {
+                if (fxArmed()) {
+                    pre = takeFxPreroll((uint32_t)nFrames);
+                    memset(dst, 0, pre * 2 * sizeof(float));
+                    got = pre * 2;
+                }
                 settlePadDebt();
-                ssiRead_.fetch_add(nFrames, std::memory_order_relaxed);
+                ssiRead_.fetch_add(nFrames - pre, std::memory_order_relaxed);
                 settled = true;
             }
             got += audioRing_.read(dst + got, want - got);

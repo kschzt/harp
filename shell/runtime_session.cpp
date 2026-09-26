@@ -521,6 +521,15 @@ bool HarpRuntime::sessionUp() {
     framesRecvAtomic_.store(0, std::memory_order_relaxed);
     ssiRead_.store(0, std::memory_order_relaxed);
     padDebtFloats_ = 0;
+    /* §8.8: the effect's input ring restarts with the SSI domain — input left over from
+     * the previous session must not render at the new SSI 0 — and fxInputPos() counts
+     * from the cleared index. This (supervisor) thread is the ring's consumer here: the
+     * feeder runs on it too, and not until after this returns. Then arm the pre-roll that
+     * holds the wet exactly fxLatencySamples() behind its input (see fxLatencySamples). */
+    if (fxArmed()) {
+        fxInBase_.store(fxInRing_.clear(), std::memory_order_release);
+        fxPreroll_.store(fxLatencySamples(), std::memory_order_release);
+    }
     /* §14.4 host-context-C: reset the clock-stats snapshot for the new session
      * (trimCount_/lastTrimPpb_ are per-session, like framesSent_; asrcLive_ flips
      * true only when the ASRC reader branch runs). Off the render path. */

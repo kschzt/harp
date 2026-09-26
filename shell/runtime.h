@@ -367,6 +367,36 @@ public:
      * frames actually written. */
     size_t writeFxInput(const float *interleaved, size_t nFrames);
 
+    /* §8.8 effect TIMING. The feeder never paces a range without its input (the
+     * availability gate) and consumes the input ring in order from the session's
+     * start, so input frame k of a session renders at SSI k — exactly, by
+     * construction. fxInputPos() is the SSI the NEXT writeFxInput() frame will
+     * occupy: the effect shell stamps a block's events against it, so automation
+     * lands on the sample of the audio it accompanies in every mode. Producer
+     * (process-thread) side; fxInBase_ is the ring index the session started at. */
+    uint64_t fxInputPos() const {
+        size_t cols = fxInSlots_.empty() ? 1 : fxInSlots_.size();
+        return (uint64_t)((fxInRing_.writeIndex() - fxInBase_.load(std::memory_order_acquire)) / cols);
+    }
+    /* The effect's CONSTANT input->wet delay in DAW samples — what the FX shell
+     * reports for PDC and what the pull side ENFORCES (the wet stream is pre-rolled
+     * by exactly this many frames of silence at stream start, and an underrun later
+     * is paid back as pad debt, so the delay never drifts):
+     *   live (real-time): latencySamples() — the ring target + device path + event
+     *     headroom the instrument reports, which covers the kBlock framing wait plus
+     *     the transport round trip;
+     *   offline: fxOfflineLatency() = kBlock-1. §8.2 fixes every pacing frame at the
+     *     negotiated nsamples (kBlock), so input reaches the device in kBlock units
+     *     and a DAW block that ends mid-frame has no wet yet. kBlock-1 is the smallest
+     *     delay that never waits on an unfinished frame for ANY block sequence — VST3
+     *     hosts may shorten any block, and the last block of a bounce usually is. (A
+     *     zero-latency lockstep stalled a full pull timeout and dropped that block's
+     *     wet on every short block.) A bounce compensates it exactly (PDC). */
+    static constexpr uint32_t fxOfflineLatency() { return kBlock - 1; }
+    uint32_t fxLatencySamples() const {
+        return wantHostPaced_.load(std::memory_order_relaxed) ? fxOfflineLatency() : latencySamples();
+    }
+
     /* §8.8 audio.fx NEVER-SILENT guard (RME "loud, not logged"). An armed effect is
      * host-paced (H→D track in, D→H wet); if that input path ever breaks (the device
      * ends up free-running, ignores the host-paced in-slots, or otherwise consumes no
@@ -861,13 +891,13 @@ private:
      * side (pullAudio) only. */
     void syncSinkEpoch(AudioSink &sink);
     /* Shared RT-underrun tail for the pullAudio*() family: zero-fill the short read
-     * [got,want), accrue the pad debt (when `padDebt` != null — the owner pull passes
-     * null for an armed FX, whose short read is PDC-late priming silence, not spent
-     * SSIs), and (when `count`) bump the §8.3 underrun/padSamples diag counters.
-     * Returns the short-by frame count (want-got)/2. Behavior-preserving extraction of
-     * the four identical memset+pad-debt+counter epilogues; each caller keeps its own
-     * gating (fxArmed pad-debt suppression on the owner pull, connected_ counter gate on
-     * the non-blocking pulls) by choosing what it passes. */
+     * [got,want), accrue the pad debt (when `padDebt` != null), and (when `count`)
+     * bump the §8.3 underrun/padSamples diag counters. Returns the short-by frame
+     * count (want-got)/2. Behavior-preserving extraction of the four identical
+     * memset+pad-debt+counter epilogues; each caller keeps its own gating (the
+     * connected_ counter gate on the non-blocking pulls) by choosing what it passes.
+     * An armed FX owes pad debt like the synth: its deliberate start-up delay is the
+     * pre-roll (takeFxPreroll), so a short read after it is a real underrun. */
     size_t padUnderrun(float *dst, size_t got, size_t want, size_t *padDebt, bool count);
     bool helloAndIdentity();
     /* §12.2/§13.4: recompute the read-only holds vs the live identity; shared by connect +
@@ -1276,6 +1306,21 @@ private:
      * never touched off the FX path, so the instrument render is unaffected). */
     std::vector<uint32_t> fxInSlots_;
     FloatRing fxInRing_{1 << 15};
+    /* §8.8 timing (see fxInputPos / fxLatencySamples). fxInBase_: the input ring
+     * index this session's SSI 0 starts at (sessionUp clears the ring — stale input
+     * from a previous session must not render at the new SSI 0). fxPreroll_: frames
+     * of silence the pull still owes at the head of the wet stream this session. */
+    std::atomic<size_t> fxInBase_{0};
+    std::atomic<uint32_t> fxPreroll_{0};
+    /* audio thread: take up to n frames of the remaining pre-roll (0 once spent) */
+    uint32_t takeFxPreroll(uint32_t n) {
+        uint32_t r = fxPreroll_.load(std::memory_order_acquire);
+        while (r) {
+            uint32_t t = r < n ? r : n;
+            if (fxPreroll_.compare_exchange_weak(r, r - t, std::memory_order_acq_rel)) return t;
+        }
+        return 0;
+    }
 
     /* §8.8 never-silent guard state (see observeFxWet / writeFxInput). The
      * accumulators are touched ONLY by the audio/process thread (writeFxInput +

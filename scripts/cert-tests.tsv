@@ -74,6 +74,7 @@ T11	meta	cloud	-	latency profile accuracy vs loopback (±1 ms; harp-perf: exact 
 T11	run	host	scripts/loopback-eth-test.sh	§14.3 loopback round-trip RTT vs the reported profile (±1 ms strict on Linux)
 T11	run	host,clap	scripts/reported-latency-test.sh	§6.4 reported PDC latency exact + agreeing across VST3/CLAP/AU
 T11	run	host	scripts/eth-rtfloor-test.sh	§6.4 declared rt-profile floor/packet (identity key 14) + clamps
+T11	run	fx,host,probe	scripts/fx-filter-eth-test.sh	§8.8 EFFECT latency: the wet arrives EXACTLY the reported PDC latency after its input (0 samples; offline blocks 64/256/1000, live 256/1024), dry/wet aligned at Mix 50%
 
 T12	meta	cloud	-	four-safe-actions UX audit (hosts): archive-before-push verified on the wire
 T12	run	probe	scripts/archive-before-push-test.sh	§11.4 action 1: the displaced state is archived from device_head BEFORE the live overwrite (ordering on the wire)

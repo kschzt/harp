@@ -492,8 +492,14 @@ void HarpRuntime::feeder() {
          * returns WET. Not armed (the instrument) => fxCols==0 => the byte-identical
          * slots=0 pacing frame, no payload, no input gate. */
         const size_t fxCols = fxArmed() ? fxInSlots_.size() : 0;
-        while (ringFrames < (size_t)targetFrames_ && inFlight < ahead_ &&
-               ssi_ + kBlock <= frontierCap) {
+        /* §8.8: an effect's pacing is bounded by its INPUT (the gate below) — and that
+         * gate is also its event-timing guarantee: a block's events are queued before its
+         * input is written, so they can never be born into an already-paced range. The
+         * instrument's ring-fill + frontier caps do not apply: the effect's ring
+         * deliberately holds the wet for its fixed latency (fxLatencySamples), and
+         * capping pacing on that fill would starve the very wet it is waiting for. */
+        while ((fxCols || (ringFrames < (size_t)targetFrames_ && ssi_ + kBlock <= frontierCap)) &&
+               inFlight < ahead_) {
             /* §8.8: only pace once the track input for this range is in the SPSC
              * ring — this couples the H→D input 1:1 to the D→H wet the reader fills,
              * so dry and wet stay sample-aligned (the lockstep host-paced effect). */

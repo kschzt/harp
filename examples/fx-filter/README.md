@@ -96,7 +96,9 @@ through the FX shell and checks, with no hardware:
   several DAW block sizes;
 - save → mutate the device → reopen restores the params, archives the displaced state, and
   renders byte-identically;
-- a front-panel knob echoes back to the DAW as automation.
+- a front-panel knob echoes back to the DAW as automation;
+- the wet arrives exactly the latency the plugin reports for delay compensation after its
+  input, offline and live, and at Mix 50% the dry and wet line up.
 
 It runs in CI on Linux, macOS and Windows as part of `scripts/eth-suite.sh`. Point it at your
 own device and plugin (`FXDEVICED=… FXPLUG=…`) and adjust the parameter ids and expected

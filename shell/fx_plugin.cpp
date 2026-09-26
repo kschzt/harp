@@ -29,12 +29,11 @@
  *   - dry/wet "Mix" knob, default 1.0 = 100% wet (§8.8 "a 100%-wet engine + a
  *     host mix control express every ratio"). At mix=1 the dry path is inert, so
  *     the plugin is robust in every host mode.
- *   - dry/wet are SAMPLE-ALIGNED in the host-paced / offline bounce (the device
- *     returns wet for exactly the input range, lockstep), which is what an
- *     Ableton offline bounce does and what the M3 demo exercises. In a live
- *     real-time insert the wet is PDC-delay-compensated (getLatencySamples), so
- *     100% wet is a clean reverb; a sample-exact dry delay-comp for mix<1 on the
- *     free-running real-time path is a documented §8.8 follow-up.
+ *   - the wet trails its input by a CONSTANT, enforced delay — the runtime's
+ *     fxLatencySamples(): 255 samples on an offline bounce (one pacing frame, so no
+ *     DAW block pattern ever waits on unfinished input), a fixed pipeline depth on a
+ *     live insert. The plugin reports exactly that for PDC and delays its local dry
+ *     by the same amount, so dry and wet are sample-aligned at every Mix.
  */
 #include <cstdint>
 #include <cstdio>
@@ -195,6 +194,9 @@ public:
                 runtime()->setStateBundle(pendingState_.data(), pendingState_.size());
             runtime()->start(rate_);
             source_ = runtime()->ownerSource();
+            /* the dry path waits as long as the wet does (off the audio thread) */
+            dryDelay_.assign(2 * (size_t)runtime()->fxLatencySamples(), 0.0f);
+            dryPos_ = 0;
         } else {
             releaseSource();
             rt_.reset();
@@ -203,14 +205,10 @@ public:
     }
 
     uint32 PLUGIN_API getLatencySamples() override {
-        /* §8.8 PDC. Host-paced/offline is LOCKSTEP — the device returns wet for
-         * exactly the input range this process() supplied, so the added latency is
-         * ~0 and dry/wet are sample-aligned. A live real-time insert reads the wet
-         * a pipeline-depth behind, so report the runtime's path latency there for
-         * the host to delay-compensate the wet. */
-        if (offline_) return 0;
-        if (runtime()) return runtime()->latencySamples();
-        return HarpRuntime::latencyFor(maxBlock_);
+        /* §8.8 PDC: the runtime ENFORCES this delay between the input and its wet
+         * (fxLatencySamples), so what the host compensates is what it gets. */
+        if (runtime()) return runtime()->fxLatencySamples();
+        return offline_ ? HarpRuntime::fxOfflineLatency() : HarpRuntime::latencyFor(maxBlock_);
     }
 
     tresult PLUGIN_API canProcessSampleSize(int32 symbolicSampleSize) override {
@@ -261,14 +259,11 @@ public:
     tresult PLUGIN_API process(ProcessData &data) override {
         if (!runtime() || !source_) return passthroughDry(data);
         HarpRuntime &rt = *runtime();
-        /* Stream position for THIS block's events (§9.2). An event must land on the
-         * same SSI as the input audio it accompanies. On the offline bounce the effect
-         * is lockstep — this block's input is rendered at streamPos() and its wet comes
-         * back in this block — so events carry NO lead. (The instrument shell leads by
-         * latencySamples() because its audio is RENDERED ahead on the device; leading an
-         * effect's events by it made offline automation land 2-5k samples after the
-         * audio it was drawn against.) A live insert keeps the runtime lead. */
-        uint64_t base = rt.streamPos() + (offline_ ? 0 : rt.latencySamples());
+        /* Stream position of THIS block's input (§9.2): its events must land on the
+         * same SSI as the audio they accompany, and the runtime knows that SSI exactly
+         * (fxInputPos). (The instrument shell leads by latencySamples() because its
+         * audio is RENDERED ahead on the device; an effect's audio is the host's input.) */
+        uint64_t base = rt.fxInputPos();
 
         /* parameter changes: device params -> §9.4 sets/ramps (ParamAutomation, the
          * instrument shell's policy); the host-side Mix updates the local dry/wet
@@ -325,8 +320,9 @@ public:
         }
         rt.writeFxInput(fxin.data(), (size_t)n);
 
-        /* WET: pull the device's processed stereo return. Offline blocks for the
-         * lockstep wet (deterministic bounce); real-time pads silence on underrun. */
+        /* WET: pull the device's processed stereo return, fxLatencySamples() behind
+         * its input. Offline blocks until it has arrived (deterministic bounce);
+         * real-time pads silence on underrun (and drops the late wet, keeping the delay). */
         static thread_local std::vector<float> wet;
         if ((int)wet.size() < 2 * n) wet.resize(2 * n);
         if (offline_)
@@ -334,16 +330,25 @@ public:
         else
             rt.pullAudio(wet.data(), (size_t)n);
 
-        /* MIX: out = mix*wet + (1-mix)*dry. In the host-paced/offline path wet[s]
-         * is the device's processing of the SAME input[s] this block supplied, so
-         * dry and wet are sample-aligned. */
+        /* MIX: out = mix*wet + (1-mix)*dry. wet[s] trails its input by exactly
+         * fxLatencySamples(), so the dry goes through a delay line of that length
+         * (dryDelay_) and the two stay sample-aligned. */
         float mix = mix_ < 0.f ? 0.f : (mix_ > 1.f ? 1.f : mix_);
         int32 nch = data.outputs[0].numChannels;
         float *outL = data.outputs[0].channelBuffers32[0];
         float *outR = nch > 1 ? data.outputs[0].channelBuffers32[1] : nullptr;
+        const size_t dlen = dryDelay_.size() / 2;
         for (int32 s = 0; s < n; s++) {
             float dryL = inL ? inL[s] : 0.0f;
             float dryR = inR ? inR[s] : 0.0f;
+            if (dlen) {
+                float dl = dryDelay_[2 * dryPos_], dr = dryDelay_[2 * dryPos_ + 1];
+                dryDelay_[2 * dryPos_] = dryL;
+                dryDelay_[2 * dryPos_ + 1] = dryR;
+                dryPos_ = dryPos_ + 1 == dlen ? 0 : dryPos_ + 1;
+                dryL = dl;
+                dryR = dr;
+            }
             float wL = wet[2 * s], wR = wet[2 * s + 1];
             float l = mix * wL + (1.0f - mix) * dryL;
             float r = mix * wR + (1.0f - mix) * dryR;
@@ -420,6 +425,9 @@ private:
     uint32_t maxBlock_ = 1024;
     bool offline_ = false;
     float mix_ = 1.0f; /* §8.8 host dry/wet; 1.0 = 100% wet */
+    /* the dry's delay line: fxLatencySamples() stereo frames, sized in setActive */
+    std::vector<float> dryDelay_;
+    size_t dryPos_ = 0;
     /* DAW automation -> §9.4 set/ramp events + §15.5 offline-edit replay (shared
      * with the instrument shell). Seeded from kFxParams in the constructor. */
     ParamAutomation automation_;

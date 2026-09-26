@@ -20,6 +20,10 @@
 #                    the saved one (§11.4, §15.3); a pre-Mix (header-less) state still loads
 #   T7 echo          a device front-panel knob echoes back to the plugin as automation
 #                    (§9.4 echo; POSIX only — the MinGW device's panel is a stub)
+#   T8 latency       the wet arrives EXACTLY the latency the plugin reports for PDC after
+#                    its input — offline and live, at several DAW block sizes (§8.8)
+#   T9 dry/wet       at Mix 50% the dry and the wet land on the same sample: the plugin
+#                    delays its dry by the latency the wet carries (§8.8)
 #
 # Exit 0 pass / 1 fail. Kills only its OWN device (by pid) on a unique port.
 set -u
@@ -67,6 +71,7 @@ counter() { "$PROBE" $PD counters 2>/dev/null | sed -nE "s/^ *(x\.[a-z0-9.-]+\.)
 #   rms FILE FROM TO          RMS of the left channel over [FROM, TO)
 #   quarters FILE             brightness (first-difference / signal energy) per quarter
 #   impulse FILE              first non-zero sample
+#   loud FILE                 first sample with |x| > 0.01
 #   firstdiff FILE OTHER      first sample where the two renders differ
 wav() { python3 - "$@" <<'EOF'
 import array, math, sys, wave
@@ -85,6 +90,8 @@ elif op == 'quarters':
                    for s in (x[j * q:(j + 1) * q] for j in range(4))))
 elif op == 'impulse':
     print(next((i for i, v in enumerate(x) if v != 0.0), -1))
+elif op == 'loud':
+    print(next((i for i, v in enumerate(x) if abs(v) > 0.01), -1))
 elif op == 'firstdiff':
     y = left(sys.argv[3])
     print(next((i for i, (a, b) in enumerate(zip(x, y)) if a != b), -1))
@@ -218,4 +225,36 @@ else
     pass "T7 echo: front-panel Cutoff/Resonance moves surfaced as plugin automation"
 fi
 
-echo "FX-FILTER PASS (§8.8 effect: processing, automation, sample accuracy, recall$( [ "$WIN" = 1 ] || echo ', echo'))"
+# ---- T8 the wet arrives exactly the reported latency after its input ----
+# An impulse in; the first non-zero wet sample must sit at the latency the plugin reports
+# (harp-vst3-host prints it as reported-samples). Live renders run against the wall clock,
+# so a scheduler hiccup on a loaded runner can underrun a block — retry those a few times.
+latency_ok() { # latency_ok BLOCK [--realtime]
+    local out rep off
+    out=$(host --block "$1" ${2:-} --set 1=1.0 --set 2=0.0 --input impulse --seconds 0.3 --out "$OUT" 2>&1) \
+        || { echo "$out"; return 2; }
+    rep=$(echo "$out" | sed -nE 's/.*reported-samples=([0-9]+).*/\1/p' | head -1)
+    off=$(wav impulse "$OUT")
+    echo "     block $1 ${2:+live }: reported $rep, wet at $off"
+    [ -n "$rep" ] && [ "$off" = "$rep" ]
+}
+for BLK in 64 256 1000; do latency_ok "$BLK" || fail "T8 offline block $BLK: wet not at the reported latency"; done
+for BLK in 256 1024; do
+    ok=0; for _ in 1 2 3; do latency_ok "$BLK" --realtime && { ok=1; break; }; done
+    [ "$ok" = 1 ] || fail "T8 live block $BLK: wet not at the reported latency (3 tries)"
+done
+pass "T8 latency: the wet arrives exactly the reported latency after its input, offline and live"
+
+# ---- T9 dry/wet alignment at Mix 50% ----
+# 50/50 of the dry impulse and its (open-filter) wet: aligned, the first audible sample is
+# at the reported latency — a dry that skipped the plugin's delay would sound at sample 0.
+for RT in "" --realtime; do
+    out=$(host --block 256 $RT --set 1=1.0 --set 2=0.0 --set 50=0.5 --input impulse --seconds 0.3 --out "$OUT" 2>&1) \
+        || { echo "$out"; fail "T9 render ${RT:-offline}"; }
+    rep=$(echo "$out" | sed -nE 's/.*reported-samples=([0-9]+).*/\1/p' | head -1)
+    at=$(wav loud "$OUT")
+    [ "$at" = "$rep" ] || fail "T9 ${RT:-offline}: first audible sample at $at, want the reported latency $rep (dry and wet misaligned)"
+done
+pass "T9 dry/wet: at Mix 50% dry and wet coincide at the reported latency, offline and live"
+
+echo "FX-FILTER PASS (§8.8 effect: processing, automation, sample accuracy, recall, latency$( [ "$WIN" = 1 ] || echo ', echo'))"
