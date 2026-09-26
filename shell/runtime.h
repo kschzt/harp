@@ -1381,10 +1381,4 @@ private:
      * read it — their channel is already baked into the UMP word by the shell;
      * only param sets/ramps need the source channel.) */
 
-    /* §11.4 archive-name disambiguation (written under ctlMutex_ in pushStateLocked): the last
-     * archive/duplicate ref name minted + a per-session sequence, so two DISTINCT displacing pushes
-     * within one wall-clock second get unique refs (the second-granularity timestamp alone collides
-     * -> the second create-if-absent refset conflicts -> the push aborts, the §11.4 MUST violated). */
-    char lastArchiveName_[96] = "";
-    unsigned archiveDupSeq_ = 0;
 };
