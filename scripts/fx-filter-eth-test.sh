@@ -454,12 +454,14 @@ realigned() { # realigned WHAT FROM_S
     echo "     $1: $2 of $3 impulses after the (re)connect window sample-exact at +$r"
     [ "$3" -ge 1 ] && [ $(( 2 * $2 )) -ge "$3" ] || fail "T12 $1: only $2 of $3 impulses realigned after the (re)connect"
 }
-# (a) restart mid-render: kill the device 1.5 s into an 8 s live render, bring it back
+# (a) restart mid-render: kill the device 1.5 s into an 8 s live render, bring it back.
+# (Truncate the host log BEFORE the watcher starts: it must key on THIS render's connect,
+# not the previous render's line.)
+: > "$HOSTOUT"
 ( for _ in $(seq 1 100); do grep -q "connected:" "$HOSTOUT" 2>/dev/null && break; sleep 0.05; done
   sleep 1.5; kill -9 "$DP" 2>/dev/null; sleep 0.3
   "$FXDEVICED" --port "$PORT" --state-dir "$STATEDIR" "${PANEL[@]}" >>"$DEVLOG" 2>&1 & echo $! > fx-filter.dp ) &
 RST=$!
-: > "$HOSTOUT"
 perl -e 'alarm 60; exec @ARGV' "$HOSTBIN" "$FXPLUG" --realtime --block 256 --input "wav:$TRAIN" --seconds 8 \
     --out "$OUT" >"$HOSTOUT" 2>&1 || { cat "$HOSTOUT" >&3; fail "T12 restart render"; }
 wait "$RST"; DP=$(cat fx-filter.dp); rm -f fx-filter.dp
@@ -473,6 +475,27 @@ perl -e 'alarm 60; exec @ARGV' "$HOSTBIN" "$FXPLUG" --realtime --block 256 --inp
     --out "$OUT" >"$HOSTOUT" 2>&1 || { cat "$HOSTOUT" >&3; fail "T12 late-connect render"; }
 wait "$LATE"; DP=$(cat fx-filter.dp); rm -f fx-filter.dp
 realigned "device up after the render started" 5
-pass "T12 reconnect: after a mid-render device restart and after a late connect, the live wet is sample-exact at the reported latency again"
+# the latency was latched at activation WITHOUT the device's declared pipeline (no device
+# yet), so the contract is a loud warning when the device then connects with one
+grep -q "is not in the FX latency reported to the host" "$HOSTOUT" \
+    || { cat "$HOSTOUT" >&3; fail "T12 late connect: no warning that the device pipeline is missing from the reported latency"; }
+# (c) automation across a restart: an LFO on Cutoff through a mid-render device restart.
+# Events stamped before the audio thread adopts the new session are delivered "now" (never
+# with an old-domain timestamp — unit-tested in test_fx_event_domain_restamp); here the
+# restarted device must see nothing late and no fence expire.
+: > "$HOSTOUT"
+( for _ in $(seq 1 100); do grep -q "connected:" "$HOSTOUT" 2>/dev/null && break; sleep 0.05; done
+  sleep 1.5; kill -9 "$DP" 2>/dev/null; sleep 0.3
+  "$FXDEVICED" --port "$PORT" --state-dir "$STATEDIR" "${PANEL[@]}" >>"$DEVLOG" 2>&1 & echo $! > fx-filter.dp ) &
+RST=$!
+perl -e 'alarm 60; exec @ARGV' "$HOSTBIN" "$FXPLUG" --realtime --block 256 --input "wav:$NOISE" --lfo 1=2:4 \
+    --seconds 6 --out "$OUT" >"$HOSTOUT" 2>&1 || { cat "$HOSTOUT" >&3; fail "T12 automated restart render"; }
+wait "$RST"; DP=$(cat fx-filter.dp); rm -f fx-filter.dp
+grep -q "device reconnected" "$HOSTOUT" || { cat "$HOSTOUT" >&3; fail "T12 (c): no reconnect"; }
+EL=$("$PROBE" $PD counters 2>/dev/null | sed -nE 's/^ *evt_late = ([0-9]+).*/\1/p')
+FT=$("$PROBE" $PD counters 2>/dev/null | sed -nE 's/^ *x\.[a-z0-9.-]+\.fence_timeouts = ([0-9]+).*/\1/p')
+[ "${EL:-x}" = 0 ] && [ "${FT:-x}" = 0 ] \
+    || fail "T12 automation across the restart: evt_late=${EL:-?} fence_timeouts=${FT:-?} on the restarted device"
+pass "T12 reconnect: after a mid-render device restart and after a late connect, the live wet is sample-exact at the reported latency again; automation across a restart lands on time"
 
 echo "FX-FILTER PASS (§8.8 effect: processing, automation, sample accuracy, recall, latency, reconnect$( [ "$WIN" = 1 ] || echo ', echo'))"
