@@ -33,7 +33,8 @@
  *     fxLatencySamples(), latched per activation: one DAW block (the automation horizon:
  *     a block's automation ramps from the previous point, so its audio is paced only after
  *     the next block's events) + 255 (a pacing frame) offline, plus the ring target live,
- *     plus the device's declared host-paced pipeline when it is connected at activation. The plugin reports exactly that for PDC; its dry follows
+ *     plus the device's content pipeline (§8.8 device-pipeline-samples) when it is
+ *     connected at activation. The plugin reports exactly that for PDC; its dry follows
  *     the runtime's actual wet delay, so dry and wet are sample-aligned at every Mix.
  */
 #include <atomic>

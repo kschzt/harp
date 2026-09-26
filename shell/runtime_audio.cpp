@@ -229,9 +229,26 @@ bool HarpRuntime::audioStart(uint32_t rate) {
             harp_cbor_uint(&req, (uint64_t)hpPort);
         }
     }
-    harp_env e;
+    harp_env e = {};
+    devPipelineSamples_ = 0; /* a response without key 1 declares none */
     bool ok = request(&req, &rsp, &e);
     harp_cbuf_free(&req);
+    /* §8.2 rsp key 1, device-pipeline-samples: the fixed engine+transport pipeline. Host-paced,
+     * it is the CONTENT delay of the wet behind its input — §8.8: how an effect reports its
+     * latency (see fx_arm.h). Free-running it is a timing term the ring target covers. */
+    if (ok && e.has_body) {
+        harp_cdec b;
+        harp_cdec_init(&b, e.body, e.body_len);
+        uint64_t n, key, v;
+        if (harp_cdec_map(&b, &n))
+            for (uint64_t i = 0; i < n; i++) {
+                if (!harp_cdec_uint(&b, &key)) break;
+                if (key == 1 && harp_cdec_uint(&b, &v)) {
+                    devPipelineSamples_ = freeRunning_ ? 0 : (v > UINT32_MAX ? UINT32_MAX : (uint32_t)v);
+                } else if (key == 1 || !harp_cdec_skip(&b))
+                    break;
+            }
+    }
     harp_cbuf_free(&rsp);
     if (!ok && admittedBps_) { /* §8.4: audio.start failed ON THE WIRE — release here, because the
                                 * sessionUp false-branch deletes transport_ WITHOUT a sessionDown */

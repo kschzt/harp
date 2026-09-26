@@ -142,7 +142,18 @@ typedef struct {
 } svf;
 static svf g_svf;
 
-void engine_voices_cold(void) { memset(&g_svf, 0, sizeof g_svf); } /* audio.start: clean state */
+/* An optional CONTENT pipeline (harp-deviced --pipeline N, audio_state.pipeline): the wet
+ * leaves N samples after its input, and the device reports N as device-pipeline-samples
+ * (§8.8) — so this example can stand in for a deep-pipeline effect in tests. 0 = none. */
+#define PIPE_MAX (DEVICE_PIPELINE_MAX + 1u) /* a power of two holding the longest N */
+static float g_pipe[2 * PIPE_MAX];
+static uint32_t g_pipe_w;
+
+void engine_voices_cold(void) { /* audio.start: clean state */
+    memset(&g_svf, 0, sizeof g_svf);
+    memset(g_pipe, 0, sizeof g_pipe);
+    g_pipe_w = 0;
+}
 void engine_voices_quiet(void) {}                                  /* no voices to free */
 /* Panic paths (CC 120/123, panel): an effect has no notes, so there is nothing to
  * release on the session thread. A queued DEV_EV_ALL_OFF clears the filter state on
@@ -301,6 +312,18 @@ uint16_t render_output(audio_state *a, float *out, uint32_t n, float rate, uint6
         if (next - pos - done < seg) seg = (uint32_t)(next - pos - done); /* next > pos+done */
         svf_run(inL, inR, avail, wet, done, seg, rate);
         done += seg;
+    }
+
+    if (a->pipeline) { /* the reported pipeline, for real: the wet trails by exactly N more */
+        uint32_t d = a->pipeline; /* <= DEVICE_PIPELINE_MAX (harp-deviced rejects more) */
+        for (uint32_t s = 0; s < n; s++) {
+            uint32_t w = g_pipe_w, r = (g_pipe_w - d) & (PIPE_MAX - 1);
+            g_pipe[2 * w] = wet[2 * s];
+            g_pipe[2 * w + 1] = wet[2 * s + 1];
+            wet[2 * s] = g_pipe[2 * r];
+            wet[2 * s + 1] = g_pipe[2 * r + 1];
+            g_pipe_w = (g_pipe_w + 1) & (PIPE_MAX - 1);
+        }
     }
 
     /* OUTPUT: pack the requested slots. 0/1 = main L/R and 2/3 = part 0 L/R (the

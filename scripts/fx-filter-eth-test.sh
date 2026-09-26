@@ -38,6 +38,12 @@
 #                    the render started: after the runtime (re)connects, every live wet
 #                    sample is again the offline render shifted by exactly the reported
 #                    latency (the audio thread adopts each new session's SSI domain)
+#   T13 pipeline     an effect with a real 2048-sample CONTENT pipeline (harp-fx-filter
+#                    --pipeline, reported as §8.8 device-pipeline-samples): connected at
+#                    activation, the reported latency includes it and the wet AND the dry
+#                    land exactly there (absolute, offline and live; Mix 50% is exactly
+#                    half dry + half wet, never a comb); connected only after activation
+#                    (#187), wet and dry both land exactly at reported + 2048, as warned
 #
 # NO-FLAKE DESIGN. Every assertion is deterministic on a loaded runner:
 #   - every client (render or probe) waits until the device has finished the previous
@@ -205,6 +211,14 @@ elif op == 'aligned':
     if stray >= 0:
         print('MISMATCH %d %r (wet outside every allowed position)' % (stray, x[stray])); sys.exit(0)
     print('%d %d %d' % (intact, tot, extras[level]))
+elif op == 'mixid':
+    # mixid HALF FULL REP: HALF (Mix 50%) must be exactly half of FULL (Mix 100%, the wet) plus
+    # half the dry, and the dry must be ONE sample at REP (int16 rounding: 2 LSB). Prints the
+    # dry's position, or MISMATCH at the first sample that is neither.
+    y = left(sys.argv[3]); rep = int(sys.argv[4]); tol = 2.5 / 32768
+    d = [a - 0.5 * b for a, b in zip(x, y)]
+    bad = next((i for i, v in enumerate(d) if (abs(v) > tol) != (i == rep)), None)
+    print('MISMATCH %d dry %r' % (bad, d[bad]) if bad is not None else rep)
 elif op == 'onsets':
     print(','.join(str(i) for i, v in enumerate(x) if abs(v) > float(sys.argv[3])))
 EOF
@@ -366,6 +380,7 @@ for BLK in 64 256 1000; do
         || fail "T8 offline render (block $BLK)"
     R=$(reported); AT=$(wav impulse "$OUT")
     echo "     offline block $BLK: reported $R, wet at $AT"
+    eval "R8_$BLK=\$R" # the pipeline-less offline latency (T13 adds a pipeline to it)
     [ -n "$R" ] && [ "$AT" = "$R" ] || fail "T8 offline block $BLK: wet at $AT, reported latency ${R:-?}"
 done
 # Live: the device's render is deterministic, so every live impulse's wet must EQUAL its
@@ -462,9 +477,12 @@ EOF
 host --block 256 --input "wav:$TRAIN" --seconds 8 --out "$REF" >/dev/null 2>&1 || fail "T12 offline reference"
 ROFF=$(reported)
 # tail N FILE: impulses (of those due at t >= FROM s) whose wet is intact
-realigned() { # realigned WHAT FROM_S
+# lag: how much later than reported the runtime warned the wet lands (a late-connected pipeline)
+lag() { sed -nE 's/.*puts the wet ([0-9]+) samples later than the FX latency.*/\1/p' "$HOSTOUT" | head -1 | grep . || echo 0; }
+realigned() { # realigned WHAT FROM_S — the wet is due at the reported latency (+ any warned lag)
     local r sh
     r=$(sed -nE 's/.*reported-samples=([0-9]+).*/\1/p' "$HOSTOUT" | head -1)
+    r=$(( r + $(lag) ))
     grep -q "connected:" "$HOSTOUT" || { cat "$HOSTOUT" >&3; fail "T12 $1: never connected"; }
     sh=$(wav aligned "$OUT" "$REF" "$ROFF" "$r" 2400 4800 $((2400 + 4800 * ($2 * 10))) "$(extras)")
     case "$sh" in MISMATCH*) cat "$HOSTOUT" >&3; fail "T12 $1: a wet sample is misplaced after the (re)connect ($sh)";; esac
@@ -499,10 +517,8 @@ perl -e 'alarm 60; exec @ARGV' "$HOSTBIN" "$FXPLUG" --realtime --block 256 --inp
 wait "$LATE"; DP=$(cat fx-filter.dp); rm -f fx-filter.dp
 grep -q "supervising for hot-plug" "$HOSTOUT" || { cat "$HOSTOUT" >&3; fail "T12 late connect: the plugin activated WITH a device — not a late connect"; }
 realigned "device up after the render started" 5
-# the latency was latched at activation WITHOUT the device's declared pipeline (no device
-# yet), so the contract is a loud warning when the device then connects with one
-grep -q "is not in the FX latency reported to the host" "$HOSTOUT" \
-    || { cat "$HOSTOUT" >&3; fail "T12 late connect: no warning that the device pipeline is missing from the reported latency"; }
+# a pipeline-less device lands exactly where the latch said: nothing to warn about (T13 has one)
+! grep -q "puts the wet" "$HOSTOUT" || { cat "$HOSTOUT" >&3; fail "T12 late connect: a lag warning for a pipeline-less device"; }
 # (c) automation across a restart: an LFO on Cutoff through a mid-render device restart.
 # Events stamped before the audio thread adopts the new session are delivered "now" (never
 # with an old-domain timestamp — unit-tested in test_fx_event_domain_restamp); here the
@@ -521,5 +537,103 @@ FT=$("$PROBE" $PD counters 2>/dev/null | sed -nE 's/^ *x\.[a-z0-9.-]+\.fence_tim
 [ "${EL:-x}" = 0 ] && [ "${FT:-x}" = 0 ] \
     || fail "T12 automation across the restart: evt_late=${EL:-?} fence_timeouts=${FT:-?} on the restarted device"
 pass "T12 reconnect: after a mid-render device restart and after a late connect, the live wet is sample-exact at the reported latency again; automation across a restart lands on time"
+
+# ---- T13 an effect with a content pipeline (#187) ----
+# harp-fx-filter --pipeline 2048 answers every pacing frame on time with wet that trails its
+# input by 2048 more, and reports it as §8.8 device-pipeline-samples. That is CONTENT, not
+# timing: it belongs in the reported latency and the dry delay, never in the pre-roll (which
+# would delay the wet twice and comb the dry against it at any Mix < 100%).
+PIPE=2048
+kill -9 "$DP" 2>/dev/null; wait "$DP" 2>/dev/null
+rm -rf "$STATEDIR"; : > "$DEVLOG"; echo 0 > "$SESSF"
+startpipe() { "$FXDEVICED" --port "$PORT" --state-dir "$STATEDIR" --pipeline "$PIPE" "${PANEL[@]}" >>"$DEVLOG" 2>&1 & DP=$!; }
+startpipe; listening 1 || fail "T13 pipeline device did not start"
+# (a) connected at activation, offline: ABSOLUTE — the first wet sample is at the reported
+# latency, which is the pipeline-less one + the pipeline; at Mix 50% the output is exactly
+# half the wet + half a dry impulse at that same sample.
+for BLK in 64 256 1000; do
+    host --block "$BLK" --set 1=1.0 --set 2=0.0 --input impulse --seconds 0.3 --out "$OUT" >/dev/null 2>&1 \
+        || fail "T13 offline render (block $BLK)"
+    R=$(reported); AT=$(wav impulse "$OUT"); eval "R0=\$R8_$BLK"
+    echo "     offline block $BLK: reported $R (pipeline-less $R0 + $PIPE), wet at $AT"
+    [ -n "$R" ] && [ "$R" = $((R0 + PIPE)) ] || fail "T13 offline block $BLK: reported ${R:-?}, want $R0 + $PIPE"
+    [ "$AT" = "$R" ] || fail "T13 offline block $BLK: wet at $AT, reported latency $R"
+    cp "$OUT" "$REF"
+    host --block "$BLK" --set 1=1.0 --set 2=0.0 --set 50=0.5 --input impulse --seconds 0.3 --out "$OUT" >/dev/null 2>&1 \
+        || fail "T13 offline Mix 50% render (block $BLK)"
+    MX=$(wav mixid "$OUT" "$REF" "$R")
+    [ "$MX" = "$R" ] || fail "T13 offline block $BLK: Mix 50% is not half wet + half dry at $R ($MX)"
+done
+# (b) connected at activation, live: the wet sample-exact at reported (the aligned check
+# against the absolute offline reference), and the dry onsets exactly there too (T9).
+host --block 256 --set 1=1.0 --set 2=0.0 --input "wav:$TRAIN" --seconds 8 --out "$REF" >/dev/null 2>&1 \
+    || fail "T13 offline reference"
+ROFF=$(reported)
+host --realtime --block 256 --set 1=1.0 --set 2=0.0 --input "wav:$TRAIN" --seconds 2 --out "$OUT" >/dev/null 2>&1 \
+    || fail "T13 live render"
+R=$(reported)
+SH=$(wav aligned "$OUT" "$REF" "$ROFF" "$R" 2400 4800 0 "$(extras)")
+case "$SH" in MISMATCH*) fail "T13 live: wet not at the reported latency $R ($SH)";; esac
+set -- $SH
+[ "$2" -ge 1 ] && [ $(( 2 * $1 )) -ge "$2" ] || fail "T13 live: only $1 of $2 impulses came through"
+echo "     live: reported $R, $1 of $2 impulses' wet sample-exact at +$R"
+dry_at() { # dry_at WHAT REP FROM_S TO_S: every Mix-50% dry onset in [FROM, TO) s is its impulse +
+    local sh #  REP (+ a logged re-anchor's extra: the dry follows the wet), and none is elsewhere
+    sh=$(python3 - "$(wav onsets "$OUT" 0.3)" "$2" $(($3 * 48000)) $(($4 * 48000)) "$(extras)" <<'EOF'
+import sys
+got = [int(v) for v in sys.argv[1].split(',') if v]
+rep, a, b = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+ex = [int(e) for e in sys.argv[5].split(',')]
+got = [g for g in got if a <= g < b]
+due = [k for k in range(2400, 8 * 48000, 4800) if a <= k + rep < b]
+ok = [g for g in got if any(g - rep - e in due for e in ex)]
+stray = sorted(set(got) - set(ok))
+hit = sum(1 for k in due if any(k + rep + e in got for e in ex))
+if stray: print('MISMATCH dry at %s: no impulse + %d%s there' % (stray[:5], rep, ' (+ %s)' % ex[1:] if ex[1:] else ''))
+elif not due or (hit < len(due) and len(ex) == 1): print('MISMATCH %d of %d dry onsets' % (hit, len(due)))
+else: print('%d %d' % (hit, len(due)))
+EOF
+)
+    case "$sh" in MISMATCH*|'') cat "$HOSTOUT" >&3; fail "T13 $1: $sh";; esac
+    echo "     $1: $sh dry onsets exactly at +$2"
+}
+host --realtime --block 256 --set 1=0.0 --set 2=0.0 --set 50=0.5 --input "wav:$TRAIN" --seconds 2 --out "$OUT" \
+    >/dev/null 2>&1 || fail "T13 live Mix 50% render"
+dry_at "live, Mix 50%" "$(reported)" 0 2
+pass "T13 pipeline at activation: reported = pipeline-less + $PIPE, and wet and dry land exactly there (offline, live, Mix 50%)"
+# (c) late connect (#187): the latch has no pipeline, so the wet lands $PIPE later than
+# reported — warned, with the amount — and the dry follows it exactly. First the wet, then the
+# dry (Cutoff 0 at Mix 50%: every loud sample is dry) — each a live render during which the
+# device comes up only once the plugin is supervising for hot-plug (event-ordered, no sleep).
+latecon() { # latecon ARGS...: a live 8 s render with the device started after activation
+    kill -9 "$DP" 2>/dev/null; wait "$DP" 2>/dev/null
+    : > "$HOSTOUT"
+    ( for _ in $(seq 1 600); do grep -q "supervising for hot-plug" "$HOSTOUT" 2>/dev/null && break; sleep 0.05; done
+      startpipe; echo "$DP" > fx-filter.dp ) &
+    local late=$!
+    perl -e 'alarm 60; exec @ARGV' "$HOSTBIN" "$FXPLUG" --realtime --block 256 "$@" --input "wav:$TRAIN" --seconds 8 \
+        --out "$OUT" >"$HOSTOUT" 2>&1 || { cat "$HOSTOUT" >&3; fail "T13 late-connect render"; }
+    wait "$late"; DP=$(cat fx-filter.dp); rm -f fx-filter.dp
+    grep -q "supervising for hot-plug" "$HOSTOUT" || { cat "$HOSTOUT" >&3; fail "T13: the plugin activated WITH a device — not a late connect"; }
+    grep -q "connected:" "$HOSTOUT" || { cat "$HOSTOUT" >&3; fail "T13 late connect: never connected"; }
+    [ "$(lag)" = "$PIPE" ] || { cat "$HOSTOUT" >&3; fail "T13 late connect: warned lag $(lag), want $PIPE"; }
+}
+# the reference: a FRESH device at default parameters, like T12 — the first block after a
+# connect renders with the device's own stored parameters, which (a)/(b) changed
+kill -9 "$DP" 2>/dev/null; wait "$DP" 2>/dev/null
+rm -rf "$STATEDIR"; : > "$DEVLOG"; echo 0 > "$SESSF"
+startpipe; listening 1 || fail "T13 fresh pipeline device did not start"
+host --block 256 --input "wav:$TRAIN" --seconds 8 --out "$REF" >/dev/null 2>&1 || fail "T13 offline default-params reference"
+ROFF=$(reported)
+latecon
+R=$(reported)
+SH=$(wav aligned "$OUT" "$REF" "$ROFF" $((R + PIPE)) 2400 4800 $((2400 + 4800 * 30)) "$(extras)")
+case "$SH" in MISMATCH*) cat "$HOSTOUT" >&3; fail "T13 late connect: the wet is not at reported + $PIPE ($((R + PIPE))): $SH";; esac
+set -- $SH
+echo "     late connect: reported $R, $1 of $2 impulses' wet sample-exact at +$((R + PIPE))$( [ "$3" = 0 ] || echo " (+$3 after a logged re-anchor)")"
+[ "$2" -ge 1 ] && [ $(( 2 * $1 )) -ge "$2" ] || fail "T13 late connect: only $1 of $2 impulses came through"
+latecon --set 1=0.0 --set 2=0.0 --set 50=0.5
+dry_at "late connect, Mix 50%" $(( $(reported) + PIPE )) 5 8
+pass "T13 pipeline late connect (#187): the wet and the dry both land exactly at reported + $PIPE, and the lag is warned"
 
 echo "FX-FILTER PASS (§8.8 effect: processing, automation, sample accuracy, recall, latency, reconnect$( [ "$WIN" = 1 ] || echo ', echo'))"

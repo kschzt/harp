@@ -1,5 +1,6 @@
 #include "runtime.h"
 #include "runtime_registry.h" /* §8.4 admission ledger (ledger_reserve/release/reserved) */
+#include "fx_arm.h"        /* §8.8 FX session arming (pure, unit-tested) */
 #include "fx_late_guard.h" /* §8.8 live-FX late-guard policy (pure, unit-tested) */
 #include "runtime_log.h" /* log_msg / log_param_map_drift (shared w/ runtime_recall.cpp) */
 #include "shell_config.h" /* HARP_SHELL_ENGINE_FILTER / HARP_SHELL_ETHERNET_ONLY (default = refdev) */
@@ -947,11 +948,20 @@ bool HarpRuntime::fxBeginBlock() {
     if (!fxArmed()) return false;
     uint64_t g = sessionGen_.load(std::memory_order_acquire);
     if (g == fxAdoptedGen_.load(std::memory_order_relaxed)) return false;
-    uint32_t lat = fxLatencySamples();
+    /* arm this session's wet (the policy is pure + unit-tested: shell/fx_arm.h): pre-roll the
+     * mode's timing budget, and place the device's CONTENT pipeline after it — at the latched
+     * (reported) position when the session's pipeline is no deeper than the latched one, else
+     * as early as the timing allows (a late connect / a deeper unit, #187: sessionUp warned).
+     * The dry follows fxWetDelay(), so dry and wet stay aligned either way. */
+    uint32_t pipe = fxSessionPipeline_.load(std::memory_order_relaxed); /* ordered by the gen acquire */
+    FxArm arm = fxArmFor(fxModeBase(), fxLatchedPipeline_.load(std::memory_order_relaxed), pipe,
+                         kFxMaxWetDelay);
+    uint32_t lat = arm.preroll;
     fxInBase_.store(fxInRing_->writeIndex(), std::memory_order_relaxed);
     fxHorizon_.store(0, std::memory_order_relaxed); /* nothing of this domain is pacable yet */
     fxArmedDelay_ = fxTestUnderbudget_ >= lat ? 0 : lat - fxTestUnderbudget_;
     fxPreroll_ = fxArmedDelay_;
+    fxPipe_ = pipe;
     fxExtraDelay_ = 0;
     fxGapN_ = 0;
     fxLateRunFrames_ = 0;
@@ -1140,10 +1150,12 @@ size_t HarpRuntime::writeFxInput(const float *interleaved, size_t nFrames) {
     size_t written = fxInRing_->write(interleaved, nFrames * cols) / cols;
     if (written < nFrames) {
         /* overflow (the feeder stalled for a whole ring): the dropped input never reaches
-         * the device, but its dry does. Record the gap at the SSI where it happened; the
-         * live pull plays that much silence there, keeping every later wet aligned. */
+         * the device, but its dry does. Record the gap at the wet SSI where it shows: the
+         * input SSI, plus the device's content pipeline (the wet at SSI s is the input at
+         * s - pipe, so the wet just before the gap is still due for `pipe` frames). The live
+         * pull plays that much silence there, keeping every later wet aligned. */
         uint32_t dropped = (uint32_t)(nFrames - written);
-        uint64_t at = fxInputPos();
+        uint64_t at = fxInputPos() + fxPipe_;
         if (fxGapN_ && fxGaps_[fxGapN_ - 1].ssi == at)
             fxGaps_[fxGapN_ - 1].frames += dropped;
         else if (fxGapN_ < sizeof fxGaps_ / sizeof fxGaps_[0])
@@ -1229,14 +1241,16 @@ void HarpRuntime::fxLateGuard(size_t nFrames) {
     padDebtFloats_ = 0;
     /* the wet now trails by this much more: the dry follows (fxWetDelay), up to what a shell
      * can align — past that the dry cannot follow, which is said loudly below */
-    bool capped = (uint64_t)fxArmedDelay_ + fxExtraDelay_ + owed > kFxMaxWetDelay;
-    fxExtraDelay_ = capped ? kFxMaxWetDelay - fxArmedDelay_ : fxExtraDelay_ + (uint32_t)owed;
+    uint64_t fixedDelay = (uint64_t)fxArmedDelay_ + fxPipe_;
+    bool capped = fixedDelay + fxExtraDelay_ + owed > kFxMaxWetDelay;
+    fxExtraDelay_ = capped ? (fixedDelay < kFxMaxWetDelay ? kFxMaxWetDelay - (uint32_t)fixedDelay : 0)
+                           : fxExtraDelay_ + (uint32_t)owed;
     fxReanchors_.fetch_add(1, std::memory_order_relaxed);
     char msg[200];
     snprintf(msg, sizeof msg,
-             "armed FX wet later than its reported latency (%u) for 250 ms — re-anchored: the "
+             "armed FX wet later than its armed delay (%u) for 250 ms — re-anchored: the "
              "wet now trails by %zu more frames than the host compensates",
-             fxArmedDelay_, owed);
+             fxArmedDelay_ + fxPipe_, owed);
     recordLog(HARP_LOG_ERROR, "audio.fx", msg);
     log_msg("§8.8 FX re-anchor: %s", msg);
     if (capped) {

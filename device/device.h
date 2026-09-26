@@ -123,6 +123,7 @@ extern dev_param g_params[NPARAMS];
  * (knobs); read everywhere; last-write-wins, relaxed — ordering for
  * timestamped changes comes from the event queue. */
 int param_index(uint32_t id); /* slot in g_params, or -1 (engine.c) */
+#define DEVICE_PIPELINE_MAX 65535u /* harp-deviced --pipeline bound (what an engine must hold) */
 int engine_is_fx(void);       /* §8.8 role: 1 = effect (processes a->fx_in), 0 = synth */
 
 /* Cross-module per-part value access (engine.c). state.c (snapshot encode/
@@ -340,6 +341,11 @@ typedef struct {
                                 * at exactly the host's consumption rate and the
                                 * host plays 1:1 (no resampling = bit-exact). 0 =
                                 * nominal (the byte-identical free-running path). */
+    uint32_t pipeline; /* harp-deviced --pipeline N (effect engines only, <= DEVICE_PIPELINE_MAX): a
+                          CONTENT pipeline, in samples — the engine's wet trails its input by N
+                          more, and the device reports N as device-pipeline-samples (host-paced
+                          audio.start rsp key 1; §8.8). examples/fx-filter applies it, to stand in
+                          for a deep-pipeline effect. 0 = none (the default). */
     double tone_hz; /* test/measurement: when >0, render_output emits a pure
                        stereo sine at this Hz INSTEAD of the synth — a clean
                        reference for SINAD over the free-running RTP path (the
