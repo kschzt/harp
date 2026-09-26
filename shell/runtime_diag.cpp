@@ -344,7 +344,7 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
      * §8.7 rtp_loss — the canonical host-section homes per docs/diag-bundle-design.md;
      * clock-stats key 4 mirrors reanchors, key 7 there is reserved for ptp-stats.) */
     harp_cbor_uint(&out, 5);
-    harp_cbor_map(&out, 11);
+    harp_cbor_map(&out, 12);
     harp_cbor_uint(&out, 0);
     harp_cbor_uint(&out, underruns_.load(std::memory_order_relaxed)); /* host_underruns */
     harp_cbor_uint(&out, 1);
@@ -378,6 +378,10 @@ std::vector<uint8_t> HarpRuntime::getDiagBundle(bool anonymize) {
      * shorter "x.harp.rtp_silent" (len 17) sorts ahead of "x.harp.fx_silent_wet" (len 20). */
     harp_cbor_text(&out, "x.harp.rtp_silent");
     harp_cbor_uint(&out, rtpSilentFaults_.load(std::memory_order_relaxed));
+    /* §8.8 live-FX re-anchors (fxLateGuard): len 19, between rtp_silent (17) and
+     * fx_silent_wet (20) in deterministic-CBOR key order. Additive x.* key. */
+    harp_cbor_text(&out, "x.harp.fx_reanchors");
+    harp_cbor_uint(&out, fxReanchors_.load(std::memory_order_relaxed));
     harp_cbor_text(&out, "x.harp.fx_silent_wet");
     harp_cbor_uint(&out, fxSilentWetFaults_.load(std::memory_order_relaxed));
 

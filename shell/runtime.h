@@ -420,6 +420,10 @@ public:
     uint64_t fxSilentWetFaults() const {
         return fxSilentWetFaults_.load(std::memory_order_relaxed);
     }
+    /* §8.8 re-anchors: episodes where the wet stayed later than fxLatencySamples() for a
+     * full ~250 ms and the pull stopped owing it (see fxLateGuard). Also emitted as diag
+     * host-counter x.harp.fx_reanchors. 0 on a healthy session. */
+    uint64_t fxReanchors() const { return fxReanchors_.load(std::memory_order_relaxed); }
     /* Sticky: the §8.8 guard has tripped this session. The offline/host bounce returns
      * non-zero on it (fx_plugin.cpp); a live insert keeps running (log + counter only). */
     bool fxSilentWetTripped() const {
@@ -1312,6 +1316,9 @@ private:
      * of silence the pull still owes at the head of the wet stream this session. */
     std::atomic<size_t> fxInBase_{0};
     std::atomic<uint32_t> fxPreroll_{0};
+    std::atomic<uint64_t> fxReanchors_{0}; /* host-readable: x.harp.fx_reanchors */
+    uint64_t fxLateRunFrames_ = 0;         /* audio thread: frames pulled with late wet owed */
+    void fxLateGuard(size_t nFrames);
     /* audio thread: take up to n frames of the remaining pre-roll (0 once spent) */
     uint32_t takeFxPreroll(uint32_t n) {
         uint32_t r = fxPreroll_.load(std::memory_order_acquire);

@@ -24,6 +24,10 @@
 #                    its input — offline and live, at several DAW block sizes (§8.8)
 #   T9 dry/wet       at Mix 50% the dry and the wet land on the same sample: the plugin
 #                    delays its dry by the latency the wet carries (§8.8)
+#   T10 late guard   a live wet that is PERSISTENTLY later than its budget (simulated:
+#                    HARP_FX_TEST_UNDERBUDGET) re-anchors and stays audible instead of
+#                    dropping every block, counted in x.harp.fx_reanchors; a healthy
+#                    live stream never re-anchors
 #
 # Exit 0 pass / 1 fail. Kills only its OWN device (by pid) on a unique port.
 set -u
@@ -53,7 +57,7 @@ rm -rf "$STATEDIR" "$STATEFILE" "$NOISE" "$OUT" "$SOCK"; : > "$DEVLOG"
 PANEL=(); [ "$WIN" = 0 ] && PANEL=(--panel-sock "$SOCK")
 "$FXDEVICED" --port "$PORT" --state-dir "$STATEDIR" "${PANEL[@]}" >"$DEVLOG" 2>&1 &
 DP=$!
-trap 'kill -9 "$DP" 2>/dev/null; wait "$DP" 2>/dev/null; rm -rf "$STATEDIR" "$STATEFILE" "$STATEFILE.legacy" "$NOISE" "$OUT" fx-filter-ref.wav' EXIT INT TERM
+trap 'kill -9 "$DP" 2>/dev/null; wait "$DP" 2>/dev/null; rm -rf "$STATEDIR" "$STATEFILE" "$STATEFILE.legacy" "$NOISE" "$OUT" fx-filter-ref.wav fx-filter-diag.cbor' EXIT INT TERM
 for _ in $(seq 1 25); do grep -q "listening on $PORT" "$DEVLOG" 2>/dev/null && break; sleep 0.2; done
 grep -q "listening on $PORT" "$DEVLOG" || { cat "$DEVLOG"; fail "device didn't start on $PORT"; }
 
@@ -72,6 +76,7 @@ counter() { "$PROBE" $PD counters 2>/dev/null | sed -nE "s/^ *(x\.[a-z0-9.-]+\.)
 #   quarters FILE             brightness (first-difference / signal energy) per quarter
 #   impulse FILE              first non-zero sample
 #   loud FILE                 first sample with |x| > 0.01
+#   rmstail FILE              RMS of the left channel over the second half
 #   firstdiff FILE OTHER      first sample where the two renders differ
 wav() { python3 - "$@" <<'EOF'
 import array, math, sys, wave
@@ -90,6 +95,8 @@ elif op == 'quarters':
                    for s in (x[j * q:(j + 1) * q] for j in range(4))))
 elif op == 'impulse':
     print(next((i for i, v in enumerate(x) if v != 0.0), -1))
+elif op == 'rmstail':
+    s = x[len(x) // 2:]; print('%.6f' % math.sqrt(sum(v * v for v in s) / len(s)))
 elif op == 'loud':
     print(next((i for i, v in enumerate(x) if abs(v) > 0.01), -1))
 elif op == 'firstdiff':
@@ -256,5 +263,30 @@ for RT in "" --realtime; do
     [ "$at" = "$rep" ] || fail "T9 ${RT:-offline}: first audible sample at $at, want the reported latency $rep (dry and wet misaligned)"
 done
 pass "T9 dry/wet: at Mix 50% dry and wet coincide at the reported latency, offline and live"
+
+# ---- T10 the live late guard ----
+# With the whole latency budget removed the wet can never be on time. Paying the pad debt
+# would drop every block (a silent insert); the guard must re-anchor once (~250 ms in) and
+# the rest of the render must carry the wet. A healthy live render must never re-anchor.
+DB=fx-filter-diag.cbor
+host --realtime --block 256 --set 1=1.0 --input sine:1000 --seconds 2 --out "$OUT" >"$LOG" 2>&1 \
+    || { cat "$LOG"; fail "T10 healthy live render"; }
+grep -q "FX re-anchor" "$LOG" && { grep "FX re-anchor" "$LOG"; fail "T10 a healthy live stream re-anchored"; }
+HARP_FX_TEST_UNDERBUDGET=100000 host --realtime --block 256 --set 1=1.0 --input sine:1000 --seconds 2 \
+    --out "$OUT" --diag-bundle "$DB" >"$LOG" 2>&1 || { cat "$LOG"; fail "T10 late live render"; }
+TAIL=$(wav rmstail "$OUT")
+python3 -c "import sys; sys.exit(0 if $TAIL > 0.3 else 1)" \
+    || fail "T10 persistently-late wet went silent (second-half rms $TAIL) — the late guard did not re-anchor"
+grep -q "FX re-anchor" "$LOG" || { cat "$LOG"; fail "T10 no re-anchor logged"; }
+if python3 -c "import cbor2" 2>/dev/null; then
+    N=$(python3 -c "import cbor2,sys; print(cbor2.loads(open(sys.argv[1],'rb').read())[5]['x.harp.fx_reanchors'])" "$DB") \
+        || fail "T10 diag bundle unreadable"
+    [ "$N" -ge 1 ] || fail "T10 x.harp.fx_reanchors = $N, want >= 1"
+    CNT="x.harp.fx_reanchors=$N"
+else
+    CNT="(cbor2 absent: counter not decoded)"
+fi
+rm -f "$DB"
+pass "T10 late guard: persistently-late wet re-anchored and stayed audible (tail rms $TAIL, $CNT); healthy live stream never re-anchored"
 
 echo "FX-FILTER PASS (§8.8 effect: processing, automation, sample accuracy, recall, latency$( [ "$WIN" = 1 ] || echo ', echo'))"

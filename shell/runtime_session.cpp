@@ -528,7 +528,17 @@ bool HarpRuntime::sessionUp() {
      * holds the wet exactly fxLatencySamples() behind its input (see fxLatencySamples). */
     if (fxArmed()) {
         fxInBase_.store(fxInRing_.clear(), std::memory_order_release);
-        fxPreroll_.store(fxLatencySamples(), std::memory_order_release);
+        uint32_t preroll = fxLatencySamples();
+        /* TEST seam (fx-filter-eth-test T10): HARP_FX_TEST_UNDERBUDGET=N enforces N frames
+         * LESS than the reported latency — a transport slower than its budget — so the
+         * wet is persistently late and the live late guard (fxLateGuard) must re-anchor.
+         * Unset (production) = the exact reported latency. */
+        if (const char *e = getenv("HARP_FX_TEST_UNDERBUDGET")) {
+            long u = atol(e);
+            if (u > 0) preroll = (uint32_t)u >= preroll ? 0 : preroll - (uint32_t)u;
+        }
+        fxPreroll_.store(preroll, std::memory_order_release);
+        fxLateRunFrames_ = 0;
     }
     /* §14.4 host-context-C: reset the clock-stats snapshot for the new session
      * (trimCount_/lastTrimPpb_ are per-session, like framesSent_; asrcLive_ flips

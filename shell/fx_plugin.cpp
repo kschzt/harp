@@ -37,6 +37,7 @@
  */
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -198,6 +199,17 @@ public:
             dryDelay_.assign(2 * (size_t)runtime()->fxLatencySamples(), 0.0f);
             dryPos_ = 0;
         } else {
+            /* §14.4 host-context-A capture, OPT-IN by env (harp-vst3-host --diag-bundle),
+             * exactly as the instrument shell: read-only, after the render, while the
+             * session is still up. Unset env = no-op. */
+            if (const char *p = getenv("HARP_DIAG_BUNDLE_OUT"); p && p[0] && runtime()) {
+                const char *a = getenv("HARP_DIAG_BUNDLE_ANON");
+                std::vector<uint8_t> db = runtime()->getDiagBundle(a && a[0] && a[0] != '0');
+                if (FILE *f = fopen(p, "wb")) {
+                    if (!db.empty()) fwrite(db.data(), 1, db.size(), f);
+                    fclose(f);
+                }
+            }
             releaseSource();
             rt_.reset();
         }

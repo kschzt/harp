@@ -899,6 +899,7 @@ size_t HarpRuntime::pullAudio(float *dst, size_t nFrames) {
     if (got < want)
         shortBy = padUnderrun(dst + pre * 2, got, want, &padDebtFloats_,
                               connected_.load(std::memory_order_acquire));
+    if (fxArmed() && !pre) fxLateGuard(nFrames);
     /* §8.8 never-silent guard: observe the wet just delivered (read-only). Gated on
      * fxArmed, so the instrument path is byte-identical (the golden gate). */
     if (fxArmed()) observeFxWet(dst, nFrames);
@@ -1086,6 +1087,37 @@ void HarpRuntime::observeFxWet(const float *wet, size_t nFrames) {
         recordLog(HARP_LOG_ERROR, "audio.fx", msg);
         log_msg("§8.8 NEVER-SILENT: %s", msg); /* loud stderr copy */
     }
+}
+
+/* §8.8 live-FX late guard. The pre-roll + pad debt hold the wet exactly fxLatencySamples()
+ * behind its input, which is right while the wet arrives within that budget: a transient
+ * late block costs one padded block, and its late wet is dropped when it lands, clearing the
+ * debt. But if the wet is PERSISTENTLY later than the budget (an overloaded host, a transport
+ * round trip longer than the reported latency), the debt never clears and paying it drops
+ * nearly every block — a silent insert. The signal is the DEBT, not the short reads: under
+ * jitter, short blocks interleave with blocks whose wet is eaten paying the debt, so a
+ * "continuous underrun" trigger never fires. Once late wet has been owed without a break for
+ * ~250 ms, re-anchor: forgive the debt so the late wet plays (the delay grows by what was
+ * owed, beyond what PDC compensates), count the episode (x.harp.fx_reanchors) and log it
+ * loudly. Audio thread only (the live pullAudio). */
+void HarpRuntime::fxLateGuard(size_t nFrames) {
+    if (!padDebtFloats_ || !connected_.load(std::memory_order_acquire)) {
+        fxLateRunFrames_ = 0;
+        return;
+    }
+    fxLateRunFrames_ += nFrames;
+    if (fxLateRunFrames_ < rate_ / 4 || !padDebtFloats_) return;
+    size_t owed = padDebtFloats_ / 2;
+    padDebtFloats_ = 0;
+    fxLateRunFrames_ = 0;
+    fxReanchors_.fetch_add(1, std::memory_order_relaxed);
+    char msg[200];
+    snprintf(msg, sizeof msg,
+             "armed FX wet later than its reported latency (%u) for 250 ms — re-anchored: the "
+             "wet now trails by %zu more frames than the host compensates",
+             fxLatencySamples(), owed);
+    recordLog(HARP_LOG_ERROR, "audio.fx", msg);
+    log_msg("§8.8 FX re-anchor: %s", msg);
 }
 
 /* §8.7 eth RTP audio NEVER-SILENT guard — see runtime.h. The detection seam the reader()

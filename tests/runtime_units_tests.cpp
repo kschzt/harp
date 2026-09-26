@@ -312,6 +312,15 @@ static void test_fx_never_silent() {
         for (size_t i = 0; bundle.size() >= nl && i + nl <= bundle.size(); i++)
             if (memcmp(bundle.data() + i, needle, nl) == 0) { found = true; break; }
         CHECK(found);
+        /* its §8.8 sibling, the live-FX re-anchor count: present, and 0 — the late
+         * guard only acts on a CONNECTED live stream, never on this device-less one */
+        const char *reanchor = "x.harp.fx_reanchors";
+        size_t rl = strlen(reanchor);
+        found = false;
+        for (size_t i = 0; bundle.size() >= rl && i + rl <= bundle.size(); i++)
+            if (memcmp(bundle.data() + i, reanchor, rl) == 0) { found = true; break; }
+        CHECK(found);
+        CHECK(rt->fxReanchors() == 0);
     }
 
     /* (b1) NO FALSE POSITIVE — a working device: non-silent input AND non-silent wet ->
