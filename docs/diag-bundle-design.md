@@ -158,8 +158,8 @@ host-counters = {
   ? 8 => uint,        ; rtp_loss              (RTP seq gaps, §8.7), free-running net only
   ? 9 => uint,        ; admission_failures    (§8.4 admission-control rejections)
     * vendor-counter-key => uint / int   ; host/vendor x.* extension counters
-    ; shipped host vendor counters (emitted in deterministic-CBOR key order: the shorter
-    ; "x.harp.rtp_silent" sorts ahead of "x.harp.fx_silent_wet"):
+    ; shipped host vendor counters (emitted in deterministic-CBOR key order — shorter
+    ; keys first: "x.harp.rtp_silent", "x.harp.fx_reanchors", "x.harp.fx_silent_wet"):
     ;   "x.harp.rtp_silent"   => uint   ; §8.7 eth RTP audio NEVER-SILENT guard (the
     ;     symmetric partner of x.harp.fx_silent_wet, for the D->H direction): RTP-silent
     ;     stall episodes — a connected free-running stream stopped delivering packets for a
@@ -170,8 +170,12 @@ host-counters = {
     ;   "x.harp.fx_silent_wet" => uint   ; §8.8 audio.fx NEVER-SILENT guard — armed-FX
     ;     silent-wet faults (the H->D input path was live but the device's wet stayed
     ;     silent a full ~1 s window: the device is free-running / not host-paced).
-    ;   Both: additive (tstr x.* key), so no diag-bundle version bump. Always present (0 =
-    ;   clean) so a host monitor can poll them on any session, FX or instrument.
+    ;   "x.harp.fx_reanchors" => uint   ; §8.8 live-FX re-anchors (sorts between the two
+    ;     above): episodes where an armed FX's wet stayed later than its reported latency
+    ;     for ~250 ms, so the host stopped owing the late wet and let the delay grow rather
+    ;     than drop every block. 0 on a healthy session.
+    ;   All three: additive (tstr x.* key), so no diag-bundle version bump. Always present
+    ;   (0 = clean) so a host monitor can poll them on any session, FX or instrument.
 }
 
 ; --- session state-machine history (§12.1) ---

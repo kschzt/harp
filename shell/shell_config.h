@@ -71,4 +71,36 @@
  * HARP_SHELL_ETHERNET_ONLY (optional): if defined, the shell never claims a USB
  * device (a network-only product). Undefined (default) = USB + network. */
 
+/* ---------------- the §8.8 FX shell (shell/fx_plugin.cpp) ----------------
+ * The effect sibling of the instrument shell, configured the same way. The DEFAULTS
+ * are harp's example effect (examples/fx-filter, a resonant lowpass); an effect
+ * product overrides them from its HARP_SHELL_CONFIG_HEADER (build it with
+ * -DHARP_SHELL_VARIANT_KIND=fx, see tools/vst3-host/CMakeLists.txt). */
+#ifndef HARP_FX_SHELL_PLUGIN_NAME
+#define HARP_FX_SHELL_PLUGIN_NAME "HARP FX Filter"
+#endif
+/* VST3 subcategory string (Steinberg::Vst::PlugType, e.g. "Fx|Filter", "Fx|Reverb") */
+#ifndef HARP_FX_SHELL_CATEGORY
+#define HARP_FX_SHELL_CATEGORY "Fx|Filter"
+#endif
+/* class UIDs — DISTINCT per product, NEVER changed once shipped */
+#ifndef HARP_FX_SHELL_PROC_FUID
+#define HARP_FX_SHELL_PROC_FUID 0x7E196137, 0x1BA84D04, 0xAA65F399, 0xFC2F691E
+#endif
+#ifndef HARP_FX_SHELL_CTRL_FUID
+#define HARP_FX_SHELL_CTRL_FUID 0x76254C06, 0x33AC4576, 0xAE6E0650, 0x3CF61F48
+#endif
+/* The device parameter table, same {id, name, stepCount, defaultVal, labels} shape as
+ * HARP_SHELL_PARAMS. MUST mirror the effect device's param map (ids + defaults) so
+ * automation lands on the right param and recall stays sane. */
+#ifndef HARP_FX_SHELL_PARAMS
+#define HARP_FX_SHELL_PARAMS \
+    {1, "Cutoff", 0, 0.7, nullptr}, {2, "Resonance", 0, 0.2, nullptr}
+#endif
+/* The device input slots the track audio is sent on (audio.start key 3): `0, 1` =
+ * stereo (L on slot 0, R on slot 1), `0` = mono (the shell sums L+R). At most 2. */
+#ifndef HARP_FX_SHELL_IN_SLOTS
+#define HARP_FX_SHELL_IN_SLOTS 0, 1
+#endif
+
 #endif /* HARP_SHELL_CONFIG_H */

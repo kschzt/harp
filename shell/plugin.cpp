@@ -28,6 +28,7 @@
 #include "public.sdk/source/vst/vsteditcontroller.h"
 
 #include "note_voice_map.h"
+#include "param_automation.h"
 #include "runtime.h"
 #include "runtime_registry.h"
 #include "shell_config.h" /* per-product identity/params/device-filter (default = refdev) */
@@ -54,9 +55,9 @@ struct DevParam {
     const char *labels; /* nullptr, or "A|B|C" enum labels (stepCount+1 of them) */
 };
 /* The refdev default set lives in shell_config.h's HARP_SHELL_PARAMS (a downstream
- * product overrides it). It MUST mirror the device's contiguous 1..12 ids (engine
- * 2.1.0: the drone's old id 7 / phantom "FX Send" is gone, the set renumbered with
- * no hole) so id == array index + 1 holds — see process()'s inputParameterChanges. */
+ * product overrides it). It MUST mirror the device's param ids + defaults (engine
+ * 2.1.0: contiguous 1..12 — the drone's old id 7 / phantom "FX Send" is gone). process()
+ * resolves a host param id to its table slot by lookup (ParamAutomation::slotOf). */
 static const DevParam kParams[] = { HARP_SHELL_PARAMS };
 static constexpr int kNumParams = sizeof(kParams) / sizeof(kParams[0]);
 #ifdef HARP_SHELL_ENGINE_TABLES
@@ -109,7 +110,16 @@ static void meterParamName(uint32_t id, char *buf, size_t n) {
 
 class HarpProcessor : public AudioEffect {
 public:
-    HarpProcessor() { setControllerClass(kHarpControllerUID); }
+    HarpProcessor() {
+        setControllerClass(kHarpControllerUID);
+        uint32_t ids[kNumParams];
+        float defs[kNumParams];
+        for (int i = 0; i < kNumParams; i++) {
+            ids[i] = kParams[i].id;
+            defs[i] = (float)kParams[i].defaultVal;
+        }
+        automation_.init(ids, defs, kNumParams);
+    }
 
     /* Defensive teardown: the host calls setActive(false) before destroying us
      * (which resets rt_), but if it doesn't, tear down here so the private
@@ -396,52 +406,11 @@ public:
             }
         }
 
-        /* §15.5 offline editing: replay edits made while the device was ABSENT, on the
-         * device's RECONNECT edge — "a mismatch resolved by Push". The apply loop records
-         * curVal_ for every param and flags dirtyOffline_ for ones edited during an offline
-         * gap; here we replay ONLY those, ONLY on a TRUE reconnect (everConnected_), AFTER
-         * sessionUp drained the stale event ring (connected_ flips true only then). The FIRST
-         * connect replays NOTHING — sessionUp's bundle + the live flow carry the initial
-         * state, so the goldens/recall stay byte-untouched (a blind replay-all-on-connect
-         * here clobbered recalled state with defaults — the bug this guards). */
-        if (!curValInit_) {
-            for (size_t i = 0; i < kNumParams; i++) curVal_[i] = kParams[i].defaultVal;
-            curValInit_ = true;
-        }
-        bool nowConn = rt.connected();
-        if (nowConn && !wasConnected_) {
-            if (everConnected_)
-                for (size_t i = 0; i < kNumParams; i++)
-                    if (dirtyOffline_[i]) {
-                        rt.queueParamSet(source_, (uint32_t)i + 1, curVal_[i], 0);
-                        dirtyOffline_[i] = false;
-                    }
-            everConnected_ = true;
-        }
-        wasConnected_ = nowConn;
-
-        /* parameter changes -> timestamped sets; consecutive points become
-         * §9.4 ramps — a DAW curve as a handful of ramps (§9.1). Thinned to
-         * one emission per param per 256 samples: at 64-sample buffers a
-         * DAW sends ~750 points/s/param, and ramps spanning 64 samples say
-         * nothing a 256-sample ramp doesn't (the device interpolates at
-         * control rate regardless). Skipped points fold into the next
-         * ramp's target; a pend with no successor flushes below. */
-        for (size_t idx = 0; idx < kNumParams; idx++) {
-            /* Flush a pending fold only when the gesture is OVER — no
-             * successor point for a full pacing block. Flushing one DAW
-             * block after the fold (the original logic) emitted 64-sample
-             * ramps whose END was already at "now": ~1100/s of
-             * guaranteed-stale timestamps at 64-sample buffers (measured;
-             * invisible at >= 256 where folding never triggers). The pend
-             * holds a gesture's final settling value; a "now" set delivers
-             * it without inventing a timestamp the stream already passed. */
-            if (pendHas_[idx] && base >= pendTs_[idx] + 256) {
-                rt.queueParamSet(source_, (uint32_t)idx + 1, pendVal_[idx], 0);
-                lastTs_[idx] = pendTs_[idx];
-                pendHas_[idx] = false;
-            }
-        }
+        /* DAW automation -> §9.4 events: consecutive points become ramps (thinned
+         * to one per param per 256 samples), and params edited while the device was
+         * absent replay on its reconnect edge (§15.5). The policy is shared with the
+         * FX shell — shell/param_automation.h. */
+        automation_.beginBlock(rt, source_, base);
         if (data.inputParameterChanges) {
             int32 nq = data.inputParameterChanges->getParameterCount();
             for (int32 i = 0; i < nq; i++) {
@@ -449,7 +418,7 @@ public:
                 if (!q) continue;
                 uint32_t id = (uint32_t)q->getParameterId();
                 int32 np = q->getPointCount();
-                size_t idx = (id >= 1 && id <= kNumParams) ? id - 1 : SIZE_MAX;
+                size_t idx = automation_.slotOf(id);
                 for (int32 k = 0; k < np; k++) {
                     int32 off;
                     ParamValue v;
@@ -472,23 +441,7 @@ public:
                         rt.queueParamSet(source_, id, (float)v, ts);
                         continue;
                     }
-                    curVal_[idx] = (float)v;                                   /* §15.5: track current value */
-                    if (everConnected_ && !nowConn) dirtyOffline_[idx] = true; /* edited during an offline gap -> replay on reconnect */
-                    if (hasLast_[idx] && ts > lastTs_[idx] && ts - lastTs_[idx] < 256) {
-                        pendHas_[idx] = true; /* too soon: fold into next ramp */
-                        pendTs_[idx] = ts;
-                        pendVal_[idx] = (float)v;
-                        continue;
-                    }
-                    bool ramp = hasLast_[idx] && ts > lastTs_[idx] &&
-                                ts - lastTs_[idx] <= 4800; /* >100 ms gap = a jump */
-                    if (ramp)
-                        rt.queueRamp(source_, id, (float)v, lastTs_[idx], ts);
-                    else
-                        rt.queueParamSet(source_, id, (float)v, ts);
-                    lastTs_[idx] = ts;
-                    hasLast_[idx] = true;
-                    pendHas_[idx] = false;
+                    automation_.point(rt, source_, idx, (float)v, ts);
                 }
             }
         }
@@ -726,23 +679,9 @@ private:
      * (noteId -> voice key) is shared with the CLAP shell — note_voice_map.h. */
     NoteVoiceMap noteVoices_;
     bool offline_ = false;
-    /* per-param ramp-synthesis state: last emitted point + pending folded
-     * point awaiting the 256-sample thinning interval */
-    uint64_t lastTs_[kNumParams] = {};
-    bool hasLast_[kNumParams] = {};
-    bool pendHas_[kNumParams] = {};
-    uint64_t pendTs_[kNumParams] = {};
-    float pendVal_[kNumParams] = {};
-    /* §15.5 offline editing: the current value of each device param, recorded by the apply
-     * loop whether or not a device is connected. On the (re)connect EDGE the process loop
-     * replays these so an edit made while the device was ABSENT reaches it — the host's live
-     * state winning, "a mismatch resolved by Push" (§11.4). Seeded to the device defaults so
-     * an unedited param re-asserts its true value (idempotent). */
-    float curVal_[kNumParams];
-    bool curValInit_ = false;
-    bool wasConnected_ = false;
-    bool everConnected_ = false;         /* gate: replay only on a TRUE reconnect, never the first connect */
-    bool dirtyOffline_[kNumParams] = {}; /* params edited during an offline gap — ONLY these get replayed */
+    /* DAW automation -> §9.4 set/ramp events + §15.5 offline-edit replay (shared
+     * with the FX shell). Seeded from kParams in the constructor. */
+    ParamAutomation automation_;
 
 
 };

@@ -147,6 +147,33 @@ else()
   endif()
 endif()
 
+# examples/fx-filter: a minimal §8.8 audio.fx EFFECT device — harp-deviced with the refdev's
+# engine.c swapped for a resonant lowpass (examples/fx-filter/README.md). NPARAMS and the
+# engine identity are compile-time constants in the session/state code, so this target
+# compiles the harpdevice sources itself with the example's values instead of linking the
+# refdev-configured library. Transports and platform branches mirror harp-deviced.
+add_executable(harp-fx-filter
+  examples/fx-filter/fx_filter.c # the engine seam: params, event queue, DSP
+  device/state.c device/session.c device/audio_loop.c device/log_ring.c
+  device/harp-deviced.c
+  host/rtp.c host/sock_io.c
+  ${HARP_PLAT_SRC})
+target_compile_definitions(harp-fx-filter PRIVATE
+  NPARAMS=2 ENGINE_ID="fx-filter" ENGINE_VERSION="1.0.0" DEVICE_PRODUCT="harp-fx-filter")
+target_include_directories(harp-fx-filter PRIVATE device host)
+target_link_libraries(harp-fx-filter harpcore ${HARP_MATH_LIB} ${HARP_PLAT_LIBS})
+if(WIN32)
+  target_sources(harp-fx-filter PRIVATE device/panel_stub_win.c)
+  target_link_libraries(harp-fx-filter ws2_32)
+else()
+  find_package(Threads REQUIRED)
+  target_sources(harp-fx-filter PRIVATE device/panel.c)
+  target_link_libraries(harp-fx-filter Threads::Threads)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(harp-fx-filter PRIVATE device/ffs.c device/ffs_link.c)
+  endif()
+endif()
+
 # debt #19: the DEVICE engine-render golden (cloud-gated). Links the refdev engine seam
 # (engine.c render_output / engine_voices_cold / evq_*) DIRECTLY — no shell, no transport, no USB —
 # so the raw synth DSP is pinned in cloud CI, not only on the hw rig. See scripts/engine-golden-test.sh.

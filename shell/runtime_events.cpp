@@ -59,7 +59,7 @@ void EventManager::queueParamSet(EventSource *src, uint32_t id, float v, uint64_
     uint8_t ch = (channel == kChanFromSource)
                      ? (uint8_t)(src->chan.load(std::memory_order_relaxed) & 0xf)
                      : (uint8_t)(channel & 0xf);
-    if (src->ring.push({0, id, v, ts, 0, ch}))
+    if (src->ring.push({0, id, v, ts, 0, ch, domainTag_.load(std::memory_order_relaxed)}))
         evtQueuedSeq_.fetch_add(1, std::memory_order_release);
     else
         evDrops_.fetch_add(1, std::memory_order_relaxed);
@@ -70,14 +70,14 @@ void EventManager::queueRamp(EventSource *src, uint32_t id, float target, uint64
     uint8_t ch = (channel == kChanFromSource)
                      ? (uint8_t)(src->chan.load(std::memory_order_relaxed) & 0xf)
                      : (uint8_t)(channel & 0xf);
-    if (src->ring.push({1, id, target, start, end, ch}))
+    if (src->ring.push({1, id, target, start, end, ch, domainTag_.load(std::memory_order_relaxed)}))
         evtQueuedSeq_.fetch_add(1, std::memory_order_release);
     else
         evDrops_.fetch_add(1, std::memory_order_relaxed);
 }
 void EventManager::queueNote(EventSource *src, uint32_t word, uint64_t ts) {
     if (!src) return;
-    if (src->ring.push({2, word, 0.0f, ts, 0})) {
+    if (src->ring.push({2, word, 0.0f, ts, 0, 0, domainTag_.load(std::memory_order_relaxed)})) {
         evtQueuedSeq_.fetch_add(1, std::memory_order_release);
     } else {
         evDrops_.fetch_add(1, std::memory_order_relaxed);
@@ -100,7 +100,7 @@ void EventManager::queueMod(EventSource *src, uint32_t id, float offset,
      * derives its part from the voice key (encodeModEvent), a part-wide mod (voice 0)
      * uses this channel, byte-identical to the prior src.chan path. */
     uint8_t ch = (uint8_t)(src->chan.load(std::memory_order_relaxed) & 0xf);
-    if (src->ring.push({4, id, offset, ts, voice, ch}))
+    if (src->ring.push({4, id, offset, ts, voice, ch, domainTag_.load(std::memory_order_relaxed)}))
         evtQueuedSeq_.fetch_add(1, std::memory_order_release);
     else
         evDrops_.fetch_add(1, std::memory_order_relaxed);
@@ -115,7 +115,7 @@ void EventManager::queueTransport(EventSource *src, uint32_t flags, double tempo
     (void)src;
     uint64_t ppqBits;
     memcpy(&ppqBits, &ppq, sizeof ppqBits);
-    if (ownerSource_.ring.push({3, flags, (float)tempo, ts, ppqBits}))
+    if (ownerSource_.ring.push({3, flags, (float)tempo, ts, ppqBits, 0, domainTag_.load(std::memory_order_relaxed)}))
         evtQueuedSeq_.fetch_add(1, std::memory_order_release);
     else
         evDrops_.fetch_add(1, std::memory_order_relaxed);
@@ -254,7 +254,19 @@ int EventManager::drainOwner(harp_cbuf &batch, harp_cbuf &msgbuf, int budget) {
      * byte-identical (its events all carry src.chan). Notes carry their channel in the UMP word. */
     TimedEv te;
     int sent = 0;
+    const uint32_t curTag = expectedTag_.load(std::memory_order_acquire);
     for (; sent < budget && ownerSource_.ring.pop(te); sent++) {
+        /* §8.8: an event stamped in another SSI domain (an effect's audio thread computed its
+         * timestamp before adopting the CURRENT session — the one sessionUp set as expected,
+         * whether or not the audio thread has adopted it yet) cannot keep its timestamp —
+         * the audio it accompanied was discarded with that domain. Deliver it "now" (ts 0),
+         * a ramp as a set of its target, so the value still lands. It is still SENT, so the
+         * §8.3.1 fence count stays exact. Untagged (the instrument): never touched. */
+        if (te.tag && te.tag != curTag) {
+            if (te.kind == 1) te.kind = 0;
+            te.ts = 0;
+            staleRestamped_.fetch_add(1, std::memory_order_relaxed);
+        }
         harp_cbuf_reset(&msgbuf);
         if (te.kind == 0)
             encodeParamEvent(&msgbuf, te.a, te.v, te.ts, te.channel);
@@ -307,6 +319,9 @@ void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t
         roWrDrops_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    /* §8.8: an effect's event can never reach into audio the feeder may already pace — a
+     * "now" (ts 0) or a stale timestamp lands on the automation horizon (fxClampTs) */
+    if (fxArmed()) ts = fxClampTs(ts);
     events_.queueParamSet(src, id, v, ts, channel);
 }
 void HarpRuntime::queueRamp(EventSource *src, uint32_t id, float target, uint64_t start,
@@ -316,6 +331,10 @@ void HarpRuntime::queueRamp(EventSource *src, uint32_t id, float target, uint64_
         roExplicit_.load(std::memory_order_relaxed)) {
         roWrDrops_.fetch_add(1, std::memory_order_relaxed);
         return;
+    }
+    if (fxArmed()) { /* §8.8: a ramp starting before the horizon starts ON it (see above) */
+        start = fxClampTs(start);
+        if (end < start) end = start;
     }
     events_.queueRamp(src, id, target, start, end, channel);
 }

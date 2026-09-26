@@ -20,6 +20,7 @@
 #endif
 
 #include "runtime_registry.h" /* runtime_acquire() — the no-device construction seam */
+#include "fx_late_guard.h"
 #include "runtime.h"          /* HarpRuntime, EventSource, queue*, setStateBundle */
 #include "ring.h"             /* TimedEv, TimedRing — the host-free observable */
 #include "note_voice_map.h"   /* NoteVoiceMap */
@@ -312,6 +313,15 @@ static void test_fx_never_silent() {
         for (size_t i = 0; bundle.size() >= nl && i + nl <= bundle.size(); i++)
             if (memcmp(bundle.data() + i, needle, nl) == 0) { found = true; break; }
         CHECK(found);
+        /* its §8.8 sibling, the live-FX re-anchor count: present, and 0 — the late
+         * guard only acts on a CONNECTED live stream, never on this device-less one */
+        const char *reanchor = "x.harp.fx_reanchors";
+        size_t rl = strlen(reanchor);
+        found = false;
+        for (size_t i = 0; bundle.size() >= rl && i + rl <= bundle.size(); i++)
+            if (memcmp(bundle.data() + i, reanchor, rl) == 0) { found = true; break; }
+        CHECK(found);
+        CHECK(rt->fxReanchors() == 0);
     }
 
     /* (b1) NO FALSE POSITIVE — a working device: non-silent input AND non-silent wet ->
@@ -394,6 +404,118 @@ static void test_fx_never_silent() {
  *    call the reader() eth loop makes per receive poll — so it is socket-free and
  *    hardware-free. silentMs is a parameter, so the ~1 s window is crossed instantly with
  *    a synthetic value (no real waiting). The default window is 1000 ms (rtpSilentWindowMs_). */
+/* 8. §8.8 live-FX late guard POLICY (shell/fx_late_guard.h, pure). The runtime holds an
+ *    armed FX's wet exactly its reported latency behind the input; this decides when a
+ *    wet that stays late must re-anchor instead of being dropped forever. The property the
+ *    eth test cannot pin deterministically (it runs against a wall clock): a TRANSIENT
+ *    hiccup never re-anchors, however often it recurs — only an unbroken window of owed
+ *    late wet does, exactly once per window — and a disconnected stream never does. */
+static void test_fx_late_guard_policy() {
+    const uint64_t kWin = 12000; /* 250 ms at 48 kHz, as the runtime uses (rate_/4) */
+    const size_t kBlk = 256;
+    uint64_t run = 0;
+    /* (a) transient: debt owed for 200 ms, then paid back, repeated 20x -> never fires */
+    int fired = 0;
+    for (int rep = 0; rep < 20; rep++) {
+        for (size_t f = 0; f < 9600; f += kBlk) fired += fxLateStep(run, true, true, kBlk, kWin);
+        fired += fxLateStep(run, false, true, kBlk, kWin); /* the late wet landed: debt clear */
+    }
+    CHECK(fired == 0);
+    CHECK(run == 0);
+    /* (b) persistent: owed without a break -> fires once per full window, not per block */
+    run = 0;
+    fired = 0;
+    size_t firstAt = 0;
+    for (size_t f = 0; f < 3 * kWin; f += kBlk)
+        if (fxLateStep(run, true, true, kBlk, kWin) && ++fired == 1) firstAt = f + kBlk;
+    CHECK(fired == 2 || fired == 3);          /* 3 windows of pulls, 256-frame granularity */
+    CHECK(firstAt >= kWin && firstAt < kWin + kBlk); /* at the window, not a block early/late */
+    /* (c) disconnected: owed but no session -> never fires, and the run restarts */
+    run = 0;
+    fired = 0;
+    for (size_t f = 0; f < 3 * kWin; f += kBlk) fired += fxLateStep(run, true, false, kBlk, kWin);
+    CHECK(fired == 0);
+    CHECK(run == 0);
+    /* (d) a single clean pull in the middle of a late stretch restarts the window */
+    run = 0;
+    for (size_t f = 0; f < kWin - kBlk; f += kBlk) CHECK(!fxLateStep(run, true, true, kBlk, kWin));
+    CHECK(!fxLateStep(run, false, true, kBlk, kWin));
+    CHECK(!fxLateStep(run, true, true, kBlk, kWin));
+    CHECK(run == kBlk);
+}
+
+/* 9. §8.8 SSI-domain tags (review A): an event stamped in an older domain — queued after
+ *    sessionUp drained the ring but before the audio thread adopted the new session — must
+ *    be delivered "now" (ts 0, a ramp as a set) and still SENT (the §8.3.1 fence counts
+ *    it); an event of the expected domain, and any untagged (instrument) event, keep their
+ *    timestamps. Drives EventManager directly: no runtime, no wire. */
+static void test_fx_event_domain_restamp() {
+    const uint64_t kOldTs = 28000000; /* an old-domain SSI (minutes into the previous session) */
+    auto has_ts = [](const harp_cbuf &b, uint64_t ts) { /* CBOR uint32 encoding of ts present? */
+        uint8_t enc[5] = {0x1a, (uint8_t)(ts >> 24), (uint8_t)(ts >> 16), (uint8_t)(ts >> 8), (uint8_t)ts};
+        for (size_t i = 0; i + 5 <= b.len; i++)
+            if (memcmp(b.buf + i, enc, 5) == 0) return true;
+        return false;
+    };
+    for (int kase = 0; kase < 3; kase++) {
+        EventManager em;
+        uint32_t tag = kase == 0 ? 2 : (kase == 1 ? 3 : 0); /* 0: untagged (instrument) */
+        if (tag) em.setDomainTag(tag);
+        em.setExpectedTag(3); /* the current session expects tag 3 */
+        em.queueParamSet(em.ownerSource(), 1, 0.25f, kOldTs, EventManager::kChanFromSource);
+        em.queueRamp(em.ownerSource(), 2, 0.75f, kOldTs, kOldTs + 256, EventManager::kChanFromSource);
+        CHECK(em.fenceStamp() == 2);
+        harp_cbuf batch, msg;
+        harp_cbuf_init(&batch);
+        harp_cbuf_init(&msg);
+        CHECK(em.drainOwner(batch, msg, 64) == 2); /* both SENT in every case */
+        if (kase == 0) { /* older domain: re-stamped, no old timestamp on the wire */
+            CHECK(em.staleRestamped() == 2);
+            CHECK(!has_ts(batch, kOldTs));
+        } else {         /* expected domain / untagged: untouched */
+            CHECK(em.staleRestamped() == 0);
+            CHECK(has_ts(batch, kOldTs));
+        }
+        harp_cbuf_free(&batch);
+        harp_cbuf_free(&msg);
+    }
+}
+
+/* 10. §8.8 live pull stream order (review B + item 13): after the audio thread adopts a new
+ *     session, ssiRead_ restarts at 0 (it was left mid-old-domain) and an input gap recorded
+ *     at SSI 100 (50 dropped input frames) plays 50 frames of silence exactly there — the
+ *     wet before it and after it keep their SSIs. Synthetic wet in audioRing_, no device. */
+struct HarpRuntimeTestPeer {
+    static void run() {
+        std::unique_ptr<HarpRuntime> rt = runtime_acquire();
+        rt->configure(48000, 256);
+        rt->setFxInputSlots({0, 1});
+        rt->ssiRead_.store(12345); /* the old domain's position, where sessionUp left it */
+        rt->sessionGen_.store(1);  /* a session came up (supervisor) */
+        CHECK(rt->fxBeginBlock()); /* ...and the audio thread adopts it */
+        CHECK(!rt->fxBeginBlock());
+        CHECK(rt->ssiRead_.load() == 0);
+        CHECK(rt->fxWetDelay() == rt->fxLatencySamples());
+        rt->fxPreroll_ = 0; /* look at the wet itself, not the pre-roll before it */
+        rt->fxGaps_[0] = {100, 50};
+        rt->fxGapN_ = 1;
+        float wet[2 * 300];
+        for (int i = 0; i < 300; i++) wet[2 * i] = wet[2 * i + 1] = (float)(i + 1); /* SSI i -> i+1 */
+        rt->audioRing_.write(wet, 2 * 300);
+        float out[2 * 350];
+        rt->pullAudio(out, 350);
+        bool ok = true;
+        for (int f = 0; f < 350; f++) {
+            float want = f < 100 ? (float)(f + 1) : (f < 150 ? 0.0f : (float)(f - 50 + 1));
+            if (out[2 * f] != want || out[2 * f + 1] != want) ok = false;
+        }
+        CHECK(ok);
+        CHECK(rt->fxGapN_ == 0);
+        CHECK(rt->ssiRead_.load() == 300); /* gap silence consumes no SSI */
+    }
+};
+static void test_fx_pull_gap_and_rebase() { HarpRuntimeTestPeer::run(); }
+
 static void test_rtp_never_silent() {
     const unsigned kWinMs = 1000; /* rtpSilentWindowMs_ default */
     const unsigned kStall = kWinMs + 500; /* a silentMs past the window => a real stall */
@@ -510,6 +632,9 @@ int main() {
     test_note_voice_map();
     test_setstatebundle_rejection();
     test_fx_never_silent();
+    test_fx_late_guard_policy();
+    test_fx_event_domain_restamp();
+    test_fx_pull_gap_and_rebase();
     test_rtp_never_silent();
 
     return check_report("harp-runtime-units-tests");

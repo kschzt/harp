@@ -492,12 +492,43 @@ void HarpRuntime::feeder() {
          * returns WET. Not armed (the instrument) => fxCols==0 => the byte-identical
          * slots=0 pacing frame, no payload, no input gate. */
         const size_t fxCols = fxArmed() ? fxInSlots_.size() : 0;
-        while (ringFrames < (size_t)targetFrames_ && inFlight < ahead_ &&
-               ssi_ + kBlock <= frontierCap) {
+        /* §8.8: pace an effect's input only once the audio thread has adopted THIS session's
+         * domain (fxBeginBlock published fxInBase_, then fxAdoptedGen_), and never input from
+         * before it — discard the ring below the base (this thread is the ring's consumer). */
+        bool fxReady = false;
+        if (fxCols) {
+            fxReady = fxAdoptedGen_.load(std::memory_order_acquire) ==
+                      sessionGen_.load(std::memory_order_acquire);
+            if (fxReady) {
+                size_t base = fxInBase_.load(std::memory_order_relaxed);
+                float scratch[1024];
+                while (fxInRing_->readIndex() < base) {
+                    size_t stale = base - fxInRing_->readIndex();
+                    fxInRing_->read(scratch, stale < 1024 ? stale : 1024);
+                }
+            }
+            uint64_t dropped = fxInDropped_.load(std::memory_order_relaxed);
+            if (dropped != fxInDroppedLogged_) {
+                log_msg("WARNING: %llu FX input frames dropped (input ring overflow) — their wet is "
+                        "replaced by silence in place", (unsigned long long)(dropped - fxInDroppedLogged_));
+                fxInDroppedLogged_ = dropped;
+            }
+        }
+        /* §8.8: an effect's pacing is bounded by its INPUT (the gate below) — and that
+         * gate is also its event-timing guarantee: a block's events are queued before its
+         * input is written, so they can never be born into an already-paced range. The
+         * instrument's ring-fill + frontier caps do not apply: the effect's ring
+         * deliberately holds the wet for its fixed latency (fxLatencySamples), and
+         * capping pacing on that fill would starve the very wet it is waiting for. */
+        while ((fxCols ? fxReady : (ringFrames < (size_t)targetFrames_ && ssi_ + kBlock <= frontierCap)) &&
+               inFlight < ahead_) {
             /* §8.8: only pace once the track input for this range is in the SPSC
              * ring — this couples the H→D input 1:1 to the D→H wet the reader fills,
              * so dry and wet stay sample-aligned (the lockstep host-paced effect). */
-            if (fxCols && fxInRing_.readAvailable() < kBlock * fxCols) break;
+            if (fxCols && fxInRing_->readAvailable() < kBlock * fxCols) break;
+            /* §8.8: and only up to the automation horizon — this range's events are on the
+             * device before it renders (see fxHorizon_) */
+            if (fxCols && ssi_ + kBlock > fxHorizon_.load(std::memory_order_acquire)) break;
             /* every pacing frame carries the event fence (§8.3.1): the
              * count of events queued so far this session. Any event queued
              * before this instant is guaranteed consumed device-side
@@ -538,7 +569,7 @@ void HarpRuntime::feeder() {
                  * a->fx_in[c]; writeFxInput already interleaved process()'s input
                  * by fxCols, so a straight ring read fills the payload in column
                  * order. The availability gate above guarantees a full block. */
-                fxInRing_.read((float *)(ph + frameLen), (size_t)kBlock * fxCols);
+                fxInRing_->read((float *)(ph + frameLen), (size_t)kBlock * fxCols);
                 frameLen += (size_t)kBlock * fxCols * 4;
             }
             if (!transport_->audioWrite(ph, (int)frameLen, 8)) break;

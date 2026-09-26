@@ -241,12 +241,12 @@ if(LIBUSB_FOUND)
   message(STATUS "harp-shell: building VST3 shell with libusb")
 
   # ---- the HARP FX shell (shell/fx_plugin.cpp) — §8.8 audio.fx EFFECT variant ----
-  # A SEPARATE VST3 (its own factory + frozen UIDs, category kFxReverb) built from
-  # the SAME embedded HarpRuntime as the instrument shell. The ONLY source difference
-  # is fx_plugin.cpp in place of plugin.cpp: it adds a stereo INPUT bus and opts in to
-  # the runtime's §8.8 host->device input path (setFxInputSlots/writeFxInput) to route
-  # the track audio H->D to an `audio.fx` device (harp-fx-deviced) and return the wet.
-  # The instrument shell (plugin.cpp) and its golden test are untouched.
+  # A SEPARATE VST3 (its own factory + frozen UIDs) built from the SAME embedded
+  # HarpRuntime as the instrument shell. The ONLY source difference is fx_plugin.cpp in
+  # place of plugin.cpp: it adds a stereo INPUT bus and opts in to the runtime's §8.8
+  # host->device input path (setFxInputSlots/writeFxInput) to route the track audio H->D
+  # to an `audio.fx` device and return the wet. Its identity + param map default to the
+  # examples/fx-filter device (shell_config.h HARP_FX_SHELL_*).
   smtg_add_vst3plugin(harp-fx-shell
     ${SHELL_MAIN}
     ${HARP_ROOT}/shell/fx_plugin.cpp
@@ -554,12 +554,20 @@ if(LIBUSB_FOUND)
   #   -DHARP_SHELL_VARIANT_CONFIG=<config.h>  (header #defining HARP_SHELL_* macros)
   #   [-DHARP_SHELL_VARIANT_INCDIR=<dir>]     (dir of that header, on the include path)
   #   [-DHARP_SHELL_VARIANT_BUNDLE=<name>]    (installed bundle dir, default = NAME)
+  #   [-DHARP_SHELL_VARIANT_KIND=fx]          (an EFFECT: build the §8.8 FX shell, fx_plugin.cpp,
+  #                                            configured by the header's HARP_FX_SHELL_* macros;
+  #                                            default = the instrument shell, plugin.cpp)
   # The config header lives OUTSIDE this repo, so harp carries no product-specific
   # strings — only this generic mechanism + the refdev default in shell_config.h.
   if(HARP_SHELL_VARIANT_NAME AND HARP_SHELL_VARIANT_CONFIG)
+    if(HARP_SHELL_VARIANT_KIND STREQUAL "fx")
+      set(HARP_SHELL_VARIANT_SRC ${HARP_ROOT}/shell/fx_plugin.cpp)
+    else()
+      set(HARP_SHELL_VARIANT_SRC ${HARP_ROOT}/shell/plugin.cpp)
+    endif()
     smtg_add_vst3plugin(${HARP_SHELL_VARIANT_NAME}
       ${SHELL_MAIN}
-      ${HARP_ROOT}/shell/plugin.cpp ${HARP_SHELL_SRC}
+      ${HARP_SHELL_VARIANT_SRC} ${HARP_SHELL_SRC}
       ${HARP_ROOT}/host/usb_io.c ${HARP_ROOT}/host/sock_io.c ${HARP_ROOT}/host/rtp.c
       ${HARP_ROOT}/host/freerun.c ${HARP_ROOT}/host/client.c
       ${HARP_CORE_SRC}

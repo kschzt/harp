@@ -61,14 +61,25 @@ if [ -z "${FENCE:-}" ]; then
   elif [ -x "./build-dev/harp-eth-fence-test.exe" ]; then FENCE="./build-dev/harp-eth-fence-test.exe"
   else FENCE="$(find1 . "harp-eth-fence-test$EXE")"; fi
 fi
-export DEVICED HOSTBIN VHOST CHOST PROBE FENCE
+# §8.8 FX: the examples/fx-filter effect device + the FX shell that drives it (fx-filter test).
+if [ -z "${FXDEVICED:-}" ]; then
+  if   [ -x "./build/harp-fx-filter" ];         then FXDEVICED="./build/harp-fx-filter"
+  elif [ -x "./build-dev/harp-fx-filter.exe" ]; then FXDEVICED="./build-dev/harp-fx-filter.exe"
+  else FXDEVICED="$(find1 . "harp-fx-filter$EXE")"; fi
+fi
+[ -n "${FXPLUG:-}" ] || FXPLUG="$(find build-vst -maxdepth 5 -name harp-fx-shell.vst3 -type d 2>/dev/null | head -1)"
+export DEVICED HOSTBIN VHOST CHOST PROBE FENCE FXDEVICED FXPLUG
 
 have() { [ -n "${1:-}" ] && [ -x "$1" ]; }
+# a VST3 bundle DIRECTORY is laid out at CMake configure time; only a BUILT one carries the
+# module binary (Contents/<arch>/<name>[.so|.vst3]) — so test for the binary, not the dir.
+vst3_built() { [ -n "${1:-}" ] && [ -d "$1" ] && find "$1/Contents" -type f -name "$(basename "$1" .vst3)*" 2>/dev/null | grep -q .; }
 
 echo "── eth-suite on $OSID"
 echo "   DEVICED=$DEVICED"
 echo "   HOSTBIN=$HOSTBIN"
 echo "   CHOST=$CHOST"
+echo "   FXDEVICED=${FXDEVICED:-<none>}  FXPLUG=${FXPLUG:-<none>}"
 echo "   PROBE=${PROBE:-<none>}  $(have "$PROBE" && echo '(present)' || echo '(absent — probe tests skip)')"
 
 # ---- EXTERNAL-ENDPOINT MODE gate (capability-based, exactly like the per-OS / probe skips) ---
@@ -101,7 +112,7 @@ extern_reason() {
     ratelimit) echo "needs --force-peer-ip on a harness-started deviced (§16 shed seam)";;
     param-map-recall) echo "restarts the deviced with a mutated param-map to force §13.4 drift";;
     credit) echo "needs HARP_FORCE_CREDIT_GRANT in the DEVICE process env (a harness-started daemon)";;
-    recall|archive-before-push|bloat-recall|gc|offline-edit)
+    recall|archive-before-push|bloat-recall|gc|offline-edit|fx-filter)
       echo "mutates/inspects the device store — needs a harness-owned fresh device state-dir";;
     diag-bundle) echo "device-side harp-probe bundle needs a harness-owned state-dir; diag-bundle-host covers §8.3 counters over the real hop";;
     diag-counters) echo "storage-gauge bounds need a harness-owned state-dir; diag-bundle-host covers the §14.2 counters over the real hop";;
@@ -199,6 +210,14 @@ else skip realtime-fence "harp-eth-fence-test not built"; fi
 # until the Windows panel transport lands.
 if [ "$OSID" = windows ]; then skip part-filter "MinGW device panel is a stub (§9.4 multi-instance demux pending Windows panel transport)"
 else run part-filter    scripts/part-filter-eth-test.sh; fi
+
+# §8.8 audio.fx: the examples/fx-filter EFFECT device through the FX shell — H->D track audio
+# in / wet out, automation (ramps, sample-accurate relative to the audio, zero late), exact
+# recall with archive, and (POSIX) the front-panel echo. Needs the fx device + FX shell + probe.
+if ! have "$FXDEVICED"; then skip fx-filter "harp-fx-filter not built on $OSID"
+elif ! vst3_built "$FXPLUG"; then skip fx-filter "harp-fx-shell.vst3 not built on $OSID"
+elif ! have "$PROBE"; then skip fx-filter "harp-probe not built on $OSID"
+else run fx-filter      scripts/fx-filter-eth-test.sh; fi
 
 # MULTI-OUT (M1): the Kontakt/Overbridge-style multi-out main — one VST3 instance, 17 output
 # buses. Per-part zero-bleed isolation over free-running RTP (the wide-union >8-slot

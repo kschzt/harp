@@ -29,7 +29,8 @@
 #   scripts/cert-harness.sh            run the cloud subset, print the report
 #   DRY_RUN=1 scripts/cert-harness.sh  print the run/skip plan for this host and exit 0
 #   CERT_TIMEOUT=180 scripts/...       per-test wall-clock cap in seconds (default 300)
-#   DEVICED=… PROBE=… HOSTBIN=… CHOST=… FENCE=…  override binary locations (else auto-located)
+#   DEVICED=… PROBE=… HOSTBIN=… CHOST=… FENCE=… FXDEVICED=… FXPLUG=…
+#                                      override binary locations (else auto-located)
 #
 # Binaries are auto-located with the SAME convention as eth-suite.sh, so a normal
 #   cmake -B build && cmake --build build -j
@@ -86,7 +87,14 @@ if [ -z "${FENCE:-}" ]; then
   elif [ -x "./build-dev/harp-eth-fence-test.exe" ]; then FENCE="./build-dev/harp-eth-fence-test.exe"
   else FENCE="$(find1 . "harp-eth-fence-test$EXE")"; fi
 fi
-export DEVICED PROBE HOSTBIN VHOST CHOST FENCE
+# §8.8 FX: the examples/fx-filter effect device + the FX shell (the `fx` token)
+if [ -z "${FXDEVICED:-}" ]; then
+  if   [ -x "./build/harp-fx-filter" ];         then FXDEVICED="./build/harp-fx-filter"
+  elif [ -x "./build-dev/harp-fx-filter.exe" ]; then FXDEVICED="./build-dev/harp-fx-filter.exe"
+  else FXDEVICED="$(find1 . "harp-fx-filter$EXE")"; fi
+fi
+[ -n "${FXPLUG:-}" ] || FXPLUG="$(find build-vst -maxdepth 5 -name harp-fx-shell.vst3 -type d 2>/dev/null | head -1)"
+export DEVICED PROBE HOSTBIN VHOST CHOST FENCE FXDEVICED FXPLUG
 
 # a ctest build dir carrying the unit suite (root cmake tree)
 UNIT_DIR=""
@@ -95,6 +103,9 @@ for d in build build-cov build-rel .; do
 done
 
 have() { [ -n "${1:-}" ] && [ -x "$1" ]; }
+# a VST3 bundle DIRECTORY is laid out at CMake configure time; only a BUILT one carries the
+# module binary (Contents/<arch>/<name>[.so|.vst3]) — so test for the binary, not the dir.
+vst3_built() { [ -n "${1:-}" ] && [ -d "$1" ] && find "$1/Contents" -type f -name "$(basename "$1" .vst3)*" 2>/dev/null | grep -q .; }
 
 # requires-token -> "present?" predicate (returns 0 if satisfiable in this lane)
 req_ok() {
@@ -104,6 +115,7 @@ req_ok() {
     host)   have "$HOSTBIN" ;;
     clap)   have "$CHOST" ;;
     fence)  have "$FENCE" ;;
+    fx)     have "$FXDEVICED" && vst3_built "$FXPLUG" ;;
     unit)   [ -n "$UNIT_DIR" ] ;;
     -|"")   true ;;
     *)      false ;;
@@ -115,6 +127,7 @@ req_bin() {
     device) echo harp-deviced ;; probe) echo harp-probe ;;
     host)   echo harp-vst3-host ;; clap) echo clap-host ;;
     fence)  echo harp-eth-fence-test ;; unit) echo "ctest build dir" ;;
+    fx)     echo "harp-fx-filter + harp-fx-shell.vst3" ;;
     *)      echo "$1" ;;
   esac
 }
@@ -216,13 +229,24 @@ for n in $TORDER; do
         # buffer to a per-test capture (keyed by the covering script's basename) so the §17 gate
         # phase can parse the measured numbers; a direct redirect (not a pipe) preserves rc/124.
         caplog="$CAPDIR/$(basename "${rcmd%%[ ]*}").log"
-        if run_bounded "$CERT_TIMEOUT" bash -c "$rcmd" >"$caplog" 2>&1; then
+        # one covering script may index several T's (e.g. fx-filter under T5/T11/T16): run a
+        # given command ONCE per harness invocation and reuse its verdict + capture after that.
+        memo="$CAPDIR/memo-$(printf '%s' "$rcmd" | cksum | cut -d' ' -f1)"
+        if [ -f "$memo.rc" ]; then
+          cp "$memo.log" "$caplog"
+          echo "     (same command already ran for an earlier T this invocation — reusing its result)"
+          rc=$(cat "$memo.rc")
+        else
+          run_bounded "$CERT_TIMEOUT" bash -c "$rcmd" >"$caplog" 2>&1
+          rc=$?
+          echo "$rc" > "$memo.rc"; cp "$caplog" "$memo.log"
+        fi
+        if [ "$rc" -eq 0 ]; then
           cat "$caplog"
           echo "::endgroup::"
           echo "   ✓ PASS  ${cmd##*/}"
           ran_pass=1
         else
-          rc=$?
           cat "$caplog"
           echo "::endgroup::"
           if [ "$rc" = 124 ]; then

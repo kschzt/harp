@@ -49,16 +49,16 @@ jobs:
           fi
           # CBOR decoder for the diag-bundle conformance assertions (rtp-loss host-counters key 8, etc.)
           python3 -m pip install cbor2 || python3 -m pip install --break-system-packages cbor2
-      - name: build device + POSIX eth test tools (harp-deviced + harp-probe + latefr/fence)
+      - name: build device + POSIX eth test tools (harp-deviced + harp-probe + latefr/fence + fx-filter)
         if: runner.os != 'Windows'
         run: |
           cmake -B build -S .
-          cmake --build build --target harp-deviced harp-probe harp-eth-latefr-test harp-eth-fence-test -j
+          cmake --build build --target harp-deviced harp-probe harp-eth-latefr-test harp-eth-fence-test harp-fx-filter -j
       - name: build shell + host (+ AU host on macOS)
         if: runner.os != 'Windows'
         run: |
           cmake -B build-vst -S tools/vst3-host
-          cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host -j
+          cmake --build build-vst --target harp-vst3-host harp-shell harp-fx-shell harp-clap clap-host -j
           if [ "$RUNNER_OS" = "macOS" ]; then
             cmake --build build-vst --target harp-au au-host -j
           fi
@@ -94,7 +94,9 @@ jobs:
           # runs it on the production MinGW binary so the Windows/MinGW libm render is pinned as
           # well — a MinGW-vs-clang DSP divergence can no longer slip past (#116, closes the
           # third-OS gap in the engine-render regression oracle).
-          cmake --build build-dev --target harp-deviced harp-probe harp-device-tests harp-eth-fence-test harp-engine-golden
+          # harp-fx-filter too — the examples/fx-filter §8.8 EFFECT device, so the fx-filter
+          # conformance test (processing/automation/recall) runs on the MinGW device as well.
+          cmake --build build-dev --target harp-deviced harp-probe harp-device-tests harp-eth-fence-test harp-engine-golden harp-fx-filter
           ./build-dev/harp-deviced.exe --bogus 2>&1 | head -3 || true   # smoke: it starts
           ./build-dev/harp-device-tests.exe   # device_codec on the production MinGW binary
           ENGINE_GOLDEN=./build-dev/harp-engine-golden.exe ./scripts/engine-golden-test.sh
@@ -118,7 +120,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           cmake -B build-vst -S tools/vst3-host -G "Visual Studio 17 2022" -A x64
           cmake --build build-vst --config Release `
-            --target harp-vst3-host harp-shell harp-clap clap-host
+            --target harp-vst3-host harp-shell harp-fx-shell harp-clap clap-host
       - name: locate Windows binaries for the suite
         if: runner.os == 'Windows'
         shell: bash
@@ -135,6 +137,7 @@ jobs:
             # fallback; exporting it here guarantees the coverage BY DESIGN (not by a
             # CWD-relative -x probe that could silently regress to "harp-probe not built").
             echo "PROBE=$(find build-dev -name 'harp-probe.exe' | head -1)"
+            echo "FXDEVICED=build-dev/harp-fx-filter.exe"
           } >> "$GITHUB_ENV"
       # §8.7 HIGH #6: the rtp-loss/rtp-reorder "loss MUST be counted, never silently concealed"
       # assertion decodes the diag bundle with python3+cbor2. The suite runs under Git Bash, whose

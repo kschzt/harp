@@ -38,7 +38,12 @@
 
 #define PROTO_MAJOR 1
 #define PROTO_MINOR 0
+/* ENGINE_ID / ENGINE_VERSION / DEVICE_PRODUCT are overridable (-D...) like NPARAMS, so a
+ * downstream daemon that swaps engine.c (e.g. examples/fx-filter) reports its OWN §6.2
+ * engine identity — the §12.2/§13.4 recall gates key on it. Defaults = the refdev. */
+#ifndef ENGINE_ID
 #define ENGINE_ID "refdev-synth"
+#endif
 /* Drone removed: bumped 1.1.0 -> 2.0.0. §6.2/§6.4 name DSP + render contract as
  * version-bearing — every part is note-only now, so stored state that relied on
  * the continuous part-0 drone sounds different (silent until a note plays). The
@@ -55,7 +60,13 @@
  * hole): Master Level 8->7, the arp 9..12 -> 8..11, Glide 13->12. This moves the
  * param-map-hash AGAIN (a fresh §9.3 identity, hence the MINOR bump) but the
  * audio render is UNCHANGED — every value still maps to the same named param. */
+#ifndef ENGINE_VERSION
 #define ENGINE_VERSION "2.1.0"
+#endif
+/* default identity product/model (--product overrides); NULL => "harp-refdev" */
+#ifndef DEVICE_PRODUCT
+#define DEVICE_PRODUCT NULL
+#endif
 #define FW_VERSION "0.1.0"
 #define CREDIT_GRANT (16u << 20)
 #define HARP_SENDQ_CAP 1024 /* §4.2.1 bounded obj-send queue (FIFO of hashes); 1024*33B ≈ 33 KiB */
