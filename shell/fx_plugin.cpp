@@ -30,10 +30,11 @@
  *     host mix control express every ratio"). At mix=1 the dry path is inert, so
  *     the plugin is robust in every host mode.
  *   - the wet trails its input by a CONSTANT, enforced delay — the runtime's
- *     fxLatencySamples(): 255 samples on an offline bounce (one pacing frame, so no
- *     DAW block pattern ever waits on unfinished input), a fixed pipeline depth on a
- *     live insert. The plugin reports exactly that for PDC and delays its local dry
- *     by the same amount, so dry and wet are sample-aligned at every Mix.
+ *     fxLatencySamples(), latched per activation: 255 samples on an offline bounce (one
+ *     pacing frame, so no DAW block pattern ever waits on unfinished input) or the ring
+ *     target + 255 live, plus the device's declared host-paced pipeline when it is
+ *     connected at activation. The plugin reports exactly that for PDC; its dry follows
+ *     the runtime's actual wet delay, so dry and wet are sample-aligned at every Mix.
  */
 #include <atomic>
 #include <cmath>
@@ -207,6 +208,9 @@ public:
             wet_.assign(2 * (size_t)maxBlock_, 0.0f);
             dryBuf_.assign(2 * (size_t)kDryMaxFrames, 0.0f);
             dryW_ = 0;
+            dryD_ = dryPrevD_ = runtime()->fxWetDelay();
+            dryXfade_ = 0;
+            dryPrimed_ = false;
             mixLin_ = mixSm_ = mixTarget_.load(std::memory_order_relaxed);
             mixFresh_ = true; /* the first block STARTS at its first Mix value (no glide) */
         } else {
@@ -371,9 +375,16 @@ public:
          * - Mix automation is sample-accurate: linear between this block's points (VST3
          *   point semantics), from the previous block's value; with no points it heads for
          *   mixTarget_ (a UI edit or a restored state). A 3 ms one-pole de-clicks steps. */
-        uint32_t d = rt.fxWetDelay();
-        if (d >= kDryMaxFrames) d = kDryMaxFrames - 1; /* > 1.3 s of device latency: clamp */
-        if (!nMixPts_) mixPts_[nMixPts_++] = {0, mixTarget_.load(std::memory_order_relaxed)};
+        uint32_t d = rt.fxWetDelay(); /* <= kFxMaxWetDelay < kDryMaxFrames (the runtime caps it) */
+        if (d >= kDryMaxFrames) d = kDryMaxFrames - 1;
+        if (d != dryD_) { /* the wet's delay changed (new session, re-anchor): crossfade the */
+            dryPrevD_ = dryD_; /* dry's read point over kDryXfade samples instead of jumping */
+            dryD_ = d;
+            dryXfade_ = dryPrimed_ ? kDryXfade : 0; /* nothing played yet: just take it */
+        }
+        dryPrimed_ = true;
+        const bool mixAutomated = nMixPts_ > 0;
+        if (!mixAutomated) mixPts_[nMixPts_++] = {0, mixTarget_.load(std::memory_order_relaxed)};
         if (mixFresh_) { /* a render's first block starts at the value the host gave it, not a
                           * glide from the default — so how the Mix arrived (automation, a
                           * restored state) cannot change the bounce */
@@ -400,10 +411,16 @@ public:
             }
             lin = lin < 0.f ? 0.f : (lin > 1.f ? 1.f : lin);
             mixSm_ += (lin - mixSm_) * mixCoef_;
-            size_t w = dryW_, r = (dryW_ - d) & (kDryMaxFrames - 1);
+            size_t w = dryW_, r = (dryW_ - dryD_) & (kDryMaxFrames - 1);
             dryBuf_[2 * w] = inL ? inL[s] : 0.0f;
             dryBuf_[2 * w + 1] = inR ? inR[s] : 0.0f;
             float dryL = dryBuf_[2 * r], dryR = dryBuf_[2 * r + 1];
+            if (dryXfade_) {
+                size_t r0 = (dryW_ - dryPrevD_) & (kDryMaxFrames - 1);
+                float a = (float)dryXfade_-- / (float)kDryXfade; /* weight of the old read point */
+                dryL = a * dryBuf_[2 * r0] + (1.0f - a) * dryL;
+                dryR = a * dryBuf_[2 * r0 + 1] + (1.0f - a) * dryR;
+            }
             dryW_ = (dryW_ + 1) & (kDryMaxFrames - 1);
             float l = mixSm_ * wet_[2 * (size_t)s] + (1.0f - mixSm_) * dryL;
             float rr = mixSm_ * wet_[2 * (size_t)s + 1] + (1.0f - mixSm_) * dryR;
@@ -412,7 +429,10 @@ public:
             else outL[s] = 0.5f * (l + rr); /* mono host: sum */
         }
         mixLin_ = mixPts_[nMixPts_ - 1].v; /* the curve ends at its last point */
-        mixTarget_.store(mixLin_, std::memory_order_relaxed);
+        /* publish automation back (getState must save it) — but ONLY when this block had
+         * real Mix points: otherwise a setState/preset landing mid-block would be overwritten
+         * with the value this block started from */
+        if (mixAutomated) mixTarget_.store(mixLin_, std::memory_order_relaxed);
         data.outputs[0].silenceFlags = 0;
         /* device front-panel echoes (§9.4) -> output parameter changes, so a knob
          * turned on the hardware moves (and records into) the DAW's parameter. An
@@ -496,6 +516,10 @@ private:
     static constexpr size_t kDryMaxFrames = 1u << 16;
     std::vector<float> fxin_, wet_, dryBuf_;
     size_t dryW_ = 0;
+    uint32_t dryD_ = 0, dryPrevD_ = 0, dryXfade_ = 0; /* current / previous read delay, fade left */
+    bool dryPrimed_ = false;                           /* a block has been played this activation */
+    static constexpr uint32_t kDryXfade = 64;
+    static_assert(HarpRuntime::kFxMaxWetDelay < kDryMaxFrames, "the dry line must hold the longest wet delay");
     /* DAW automation -> §9.4 set/ramp events + §15.5 offline-edit replay (shared
      * with the instrument shell). Seeded from kFxParams in the constructor. */
     ParamAutomation automation_;

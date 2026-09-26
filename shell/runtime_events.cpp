@@ -254,10 +254,11 @@ int EventManager::drainOwner(harp_cbuf &batch, harp_cbuf &msgbuf, int budget) {
      * byte-identical (its events all carry src.chan). Notes carry their channel in the UMP word. */
     TimedEv te;
     int sent = 0;
-    const uint32_t curTag = domainTag_.load(std::memory_order_acquire);
+    const uint32_t curTag = expectedTag_.load(std::memory_order_acquire);
     for (; sent < budget && ownerSource_.ring.pop(te); sent++) {
-        /* §8.8: an event stamped in an OLDER SSI domain (an effect's audio thread computed
-         * its timestamp before adopting the current session) cannot keep its timestamp —
+        /* §8.8: an event stamped in another SSI domain (an effect's audio thread computed its
+         * timestamp before adopting the CURRENT session — the one sessionUp set as expected,
+         * whether or not the audio thread has adopted it yet) cannot keep its timestamp —
          * the audio it accompanied was discarded with that domain. Deliver it "now" (ts 0),
          * a ramp as a set of its target, so the value still lands. It is still SENT, so the
          * §8.3.1 fence count stays exact. Untagged (the instrument): never touched. */

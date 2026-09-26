@@ -20,6 +20,7 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <cstdint>
 #include <cstdlib>
 #ifdef __APPLE__
@@ -210,6 +211,10 @@ public:
      * effect's domain adoption — fxBeginBlock); 0 = untagged (the instrument). The pump
      * re-stamps an event whose tag is not the current one to "now" (drainOwner). */
     void setDomainTag(uint32_t tag) { domainTag_.store(tag, std::memory_order_release); }
+    /* the tag the CURRENT session expects (sessionUp, before the pump starts): the pump
+     * re-stamps every tagged event whose tag differs — the audio thread may not have
+     * adopted the session yet, so its own domainTag_ cannot be the reference */
+    void setExpectedTag(uint32_t tag) { expectedTag_.store(tag, std::memory_order_release); }
     uint64_t staleRestamped() const { return staleRestamped_.load(std::memory_order_relaxed); }
     /* session start: drain events left carrying the PREVIOUS stream's stale
      * timestamps (safe: no pump runs yet, so this is the only ring toucher). */
@@ -254,7 +259,8 @@ private:
     std::atomic<uint32_t> evtQueuedSeq_{0};
     std::atomic<uint32_t> evtEpochBase_{0};
     std::atomic<uint64_t> evDrops_{0};    /* events lost to ring overflow — never silent */
-    std::atomic<uint32_t> domainTag_{0};       /* §8.8 current SSI-domain tag (0 = untagged) */
+    std::atomic<uint32_t> domainTag_{0};       /* §8.8 tag stamped on new events (0 = untagged) */
+    std::atomic<uint32_t> expectedTag_{0};     /* §8.8 the tag the current session accepts */
     std::atomic<uint64_t> staleRestamped_{0};  /* §8.8 older-domain events delivered "now" */
     uint64_t evDropsLogged_ = 0;          /* feeder-owned: last count pollDropLog reported */
     std::atomic<bool> panicPending_{false}; /* a note-off was lost: all-off NOW */
@@ -267,6 +273,9 @@ private:
 };
 
 class HarpRuntime {
+    /* unit-test access to private state (tests/runtime_units_tests.cpp defines it) — the
+     * §8.8 gap/domain tests drive the pull with synthetic wet, no device, no wall clock */
+    friend struct HarpRuntimeTestPeer;
 public:
     /* Called from setupProcessing: the ring cushion must scale with the
      * DAW's block size (a 1024-sample pull through a 1280-sample cushion
@@ -364,6 +373,10 @@ public:
     void setFxInputSlots(const std::vector<uint32_t> &slots) {
         fxInSlots_ = slots;
         if (fxInSlots_.size() > kMaxFxInCols) fxInSlots_.resize(kMaxFxInCols);
+        /* an armed effect's events are tagged from the start: tag 1 = the pre-session
+         * domain (generation 0), so nothing it queues before its first session can pass
+         * as current (tag 0 would mean "untagged", never re-stamped) */
+        if (!fxInSlots_.empty()) events_.setDomainTag(1);
     }
     bool fxArmed() const { return !fxInSlots_.empty(); }
     /* Audio-thread (process()) producer of the H→D effect input. Pushes nFrames,
@@ -393,7 +406,7 @@ public:
      * against it, so automation lands on the sample of the audio it accompanies */
     uint64_t fxInputPos() const {
         size_t cols = fxInSlots_.empty() ? 1 : fxInSlots_.size();
-        return (uint64_t)((fxInRing_.writeIndex() - fxInBase_.load(std::memory_order_relaxed)) / cols);
+        return (uint64_t)((fxInRing_->writeIndex() - fxInBase_.load(std::memory_order_relaxed)) / cols);
     }
     /* The effect's input->wet delay in DAW samples — what the FX shell reports for PDC
      * and what the pull side ENFORCES: the wet stream is pre-rolled by exactly this many
@@ -424,13 +437,29 @@ public:
     static constexpr uint32_t fxOfflineLatency() { return kBlock - 1; }
     uint32_t fxLiveLatency() const { return targetFrames_ + (kBlock - 1); }
     static uint32_t fxLiveLatencyFor(uint32_t maxDawBlock) { return targetFramesFor(maxDawBlock) + (kBlock - 1); }
+    /* + the device's declared host-paced pipeline (§8.8: an effect MUST report it; §6.4 key 3,
+     * buf_depth — the converter keys are not in a host-paced digital path), LATCHED once per
+     * activation in start(): known when the device is connected at activation (start()'s
+     * first session is synchronous — the common case), else 0. So the value is constant for
+     * the activation and always what the host was told; a device that connects later with a
+     * pipeline the latch lacks is warned about loudly (sessionUp) — the dry still follows the
+     * wet, only the host's compensation lags, and re-activating the plugin reports it. */
     uint32_t fxLatencySamples() const {
-        return wantHostPaced_.load(std::memory_order_relaxed) ? fxOfflineLatency() : fxLiveLatency();
+        uint32_t base = wantHostPaced_.load(std::memory_order_relaxed) ? fxOfflineLatency() : fxLiveLatency();
+        return base + fxLatchedPipeline_.load(std::memory_order_relaxed);
+    }
+    uint32_t devicePipelineSamples() const {
+        for (size_t i = 0; i < nLat_; i++)
+            if (latProfiles_[i].rate == rate_) return latProfiles_[i].buf_depth;
+        return 0;
     }
     /* The wet's ACTUAL delay behind its input this session (audio thread): the armed
      * pre-roll plus what a late-guard re-anchor added. The FX shell delays its dry by
      * this, so dry and wet stay aligned even when it differs from the reported value. */
     uint32_t fxWetDelay() const { return fxArmedDelay_ + fxExtraDelay_; }
+    /* the longest wet delay a shell must be able to align its dry to (re-anchors stop growing
+     * it here, and say so) */
+    static constexpr uint32_t kFxMaxWetDelay = 65535;
     /* input frames writeFxInput dropped on ring overflow (their wet is replaced by
      * silence at their position, so the stream stays aligned); diagnostic */
     uint64_t fxInputDropped() const { return fxInDropped_.load(std::memory_order_relaxed); }
@@ -1348,7 +1377,10 @@ private:
      * (consumer), sized like audioRing_; allocated unconditionally (memory only,
      * never touched off the FX path, so the instrument render is unaffected). */
     std::vector<uint32_t> fxInSlots_;
-    FloatRing fxInRing_{1 << 15};
+    /* sized in start() (off the audio thread) from the host's max block: an offline host
+     * writes a whole block before it pulls, so the ring must hold >= 2 x (maxBlock + kBlock)
+     * frames or a large block would overflow into a gap (review D). Never null once armed. */
+    std::unique_ptr<FloatRing> fxInRing_ = std::unique_ptr<FloatRing>(new FloatRing(1 << 15));
     /* §8.8 timing state (see fxBeginBlock). fxInBase_ (input ring index of this
      * session's SSI 0) and fxAdoptedGen_ (the sessionGen_ the audio thread adopted) are
      * written by the audio thread and read by the feeder — base first, then the gen with
@@ -1356,6 +1388,8 @@ private:
      * thread-only. */
     std::atomic<size_t> fxInBase_{0};
     std::atomic<uint64_t> fxAdoptedGen_{0};
+    std::atomic<uint32_t> fxLatchedPipeline_{0}; /* device pipeline in the latched latency (start) */
+    bool fxLatched_ = false;                     /* start() has latched it for this activation */
     std::atomic<uint64_t> fxReanchors_{0};  /* host-readable: x.harp.fx_reanchors */
     std::atomic<uint64_t> fxInDropped_{0};  /* writeFxInput overflow, frames */
     uint64_t fxInDroppedLogged_ = 0;        /* feeder: last value logged */
@@ -1372,6 +1406,7 @@ private:
     uint32_t fxGapN_ = 0;
     void fxLateGuard(size_t nFrames);
     size_t pullFxLive(float *dst, size_t nFrames);
+    size_t pullFxOffline(float *dst, size_t nFrames, unsigned timeoutMs);
     uint32_t takeFxPreroll(uint32_t n) {
         uint32_t t = fxPreroll_ < n ? fxPreroll_ : n;
         fxPreroll_ -= t;

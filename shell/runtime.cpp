@@ -948,13 +948,15 @@ bool HarpRuntime::fxBeginBlock() {
     uint64_t g = sessionGen_.load(std::memory_order_acquire);
     if (g == fxAdoptedGen_.load(std::memory_order_relaxed)) return false;
     uint32_t lat = fxLatencySamples();
-    fxInBase_.store(fxInRing_.writeIndex(), std::memory_order_relaxed);
+    fxInBase_.store(fxInRing_->writeIndex(), std::memory_order_relaxed);
     fxArmedDelay_ = fxTestUnderbudget_ >= lat ? 0 : lat - fxTestUnderbudget_;
     fxPreroll_ = fxArmedDelay_;
     fxExtraDelay_ = 0;
     fxGapN_ = 0;
     fxLateRunFrames_ = 0;
     padDebtFloats_ = 0; /* the previous domain's debt is meaningless in this one */
+    ssiRead_.store(0, std::memory_order_relaxed); /* the wet SSI counter restarts with the
+                                                   * domain: gap SSIs are measured against it */
     events_.setDomainTag((uint32_t)g + 1); /* events stamped from here on belong to g */
     fxAdoptedGen_.store(g, std::memory_order_release);
     return true;
@@ -984,7 +986,7 @@ size_t HarpRuntime::pullAudio(AudioSink *sink, float *dst, size_t nFrames) {
 }
 
 size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeoutMs) {
-    size_t pre = 0; /* §8.8 pre-roll frames at the head of this block (see pullAudio) */
+    if (fxArmed()) return pullFxOffline(dst, nFrames, timeoutMs); /* §8.8: see pullFxOffline */
     size_t want = nFrames * 2;
     size_t got = 0;
     unsigned waited = 0;
@@ -1002,13 +1004,8 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
                             flipTargetGen_.load(std::memory_order_acquire);
         if (!flipping) {
             if (!settled) {
-                if (fxArmed()) {
-                    pre = takeFxPreroll((uint32_t)nFrames);
-                    memset(dst, 0, pre * 2 * sizeof(float));
-                    got = pre * 2;
-                }
                 settlePadDebt();
-                ssiRead_.fetch_add(nFrames - pre, std::memory_order_relaxed);
+                ssiRead_.fetch_add(nFrames, std::memory_order_relaxed);
                 settled = true;
             }
             got += audioRing_.read(dst + got, want - got);
@@ -1016,15 +1013,61 @@ size_t HarpRuntime::pullAudioBlocking(float *dst, size_t nFrames, unsigned timeo
         }
         if ((!flipping && !connected_.load(std::memory_order_acquire)) || waited >= timeoutMs) {
             if (!settled) ssiRead_.fetch_add(nFrames, std::memory_order_relaxed); /* advance EXACTLY once per call */
-            size_t shortBy = padUnderrun(dst, got, want, &padDebtFloats_, true);
-            if (fxArmed()) observeFxWet(dst, nFrames); /* §8.8 never-silent guard (offline) */
-            return shortBy;
+            return padUnderrun(dst, got, want, &padDebtFloats_, true);
         }
         harp_sleep_ns(500000ull); /* 0.5 ms */
         waited++;
     }
-    if (fxArmed()) observeFxWet(dst, nFrames); /* §8.8 never-silent guard (offline) */
     return 0;
+}
+
+/* §8.8 offline (host-paced bounce) pull for an armed effect: the live pull's stream order —
+ * pre-roll, then wet by SSI with silence at each input gap — but WAITING for each wet
+ * range while the device is connected (a bounce has no deadline; `timeoutMs` polls of
+ * 0.5 ms only bound a connected-but-wedged device). A gap is only possible here if the host
+ * broke its maxSamplesPerBlock (the input ring is sized for 2 x (maxBlock + kBlock)); it is
+ * honoured anyway, so such a bounce stays aligned and never waits for wet that cannot exist.
+ * An effect never flips live<->offline (setOffline is a no-op when armed), so the instrument
+ * pull's mode-flip fence does not apply. Audio thread only. */
+size_t HarpRuntime::pullFxOffline(float *dst, size_t nFrames, unsigned timeoutMs) {
+    settlePadDebt();
+    size_t done = 0, shortBy = 0;
+    unsigned waited = 0;
+    while (done < nFrames) {
+        size_t rem = nFrames - done;
+        if (uint32_t pre = takeFxPreroll((uint32_t)rem)) {
+            memset(dst + done * 2, 0, (size_t)pre * 2 * sizeof(float));
+            done += pre;
+            continue;
+        }
+        uint64_t pos = ssiRead_.load(std::memory_order_relaxed);
+        if (fxGapN_ && fxGaps_[0].ssi <= pos) {
+            uint32_t g = fxGaps_[0].frames < rem ? fxGaps_[0].frames : (uint32_t)rem;
+            memset(dst + done * 2, 0, (size_t)g * 2 * sizeof(float));
+            done += g;
+            if ((fxGaps_[0].frames -= g) == 0)
+                memmove(fxGaps_, fxGaps_ + 1, (size_t)(--fxGapN_) * sizeof fxGaps_[0]);
+            continue;
+        }
+        size_t take = rem;
+        if (fxGapN_ && fxGaps_[0].ssi - pos < take) take = (size_t)(fxGaps_[0].ssi - pos);
+        size_t want = take * 2, got = 0;
+        while (got < want) {
+            got += audioRing_.read(dst + done * 2 + got, want - got);
+            if (got >= want) break;
+            if (!connected_.load(std::memory_order_acquire) || waited >= timeoutMs) {
+                shortBy += padUnderrun(dst + done * 2, got, want, &padDebtFloats_, true);
+                got = want;
+                break;
+            }
+            harp_sleep_ns(500000ull); /* 0.5 ms */
+            waited++;
+        }
+        ssiRead_.fetch_add(take, std::memory_order_relaxed);
+        done += take;
+    }
+    observeFxWet(dst, nFrames); /* §8.8 never-silent guard (offline) */
+    return shortBy;
 }
 
 /* Offline per-part pull: block until the sink's demuxed range has arrived. Like
@@ -1086,7 +1129,7 @@ size_t HarpRuntime::writeFxInput(const float *interleaved, size_t nFrames) {
             break;
         }
     fxInRunFrames_ = energy ? fxInRunFrames_ + nFrames : 0;
-    size_t written = fxInRing_.write(interleaved, nFrames * cols) / cols;
+    size_t written = fxInRing_->write(interleaved, nFrames * cols) / cols;
     if (written < nFrames) {
         /* overflow (the feeder stalled for a whole ring): the dropped input never reaches
          * the device, but its dry does. Record the gap at the SSI where it happened; the
@@ -1176,7 +1219,10 @@ void HarpRuntime::fxLateGuard(size_t nFrames) {
         return;
     size_t owed = padDebtFloats_ / 2;
     padDebtFloats_ = 0;
-    fxExtraDelay_ += (uint32_t)owed; /* the wet now trails by this much more: the dry follows */
+    /* the wet now trails by this much more: the dry follows (fxWetDelay), up to what a shell
+     * can align — past that the dry cannot follow, which is said loudly below */
+    bool capped = (uint64_t)fxArmedDelay_ + fxExtraDelay_ + owed > kFxMaxWetDelay;
+    fxExtraDelay_ = capped ? kFxMaxWetDelay - fxArmedDelay_ : fxExtraDelay_ + (uint32_t)owed;
     fxReanchors_.fetch_add(1, std::memory_order_relaxed);
     char msg[200];
     snprintf(msg, sizeof msg,
@@ -1185,6 +1231,10 @@ void HarpRuntime::fxLateGuard(size_t nFrames) {
              fxArmedDelay_, owed);
     recordLog(HARP_LOG_ERROR, "audio.fx", msg);
     log_msg("§8.8 FX re-anchor: %s", msg);
+    if (capped) {
+        recordLog(HARP_LOG_ERROR, "audio.fx", "FX wet delay at its maximum: the dry can no longer follow it");
+        log_msg("§8.8 FX re-anchor: wet delay capped at %u — dry and wet are no longer aligned", kFxMaxWetDelay);
+    }
 }
 
 /* §8.7 eth RTP audio NEVER-SILENT guard — see runtime.h. The detection seam the reader()

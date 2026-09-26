@@ -519,8 +519,12 @@ bool HarpRuntime::sessionUp() {
     events_.resetFence(); /* evtQueuedSeq_ = evtEpochBase_ = 0: fresh fence epoch */
     ssi_ = framesSent_ = framesRecv_ = 0;
     framesRecvAtomic_.store(0, std::memory_order_relaxed);
-    ssiRead_.store(0, std::memory_order_relaxed);
-    if (!fxArmed()) padDebtFloats_ = 0; /* an FX's pad debt is audio-thread-owned (fxBeginBlock) */
+    /* an armed FX's wet SSI counter and pad debt are audio-thread-owned: fxBeginBlock
+     * re-bases both at adoption (until then the pull still runs in the old domain) */
+    if (!fxArmed()) {
+        ssiRead_.store(0, std::memory_order_relaxed);
+        padDebtFloats_ = 0;
+    }
     /* §8.8: an armed effect's timing state (input base, pre-roll, pad debt, late guard) is
      * NOT reset here — this supervisor thread runs while process() does. The audio thread
      * adopts the new domain itself at its next block (fxBeginBlock), triggered by the
@@ -552,7 +556,23 @@ bool HarpRuntime::sessionUp() {
      * sessionGen_>=flipTargetGen_ test). EVERY sessionUp re-reads wantHostPaced_, so the
      * session is always in the latest requested mode — even a coincidental reconnect
      * satisfies a pending flip. */
-    sessionGen_.fetch_add(1, std::memory_order_release);
+    if (fxArmed() && fxLatched_ && devicePipelineSamples() != fxLatchedPipeline_.load(std::memory_order_relaxed)) {
+        char msg[400];
+        snprintf(msg, sizeof msg,
+                 "WARNING: this device's host-paced pipeline (%u samples) is not in the FX latency "
+                 "reported to the host (%u, latched at activation without it) — the host's delay "
+                 "compensation lags by the difference; dry and wet stay aligned. Re-activate the "
+                 "plugin to report it.",
+                 devicePipelineSamples(), fxLatencySamples());
+        recordLog(HARP_LOG_WARN, "audio.fx", msg);
+        log_msg("§8.8 %s", msg);
+    }
+    uint64_t gen = sessionGen_.fetch_add(1, std::memory_order_release) + 1;
+    /* §8.8: from here on only events stamped in THIS session's domain (tag gen+1, set by the
+     * audio thread's adoption) keep their timestamps; the pump re-stamps any other tagged
+     * event — including one queued after the stale-ring drain above but before the audio
+     * thread adopted this session. Set before the pump thread starts below. */
+    if (fxArmed()) events_.setExpectedTag((uint32_t)gen + 1);
     modeFlipPending_.store(false, std::memory_order_release);
     /* The reader thread feeds audioRing_ for BOTH bindings: USB drains the
      * host-paced audio-IN endpoint (+ demux); Ethernet receives the RTP stream
@@ -761,7 +781,20 @@ bool HarpRuntime::start(uint32_t sampleRate) {
      * DAW. Try only the fast USB / pinned-eth paths here; the supervisor (background) does
      * discovery, so a network synth still hot-plugs in a beat later. */
     allowDiscovery_.store(false, std::memory_order_relaxed);
+    if (fxArmed()) {
+        /* §8.8: size the input ring for this host's blocks (review D), off the audio thread */
+        size_t need = 2 * ((size_t)maxDawBlock_ + kBlock) * fxInSlots_.size(), cap = 1 << 15;
+        while (cap < need) cap <<= 1;
+        fxInRing_.reset(new FloatRing(cap));
+        fxLatchedPipeline_.store(0, std::memory_order_relaxed);
+        fxLatched_ = false;
+    }
     bool now = sessionUp(); /* fast path: report a present USB/pinned device immediately */
+    if (fxArmed()) {
+        /* latch the effect's latency for this activation (see fxLatencySamples) */
+        fxLatchedPipeline_.store(now ? devicePipelineSamples() : 0, std::memory_order_relaxed);
+        fxLatched_ = true;
+    }
     allowDiscovery_.store(true, std::memory_order_relaxed);
     if (!now) log_msg("no HARP device on the bus; supervising for hot-plug");
     supervisorThread_ = std::thread([this] { supervisor(); });

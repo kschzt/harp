@@ -502,9 +502,9 @@ void HarpRuntime::feeder() {
             if (fxReady) {
                 size_t base = fxInBase_.load(std::memory_order_relaxed);
                 float scratch[1024];
-                while (fxInRing_.readIndex() < base) {
-                    size_t stale = base - fxInRing_.readIndex();
-                    fxInRing_.read(scratch, stale < 1024 ? stale : 1024);
+                while (fxInRing_->readIndex() < base) {
+                    size_t stale = base - fxInRing_->readIndex();
+                    fxInRing_->read(scratch, stale < 1024 ? stale : 1024);
                 }
             }
             uint64_t dropped = fxInDropped_.load(std::memory_order_relaxed);
@@ -525,7 +525,7 @@ void HarpRuntime::feeder() {
             /* §8.8: only pace once the track input for this range is in the SPSC
              * ring — this couples the H→D input 1:1 to the D→H wet the reader fills,
              * so dry and wet stay sample-aligned (the lockstep host-paced effect). */
-            if (fxCols && fxInRing_.readAvailable() < kBlock * fxCols) break;
+            if (fxCols && fxInRing_->readAvailable() < kBlock * fxCols) break;
             /* every pacing frame carries the event fence (§8.3.1): the
              * count of events queued so far this session. Any event queued
              * before this instant is guaranteed consumed device-side
@@ -566,7 +566,7 @@ void HarpRuntime::feeder() {
                  * a->fx_in[c]; writeFxInput already interleaved process()'s input
                  * by fxCols, so a straight ring read fills the payload in column
                  * order. The availability gate above guarantees a full block. */
-                fxInRing_.read((float *)(ph + frameLen), (size_t)kBlock * fxCols);
+                fxInRing_->read((float *)(ph + frameLen), (size_t)kBlock * fxCols);
                 frameLen += (size_t)kBlock * fxCols * 4;
             }
             if (!transport_->audioWrite(ph, (int)frameLen, 8)) break;
