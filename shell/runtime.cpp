@@ -1,5 +1,6 @@
 #include "runtime.h"
 #include "runtime_registry.h" /* §8.4 admission ledger (ledger_reserve/release/reserved) */
+#include "fx_late_guard.h" /* §8.8 live-FX late-guard policy (pure, unit-tested) */
 #include "runtime_log.h" /* log_msg / log_param_map_drift (shared w/ runtime_recall.cpp) */
 #include "shell_config.h" /* HARP_SHELL_ENGINE_FILTER / HARP_SHELL_ETHERNET_ONLY (default = refdev) */
 #include "ump.h"
@@ -1101,15 +1102,12 @@ void HarpRuntime::observeFxWet(const float *wet, size_t nFrames) {
  * owed, beyond what PDC compensates), count the episode (x.harp.fx_reanchors) and log it
  * loudly. Audio thread only (the live pullAudio). */
 void HarpRuntime::fxLateGuard(size_t nFrames) {
-    if (!padDebtFloats_ || !connected_.load(std::memory_order_acquire)) {
-        fxLateRunFrames_ = 0;
+    /* the policy is pure + unit-tested: shell/fx_late_guard.h */
+    if (!fxLateStep(fxLateRunFrames_, padDebtFloats_ != 0,
+                    connected_.load(std::memory_order_acquire), nFrames, rate_ / 4))
         return;
-    }
-    fxLateRunFrames_ += nFrames;
-    if (fxLateRunFrames_ < rate_ / 4 || !padDebtFloats_) return;
     size_t owed = padDebtFloats_ / 2;
     padDebtFloats_ = 0;
-    fxLateRunFrames_ = 0;
     fxReanchors_.fetch_add(1, std::memory_order_relaxed);
     char msg[200];
     snprintf(msg, sizeof msg,

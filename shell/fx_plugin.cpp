@@ -337,8 +337,13 @@ public:
          * real-time pads silence on underrun (and drops the late wet, keeping the delay). */
         static thread_local std::vector<float> wet;
         if ((int)wet.size() < 2 * n) wet.resize(2 * n);
+        /* Offline waits as long as the device is CONNECTED — a bounce has no real-time
+         * deadline, and giving up early would pad silence into a render that must be
+         * deterministic (a stalled host or device for 0.5 s used to do exactly that). The
+         * bound (20000 polls x 0.5 ms = 10 s) only catches a connected-but-wedged device;
+         * a disconnect ends the wait at once. */
         if (offline_)
-            rt.pullAudioBlocking(wet.data(), (size_t)n, 1000);
+            rt.pullAudioBlocking(wet.data(), (size_t)n, 20000);
         else
             rt.pullAudio(wet.data(), (size_t)n);
 

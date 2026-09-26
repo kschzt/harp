@@ -20,6 +20,7 @@
 #endif
 
 #include "runtime_registry.h" /* runtime_acquire() — the no-device construction seam */
+#include "fx_late_guard.h"
 #include "runtime.h"          /* HarpRuntime, EventSource, queue*, setStateBundle */
 #include "ring.h"             /* TimedEv, TimedRing — the host-free observable */
 #include "note_voice_map.h"   /* NoteVoiceMap */
@@ -403,6 +404,46 @@ static void test_fx_never_silent() {
  *    call the reader() eth loop makes per receive poll — so it is socket-free and
  *    hardware-free. silentMs is a parameter, so the ~1 s window is crossed instantly with
  *    a synthetic value (no real waiting). The default window is 1000 ms (rtpSilentWindowMs_). */
+/* 8. §8.8 live-FX late guard POLICY (shell/fx_late_guard.h, pure). The runtime holds an
+ *    armed FX's wet exactly its reported latency behind the input; this decides when a
+ *    wet that stays late must re-anchor instead of being dropped forever. The property the
+ *    eth test cannot pin deterministically (it runs against a wall clock): a TRANSIENT
+ *    hiccup never re-anchors, however often it recurs — only an unbroken window of owed
+ *    late wet does, exactly once per window — and a disconnected stream never does. */
+static void test_fx_late_guard_policy() {
+    const uint64_t kWin = 12000; /* 250 ms at 48 kHz, as the runtime uses (rate_/4) */
+    const size_t kBlk = 256;
+    uint64_t run = 0;
+    /* (a) transient: debt owed for 200 ms, then paid back, repeated 20x -> never fires */
+    int fired = 0;
+    for (int rep = 0; rep < 20; rep++) {
+        for (size_t f = 0; f < 9600; f += kBlk) fired += fxLateStep(run, true, true, kBlk, kWin);
+        fired += fxLateStep(run, false, true, kBlk, kWin); /* the late wet landed: debt clear */
+    }
+    CHECK(fired == 0);
+    CHECK(run == 0);
+    /* (b) persistent: owed without a break -> fires once per full window, not per block */
+    run = 0;
+    fired = 0;
+    size_t firstAt = 0;
+    for (size_t f = 0; f < 3 * kWin; f += kBlk)
+        if (fxLateStep(run, true, true, kBlk, kWin) && ++fired == 1) firstAt = f + kBlk;
+    CHECK(fired == 2 || fired == 3);          /* 3 windows of pulls, 256-frame granularity */
+    CHECK(firstAt >= kWin && firstAt < kWin + kBlk); /* at the window, not a block early/late */
+    /* (c) disconnected: owed but no session -> never fires, and the run restarts */
+    run = 0;
+    fired = 0;
+    for (size_t f = 0; f < 3 * kWin; f += kBlk) fired += fxLateStep(run, true, false, kBlk, kWin);
+    CHECK(fired == 0);
+    CHECK(run == 0);
+    /* (d) a single clean pull in the middle of a late stretch restarts the window */
+    run = 0;
+    for (size_t f = 0; f < kWin - kBlk; f += kBlk) CHECK(!fxLateStep(run, true, true, kBlk, kWin));
+    CHECK(!fxLateStep(run, false, true, kBlk, kWin));
+    CHECK(!fxLateStep(run, true, true, kBlk, kWin));
+    CHECK(run == kBlk);
+}
+
 static void test_rtp_never_silent() {
     const unsigned kWinMs = 1000; /* rtpSilentWindowMs_ default */
     const unsigned kStall = kWinMs + 500; /* a silentMs past the window => a real stall */
@@ -519,6 +560,7 @@ int main() {
     test_note_voice_map();
     test_setstatebundle_rejection();
     test_fx_never_silent();
+    test_fx_late_guard_policy();
     test_rtp_never_silent();
 
     return check_report("harp-runtime-units-tests");
