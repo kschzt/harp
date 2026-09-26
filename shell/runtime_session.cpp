@@ -560,14 +560,22 @@ bool HarpRuntime::sessionUp() {
      * sessionGen_>=flipTargetGen_ test). EVERY sessionUp re-reads wantHostPaced_, so the
      * session is always in the latest requested mode — even a coincidental reconnect
      * satisfies a pending flip. */
-    if (fxArmed() && fxLatched_ && devicePipelineSamples() != fxLatchedPipeline_.load(std::memory_order_relaxed)) {
+    /* this session's device pipeline, published with the gen bump below: the audio thread
+     * arms the wet with it on adoption (fxBeginBlock, #187) and must not read latProfiles_,
+     * which the next connect's identity parse rewrites. */
+    uint32_t pipe = devicePipelineSamples();
+    fxSessionPipeline_.store(pipe, std::memory_order_relaxed);
+    /* a deeper pipeline than the latch: the wet is armed with it but the host was told less.
+     * (A shallower one is harmless: the latched delay still holds.) */
+    uint32_t latchedPipe = fxLatchedPipeline_.load(std::memory_order_relaxed);
+    if (fxArmed() && fxLatched_ && pipe > latchedPipe) {
         char msg[400];
         snprintf(msg, sizeof msg,
-                 "WARNING: this device's host-paced pipeline (%u samples) is not in the FX latency "
-                 "reported to the host (%u, latched at activation without it) — the host's delay "
-                 "compensation lags by the difference; dry and wet stay aligned. Re-activate the "
-                 "plugin to report it.",
-                 devicePipelineSamples(), fxLatencySamples());
+                 "WARNING: this device's host-paced pipeline (%u samples) is %u samples deeper "
+                 "than the one in the FX latency reported to the host (%u, latched at activation) "
+                 "— the host's delay compensation lags by the difference; dry and wet stay "
+                 "aligned. Re-activate the plugin to report it.",
+                 pipe, pipe - latchedPipe, fxLatencySamples());
         recordLog(HARP_LOG_WARN, "audio.fx", msg);
         log_msg("§8.8 %s", msg);
     }

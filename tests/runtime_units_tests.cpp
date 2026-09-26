@@ -513,7 +513,28 @@ struct HarpRuntimeTestPeer {
         CHECK(rt->fxGapN_ == 0);
         CHECK(rt->ssiRead_.load() == 300); /* gap silence consumes no SSI */
     }
+    /* 11. #187: a session whose device pipeline is deeper than the latched one (a late
+     *     connect, or a reconnect to a deeper unit) arms the wet with the difference too —
+     *     else it is late from the first block (dropout, then a re-anchor). A shallower one
+     *     arms just the latched latency (the pre-roll pads the rest). */
+    static void pipeline() {
+        std::unique_ptr<HarpRuntime> rt = runtime_acquire();
+        rt->configure(48000, 256);
+        rt->setFxInputSlots({0, 1});
+        rt->fxLatchedPipeline_.store(256); /* activated with a 256-sample-pipeline device */
+        const uint32_t reported = rt->fxLatencySamples();
+        rt->fxSessionPipeline_.store(2048); /* ...then a deeper one connected */
+        rt->sessionGen_.store(1);
+        CHECK(rt->fxBeginBlock());
+        CHECK(rt->fxWetDelay() == reported + 2048 - 256);
+        CHECK(rt->fxLatencySamples() == reported); /* the host's value is unchanged */
+        rt->fxSessionPipeline_.store(0); /* a pipeline-less device */
+        rt->sessionGen_.store(2);
+        CHECK(rt->fxBeginBlock());
+        CHECK(rt->fxWetDelay() == reported);
+    }
 };
+static void test_fx_late_connect_pipeline() { HarpRuntimeTestPeer::pipeline(); }
 static void test_fx_pull_gap_and_rebase() { HarpRuntimeTestPeer::run(); }
 
 static void test_rtp_never_silent() {
@@ -635,6 +656,7 @@ int main() {
     test_fx_late_guard_policy();
     test_fx_event_domain_restamp();
     test_fx_pull_gap_and_rebase();
+    test_fx_late_connect_pipeline();
     test_rtp_never_silent();
 
     return check_report("harp-runtime-units-tests");

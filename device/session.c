@@ -368,7 +368,7 @@ static void encode_identity(device *d, harp_cbuf *m) {
     harp_cbor_uint(m, 2);
     harp_cbor_uint(m, d->out_lat); /* §6.4 key 2: analog-out path latency (--out-lat) */
     harp_cbor_uint(m, 3);
-    harp_cbor_uint(m, 256);
+    harp_cbor_uint(m, d->buf_depth); /* §6.4 key 3: host-paced pipeline (256 unless --pipeline) */
     harp_cbor_uint(m, 9); /* build id */
     harp_cbor_text(m, "refdev sim " __DATE__);
     harp_cbor_uint(m, 10); /* boot count */

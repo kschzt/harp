@@ -1387,6 +1387,7 @@ private:
     std::atomic<size_t> fxInBase_{0};
     std::atomic<uint64_t> fxAdoptedGen_{0};
     std::atomic<uint32_t> fxLatchedPipeline_{0}; /* device pipeline in the latched latency (start) */
+    std::atomic<uint32_t> fxSessionPipeline_{0}; /* the current session's device pipeline (sessionUp) */
     /* §8.8 automation horizon (SSI, current domain): the audio thread publishes the input
      * position at which it finished queueing a block's events (writeFxInput, before writing
      * that block's input); the feeder paces only frames that END at or before it, and the

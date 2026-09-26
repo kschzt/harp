@@ -38,6 +38,10 @@
 #                    the render started: after the runtime (re)connects, every live wet
 #                    sample is again the offline render shifted by exactly the reported
 #                    latency (the audio thread adopts each new session's SSI domain)
+#   T13 deep late    a device with a REAL 2048-sample pipeline (harp-fx-filter --pipeline)
+#                    connects only after activation: the runtime arms the pipeline the
+#                    latch lacked, so the wet is sample-exact at reported + 2048 from the
+#                    start — no dropout, no re-anchor (#187)
 #
 # NO-FLAKE DESIGN. Every assertion is deterministic on a loaded runner:
 #   - every client (render or probe) waits until the device has finished the previous
@@ -462,9 +466,10 @@ EOF
 host --block 256 --input "wav:$TRAIN" --seconds 8 --out "$REF" >/dev/null 2>&1 || fail "T12 offline reference"
 ROFF=$(reported)
 # tail N FILE: impulses (of those due at t >= FROM s) whose wet is intact
-realigned() { # realigned WHAT FROM_S
-    local r sh
+realigned() { # realigned WHAT FROM_S — the wet is due at the reported latency, plus (after a late
+    local r sh #  connect) the pipeline the device declared that the latch lacked (#187)
     r=$(sed -nE 's/.*reported-samples=([0-9]+).*/\1/p' "$HOSTOUT" | head -1)
+    r=$(( r + $(sed -nE 's/.*pipeline \([0-9]+ samples\) is ([0-9]+) samples deeper than the one in the FX latency.*/\1/p' "$HOSTOUT" | head -1 | grep . || echo 0) ))
     grep -q "connected:" "$HOSTOUT" || { cat "$HOSTOUT" >&3; fail "T12 $1: never connected"; }
     sh=$(wav aligned "$OUT" "$REF" "$ROFF" "$r" 2400 4800 $((2400 + 4800 * ($2 * 10))) "$(extras)")
     case "$sh" in MISMATCH*) cat "$HOSTOUT" >&3; fail "T12 $1: a wet sample is misplaced after the (re)connect ($sh)";; esac
@@ -501,7 +506,7 @@ grep -q "supervising for hot-plug" "$HOSTOUT" || { cat "$HOSTOUT" >&3; fail "T12
 realigned "device up after the render started" 5
 # the latency was latched at activation WITHOUT the device's declared pipeline (no device
 # yet), so the contract is a loud warning when the device then connects with one
-grep -q "is not in the FX latency reported to the host" "$HOSTOUT" \
+grep -q "samples deeper than the one in the FX latency reported to the host" "$HOSTOUT" \
     || { cat "$HOSTOUT" >&3; fail "T12 late connect: no warning that the device pipeline is missing from the reported latency"; }
 # (c) automation across a restart: an LFO on Cutoff through a mid-render device restart.
 # Events stamped before the audio thread adopts the new session are delivered "now" (never
@@ -521,5 +526,38 @@ FT=$("$PROBE" $PD counters 2>/dev/null | sed -nE 's/^ *x\.[a-z0-9.-]+\.fence_tim
 [ "${EL:-x}" = 0 ] && [ "${FT:-x}" = 0 ] \
     || fail "T12 automation across the restart: evt_late=${EL:-?} fence_timeouts=${FT:-?} on the restarted device"
 pass "T12 reconnect: after a mid-render device restart and after a late connect, the live wet is sample-exact at the reported latency again; automation across a restart lands on time"
+
+# ---- T13 late connect to a deep-pipeline device (#187) ----
+# The latency was latched at activation without a device, so it lacks the device's pipeline.
+# The runtime must arm the pre-roll with it anyway: the wet then sits EXACTLY at reported +
+# 2048 from the first impulses after the connect (the reference: the same device, connected
+# at activation). Without that, the wet came back ~700 samples late from the first block
+# (the pipeline exceeds the target's slack): a 250 ms dropout, then a re-anchor to wherever
+# the wet actually was — a position this check does not allow.
+PIPE=2048
+kill -9 "$DP" 2>/dev/null; wait "$DP" 2>/dev/null
+rm -rf "$STATEDIR"; : > "$DEVLOG"; echo 0 > "$SESSF"
+"$FXDEVICED" --port "$PORT" --state-dir "$STATEDIR" --pipeline "$PIPE" "${PANEL[@]}" >>"$DEVLOG" 2>&1 & DP=$!
+listening 1 || fail "T13 deep-pipeline device did not start"
+host --block 256 --input "wav:$TRAIN" --seconds 8 --out "$REF" >/dev/null 2>&1 || fail "T13 offline reference"
+ROFF=$(reported) # includes the pipeline: the device was connected at activation
+kill -9 "$DP" 2>/dev/null; wait "$DP" 2>/dev/null
+: > "$HOSTOUT"
+( for _ in $(seq 1 600); do grep -q "supervising for hot-plug" "$HOSTOUT" 2>/dev/null && break; sleep 0.05; done
+  "$FXDEVICED" --port "$PORT" --state-dir "$STATEDIR" --pipeline "$PIPE" "${PANEL[@]}" >>"$DEVLOG" 2>&1 & echo $! > fx-filter.dp ) &
+LATE=$!
+perl -e 'alarm 60; exec @ARGV' "$HOSTBIN" "$FXPLUG" --realtime --block 256 --input "wav:$TRAIN" --seconds 8 \
+    --out "$OUT" >"$HOSTOUT" 2>&1 || { cat "$HOSTOUT" >&3; fail "T13 late-connect render"; }
+wait "$LATE"; DP=$(cat fx-filter.dp); rm -f fx-filter.dp
+grep -q "supervising for hot-plug" "$HOSTOUT" || { cat "$HOSTOUT" >&3; fail "T13: the plugin activated WITH a device — not a late connect"; }
+grep -q "pipeline ($PIPE samples) is $PIPE samples deeper than the one in the FX latency" "$HOSTOUT" \
+    || { cat "$HOSTOUT" >&3; fail "T13: no warning that the device pipeline is missing from the reported latency"; }
+R=$(reported)
+SH=$(wav aligned "$OUT" "$REF" "$ROFF" $((R + PIPE)) 2400 4800 $((2400 + 4800 * 30)) "$(extras)")
+case "$SH" in MISMATCH*) cat "$HOSTOUT" >&3; fail "T13: the wet is not at reported + pipeline ($((R + PIPE))): $SH";; esac
+set -- $SH
+echo "     late connect, $PIPE-sample pipeline: reported $R, $1 of $2 impulses sample-exact at +$((R + PIPE))$( [ "$3" = 0 ] || echo " (+$3 after a logged re-anchor)")"
+[ "$2" -ge 1 ] && [ $(( 2 * $1 )) -ge "$2" ] || fail "T13: only $1 of $2 impulses came through"
+pass "T13 deep late: a late-connected $PIPE-sample-pipeline device is armed with its pipeline — the wet is sample-exact at reported + $PIPE from the connect on, no dropout"
 
 echo "FX-FILTER PASS (§8.8 effect: processing, automation, sample accuracy, recall, latency, reconnect$( [ "$WIN" = 1 ] || echo ', echo'))"

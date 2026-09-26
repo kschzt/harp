@@ -340,6 +340,10 @@ typedef struct {
                                 * at exactly the host's consumption rate and the
                                 * host plays 1:1 (no resampling = bit-exact). 0 =
                                 * nominal (the byte-identical free-running path). */
+    uint32_t pipeline; /* harp-deviced --pipeline N: a REAL host-paced pipeline, in samples, that an
+                          engine applies to its output (the wet trails its input by N more) and the
+                          device declares as §6.4 key 3. 0 = none (the default; the refdev ignores it).
+                          examples/fx-filter honours it, to stand in for a deep-pipeline effect. */
     double tone_hz; /* test/measurement: when >0, render_output emits a pure
                        stereo sine at this Hz INSTEAD of the synth — a clean
                        reference for SINAD over the free-running RTP path (the
@@ -413,6 +417,9 @@ typedef struct {
                              adopts it as the audio.start packet size instead of the 256 default.
                              Smaller = lower latency + smoother delivery on a clean link; the host
                              clamps it to [32, kBlock]. */
+    uint32_t buf_depth; /* §6.4 latency-profile key 3: the host-paced render pipeline declared in the
+                           identity. 256 (the refdev's render block) unless harp-deviced --pipeline N
+                           declares a real one (then N — see audio_state.pipeline). */
     uint32_t in_lat, out_lat; /* harp-deviced --in-lat / --out-lat N: §6.4 latency-profile keys 1/2
                                  (analog-in→stream, stream→analog-out), samples. 0 = pure-digital (the
                                  refdev default). A converter-bearing device declares them so the host

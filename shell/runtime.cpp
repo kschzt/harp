@@ -947,7 +947,15 @@ bool HarpRuntime::fxBeginBlock() {
     if (!fxArmed()) return false;
     uint64_t g = sessionGen_.load(std::memory_order_acquire);
     if (g == fxAdoptedGen_.load(std::memory_order_relaxed)) return false;
+    /* the latched latency, plus any pipeline this session's device declares that the latch
+     * lacks (a late connect or a reconnect to a deeper unit; #187). Arming only the latched
+     * value made such a device's wet late from the first block: ~250 ms of dropout, then a
+     * re-anchor, on every connect. The dry follows fxWetDelay(), so dry and wet stay aligned;
+     * only the host's compensation lags — the WARNING sessionUp logs for exactly this case. */
     uint32_t lat = fxLatencySamples();
+    uint32_t latched = fxLatchedPipeline_.load(std::memory_order_relaxed);
+    uint32_t pipe = fxSessionPipeline_.load(std::memory_order_relaxed); /* ordered by the gen acquire */
+    if (pipe > latched) lat += pipe - latched;
     fxInBase_.store(fxInRing_->writeIndex(), std::memory_order_relaxed);
     fxHorizon_.store(0, std::memory_order_relaxed); /* nothing of this domain is pacable yet */
     fxArmedDelay_ = fxTestUnderbudget_ >= lat ? 0 : lat - fxTestUnderbudget_;
