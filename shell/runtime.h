@@ -1395,6 +1395,7 @@ private:
     std::atomic<uint32_t> fxLatchedPipeline_{0}; /* device pipeline in the latched latency (start) */
     std::atomic<uint32_t> fxSessionPipeline_{0}; /* the current session's content pipeline (sessionUp) */
     uint32_t devPipelineSamples_ = 0; /* audio.start rsp key 1, host-paced (supervisor thread) */
+    uint32_t fxTurnWarned_ = 0;       /* key-3 turnaround last warned about this activation (sessionUp) */
     /* §8.8 automation horizon (SSI, current domain): the audio thread publishes the input
      * position at which it finished queueing a block's events (writeFxInput, before writing
      * that block's input); the feeder paces only frames that END at or before it, and the

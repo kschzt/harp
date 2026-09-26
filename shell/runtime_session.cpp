@@ -592,9 +592,11 @@ bool HarpRuntime::sessionUp() {
             log_msg("§8.8 ERROR: %s", msg);
         }
         /* §6.4 key 3 is WHEN the wet arrives: the live ring target budgets a one-block
-         * turnaround, and the pacing window (ahead_) keeps only a couple of blocks in flight */
+         * turnaround, and the pacing window (ahead_) keeps only a couple of blocks in flight
+         * (#190). Said once per activation and per declared value — not on every reconnect. */
         uint32_t turn = deviceTurnaroundSamples();
-        if (turn > kBlock) {
+        if (turn > kBlock && turn != fxTurnWarned_) {
+            fxTurnWarned_ = turn;
             snprintf(msg, sizeof msg,
                      "WARNING: this device declares a %u-sample render/turnaround block (§6.4 key 3); "
                      "the runtime budgets %u — its wet may arrive late (a content pipeline belongs "
@@ -825,6 +827,7 @@ bool HarpRuntime::start(uint32_t sampleRate) {
         fxInRing_.reset(new FloatRing(cap));
         fxLatchedPipeline_.store(0, std::memory_order_relaxed);
         fxLatched_ = false;
+        fxTurnWarned_ = 0;
     }
     bool now = sessionUp(); /* fast path: report a present USB/pinned device immediately */
     if (fxArmed()) {
