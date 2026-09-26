@@ -208,10 +208,13 @@ assert comp[:3] == b'HF1', comp[:3]
 comp = comp[7:]                      # drop 'HF1' + the float32 Mix: the bare bundle
 open(sys.argv[2], 'wb').write(struct.pack('<I', len(comp)) + comp + rest)
 EOF
-host --load-state "$STATEFILE.legacy" --input "wav:$NOISE" --seconds 0.2 >"$LOG" 2>&1 \
+# (headless recall: this checks the state FORMAT, not the §11.4 reconcile offer, so push at
+# once rather than wait out the 1 s offer window the archive check above uses)
+HARP_RECONCILE_TIMEOUT_MS=0 host --load-state "$STATEFILE.legacy" --input "wav:$NOISE" --seconds 0.5 >"$LOG" 2>&1 \
     || { cat "$LOG"; fail "T6 legacy-state load render"; }
 rm -f "$STATEFILE.legacy"
-[ "$(param 1)" = "0.310" ] || fail "T6 legacy (header-less) state did not restore the device (Cutoff $(param 1))"
+grep -q "restored\|SYNCED\|Push" "$LOG" || { cat "$LOG"; fail "T6 legacy state: no recall action logged"; }
+[ "$(param 1)" = "0.310" ] || { cat "$LOG"; fail "T6 legacy (header-less) state did not restore the device (Cutoff $(param 1))"; }
 pass "T6 recall: Cutoff $C Resonance $R + Mix restored, render byte-identical ($HPOST), archives $A0 -> $A1; legacy state loads"
 
 # ---- T7 front-panel echo -> DAW automation ----
