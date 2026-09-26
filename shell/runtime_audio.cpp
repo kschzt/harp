@@ -526,6 +526,9 @@ void HarpRuntime::feeder() {
              * ring — this couples the H→D input 1:1 to the D→H wet the reader fills,
              * so dry and wet stay sample-aligned (the lockstep host-paced effect). */
             if (fxCols && fxInRing_->readAvailable() < kBlock * fxCols) break;
+            /* §8.8: and only up to the automation horizon — this range's events are on the
+             * device before it renders (see fxHorizon_) */
+            if (fxCols && ssi_ + kBlock > fxHorizon_.load(std::memory_order_acquire)) break;
             /* every pacing frame carries the event fence (§8.3.1): the
              * count of events queued so far this session. Any event queued
              * before this instant is guaranteed consumed device-side

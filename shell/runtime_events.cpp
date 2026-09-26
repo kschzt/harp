@@ -319,6 +319,9 @@ void HarpRuntime::queueParamSet(EventSource *src, uint32_t id, float v, uint64_t
         roWrDrops_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    /* §8.8: an effect's event can never reach into audio the feeder may already pace — a
+     * "now" (ts 0) or a stale timestamp lands on the automation horizon (fxClampTs) */
+    if (fxArmed()) ts = fxClampTs(ts);
     events_.queueParamSet(src, id, v, ts, channel);
 }
 void HarpRuntime::queueRamp(EventSource *src, uint32_t id, float target, uint64_t start,
@@ -328,6 +331,10 @@ void HarpRuntime::queueRamp(EventSource *src, uint32_t id, float target, uint64_
         roExplicit_.load(std::memory_order_relaxed)) {
         roWrDrops_.fetch_add(1, std::memory_order_relaxed);
         return;
+    }
+    if (fxArmed()) { /* §8.8: a ramp starting before the horizon starts ON it (see above) */
+        start = fxClampTs(start);
+        if (end < start) end = start;
     }
     events_.queueRamp(src, id, target, start, end, channel);
 }

@@ -949,6 +949,7 @@ bool HarpRuntime::fxBeginBlock() {
     if (g == fxAdoptedGen_.load(std::memory_order_relaxed)) return false;
     uint32_t lat = fxLatencySamples();
     fxInBase_.store(fxInRing_->writeIndex(), std::memory_order_relaxed);
+    fxHorizon_.store(0, std::memory_order_relaxed); /* nothing of this domain is pacable yet */
     fxArmedDelay_ = fxTestUnderbudget_ >= lat ? 0 : lat - fxTestUnderbudget_;
     fxPreroll_ = fxArmedDelay_;
     fxExtraDelay_ = 0;
@@ -1116,6 +1117,10 @@ size_t HarpRuntime::pullAudioBlocking(AudioSink *sink, float *dst, size_t nFrame
  * fell behind: the output underruns in lockstep, which the pull side counts). */
 size_t HarpRuntime::writeFxInput(const float *interleaved, size_t nFrames) {
     if (fxInSlots_.empty() || !interleaved || nFrames == 0) return 0;
+    /* §8.8 automation horizon: this block's events are queued (the shell queues them before
+     * its input), so everything up to this block's first input sample may now be paced —
+     * this block's own input waits for the NEXT block's events (see fxHorizon_). */
+    fxHorizon_.store(fxInputPos(), std::memory_order_release);
     size_t cols = fxInSlots_.size();
     /* §8.8 never-silent guard: track how long the host has been pushing NON-silent
      * input. A run of non-silent blocks means the input path is live and the device

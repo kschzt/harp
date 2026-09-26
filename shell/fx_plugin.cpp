@@ -30,10 +30,10 @@
  *     host mix control express every ratio"). At mix=1 the dry path is inert, so
  *     the plugin is robust in every host mode.
  *   - the wet trails its input by a CONSTANT, enforced delay — the runtime's
- *     fxLatencySamples(), latched per activation: 255 samples on an offline bounce (one
- *     pacing frame, so no DAW block pattern ever waits on unfinished input) or the ring
- *     target + 255 live, plus the device's declared host-paced pipeline when it is
- *     connected at activation. The plugin reports exactly that for PDC; its dry follows
+ *     fxLatencySamples(), latched per activation: one DAW block (the automation horizon:
+ *     a block's automation ramps from the previous point, so its audio is paced only after
+ *     the next block's events) + 255 (a pacing frame) offline, plus the ring target live,
+ *     plus the device's declared host-paced pipeline when it is connected at activation. The plugin reports exactly that for PDC; its dry follows
  *     the runtime's actual wet delay, so dry and wet are sample-aligned at every Mix.
  */
 #include <atomic>
@@ -235,7 +235,7 @@ public:
         /* §8.8 PDC: the runtime ENFORCES this delay between the input and its wet
          * (fxLatencySamples), so what the host compensates is what it gets. */
         if (runtime()) return runtime()->fxLatencySamples();
-        return offline_ ? HarpRuntime::fxOfflineLatency() : HarpRuntime::fxLiveLatencyFor(maxBlock_);
+        return offline_ ? HarpRuntime::fxOfflineLatencyFor(maxBlock_) : HarpRuntime::fxLiveLatencyFor(maxBlock_);
     }
 
     tresult PLUGIN_API canProcessSampleSize(int32 symbolicSampleSize) override {

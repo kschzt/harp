@@ -412,31 +412,29 @@ public:
      * and what the pull side ENFORCES: the wet stream is pre-rolled by exactly this many
      * frames of silence at each session's start, and an underrun later is paid back as
      * pad debt, so the delay never drifts.
+     *   Both modes include one DAW block of AUTOMATION HORIZON (see fxHorizon_): an automation
+     *   point ramps from the PREVIOUS point, which lies in the previous block, so the device
+     *   must not render a block until the NEXT block's events are on it. The feeder paces an
+     *   effect's input only up to the horizon the audio thread publishes after queueing each
+     *   block's events — one block behind — which is what makes an automated offline bounce
+     *   deterministic (the set of events each frame renders with no longer depends on thread
+     *   timing) and a live ramp sample-accurate instead of arriving after its range played.
      *   live: fxLiveLatency() = ring target (>= 2 DAW blocks and >= 512: the one-block
-     *     pipeline plus transport margin) + kBlock-1 (the framing wait).
-     *     No event headroom: an effect's events are ordered by the input gate itself
-     *     (a block's events are queued before its input is written), so the instrument's
-     *     event lead would only add latency.
-     *     No §6.4 device-path term either, deliberately: it is unknown until hello, so a
-     *     value including it changes when a device connects AFTER activation (late connect,
-     *     hot-plug, a reconnect to another unit) — and VST3 can only announce a latency
-     *     change from the UI thread, which a UI-less plugin does not reliably have (the SDK
-     *     timer is a no-op on Linux without an editor). Its converter terms are not in a
-     *     host-paced digital path, and a host-paced pipeline depth sits inside the target's
-     *     margin (>= one block + 255 beyond the measured one-block turnaround). So the value
-     *     is a pure function of the DAW block size and mode: identical before and after
-     *     connect, reported once, always true. A device whose pipeline exceeds the margin is
-     *     still safe: the late guard re-anchors (counted, logged) and the dry follows.
-     *   offline: fxOfflineLatency() = kBlock-1. §8.2 fixes every pacing frame at the
-     *     negotiated nsamples (kBlock), so input reaches the device in kBlock units
-     *     and a DAW block that ends mid-frame has no wet yet. kBlock-1 is the smallest
-     *     delay that never waits on an unfinished frame for ANY block sequence — VST3
-     *     hosts may shorten any block, and the last block of a bounce usually is. (A
-     *     zero-latency lockstep stalled a full pull timeout and dropped that block's
-     *     wet on every short block.) A bounce compensates it exactly (PDC). */
-    static constexpr uint32_t fxOfflineLatency() { return kBlock - 1; }
-    uint32_t fxLiveLatency() const { return targetFrames_ + (kBlock - 1); }
-    static uint32_t fxLiveLatencyFor(uint32_t maxDawBlock) { return targetFramesFor(maxDawBlock) + (kBlock - 1); }
+     *     turnaround plus transport margin) + the horizon block + kBlock-1 (framing).
+     *   offline: fxOfflineLatency() = the horizon block + kBlock-1. §8.2 fixes every pacing
+     *     frame at the negotiated nsamples (kBlock), so input reaches the device in kBlock
+     *     units and a DAW block that ends mid-frame has no wet yet; kBlock-1 more than the
+     *     horizon never waits on an unfinished frame for ANY block sequence (VST3 hosts may
+     *     shorten any block, and a bounce's last block usually is). A bounce compensates it
+     *     exactly (PDC).
+     *   Both are pure functions of the DAW block size and mode (no device term that only
+     *   hello reveals), so the value is the same before and after the device connects. */
+    uint32_t fxOfflineLatency() const { return fxOfflineLatencyFor(maxDawBlock_); }
+    static uint32_t fxOfflineLatencyFor(uint32_t maxDawBlock) { return maxDawBlock + (kBlock - 1); }
+    uint32_t fxLiveLatency() const { return targetFrames_ + maxDawBlock_ + (kBlock - 1); }
+    static uint32_t fxLiveLatencyFor(uint32_t maxDawBlock) {
+        return targetFramesFor(maxDawBlock) + maxDawBlock + (kBlock - 1);
+    }
     /* + the device's declared host-paced pipeline (§8.8: an effect MUST report it; §6.4 key 3,
      * buf_depth — the converter keys are not in a host-paced digital path), LATCHED once per
      * activation in start(): known when the device is connected at activation (start()'s
@@ -1389,6 +1387,17 @@ private:
     std::atomic<size_t> fxInBase_{0};
     std::atomic<uint64_t> fxAdoptedGen_{0};
     std::atomic<uint32_t> fxLatchedPipeline_{0}; /* device pipeline in the latched latency (start) */
+    /* §8.8 automation horizon (SSI, current domain): the audio thread publishes the input
+     * position at which it finished queueing a block's events (writeFxInput, before writing
+     * that block's input); the feeder paces only frames that END at or before it, and the
+     * runtime clamps any FX event timestamp below it up to it (fxClampTs). So every event a
+     * block queues reaches the device before any audio it can shape is paced, and each
+     * frame's event set is a deterministic function of the audio thread's progress. */
+    std::atomic<uint64_t> fxHorizon_{0};
+    uint64_t fxClampTs(uint64_t ts) const {
+        uint64_t h = fxHorizon_.load(std::memory_order_relaxed);
+        return ts < h ? h : ts;
+    }
     bool fxLatched_ = false;                     /* start() has latched it for this activation */
     std::atomic<uint64_t> fxReanchors_{0};  /* host-readable: x.harp.fx_reanchors */
     std::atomic<uint64_t> fxInDropped_{0};  /* writeFxInput overflow, frames */
