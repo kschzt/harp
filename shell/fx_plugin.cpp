@@ -2,12 +2,20 @@
  * to a DAW as an insert/send.
  *
  * Where shell/plugin.cpp is an INSTRUMENT (event input -> stereo out, the synth
- * refdev), this is its EFFECT sibling: a STEREO IN + STEREO OUT plugin in the
- * kFxReverb category. The track audio the DAW puts on the input bus travels
- * H->D to a HARP `audio.fx` device (e.g. harp-fx-deviced, the resonator-network
- * reverb), the device transforms it and returns the WET (processed) signal D->H,
- * and the plugin mixes that wet against the locally-held DRY (§8.8: the dry path
- * NEVER crosses the transport; the host holds it and the device returns wet only).
+ * refdev), this is its EFFECT sibling: a STEREO IN + STEREO OUT plugin. The track
+ * audio the DAW puts on the input bus travels H->D to a HARP `audio.fx` device
+ * (e.g. examples/fx-filter), the device transforms it and returns the WET
+ * (processed) signal D->H, and the plugin mixes that wet against the locally-held
+ * DRY (§8.8: the dry path NEVER crosses the transport; the host holds it and the
+ * device returns wet only).
+ *
+ * Identity, param map and input slots come from shell_config.h (HARP_FX_SHELL_*;
+ * default = the examples/fx-filter device), so an effect product ships its own
+ * plugin from these sources without editing them. Automation and recall behave as
+ * in the instrument shell: DAW curves become §9.4 ramps (shared ParamAutomation),
+ * device front-panel moves echo back as automation (§9.4 echo), edits made while
+ * the device was offline replay on reconnect (§15.5), and the component state is
+ * the §15.3 recall bundle.
  *
  * It shares the SAME embedded HarpRuntime as the instrument shell, opting in to
  * the runtime's §8.8 host->device input path (setFxInputSlots / writeFxInput):
@@ -45,45 +53,89 @@
 #include "public.sdk/source/vst/vstaudioeffect.h"
 #include "public.sdk/source/vst/vsteditcontroller.h"
 
+#include "param_automation.h"
 #include "runtime.h"
 #include "runtime_registry.h"
+#include "shell_config.h" /* HARP_FX_SHELL_* identity/params/in-slots (default = examples/fx-filter) */
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
 
 /* Frozen identity — its OWN class UIDs, distinct from harp-shell (so a DAW lists
- * both). NEVER change once shipped (recall/project stability). */
-static const FUID kHarpFxProcessorUID(0x6F8C21A4, 0x3E5B4C90, 0xB1D74E22, 0x0A93F5C7);
-static const FUID kHarpFxControllerUID(0x2D4A9E70, 0x7C1F46B8, 0x95E20D33, 0xF4681BAE);
+ * both). NEVER change a shipped product's UIDs (recall/project stability). */
+static const FUID kHarpFxProcessorUID(HARP_FX_SHELL_PROC_FUID);
+static const FUID kHarpFxControllerUID(HARP_FX_SHELL_CTRL_FUID);
 
-/* The harp-fx reverb device's param bank (device/reverb_engine.c g_params): ids
- * 1..4 are the user controls; defaults MIRROR the device so recall stays sane. */
+/* The effect device's param table (HARP_FX_SHELL_PARAMS) — same shape as the
+ * instrument shell's DevParam. Ids + defaults MIRROR the device so automation lands
+ * on the right param and recall stays sane. */
 struct FxParam {
     uint32_t id;
     const char *name;
+    int32 stepCount;    /* 0 = continuous (VST3: stepCount = steps - 1) */
     double defaultVal;
+    const char *labels; /* nullptr, or "A|B|C" enum labels (stepCount+1 of them) */
 };
-static const FxParam kFxParams[] = {
-    {1, "Size", 0.62},    /* room/decay (-> t60) */
-    {2, "Wet", 1.00},     /* device wet send (kept 1.0; the host Mix is separate) */
-    {3, "Diffuse", 0.50}, /* input diffusion density */
-    {4, "Width", 0.90},   /* stereo decorrelation */
-};
+static constexpr FxParam kFxParams[] = {HARP_FX_SHELL_PARAMS};
 static constexpr int kNumFxParams = sizeof(kFxParams) / sizeof(kFxParams[0]);
 
 /* HOST-SIDE dry/wet mix (§8.8) — NOT a device param: the device returns wet only
  * and this mixes it against the local dry. 1.0 = 100% wet (default). */
 static constexpr uint32_t kMixParamId = 50;
+static constexpr bool fxParamIdsClear(int i = 0) {
+    return i == kNumFxParams || (kFxParams[i].id != kMixParamId && fxParamIdsClear(i + 1));
+}
+static_assert(fxParamIdsClear(), "a device param id collides with the host Mix param (50)");
 
-/* The device's input slots (key 3). The harp-fx reverb reads a single MONO
- * column; a stereo-in effect would be {0,1} (and the runtime caps at 2). */
-static const std::vector<uint32_t> kFxInSlots = {0};
+/* The device's input slots (audio.start key 3): {0,1} = stereo, {0} = mono. */
+static const std::vector<uint32_t> kFxInSlots = {HARP_FX_SHELL_IN_SLOTS};
+
+/* Component state: 'H','F','1' + the host Mix (float32, little-endian) + the §15.3
+ * recall bundle. The device's params live in the bundle; the Mix is host-side, so the
+ * shell carries it (without it a reopened project came back 100% wet). 'H' (0x48) can
+ * never start a recall bundle (a CBOR map), so a header-less state from an older build
+ * is detected and loads as a bare bundle with the default Mix. */
+static const uint8_t kFxStateMagic[3] = {'H', 'F', '1'};
+static constexpr size_t kFxStateHeaderLen = sizeof kFxStateMagic + 4;
+
+static std::vector<uint8_t> readStream(IBStream *state) {
+    std::vector<uint8_t> raw;
+    uint8_t buf[8192];
+    int32 got = 0;
+    while (state && state->read(buf, sizeof buf, &got) == kResultOk && got > 0) {
+        raw.insert(raw.end(), buf, buf + got);
+        if (got < (int32)sizeof buf) break;
+    }
+    return raw;
+}
+/* split a component state into (mix, bundle); false if it has no bundle */
+static bool fxStateDecode(const std::vector<uint8_t> &raw, float &mix, std::vector<uint8_t> &bundle) {
+    mix = 1.0f;
+    if (raw.size() >= kFxStateHeaderLen && memcmp(raw.data(), kFxStateMagic, sizeof kFxStateMagic) == 0) {
+        const uint8_t *m = raw.data() + sizeof kFxStateMagic;
+        uint32_t bits = (uint32_t)m[0] | (uint32_t)m[1] << 8 | (uint32_t)m[2] << 16 | (uint32_t)m[3] << 24;
+        memcpy(&mix, &bits, sizeof mix);
+        if (!(mix >= 0.0f && mix <= 1.0f)) mix = 1.0f; /* corrupt/NaN -> the safe default */
+        bundle.assign(raw.begin() + kFxStateHeaderLen, raw.end());
+    } else
+        bundle = raw;
+    return !bundle.empty();
+}
 
 /* ---------------- processor ---------------- */
 
 class HarpFxProcessor : public AudioEffect {
 public:
-    HarpFxProcessor() { setControllerClass(kHarpFxControllerUID); }
+    HarpFxProcessor() {
+        setControllerClass(kHarpFxControllerUID);
+        uint32_t ids[kNumFxParams];
+        float defs[kNumFxParams];
+        for (int i = 0; i < kNumFxParams; i++) {
+            ids[i] = kFxParams[i].id;
+            defs[i] = (float)kFxParams[i].defaultVal;
+        }
+        automation_.init(ids, defs, kNumFxParams);
+    }
 
     ~HarpFxProcessor() override {
         releaseSource();
@@ -209,10 +261,19 @@ public:
     tresult PLUGIN_API process(ProcessData &data) override {
         if (!runtime() || !source_) return passthroughDry(data);
         HarpRuntime &rt = *runtime();
-        uint64_t base = rt.streamPos() + rt.latencySamples();
+        /* Stream position for THIS block's events (§9.2). An event must land on the
+         * same SSI as the input audio it accompanies. On the offline bounce the effect
+         * is lockstep — this block's input is rendered at streamPos() and its wet comes
+         * back in this block — so events carry NO lead. (The instrument shell leads by
+         * latencySamples() because its audio is RENDERED ahead on the device; leading an
+         * effect's events by it made offline automation land 2-5k samples after the
+         * audio it was drawn against.) A live insert keeps the runtime lead. */
+        uint64_t base = rt.streamPos() + (offline_ ? 0 : rt.latencySamples());
 
-        /* parameter changes: device params 1..4 -> §9.4 timestamped sets; the
-         * host-side Mix (id 50) updates the local dry/wet ratio (never sent). */
+        /* parameter changes: device params -> §9.4 sets/ramps (ParamAutomation, the
+         * instrument shell's policy); the host-side Mix updates the local dry/wet
+         * ratio and is never sent. */
+        automation_.beginBlock(rt, source_, base);
         if (data.inputParameterChanges) {
             int32 nq = data.inputParameterChanges->getParameterCount();
             for (int32 i = 0; i < nq; i++) {
@@ -228,8 +289,9 @@ public:
                         mix_ = (float)v;
                         continue;
                     }
-                    if (id >= 1 && id <= (uint32_t)kNumFxParams)
-                        rt.queueParamSet(source_, id, (float)v, base + (uint64_t)off);
+                    size_t slot = automation_.slotOf(id);
+                    if (slot != SIZE_MAX)
+                        automation_.point(rt, source_, slot, (float)v, base + (uint64_t)off);
                 }
             }
         }
@@ -240,20 +302,28 @@ public:
             !data.outputs[0].channelBuffers32)
             return kResultOk;
 
-        /* INPUT: the track signal on the input bus -> MONO (the device reads one
-         * column) -> the runtime's H->D effect input. Keep a local stereo DRY copy
-         * for the mix (the dry NEVER crosses the transport, §8.8). */
+        /* INPUT: the track signal on the input bus -> the device's input columns
+         * (stereo L/R interleaved, or summed to mono for a one-slot device) -> the
+         * runtime's H->D effect input. The dry stays local for the mix (the dry
+         * NEVER crosses the transport, §8.8). */
         const float *inL = nullptr, *inR = nullptr;
         if (data.numInputs >= 1 && data.inputs[0].channelBuffers32 &&
             data.inputs[0].numChannels >= 1) {
             inL = data.inputs[0].channelBuffers32[0];
             inR = data.inputs[0].numChannels > 1 ? data.inputs[0].channelBuffers32[1] : inL;
         }
-        static thread_local std::vector<float> mono;
-        if ((int)mono.size() < n) mono.resize(n);
-        for (int32 s = 0; s < n; s++)
-            mono[s] = inL ? 0.5f * (inL[s] + inR[s]) : 0.0f;
-        rt.writeFxInput(mono.data(), (size_t)n);
+        const size_t ncols = kFxInSlots.size() >= 2 ? 2 : 1;
+        static thread_local std::vector<float> fxin;
+        if (fxin.size() < ncols * (size_t)n) fxin.resize(ncols * (size_t)n);
+        for (int32 s = 0; s < n; s++) {
+            float l = inL ? inL[s] : 0.0f, r = inR ? inR[s] : 0.0f;
+            if (ncols == 2) {
+                fxin[2 * (size_t)s] = l;
+                fxin[2 * (size_t)s + 1] = r;
+            } else
+                fxin[(size_t)s] = 0.5f * (l + r);
+        }
+        rt.writeFxInput(fxin.data(), (size_t)n);
 
         /* WET: pull the device's processed stereo return. Offline blocks for the
          * lockstep wet (deterministic bounce); real-time pads silence on underrun. */
@@ -282,6 +352,22 @@ public:
             else outL[s] = 0.5f * (l + r); /* mono host: sum */
         }
         data.outputs[0].silenceFlags = 0;
+        /* device front-panel echoes (§9.4) -> output parameter changes, so a knob
+         * turned on the hardware moves (and records into) the DAW's parameter. An
+         * effect is one part: drain part 0's echo ring, forwarding only this
+         * plugin's params (the device also echoes its readonly meters that way). */
+        {
+            uint32_t id;
+            float v;
+            while (rt.popEcho(0, id, v)) {
+                if (!data.outputParameterChanges || automation_.slotOf(id) == SIZE_MAX) continue;
+                int32 qi = 0;
+                if (IParamValueQueue *q = data.outputParameterChanges->addParameterData(id, qi)) {
+                    int32 pi = 0;
+                    q->addPoint(0, v, pi);
+                }
+            }
+        }
         /* §8.8 NEVER-SILENT guard: the runtime's wet-side watchdog (observeFxWet, run
          * inside pullAudio/pullAudioBlocking) trips when this armed FX has been fed live
          * input but the device returned silence for a full window — the H->D input path
@@ -294,28 +380,30 @@ public:
         return kResultOk;
     }
 
-    /* component state = Recall Bundle (§15.3) — the device's param bank. No P6
-     * part header (the effect is not multitimbral). */
+    /* component state = kFxStateMagic + host Mix + Recall Bundle (§15.3, the
+     * device's param bank). No P6 part byte (the effect is not multitimbral). */
     tresult PLUGIN_API getState(IBStream *state) override {
         if (!runtime()) return kResultFalse;
         std::vector<uint8_t> bundle;
         if (!runtime()->getStateBundle(bundle)) return kResultFalse;
+        uint8_t header[kFxStateHeaderLen];
+        memcpy(header, kFxStateMagic, sizeof kFxStateMagic);
+        uint32_t bits;
+        memcpy(&bits, &mix_, sizeof bits);
+        for (int i = 0; i < 4; i++) header[sizeof kFxStateMagic + i] = (uint8_t)(bits >> (8 * i));
         int32 written = 0;
+        if (state->write(header, (int32)sizeof header, &written) != kResultOk) return kResultFalse;
         return state->write(bundle.data(), (int32)bundle.size(), &written);
     }
 
     tresult PLUGIN_API setState(IBStream *state) override {
-        std::vector<uint8_t> raw;
-        uint8_t buf[8192];
-        int32 got = 0;
-        while (state->read(buf, sizeof buf, &got) == kResultOk && got > 0) {
-            raw.insert(raw.end(), buf, buf + got);
-            if (got < (int32)sizeof buf) break;
-        }
-        if (raw.empty()) return kResultFalse;
-        pendingState_ = raw;
+        std::vector<uint8_t> bundle;
+        float mix;
+        if (!fxStateDecode(readStream(state), mix, bundle)) return kResultFalse;
+        mix_ = mix;
+        pendingState_ = bundle;
         if (runtime())
-            return runtime()->setStateBundle(raw.data(), raw.size()) ? kResultOk : kResultFalse;
+            return runtime()->setStateBundle(bundle.data(), bundle.size()) ? kResultOk : kResultFalse;
         return kResultOk;
     }
 
@@ -332,6 +420,9 @@ private:
     uint32_t maxBlock_ = 1024;
     bool offline_ = false;
     float mix_ = 1.0f; /* §8.8 host dry/wet; 1.0 = 100% wet */
+    /* DAW automation -> §9.4 set/ramp events + §15.5 offline-edit replay (shared
+     * with the instrument shell). Seeded from kFxParams in the constructor. */
+    ParamAutomation automation_;
     std::vector<uint8_t> pendingState_;
 };
 
@@ -347,26 +438,51 @@ public:
         tresult r = EditController::initialize(context);
         if (r != kResultOk) return r;
         for (auto &p : kFxParams) {
-            UString256 title(p.name);
-            parameters.addParameter(title, nullptr, 0, p.defaultVal,
+            if (p.labels) { /* a NAMED picker: register the enum labels so the DAW shows them */
+                auto *sl = new StringListParameter(UString256(p.name), p.id);
+                for (const char *s = p.labels; *s;) {
+                    const char *e = strchr(s, '|');
+                    size_t len = e ? (size_t)(e - s) : strlen(s);
+                    char buf[64];
+                    if (len >= sizeof buf) len = sizeof buf - 1;
+                    memcpy(buf, s, len);
+                    buf[len] = 0;
+                    sl->appendString(UString256(buf));
+                    if (!e) break;
+                    s = e + 1;
+                }
+                parameters.addParameter(sl);
+                continue;
+            }
+            parameters.addParameter(UString256(p.name), nullptr, p.stepCount, p.defaultVal,
                                     ParameterInfo::kCanAutomate, p.id);
         }
         parameters.addParameter(STR16("Mix"), STR16("%"), 0, 1.0,
                                 ParameterInfo::kCanAutomate, kMixParamId);
         return kResultOk;
     }
+
+    /* project reopen: show the restored host Mix (the device params are restored on
+     * the device itself, from the bundle) */
+    tresult PLUGIN_API setComponentState(IBStream *state) override {
+        std::vector<uint8_t> bundle;
+        float mix;
+        if (!fxStateDecode(readStream(state), mix, bundle)) return kResultFalse;
+        setParamNormalized(kMixParamId, mix);
+        return kResultOk;
+    }
 };
 
 /* ---------------- factory ---------------- */
 
-#define stringFxName "HARP FX"
+#define stringFxName HARP_FX_SHELL_PLUGIN_NAME
 
 BEGIN_FACTORY_DEF("HARP Project", "https://github.com/kschzt/harp",
                   "mailto:harp@example.invalid")
 
 DEF_CLASS2(INLINE_UID_FROM_FUID(kHarpFxProcessorUID), PClassInfo::kManyInstances,
            kVstAudioEffectClass, stringFxName, Vst::kDistributable,
-           Vst::PlugType::kFxReverb, "0.1.0", kVstVersionString,
+           HARP_FX_SHELL_CATEGORY, "0.1.0", kVstVersionString,
            HarpFxProcessor::createInstance)
 
 DEF_CLASS2(INLINE_UID_FROM_FUID(kHarpFxControllerUID), PClassInfo::kManyInstances,

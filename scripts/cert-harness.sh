@@ -29,7 +29,8 @@
 #   scripts/cert-harness.sh            run the cloud subset, print the report
 #   DRY_RUN=1 scripts/cert-harness.sh  print the run/skip plan for this host and exit 0
 #   CERT_TIMEOUT=180 scripts/...       per-test wall-clock cap in seconds (default 300)
-#   DEVICED=… PROBE=… HOSTBIN=… CHOST=… FENCE=…  override binary locations (else auto-located)
+#   DEVICED=… PROBE=… HOSTBIN=… CHOST=… FENCE=… FXDEVICED=… FXPLUG=…
+#                                      override binary locations (else auto-located)
 #
 # Binaries are auto-located with the SAME convention as eth-suite.sh, so a normal
 #   cmake -B build && cmake --build build -j
@@ -86,7 +87,14 @@ if [ -z "${FENCE:-}" ]; then
   elif [ -x "./build-dev/harp-eth-fence-test.exe" ]; then FENCE="./build-dev/harp-eth-fence-test.exe"
   else FENCE="$(find1 . "harp-eth-fence-test$EXE")"; fi
 fi
-export DEVICED PROBE HOSTBIN VHOST CHOST FENCE
+# §8.8 FX: the examples/fx-filter effect device + the FX shell (the `fx` token)
+if [ -z "${FXDEVICED:-}" ]; then
+  if   [ -x "./build/harp-fx-filter" ];         then FXDEVICED="./build/harp-fx-filter"
+  elif [ -x "./build-dev/harp-fx-filter.exe" ]; then FXDEVICED="./build-dev/harp-fx-filter.exe"
+  else FXDEVICED="$(find1 . "harp-fx-filter$EXE")"; fi
+fi
+[ -n "${FXPLUG:-}" ] || FXPLUG="$(find build-vst -maxdepth 5 -name harp-fx-shell.vst3 -type d 2>/dev/null | head -1)"
+export DEVICED PROBE HOSTBIN VHOST CHOST FENCE FXDEVICED FXPLUG
 
 # a ctest build dir carrying the unit suite (root cmake tree)
 UNIT_DIR=""
@@ -104,6 +112,7 @@ req_ok() {
     host)   have "$HOSTBIN" ;;
     clap)   have "$CHOST" ;;
     fence)  have "$FENCE" ;;
+    fx)     have "$FXDEVICED" && [ -n "$FXPLUG" ] && [ -d "$FXPLUG" ] ;;
     unit)   [ -n "$UNIT_DIR" ] ;;
     -|"")   true ;;
     *)      false ;;
@@ -115,6 +124,7 @@ req_bin() {
     device) echo harp-deviced ;; probe) echo harp-probe ;;
     host)   echo harp-vst3-host ;; clap) echo clap-host ;;
     fence)  echo harp-eth-fence-test ;; unit) echo "ctest build dir" ;;
+    fx)     echo "harp-fx-filter + harp-fx-shell.vst3" ;;
     *)      echo "$1" ;;
   esac
 }

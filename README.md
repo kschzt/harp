@@ -53,7 +53,8 @@ speaks the protocol gets the same treatment from any conforming host:
   the track in and mixes the device's returned **wet** against the dry it keeps
   locally (the dry never crosses the wire), with round-trip latency reported for
   PDC. The reference ships a dedicated **FX shell** (`harp-fx-shell`) that drives
-  an `audio.fx` device this way; a tight-feedback effect closes its loop *in the
+  an `audio.fx` device this way, and an example effect device
+  ([`examples/fx-filter`](examples/fx-filter)); a tight-feedback effect closes its loop *in the
   hardware*, at single-sample latency — the reason to put such an engine in a box
   at all.
 - **Multitimbral, addressed like plugins** — one physical device is one
@@ -142,6 +143,9 @@ shell/            the plugin shells over one embedded runtime: VST3 ("HARP
                   host's CoreAudio workgroup. All three render BYTE-IDENTICAL audio
                   and a project's recall state moves between them (asserted by the
                   conformance kit)
+examples/fx-filter/  a minimal §8.8 audio.fx EFFECT device (a resonant lowpass):
+                  harp-deviced with engine.c swapped for one ~330-line file —
+                  the starting point for building an effect
 tools/vst3-host/  CLI VST3 host for automated testing of any plugin —
                   params, block processing, WAV+hash, state round-trips,
                   multi-out per-part channel routing, and the §8.8 FX
@@ -310,9 +314,11 @@ the control envelope (§5), identity + capabilities (§6), time/clocking (§7–
 formats are pinned in [`spec/harp.cddl`](spec/harp.cddl). The reference device
 (`device/`, ~3k lines of C11) is the worked example — `session.c` (the protocol state
 machine), `state.c` (content-addressed, crash-atomic storage), `engine.c` (the synth
-DSP), `device.h` (the module contracts). *Not yet provided:* a step-by-step device-
-implementer's guide or marked extension points — read the spec and the reference; and
-`scripts/pi-bringup.md` is the reference Pi's **operations** runbook (provision/deploy/
+DSP), `device.h` (the module contracts). A device reuses the daemon and supplies only
+the engine seam in `device.h`; [`examples/fx-filter`](examples/fx-filter) walks through
+doing that for an **effect** (one file replacing `engine.c`, plus its plugin and
+conformance test). *Not yet provided:* a step-by-step guide for instruments — read the
+spec and the reference; and `scripts/pi-bringup.md` is the reference Pi's **operations** runbook (provision/deploy/
 debug), not an implementer tutorial. §13 firmware management is specified but not yet
 implemented on the reference device.
 

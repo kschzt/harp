@@ -404,7 +404,7 @@ int main(int argc, char **argv) {
     uint32_t rt_nsamples = 0;                         /* --rt-nsamples N: declared RTP packet size (frames), identity key 14 sub-key 1 */
     uint32_t in_lat = 0, out_lat = 0;                 /* --in-lat / --out-lat N: §6.4 latency-profile keys 1/2 (converter latency, samples) */
     const char *engine_ver = NULL;                    /* --engine-ver X.Y.Z: §12.2 test seam, override reported engine semver */
-    const char *product = NULL;                       /* --product STRING: identity product/model + panel + mDNS instance name (NULL => harp-refdev) */
+    const char *product = DEVICE_PRODUCT;             /* --product STRING: identity product/model + panel + mDNS instance name (NULL => harp-refdev) */
     const char *engine_name = NULL;                   /* --engine-name STRING: identity engine name (NULL => ENGINE_ID; media-type unaffected) */
     bool pmh_flip = false;                            /* --param-map-hash-flip: TEST seam (§9.3/§13.4) —
                                                        * advertise a 1-bit-altered param-map-hash to mimic

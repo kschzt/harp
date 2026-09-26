@@ -18,6 +18,7 @@
 # requires tokens:  device | probe | host | clap | fence | unit
 #   device=harp-deviced  probe=harp-probe  host=harp-vst3-host  clap=clap-host
 #   fence=harp-eth-fence-test  unit=a ctest build dir with the unit suite
+#   fx=the examples/fx-filter §8.8 effect device + the harp-fx-shell plugin
 #
 # The `command` runs under `bash -c`, so any ctest -R regex is single-quoted (a bare `|` would
 # become a shell pipe). @UNIT@ is substituted with the located ctest build dir.
@@ -44,6 +45,7 @@ T4	rig	-	-	The full rate matrix UNDER STREAMING LOAD is deepened on the rig (hw.
 
 T5	meta	partial	-	100 × DAW project reopen; recall verified by hash equality, silently (no dialogs on match)
 T5	run	host,probe	scripts/recall-eth-test.sh	§11.4 recall round-trip: save / restore verified by state-closure hash equality on loopback
+T5	run	fx,host,probe	scripts/fx-filter-eth-test.sh	§8.8 EFFECT recall: save / front-panel mutate / reopen restores params + host Mix, archives first, re-renders byte-identically
 T5	rig	-	-	100× real-DAW reopen: scripts/recall-roundtrip.sh + scripts/reaper-e2e.sh (headless REAPER) + scripts/cross-format-recall-test.sh (VST3↔AU) on the rig (hw.yml)
 
 T6	meta	cloud	-	firmware/engine mismatch flows: refuse-gracefully and read-only paths
@@ -97,6 +99,7 @@ T15	rig	-	-	Real-USB byte-identical golden render: scripts/golden-test.sh on the
 T16	meta	partial	-	automation parity: point, ramp, mod, and per-voice events applied within ±1 sample; supersede rules honored; value↔display round-trips against descriptors
 T16	run	host	scripts/evt-storm-eth-test.sh	§9.2 evt_late stays 0 under dense automation on the rt-nsamples=64 free-running path (on-time application)
 T16	run	host,probe	scripts/offline-edit-eth-test.sh	§15.5 edit-while-absent: live param sets reach the device
+T16	run	fx,host,probe	scripts/fx-filter-eth-test.sh	§8.8 EFFECT automation: point applied on the exact sample of its audio (0 samples, blocks 64/256/1024), ramps move stored state, evt_late=ramp_late=0
 T16	run	unit	ctest --test-dir @UNIT@ -R '^param_map_hash$' --output-on-failure	param-map descriptor codec — value↔display round-trip
 T16	rig	-	-	±1-sample point/ramp/mod/per-voice parity + supersede + cross-format: scripts/note-expr-test.sh + scripts/clap-test.sh + scripts/flood-stress.sh (ramp_late=0) on the rig (hw.yml)
 
