@@ -103,6 +103,9 @@ for d in build build-cov build-rel .; do
 done
 
 have() { [ -n "${1:-}" ] && [ -x "$1" ]; }
+# a VST3 bundle DIRECTORY is laid out at CMake configure time; only a BUILT one carries the
+# module binary (Contents/<arch>/<name>[.so|.vst3]) — so test for the binary, not the dir.
+vst3_built() { [ -n "${1:-}" ] && [ -d "$1" ] && find "$1/Contents" -type f -name "$(basename "$1" .vst3)*" 2>/dev/null | grep -q .; }
 
 # requires-token -> "present?" predicate (returns 0 if satisfiable in this lane)
 req_ok() {
@@ -112,7 +115,7 @@ req_ok() {
     host)   have "$HOSTBIN" ;;
     clap)   have "$CHOST" ;;
     fence)  have "$FENCE" ;;
-    fx)     have "$FXDEVICED" && [ -n "$FXPLUG" ] && [ -d "$FXPLUG" ] ;;
+    fx)     have "$FXDEVICED" && vst3_built "$FXPLUG" ;;
     unit)   [ -n "$UNIT_DIR" ] ;;
     -|"")   true ;;
     *)      false ;;

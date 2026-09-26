@@ -42,7 +42,8 @@ pass() { echo "  ✓ $1"; }
 [ -n "$FXDEVICED" ] && [ -x "$FXDEVICED" ] || fail "harp-fx-filter not built"
 [ -x "$HOSTBIN" ] || fail "$HOSTBIN not built"
 [ -x "$PROBE" ]   || fail "$PROBE not built"
-[ -n "$FXPLUG" ] && [ -d "$FXPLUG" ] || fail "harp-fx-shell.vst3 bundle not found"
+[ -n "$FXPLUG" ] && find "$FXPLUG/Contents" -type f -name 'harp-fx-shell*' 2>/dev/null | grep -q . \
+    || fail "harp-fx-shell.vst3 not built (no module in ${FXPLUG:-<not found>})"
 
 rm -rf "$STATEDIR" "$STATEFILE" "$NOISE" "$OUT" "$SOCK"; : > "$DEVLOG"
 PANEL=(); [ "$WIN" = 0 ] && PANEL=(--panel-sock "$SOCK")

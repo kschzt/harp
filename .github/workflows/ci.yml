@@ -562,9 +562,10 @@ jobs:
           cmake -B build -S .
           cmake --build build -j
       - name: build shell + host + clap-host (the audio-render cloud tests)
+        # harp-fx-shell: the §8.8 FX plugin the fx-filter rows (T5/T16) drive.
         run: |
           cmake -B build-vst -S tools/vst3-host
-          cmake --build build-vst --target harp-vst3-host harp-shell harp-clap clap-host -j
+          cmake --build build-vst --target harp-vst3-host harp-shell harp-fx-shell harp-clap clap-host -j
       - name: T1–T17 conformance harness (cloud subset) + report
         # pipefail so a genuine cloud FAIL is not masked by tee's exit 0. SKIP/UNCOVERED never fail.
         run: |

@@ -71,6 +71,9 @@ fi
 export DEVICED HOSTBIN VHOST CHOST PROBE FENCE FXDEVICED FXPLUG
 
 have() { [ -n "${1:-}" ] && [ -x "$1" ]; }
+# a VST3 bundle DIRECTORY is laid out at CMake configure time; only a BUILT one carries the
+# module binary (Contents/<arch>/<name>[.so|.vst3]) — so test for the binary, not the dir.
+vst3_built() { [ -n "${1:-}" ] && [ -d "$1" ] && find "$1/Contents" -type f -name "$(basename "$1" .vst3)*" 2>/dev/null | grep -q .; }
 
 echo "── eth-suite on $OSID"
 echo "   DEVICED=$DEVICED"
@@ -212,7 +215,7 @@ else run part-filter    scripts/part-filter-eth-test.sh; fi
 # in / wet out, automation (ramps, sample-accurate relative to the audio, zero late), exact
 # recall with archive, and (POSIX) the front-panel echo. Needs the fx device + FX shell + probe.
 if ! have "$FXDEVICED"; then skip fx-filter "harp-fx-filter not built on $OSID"
-elif [ -z "$FXPLUG" ]; then skip fx-filter "harp-fx-shell.vst3 not built on $OSID"
+elif ! vst3_built "$FXPLUG"; then skip fx-filter "harp-fx-shell.vst3 not built on $OSID"
 elif ! have "$PROBE"; then skip fx-filter "harp-probe not built on $OSID"
 else run fx-filter      scripts/fx-filter-eth-test.sh; fi
 
