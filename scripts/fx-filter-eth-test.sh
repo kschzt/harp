@@ -485,13 +485,19 @@ perl -e 'alarm 60; exec @ARGV' "$HOSTBIN" "$FXPLUG" --realtime --block 256 --inp
 wait "$RST"; DP=$(cat fx-filter.dp); rm -f fx-filter.dp
 grep -q "device reconnected" "$HOSTOUT" || { cat "$HOSTOUT" >&3; fail "T12 the runtime did not reconnect after the device restart"; }
 realigned "device restart mid-render" 5
-# (b) late connect: the device comes up only after the render started
+# (b) late connect: the device comes up only after the plugin activated without it. Ordered
+# by EVENT, not by a sleep: the device starts once the host has logged that it found no
+# device and is supervising for hot-plug (plugin load time varies a lot across runners —
+# a fixed delay let the device beat activation on windows-2022, so it was no late connect).
 kill -9 "$DP" 2>/dev/null; wait "$DP" 2>/dev/null
-( sleep 0.7; "$FXDEVICED" --port "$PORT" --state-dir "$STATEDIR" "${PANEL[@]}" >>"$DEVLOG" 2>&1 & echo $! > fx-filter.dp ) &
+: > "$HOSTOUT"
+( for _ in $(seq 1 600); do grep -q "supervising for hot-plug" "$HOSTOUT" 2>/dev/null && break; sleep 0.05; done
+  "$FXDEVICED" --port "$PORT" --state-dir "$STATEDIR" "${PANEL[@]}" >>"$DEVLOG" 2>&1 & echo $! > fx-filter.dp ) &
 LATE=$!
 perl -e 'alarm 60; exec @ARGV' "$HOSTBIN" "$FXPLUG" --realtime --block 256 --input "wav:$TRAIN" --seconds 8 \
     --out "$OUT" >"$HOSTOUT" 2>&1 || { cat "$HOSTOUT" >&3; fail "T12 late-connect render"; }
 wait "$LATE"; DP=$(cat fx-filter.dp); rm -f fx-filter.dp
+grep -q "supervising for hot-plug" "$HOSTOUT" || { cat "$HOSTOUT" >&3; fail "T12 late connect: the plugin activated WITH a device — not a late connect"; }
 realigned "device up after the render started" 5
 # the latency was latched at activation WITHOUT the device's declared pipeline (no device
 # yet), so the contract is a loud warning when the device then connects with one
