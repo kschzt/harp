@@ -229,13 +229,24 @@ for n in $TORDER; do
         # buffer to a per-test capture (keyed by the covering script's basename) so the §17 gate
         # phase can parse the measured numbers; a direct redirect (not a pipe) preserves rc/124.
         caplog="$CAPDIR/$(basename "${rcmd%%[ ]*}").log"
-        if run_bounded "$CERT_TIMEOUT" bash -c "$rcmd" >"$caplog" 2>&1; then
+        # one covering script may index several T's (e.g. fx-filter under T5/T11/T16): run a
+        # given command ONCE per harness invocation and reuse its verdict + capture after that.
+        memo="$CAPDIR/memo-$(printf '%s' "$rcmd" | cksum | cut -d' ' -f1)"
+        if [ -f "$memo.rc" ]; then
+          cp "$memo.log" "$caplog"
+          echo "     (same command already ran for an earlier T this invocation — reusing its result)"
+          rc=$(cat "$memo.rc")
+        else
+          run_bounded "$CERT_TIMEOUT" bash -c "$rcmd" >"$caplog" 2>&1
+          rc=$?
+          echo "$rc" > "$memo.rc"; cp "$caplog" "$memo.log"
+        fi
+        if [ "$rc" -eq 0 ]; then
           cat "$caplog"
           echo "::endgroup::"
           echo "   ✓ PASS  ${cmd##*/}"
           ran_pass=1
         else
-          rc=$?
           cat "$caplog"
           echo "::endgroup::"
           if [ "$rc" = 124 ]; then

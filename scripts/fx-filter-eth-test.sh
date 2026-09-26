@@ -31,6 +31,13 @@
 #                    dropping every block, counted in x.harp.fx_reanchors. (That a TRANSIENT
 #                    hiccup never re-anchors is pinned by the policy's unit test —
 #                    runtime_units_tests, test_fx_late_guard_policy — not a wall clock.)
+#   T11 live events  dense live automation (an LFO on Cutoff) is applied on time: evt_late,
+#                    ramp_late and fence_timeouts stay 0 (§9.2, §8.3.1) — the effect's
+#                    events carry no lead, the input gate orders them
+#   T12 reconnect    the device restarts mid-render, and separately comes up only after
+#                    the render started: after the runtime (re)connects, every live wet
+#                    sample is again the offline render shifted by exactly the reported
+#                    latency (the audio thread adopts each new session's SSI domain)
 #
 # NO-FLAKE DESIGN. Every assertion is deterministic on a loaded runner:
 #   - every client (render or probe) waits until the device has finished the previous
@@ -73,7 +80,7 @@ pass() { echo "  ✓ $1"; }
 cleanup() {
     kill -9 "${DP:-}" 2>/dev/null; wait "${DP:-}" 2>/dev/null
     rm -rf "$STATEDIR" "$STATEFILE" "$STATEFILE.legacy" "$NOISE" "$TRAIN" "$OUT" "$REF" "$DB" \
-           "$SESSF" "$HOSTOUT"
+           "$SESSF" "$HOSTOUT" fx-filter.dp
 }
 rm -rf "$STATEDIR" "$STATEFILE" "$NOISE" "$OUT" "$SOCK"; : > "$DEVLOG"; echo 0 > "$SESSF"
 PANEL=(); [ "$WIN" = 0 ] && PANEL=(--panel-sock "$SOCK")
@@ -298,7 +305,7 @@ grep -q "restored\|SYNCED\|Push" "$LOG" || { cat "$LOG"; fail "T6 legacy state: 
 # Two sessions displacing device state in the same wall-clock second collide on the
 # second-granularity archive name; the second push used to abort ("project state apply
 # failed" — the recall silently not applied: this test's windows-2022 flake). Pin the
-# timestamp so the collision is certain: both recalls must apply, archived as <ts>, <ts>.1.
+# timestamp so the collision is certain: both recalls must apply, archived as <ts>, <ts>.001.
 for i in 1 2; do
     probe knob 1 0.90 >/dev/null 2>&1 || fail "T6 archive-collision mutate $i"
     HARP_TEST_ARCHIVE_TS=collide HARP_RECONCILE_TIMEOUT_MS=0 host --load-state "$STATEFILE" \
@@ -306,7 +313,7 @@ for i in 1 2; do
     [ "$(param 1)" = "0.310" ] || { cat "$LOG"; fail "T6 recall $i with a colliding archive name was not applied (Cutoff $(param 1))"; }
 done
 ARCH=$(probe refs 2>/dev/null | grep -oE 'archive/collide(\.[0-9]+)?' | sort | tr '\n' ' ')
-[ "$ARCH" = "archive/collide archive/collide.1 " ] || fail "T6 colliding archives not both kept: [$ARCH]"
+[ "$ARCH" = "archive/collide archive/collide.001 " ] || fail "T6 colliding archives not both kept: [$ARCH]"
 pass "T6 recall: Cutoff $C Resonance $R + Mix restored, render byte-identical ($HPOST), archives $A0 -> $A1; legacy state loads; same-second recalls from two sessions both apply (archived $ARCH)"
 
 # ---- T7 front-panel echo -> DAW automation ----
@@ -344,6 +351,7 @@ done
 host --block 256 --set 1=1.0 --set 2=0.0 --input "wav:$TRAIN" --seconds 1 --out "$REF" >/dev/null 2>&1 \
     || fail "T8 offline reference render"
 ROFF=$(reported)
+CHECKED=0
 for BLK in 256 1024; do
     host --realtime --block "$BLK" --set 1=1.0 --set 2=0.0 --input "wav:$TRAIN" --seconds 1 --out "$OUT" \
         >/dev/null 2>&1 || fail "T8 live render (block $BLK)"
@@ -360,7 +368,9 @@ for BLK in 256 1024; do
     echo "     live block $BLK: reported $R, $1 of $2 impulses' wet sample-exact at +$R, no sample misplaced"
     [ "$2" -ge 1 ] && [ $(( 2 * $1 )) -ge "$2" ] \
         || fail "T8 live block $BLK: only $1 of $2 impulses came through (the runner starved the stream)"
+    CHECKED=$((CHECKED + 1))
 done
+[ "$CHECKED" -ge 1 ] || fail "T8 no live run could be checked (both re-anchored): the live claim is unproven"
 pass "T8 latency: the wet arrives exactly the reported latency after its input, offline and live"
 
 # ---- T9 dry/wet alignment at Mix 50% ----
@@ -390,11 +400,79 @@ python3 -c "import sys; sys.exit(0 if $TAIL > 0.2 else 1)" \
 if python3 -c "import cbor2" 2>/dev/null; then
     N=$(python3 -c "import cbor2,sys; print(cbor2.loads(open(sys.argv[1],'rb').read())[5]['x.harp.fx_reanchors'])" "$DB") \
         || fail "T10 diag bundle unreadable"
-    [ "$N" -ge 1 ] || fail "T10 x.harp.fx_reanchors = $N, want >= 1"
+    [ "$N" = 1 ] || fail "T10 x.harp.fx_reanchors = $N, want exactly 1 (one re-anchor settles a constant lateness)"
     CNT="x.harp.fx_reanchors=$N"
 else
     CNT="(cbor2 absent: counter not decoded)"
 fi
 pass "T10 late guard: persistently-late wet re-anchored and stayed audible (tail rms $TAIL, $CNT)"
 
-echo "FX-FILTER PASS (§8.8 effect: processing, automation, sample accuracy, recall, latency$( [ "$WIN" = 1 ] || echo ', echo'))"
+# ---- T11 live automation is applied on time ----
+# An LFO on Cutoff (dense sub-block points) and a ramp on Resonance, live, at two block
+# sizes: the effect's events are stamped at their input's SSI and ordered by the input gate
+# (queued before that input is written), so none may land late or wedge a fence.
+EL0=$(counter evt_late); RL0=$(counter ramp_late); FT0=$(counter fence_timeouts)
+for BLK in 64 256; do
+    host --realtime --block "$BLK" --input "wav:$NOISE" --lfo 1=3:4 --ramp 2=0.1:0.6 --seconds 2 \
+        >/dev/null 2>&1 || fail "T11 live automation render (block $BLK)"
+done
+EL1=$(counter evt_late); RL1=$(counter ramp_late); FT1=$(counter fence_timeouts)
+[ "$EL1" = "$EL0" ] && [ "$RL1" = "$RL0" ] && [ "$FT1" = "$FT0" ] \
+    || fail "T11 live automation late: evt_late $EL0->$EL1, ramp_late $RL0->$RL1, fence_timeouts $FT0->$FT1"
+pass "T11 live events: dense live automation at blocks 64/256 applied on time (evt_late, ramp_late, fence_timeouts unchanged)"
+
+# ---- T12 reconnect + late connect: the live wet realigns exactly ----
+# A fresh device (default params, fresh state: a hard kill loses uncommitted state, so every
+# render here must see the same device state). The runtime reconnects on its own (~1 s
+# retry); the audio thread then adopts the new session's domain. Every live sample must be
+# the offline render shifted by the reported latency, or exactly zero (while disconnected /
+# pre-rolling) — and the wet must be sample-exact again after the (re)connect.
+kill -9 "$DP" 2>/dev/null; wait "$DP" 2>/dev/null
+rm -rf "$STATEDIR"; : > "$DEVLOG"; echo 0 > "$SESSF"
+startdev() { "$FXDEVICED" --port "$PORT" --state-dir "$STATEDIR" "${PANEL[@]}" >>"$DEVLOG" 2>&1 & DP=$!; }
+listening() { for _ in $(seq 1 50); do [ "$(grep -c "listening on $PORT" "$DEVLOG")" -ge "$1" ] && return 0; sleep 0.1; done; return 1; }
+startdev; listening 1 || fail "T12 fresh device did not start"
+python3 - "$TRAIN" <<'EOF'
+import struct, sys, wave
+w = wave.open(sys.argv[1], 'wb'); w.setnchannels(2); w.setsampwidth(2); w.setframerate(48000)
+fr = bytearray()
+for i in range(8 * 48000):
+    v = 29491 if i >= 2400 and (i - 2400) % 4800 == 0 else 0
+    fr += struct.pack('<hh', v, v)
+w.writeframes(bytes(fr))
+EOF
+host --block 256 --input "wav:$TRAIN" --seconds 8 --out "$REF" >/dev/null 2>&1 || fail "T12 offline reference"
+ROFF=$(reported)
+# tail N FILE: impulses (of those due at t >= FROM s) whose wet is intact
+realigned() { # realigned WHAT FROM_S
+    local r sh
+    r=$(sed -nE 's/.*reported-samples=([0-9]+).*/\1/p' "$HOSTOUT" | head -1)
+    grep -q "connected:" "$HOSTOUT" || { cat "$HOSTOUT" >&3; fail "T12 $1: never connected"; }
+    sh=$(wav shifted "$OUT" "$REF" $((r - ROFF)) "$r" $((2400 + 4800 * ($2 * 10))) 4800)
+    case "$sh" in MISMATCH*) cat "$HOSTOUT" >&3; fail "T12 $1: a wet sample is misplaced after the (re)connect ($sh)";; esac
+    set -- "$1" $sh
+    echo "     $1: $2 of $3 impulses after the (re)connect window sample-exact at +$r"
+    [ "$3" -ge 1 ] && [ $(( 2 * $2 )) -ge "$3" ] || fail "T12 $1: only $2 of $3 impulses realigned after the (re)connect"
+}
+# (a) restart mid-render: kill the device 1.5 s into an 8 s live render, bring it back
+( for _ in $(seq 1 100); do grep -q "connected:" "$HOSTOUT" 2>/dev/null && break; sleep 0.05; done
+  sleep 1.5; kill -9 "$DP" 2>/dev/null; sleep 0.3
+  "$FXDEVICED" --port "$PORT" --state-dir "$STATEDIR" "${PANEL[@]}" >>"$DEVLOG" 2>&1 & echo $! > fx-filter.dp ) &
+RST=$!
+: > "$HOSTOUT"
+perl -e 'alarm 60; exec @ARGV' "$HOSTBIN" "$FXPLUG" --realtime --block 256 --input "wav:$TRAIN" --seconds 8 \
+    --out "$OUT" >"$HOSTOUT" 2>&1 || { cat "$HOSTOUT" >&3; fail "T12 restart render"; }
+wait "$RST"; DP=$(cat fx-filter.dp); rm -f fx-filter.dp
+grep -q "device reconnected" "$HOSTOUT" || { cat "$HOSTOUT" >&3; fail "T12 the runtime did not reconnect after the device restart"; }
+realigned "device restart mid-render" 5
+# (b) late connect: the device comes up only after the render started
+kill -9 "$DP" 2>/dev/null; wait "$DP" 2>/dev/null
+( sleep 0.7; "$FXDEVICED" --port "$PORT" --state-dir "$STATEDIR" "${PANEL[@]}" >>"$DEVLOG" 2>&1 & echo $! > fx-filter.dp ) &
+LATE=$!
+perl -e 'alarm 60; exec @ARGV' "$HOSTBIN" "$FXPLUG" --realtime --block 256 --input "wav:$TRAIN" --seconds 8 \
+    --out "$OUT" >"$HOSTOUT" 2>&1 || { cat "$HOSTOUT" >&3; fail "T12 late-connect render"; }
+wait "$LATE"; DP=$(cat fx-filter.dp); rm -f fx-filter.dp
+realigned "device up after the render started" 5
+pass "T12 reconnect: after a mid-render device restart and after a late connect, the live wet is sample-exact at the reported latency again"
+
+echo "FX-FILTER PASS (§8.8 effect: processing, automation, sample accuracy, recall, latency, reconnect$( [ "$WIN" = 1 ] || echo ', echo'))"

@@ -196,22 +196,26 @@ bool HarpRuntime::pushStateLocked(const harp_hash &target) {
         /* TEST seam (fx-filter-eth-test T6): HARP_TEST_ARCHIVE_TS pins the timestamp, so two
          * sessions' displacing pushes deterministically collide on the name below. Unset in
          * production. */
-        if (const char *ts = getenv("HARP_TEST_ARCHIVE_TS"); ts && ts[0])
+        if (const char *ts = getenv("HARP_TEST_ARCHIVE_TS"); ts && ts[0]) {
             snprintf(tsname, sizeof tsname, "%s/%s", prefix, ts);
+            log_msg("WARNING: TEST SEAM HARP_TEST_ARCHIVE_TS=%s active — archive names pinned", ts);
+        }
         /* §11.4: two DISTINCT displacing pushes within the same wall-clock second collide on this
          * second-granularity name — the second refset (expect=nullptr, create-if-absent) hits the
          * existing ref, conflicts, and the push aborted (the recall silently not applied — the
          * §11.4 MUST). The colliding push may come from ANOTHER session (a second host, a quick
          * project reopen, the next process of a test), which no per-session memory can see, so
-         * the DEVICE arbitrates: take the first free name of <ts>, <ts>.1, <ts>.2, ... — only a
-         * "conflict" (the name exists) moves on; any other error still aborts the push. */
+         * the DEVICE arbitrates: take the first free name of <ts>, <ts>.001, <ts>.002, ... — only
+         * a "conflict" (the name exists) moves on; any other error still aborts the push. The
+         * suffix is zero-padded so names sort lexicographically == chronologically, the order
+         * the device's archive retention prunes by (.010 after .002, not before it). */
         char archive[112];
         bool archived = false;
         for (unsigned seq = 0; seq < 1000 && !archived; seq++) {
             if (seq == 0)
                 snprintf(archive, sizeof archive, "%s", tsname);
             else
-                snprintf(archive, sizeof archive, "%s.%u", tsname, seq);
+                snprintf(archive, sizeof archive, "%s.%03u", tsname, seq);
             if (harp_client_refset(&client_, archive, nullptr, &deviceHead, true, false, false,
                                    nullptr) == 0)
                 archived = true;

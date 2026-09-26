@@ -259,6 +259,13 @@ static void svf_run(const float *inL, const float *inR, uint32_t avail, float *w
             wet[2 * s + c] = v2; /* lowpass output */
         }
     }
+    /* Denormals: when the track goes silent the integrators decay toward zero through the
+     * subnormal range, where x86 (without FTZ/DAZ) runs 10-100x slower — a live insert's
+     * device would stall exactly when it idles. Flush a state that small to exact zero. */
+    for (unsigned c = 0; c < 2; c++) {
+        if (fabsf(g_svf.ic1[c]) < 1e-20f) g_svf.ic1[c] = 0.0f;
+        if (fabsf(g_svf.ic2[c]) < 1e-20f) g_svf.ic2[c] = 0.0f;
+    }
 }
 
 int engine_is_fx(void) { return 1; }

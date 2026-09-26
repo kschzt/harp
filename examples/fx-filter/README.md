@@ -58,6 +58,9 @@ Rules the example follows, and yours should too:
   offline bounce is host-paced and must be byte-identical run to run; the tests check it.
 - **Stay stable everywhere.** Every parameter value a DAW can send must be safe to render
   at any automation speed. The filter is a topology-preserving SVF for exactly that reason.
+- **Never go subnormal.** Recursive state decaying toward zero on a silent track passes
+  through denormal floats, which are many times slower on x86. Flush tiny state to zero
+  (as `svf_run` does) or set flush-to-zero on the render thread.
 
 ## Identity
 
@@ -98,7 +101,13 @@ through the FX shell and checks, with no hardware:
   renders byte-identically;
 - a front-panel knob echoes back to the DAW as automation;
 - the wet arrives exactly the latency the plugin reports for delay compensation after its
-  input, offline and live, and at Mix 50% the dry and wet line up.
+  input, offline and live, and at Mix 50% the dry and wet line up;
+- dense live automation is applied on time (no late events, no fence timeouts);
+- after the device restarts mid-render, or only comes up after the render started, the
+  live wet is sample-exact at the reported latency again.
+
+Every check is deterministic on a loaded machine: no retries, no wall-clock luck (see the
+"NO-FLAKE DESIGN" note at the top of the script).
 
 It runs in CI on Linux, macOS and Windows as part of `scripts/eth-suite.sh`. Point it at your
 own device and plugin (`FXDEVICED=… FXPLUG=…`) and adjust the parameter ids and expected
