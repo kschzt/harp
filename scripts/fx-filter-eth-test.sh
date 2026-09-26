@@ -125,6 +125,9 @@ host() {
     return "$rc"
 }
 reported() { sed -nE 's/.*reported-samples=([0-9]+).*/\1/p' "$HOSTOUT" | head -1; }
+# "0,e1,e1+e2,...": the delays a live wet may legitimately have beyond the reported one —
+# each late-guard re-anchor logs how much it added ("trails by N more frames")
+extras() { sed -nE 's/.*trails by ([0-9]+) more frames.*/\1/p' "$HOSTOUT" | awk 'BEGIN{t=0; printf "0"} {t+=$1; printf ",%d", t} END{print ""}'; }
 hash_of() { sed -n 's/^output-hash: //p'; }
 param() { probe params 2>/dev/null | sed -nE "s/^ *\[$1\].*[[:space:]]([0-9.]+)$/\1/p"; }
 counter() { probe counters 2>/dev/null | sed -nE "s/^ *(x\.[a-z0-9.-]+\.)?$1 = ([0-9]+).*/\2/p" | head -1; }
@@ -136,11 +139,10 @@ counter() { probe counters 2>/dev/null | sed -nE "s/^ *(x\.[a-z0-9.-]+\.)?$1 = (
 #   loud FILE                 first sample with |x| > 0.01
 #   rmstail FILE              RMS of the left channel over the second half
 #   firstdiff FILE OTHER      first sample where the two renders differ
-#   shifted LIVE REF D L N0 P LIVE == REF delayed by D samples, except samples that are exactly
-#                             0 (a padded live block); prints "INTACT TOTAL": how many of the
-#                             train's impulses (first at N0, every P; their wet due at +L in
-#                             LIVE) came through intact, or
-#                             "MISMATCH i live ref" at the first sample that is neither
+#   aligned LIVE REF ROFF R N0 P FROM EXTRAS
+#                             every impulse's live wet equals REF's exactly at +R (+ a logged
+#                             re-anchor extra), or is zero; nothing anywhere else. Prints
+#                             "INTACT TOTAL EXTRA" (impulses from FROM on) or "MISMATCH ..."
 #   onsets FILE THR           every sample with |x| > THR, comma-separated
 wav() { python3 - "$@" <<'EOF'
 import array, math, sys, wave
@@ -166,20 +168,43 @@ elif op == 'loud':
 elif op == 'firstdiff':
     y = left(sys.argv[3])
     print(next((i for i, (a, b) in enumerate(zip(x, y)) if a != b), -1))
-elif op == 'shifted':
-    ref, d, lat = left(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
-    n0, per = int(sys.argv[6]), int(sys.argv[7])
-    for i, v in enumerate(x):
-        r = ref[i - d] if 0 <= i - d < len(ref) else 0.0
-        if v != 0.0 and v != r:
-            print('MISMATCH %d %r %r' % (i, v, r)); sys.exit(0)
-    ok = tot = 0
-    for k in range(n0, len(x) - lat - 64, per):
-        tot += 1
-        w = range(k + lat, k + lat + 64)
-        if all(x[i] == ref[i - d] for i in w) and any(x[i] != 0.0 for i in w):
-            ok += 1
-    print('%d %d' % (ok, tot))
+elif op == 'aligned':
+    # aligned LIVE REF ROFF REP N0 PER FROM EXTRAS: an impulse train (first at N0, every
+    # PER) through the effect. REF is its offline render (wet at +ROFF); in LIVE each
+    # impulse's wet window must equal REF's EXACTLY at +REP+e for e in EXTRAS (0 first,
+    # then the cumulative re-anchor extras the host logged), in non-decreasing order over
+    # time — or be exactly zero (a padded block / a gap / a disconnect). Every live sample
+    # outside the windows so placed must be exactly zero: nothing may land anywhere else.
+    ref = left(sys.argv[3]); roff, rep = int(sys.argv[4]), int(sys.argv[5])
+    n0, per, frm = int(sys.argv[6]), int(sys.argv[7]), int(sys.argv[8])
+    extras = [int(e) for e in sys.argv[9].split(',')]
+    W = per // 2
+    covered = bytearray(len(x))
+    level = intact = tot = 0
+    for I in range(n0, len(x), per):
+        for c in range(level, len(extras)):
+            s = I + rep + extras[c]
+            n = min(W, len(x) - s, len(ref) - (I + roff))  # the render's end cuts the last window
+            if n <= 0:
+                continue
+            w, seg = x[s:s + n], ref[I + roff:I + roff + n]
+            if not any(w):
+                continue
+            if all(a == b or a == 0.0 for a, b in zip(w, seg)):
+                level = c
+                for j in range(s, s + n):
+                    covered[j] = 1
+                if I >= frm and n == W:
+                    tot += 1
+                    intact += all(a == b for a, b in zip(w, seg))
+                break
+        else:
+            if I >= frm and I + rep + extras[level] + W <= min(len(x), len(ref) + rep - roff):
+                tot += 1  # nothing of it came through: padded / dropped, counted not intact
+    stray = next((i for i, v in enumerate(x) if v != 0.0 and not covered[i]), -1)
+    if stray >= 0:
+        print('MISMATCH %d %r (wet outside every allowed position)' % (stray, x[stray])); sys.exit(0)
+    print('%d %d %d' % (intact, tot, extras[level]))
 elif op == 'onsets':
     print(','.join(str(i) for i, v in enumerate(x) if abs(v) > float(sys.argv[3])))
 EOF
@@ -343,34 +368,27 @@ for BLK in 64 256 1000; do
     echo "     offline block $BLK: reported $R, wet at $AT"
     [ -n "$R" ] && [ "$AT" = "$R" ] || fail "T8 offline block $BLK: wet at $AT, reported latency ${R:-?}"
 done
-# Live: the device's render is deterministic, so every live wet sample must EQUAL the offline
-# render of the same impulse train shifted by (live latency - offline latency) — or be exactly
-# zero, where a scheduler hiccup padded a block (its late wet is then dropped to keep the
-# delay). A misaligned wet can never pass; a stalled runner can never fail. At least half the
-# impulses must come through intact, so a mostly-padded run does not pass vacuously.
+# Live: the device's render is deterministic, so every live impulse's wet must EQUAL its
+# offline render exactly at the reported latency — or be exactly zero, where a scheduler
+# hiccup padded a block (its late wet is then dropped to keep the delay). If the runner
+# stalled long enough for the late guard to re-anchor, the host logged the extra delay, and
+# the wet must then sit exactly there instead (never anywhere else). A misplaced sample can
+# never pass; a stalled runner can never fail. At least half the impulses must come through
+# intact, so a mostly-padded run does not pass vacuously.
 host --block 256 --set 1=1.0 --set 2=0.0 --input "wav:$TRAIN" --seconds 1 --out "$REF" >/dev/null 2>&1 \
     || fail "T8 offline reference render"
 ROFF=$(reported)
-CHECKED=0
 for BLK in 256 1024; do
     host --realtime --block "$BLK" --set 1=1.0 --set 2=0.0 --input "wav:$TRAIN" --seconds 1 --out "$OUT" \
         >/dev/null 2>&1 || fail "T8 live render (block $BLK)"
-    R=$(reported)
-    if grep -q "FX re-anchor" "$HOSTOUT"; then
-        # the runner stalled for > 250 ms: re-anchoring (not alignment) was then the right
-        # behaviour — T10 pins that path — so there is no alignment claim to check this run
-        echo "     live block $BLK: runner stalled > 250 ms, stream re-anchored (see T10); alignment not claimable"
-        continue
-    fi
-    SH=$(wav shifted "$OUT" "$REF" $((R - ROFF)) "$R" 2400 4800)
+    R=$(reported); EX=$(extras)
+    SH=$(wav aligned "$OUT" "$REF" "$ROFF" "$R" 2400 4800 0 "$EX")
     case "$SH" in MISMATCH*) fail "T8 live block $BLK: wet not at the reported latency $R ($SH)";; esac
     set -- $SH
-    echo "     live block $BLK: reported $R, $1 of $2 impulses' wet sample-exact at +$R, no sample misplaced"
+    echo "     live block $BLK: reported $R, $1 of $2 impulses' wet sample-exact at +$R$( [ "$3" = 0 ] || echo " (+$3 after a logged re-anchor)"), nothing misplaced"
     [ "$2" -ge 1 ] && [ $(( 2 * $1 )) -ge "$2" ] \
         || fail "T8 live block $BLK: only $1 of $2 impulses came through (the runner starved the stream)"
-    CHECKED=$((CHECKED + 1))
 done
-[ "$CHECKED" -ge 1 ] || fail "T8 no live run could be checked (both re-anchored): the live claim is unproven"
 pass "T8 latency: the wet arrives exactly the reported latency after its input, offline and live"
 
 # ---- T9 dry/wet alignment at Mix 50% ----
@@ -448,10 +466,10 @@ realigned() { # realigned WHAT FROM_S
     local r sh
     r=$(sed -nE 's/.*reported-samples=([0-9]+).*/\1/p' "$HOSTOUT" | head -1)
     grep -q "connected:" "$HOSTOUT" || { cat "$HOSTOUT" >&3; fail "T12 $1: never connected"; }
-    sh=$(wav shifted "$OUT" "$REF" $((r - ROFF)) "$r" $((2400 + 4800 * ($2 * 10))) 4800)
+    sh=$(wav aligned "$OUT" "$REF" "$ROFF" "$r" 2400 4800 $((2400 + 4800 * ($2 * 10))) "$(extras)")
     case "$sh" in MISMATCH*) cat "$HOSTOUT" >&3; fail "T12 $1: a wet sample is misplaced after the (re)connect ($sh)";; esac
     set -- "$1" $sh
-    echo "     $1: $2 of $3 impulses after the (re)connect window sample-exact at +$r"
+    echo "     $1: $2 of $3 impulses after the (re)connect window sample-exact at +$r$( [ "$4" = 0 ] || echo " (+$4 after a logged re-anchor)")"
     [ "$3" -ge 1 ] && [ $(( 2 * $2 )) -ge "$3" ] || fail "T12 $1: only $2 of $3 impulses realigned after the (re)connect"
 }
 # (a) restart mid-render: kill the device 1.5 s into an 8 s live render, bring it back.
